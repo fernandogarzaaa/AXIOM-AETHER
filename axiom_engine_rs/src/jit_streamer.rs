@@ -164,7 +164,7 @@ fn decompose_query(query: &str, max_subqueries: usize) -> Vec<String> {
         .filter(|t| t.len() > 3)
         .take(max_subqueries.saturating_sub(1))
     {
-        out.push(format!("{query} {term}"));
+        out.push(term);
     }
     out
 }

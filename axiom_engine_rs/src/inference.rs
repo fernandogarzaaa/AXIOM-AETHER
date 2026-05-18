@@ -157,6 +157,7 @@ impl InferencePipeline {
         let context_ids = self.streamer.fetch_and_pack_context(prompt);
         let context_tensor =
             Tensor::from_vec(context_ids.clone(), (1, context_ids.len()), &self.device)?;
+        // Prefill intentionally ignores logits; this stage primes the model before decode.
         let _ = self.engine.forward(&context_tensor, None, false)?;
 
         let prompt_ids = self.encode(prompt);
