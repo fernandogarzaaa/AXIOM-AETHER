@@ -99,10 +99,10 @@ impl JitContextStreamer {
             format!("{base_url}?q={encoded}")
         };
 
-        let mut request = self
-            .client
-            .get(target)
-            .header("accept", "application/json,text/markdown;q=0.9,text/plain;q=0.9");
+        let mut request = self.client.get(target).header(
+            "accept",
+            "application/json,text/markdown;q=0.9,text/plain;q=0.9",
+        );
         if let Some(api_key) = &self.api_key {
             request = request.bearer_auth(api_key);
         }

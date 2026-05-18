@@ -2,6 +2,7 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{VarBuilder, VarMap};
+use sha2::Digest;
 use tokenizers::Tokenizer;
 
 use crate::config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
@@ -154,7 +155,8 @@ impl InferencePipeline {
 
     pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> Result<String> {
         let context_ids = self.streamer.fetch_and_pack_context(prompt);
-        let context_tensor = Tensor::from_vec(context_ids.clone(), (1, context_ids.len()), &self.device)?;
+        let context_tensor =
+            Tensor::from_vec(context_ids.clone(), (1, context_ids.len()), &self.device)?;
         let _ = self.engine.forward(&context_tensor, None, false)?;
 
         let prompt_ids = self.encode(prompt);
