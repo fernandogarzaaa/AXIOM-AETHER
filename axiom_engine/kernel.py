@@ -100,7 +100,9 @@ class AxiomTTTEngine(nn.Module):
         return_states: bool = False,
     ) -> Tensor | Tuple[Tensor, List[Tensor]]:
         if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("Pass exactly one of input_ids or inputs_embeds")
+            raise ValueError(
+                "Exactly one of input_ids or inputs_embeds must be provided, not both or neither."
+            )
 
         x = inputs_embeds if inputs_embeds is not None else self.token_embedding(input_ids)
         hidden, next_states = self.forward_hidden(x, states=states, return_states=True)
