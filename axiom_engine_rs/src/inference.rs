@@ -4,7 +4,7 @@ use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{VarBuilder, VarMap};
 use sha2::{Digest, Sha256};
 
-use crate::config::AxiomConfig;
+use crate::config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use crate::kernel::AxiomTTTEngine;
 
 pub struct InferencePipeline {
@@ -16,11 +16,19 @@ pub struct InferencePipeline {
 
 impl InferencePipeline {
     pub fn new(config: AxiomConfig, device: Device) -> Result<Self> {
+        Self::with_checkpoint(config, device, DEFAULT_CHECKPOINT_PATH)
+    }
+
+    pub fn with_checkpoint(
+        config: AxiomConfig,
+        device: Device,
+        checkpoint_path: impl AsRef<str>,
+    ) -> Result<Self> {
         let mut varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let engine = AxiomTTTEngine::new(vb, config.clone())?;
 
-        let checkpoint = "axiom_kernel_v1.safetensors";
+        let checkpoint = checkpoint_path.as_ref();
         if Path::new(checkpoint).exists() {
             varmap.load(checkpoint)?;
             println!("[+] Loaded checkpoint from {checkpoint}");

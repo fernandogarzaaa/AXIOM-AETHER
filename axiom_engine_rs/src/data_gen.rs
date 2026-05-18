@@ -1,6 +1,8 @@
 use candle_core::{Device, Result, Tensor};
 use rand::Rng;
 
+use crate::config::DEFAULT_EOS_TOKEN;
+
 /// Synthetic procedural dataset generator for structure-only training.
 pub struct ProceduralDataset {
     vocab_size: u32,
@@ -12,7 +14,7 @@ impl ProceduralDataset {
         let vocab_size = vocab_size.max(8) as u32;
         Self {
             vocab_size,
-            eos_token: 2,
+            eos_token: DEFAULT_EOS_TOKEN,
         }
     }
 

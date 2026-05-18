@@ -3,6 +3,7 @@ use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::config::AxiomConfig;
+use crate::config::DEFAULT_CHECKPOINT_PATH;
 use crate::data_gen::ProceduralDataset;
 use crate::kernel::AxiomTTTEngine;
 
@@ -19,6 +20,16 @@ pub struct AxiomTrainer {
 
 impl AxiomTrainer {
     pub fn new(config: AxiomConfig, device: Device) -> Result<Self> {
+        Self::with_settings(config, device, DEFAULT_CHECKPOINT_PATH, 8, 32)
+    }
+
+    pub fn with_settings(
+        config: AxiomConfig,
+        device: Device,
+        checkpoint_path: impl Into<String>,
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<Self> {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let engine = AxiomTTTEngine::new(vb, config.clone())?;
@@ -30,9 +41,9 @@ impl AxiomTrainer {
             varmap,
             engine,
             dataset,
-            checkpoint_path: "axiom_kernel_v1.safetensors".to_string(),
-            batch_size: 8,
-            seq_len: 32,
+            checkpoint_path: checkpoint_path.into(),
+            batch_size: batch_size.max(1),
+            seq_len: seq_len.max(1),
         })
     }
 
