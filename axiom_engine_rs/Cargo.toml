@@ -1,0 +1,11 @@
+[package]
+name = "axiom_engine"
+version = "0.1.0"
+edition = "2021"
+description = "Axiom-TTT Inference Engine – Rust implementation using candle"
+
+[dependencies]
+candle-core = "0.8"
+candle-nn = "0.8"
+tokio = { version = "1.35", features = ["full"] }
+sha2 = "0.10.8"
