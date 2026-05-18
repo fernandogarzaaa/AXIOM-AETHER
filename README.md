@@ -40,5 +40,26 @@ cargo run                   # demo with small config (d_model=64, n_layers=2)
 cargo build --release       # optimised build
 ```
 
+### Deployment-aligned runtime knobs (Rust)
+
+The Rust inference path now supports:
+
+- live context retrieval via HTTP (`--context-api-url`, optional `--context-api-key`)
+- bounded context packing (`--max-context-tokens`)
+- Hugging Face tokenizer loading (`--tokenizer path/to/tokenizer.json`)
+
+Example:
+
+```bash
+cd axiom_engine_rs
+cargo run --release -- \
+  --mode generate "Analyze TTT latency primitives." \
+  --max-new-tokens 64 \
+  --checkpoint "axiom_kernel_v1.safetensors" \
+  --tokenizer "./tokenizer.json" \
+  --context-api-url "https://example-neural-search/api/search?q={query}" \
+  --max-context-tokens 512
+```
+
 Requires a stable Rust toolchain (edition 2021).  No GPU needed for the
 default CPU backend.

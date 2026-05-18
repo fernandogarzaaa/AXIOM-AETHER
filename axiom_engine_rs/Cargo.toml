@@ -11,3 +11,7 @@ tokio = { version = "1.35", features = ["full"] }
 sha2 = "0.10.8"
 rand = "0.8.5"
 indicatif = "0.17.7"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1.0"
+tokenizers = "0.15"
+urlencoding = "2.1"
