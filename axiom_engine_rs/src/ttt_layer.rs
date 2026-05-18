@@ -45,14 +45,29 @@ impl TTTLinearLayer {
         let d = self.config.head_dim;
 
         // Linear projections → [B, H, T, D]
-        let q = self.q_proj.forward(x)?.reshape((b, t, h, d))?.transpose(1, 2)?;
-        let k = self.k_proj.forward(x)?.reshape((b, t, h, d))?.transpose(1, 2)?;
-        let v = self.v_proj.forward(x)?.reshape((b, t, h, d))?.transpose(1, 2)?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, t, h, d))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, t, h, d))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((b, t, h, d))?
+            .transpose(1, 2)?
+            .contiguous()?;
 
         // Scaled attention Gram: [B, H, T, T]
         let lr_scalar = Tensor::new(self.config.lr_inner, x.device())?;
         let gram = q
-            .matmul(&k.transpose(2, 3)?)?
+            .matmul(&k.transpose(2, 3)?.contiguous()?)?
             .broadcast_mul(&lr_scalar)?;
 
         // Causal lower-triangular mask

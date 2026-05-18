@@ -1,3 +1,6 @@
+pub const DEFAULT_CHECKPOINT_PATH: &str = "axiom_kernel_v1.safetensors";
+pub const DEFAULT_EOS_TOKEN: u32 = 2;
+
 /// Static hyper-parameters for the Axiom-TTT inference engine.
 #[derive(Debug, Clone)]
 pub struct AxiomConfig {
