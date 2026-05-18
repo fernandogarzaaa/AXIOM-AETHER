@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 from dataclasses import dataclass
 from typing import List
 
@@ -21,7 +22,11 @@ class SimpleTokenizer:
         toks = text.strip().split()
         if not toks:
             return [0]
-        return [abs(hash(tok)) % self.vocab_size for tok in toks]
+        ids: List[int] = []
+        for tok in toks:
+            digest = hashlib.sha256(tok.encode("utf-8")).digest()
+            ids.append(int.from_bytes(digest[:8], byteorder="little", signed=False) % self.vocab_size)
+        return ids
 
     def decode(self, token_ids: List[int]) -> str:
         return " ".join(f"tok_{t}" for t in token_ids)

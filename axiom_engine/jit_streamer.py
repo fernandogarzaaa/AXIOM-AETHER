@@ -16,6 +16,10 @@ from torch import Tensor
 _WORD_RE = re.compile(r"[a-zA-Z0-9_]+")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _MARKDOWN_NOISE_RE = re.compile(r"^\s{0,3}(?:#|\*|>|-{3,}|={3,}|\[.*\]\(.*\))\s*$")
+_AVG_DOC_LENGTH = 64.0
+_TOKEN_SEED_MODULUS = 2**31
+_BM25_WEIGHT = 0.7
+_COSINE_WEIGHT = 0.3
 
 
 def _tokenize(text: str) -> List[str]:
@@ -57,7 +61,7 @@ def _bm25_like_score(query_terms: Sequence[str], doc_terms: Sequence[str]) -> fl
     k1 = 1.5
     b = 0.75
     dl = len(doc_terms)
-    avgdl = 64.0
+    avgdl = _AVG_DOC_LENGTH
     for term, qtf in q.items():
         tf = doc_freq.get(term, 0)
         if tf == 0:
@@ -70,7 +74,7 @@ def _bm25_like_score(query_terms: Sequence[str], doc_terms: Sequence[str]) -> fl
 
 def _deterministic_token_vector(token: str, d_model: int) -> Tensor:
     digest = hashlib.sha256(token.encode("utf-8")).digest()
-    seed = int.from_bytes(digest[:8], byteorder="little", signed=False) % (2**31)
+    seed = int.from_bytes(digest[:8], byteorder="little", signed=False) % _TOKEN_SEED_MODULUS
     g = torch.Generator(device="cpu")
     g.manual_seed(seed)
     vec = torch.randn(d_model, generator=g, dtype=torch.float32, device=torch.device("cpu"))
@@ -110,7 +114,7 @@ def process_and_pack_context(
             line_terms = _tokenize(line_norm)
             bm25_score = _bm25_like_score(query_terms, line_terms)
             cos_score = _cosine_from_counts(query_counts, Counter(line_terms))
-            score = 0.7 * bm25_score + 0.3 * cos_score
+            score = _BM25_WEIGHT * bm25_score + _COSINE_WEIGHT * cos_score
             if score > 0:
                 scored_lines.append((score, line_norm))
 
