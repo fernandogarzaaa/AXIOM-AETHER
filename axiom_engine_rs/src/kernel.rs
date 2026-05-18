@@ -137,7 +137,10 @@ impl AxiomTTTEngine {
             candle_nn::embedding(config.vocab_size, config.d_model, vs.pp("embeddings"))?;
         let mut layers = Vec::new();
         for i in 0..config.n_layers {
-            layers.push(AxiomBlock::new(vs.pp(&format!("layer_{i}")), config.clone())?);
+            layers.push(AxiomBlock::new(
+                vs.pp(&format!("layer_{i}")),
+                config.clone(),
+            )?);
         }
         let ln_f = RMSNorm::new(config.d_model, config.rms_norm_eps, vs.pp("ln_f"))?;
         let output_head =
@@ -190,17 +193,11 @@ impl AxiomTTTEngine {
     /// Allocate zeroed W_tilde tensors for all layers.
     ///
     /// Shape per layer: `[batch, num_heads, head_dim, head_dim]`.
-    pub fn init_states(
-        &self,
-        batch: usize,
-        device: &candle_core::Device,
-    ) -> Result<Vec<Tensor>> {
+    pub fn init_states(&self, batch: usize, device: &candle_core::Device) -> Result<Vec<Tensor>> {
         let h = self.config.num_heads;
         let d = self.config.head_dim;
         (0..self.config.n_layers)
-            .map(|_| {
-                Tensor::zeros((batch, h, d, d), candle_core::DType::F32, device)
-            })
+            .map(|_| Tensor::zeros((batch, h, d, d), candle_core::DType::F32, device))
             .collect()
     }
 }

@@ -1,56 +1,120 @@
 mod config;
+mod data_gen;
+mod inference;
 mod kernel;
+mod train;
 mod ttt_layer;
 
-use candle_core::{DType, Device, Tensor};
-use candle_nn::VarMap;
+use std::env;
+
+use candle_core::{bail, Device, Result};
 use config::AxiomConfig;
-use kernel::AxiomTTTEngine;
+use inference::InferencePipeline;
+use train::AxiomTrainer;
 
-fn main() -> candle_core::Result<()> {
-    let device = Device::Cpu;
+#[derive(Debug)]
+struct CliArgs {
+    mode: String,
+    prompt: Option<String>,
+    epochs: usize,
+    steps_per_epoch: usize,
+    max_new_tokens: usize,
+}
 
-    // Use small dimensions so the demo runs quickly on CPU.
+fn parse_cli() -> Result<CliArgs> {
+    let argv: Vec<String> = env::args().collect();
+
+    let mut mode = String::from("generate");
+    let mut epochs: usize = 1;
+    let mut steps_per_epoch: usize = 100;
+    let mut max_new_tokens: usize = 32;
+    let mut prompt_parts: Vec<String> = Vec::new();
+
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--mode" => {
+                i += 1;
+                if i >= argv.len() {
+                    bail!("missing value for --mode");
+                }
+                mode = argv[i].clone();
+            }
+            "--epochs" => {
+                i += 1;
+                if i >= argv.len() {
+                    bail!("missing value for --epochs");
+                }
+                epochs = argv[i]
+                    .parse::<usize>()
+                    .map_err(|_| candle_core::Error::Msg("invalid --epochs value".into()))?;
+            }
+            "--steps-per-epoch" => {
+                i += 1;
+                if i >= argv.len() {
+                    bail!("missing value for --steps-per-epoch");
+                }
+                steps_per_epoch = argv[i].parse::<usize>().map_err(|_| {
+                    candle_core::Error::Msg("invalid --steps-per-epoch value".into())
+                })?;
+            }
+            "--max-new-tokens" => {
+                i += 1;
+                if i >= argv.len() {
+                    bail!("missing value for --max-new-tokens");
+                }
+                max_new_tokens = argv[i].parse::<usize>().map_err(|_| {
+                    candle_core::Error::Msg("invalid --max-new-tokens value".into())
+                })?;
+            }
+            value => prompt_parts.push(value.to_string()),
+        }
+        i += 1;
+    }
+
+    let prompt = if prompt_parts.is_empty() {
+        None
+    } else {
+        Some(prompt_parts.join(" "))
+    };
+
+    Ok(CliArgs {
+        mode,
+        prompt,
+        epochs,
+        steps_per_epoch,
+        max_new_tokens,
+    })
+}
+
+fn main() -> Result<()> {
+    let args = parse_cli()?;
+
+    // Keep local defaults small enough for CPU experimentation.
     let config = AxiomConfig {
         d_model: 64,
         n_layers: 2,
         num_heads: 4,
-        head_dim: 16, // 64 / 4
+        head_dim: 16,
         vocab_size: 256,
         lr_inner: 1e-3,
         rms_norm_eps: 1e-6,
     };
 
-    let vm = VarMap::new();
-    let vs = candle_nn::VarBuilder::from_varmap(&vm, DType::F32, &device);
-    let engine = AxiomTTTEngine::new(vs, config.clone())?;
-
-    // -----------------------------------------------------------------------
-    // Prefill
-    // -----------------------------------------------------------------------
-    let prompt_tokens = Tensor::zeros((1, 8), DType::U32, &device)?;
-    let (prefill_logits, _) = engine.forward(&prompt_tokens, None, false)?;
-    println!(
-        "Prefill  logits shape : {:?}",
-        prefill_logits.shape().dims()
-    );
-
-    // -----------------------------------------------------------------------
-    // Decode (autoregressive)
-    // -----------------------------------------------------------------------
-    let mut states = engine.init_states(1, &device)?;
-    let mut last_token = Tensor::zeros((1, 1), DType::U32, &device)?;
-
-    for step in 0..4 {
-        let (logits, next_states) = engine.forward(&last_token, Some(states), true)?;
-        states = next_states.expect("decode must return states");
-        let next_id = logits
-            .squeeze(1)?
-            .argmax(candle_core::D::Minus1)?
-            .squeeze(0)?
-            .to_scalar::<u32>()?;
-        println!("Decode step {step}: next_token_id = {next_id}");
-        last_token = Tensor::new(&[next_id], &device)?.unsqueeze(0)?;
+    match args.mode.as_str() {
+        "train" => {
+            let mut trainer = AxiomTrainer::new(config, Device::Cpu)?;
+            trainer.run_training_epochs(args.epochs, args.steps_per_epoch)?;
+        }
+        "generate" => {
+            let prompt = args.prompt.ok_or_else(|| {
+                candle_core::Error::Msg("missing prompt for --mode generate".into())
+            })?;
+            let pipeline = InferencePipeline::new(config, Device::Cpu)?;
+            let output = pipeline.generate(&prompt, args.max_new_tokens)?;
+            println!("{output}");
+        }
+        other => bail!("unsupported mode '{other}'. Use --mode train or --mode generate"),
     }
 
     Ok(())
