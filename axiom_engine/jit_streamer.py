@@ -61,7 +61,7 @@ def _bm25_like_score(query_terms: Sequence[str], doc_terms: Sequence[str]) -> fl
         tf = doc_freq.get(term, 0)
         if tf == 0:
             continue
-        idf = 1.0 + math.log(1.0 + 1.0 / tf)
+        idf = 1.0 / (1.0 + tf)
         denom = tf + k1 * (1 - b + b * (dl / avgdl))
         score += qtf * (idf * (tf * (k1 + 1)) / max(denom, 1e-6))
     return score
@@ -71,16 +71,16 @@ def _deterministic_token_vector(token: str, d_model: int, device: torch.device) 
     seed = abs(hash(token)) % (2**31)
     g = torch.Generator(device="cpu")
     g.manual_seed(seed)
-    vec = torch.randn(d_model, generator=g, dtype=torch.float32)
+    vec = torch.randn(d_model, generator=g, dtype=torch.float32, device=torch.device("cpu"))
     vec = vec / (vec.norm(p=2) + 1e-8)
-    return vec.to(device)
+    return vec
 
 
 def _encode_tokens(tokens: Iterable[str], d_model: int, device: torch.device) -> Tensor:
     vectors = [_deterministic_token_vector(tok, d_model, device) for tok in tokens]
     if not vectors:
         return torch.zeros(1, d_model, device=device)
-    return torch.stack(vectors, dim=0)
+    return torch.stack(vectors, dim=0).to(device)
 
 
 def process_and_pack_context(

@@ -54,13 +54,13 @@ class AxiomInferenceRunner:
         input_ids = torch.tensor([prompt_ids], device=self.device, dtype=torch.long)
 
         logits, states = self.model(input_ids=input_ids, states=states, return_states=True)
-        next_token = int(torch.argmax(logits[:, -1, :], dim=-1).item())
+        next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
         generated = [next_token]
 
         for _ in range(max_new_tokens - 1):
             step_ids = torch.tensor([[generated[-1]]], device=self.device, dtype=torch.long)
             logits, states = self.model(input_ids=step_ids, states=states, return_states=True)
-            next_token = int(torch.argmax(logits[:, -1, :], dim=-1).item())
+            next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
             generated.append(next_token)
 
         self.model.reset_dynamic_state()

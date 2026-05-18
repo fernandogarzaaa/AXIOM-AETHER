@@ -18,12 +18,9 @@ class TTTLinearLayer(nn.Module):
         self.W_Q = nn.Linear(d_model, d_model, bias=False)
         self.W_K = nn.Linear(d_model, d_model, bias=False)
         self.W_V = nn.Linear(d_model, d_model, bias=False)
+        self.W_G = nn.Linear(d_model, d_model, bias=False)
 
         self._dynamic_state: Optional[Tensor] = None
-
-    @staticmethod
-    def _swiglu_like(x: Tensor) -> Tensor:
-        return F.silu(x) * x
 
     def reset_state(self) -> None:
         self._dynamic_state = None
@@ -63,12 +60,13 @@ class TTTLinearLayer(nn.Module):
 
             k_t = self.W_K(x_t)
             v_t = self.W_V(x_t)
+            g_t = self.W_G(x_t)
 
             k_col = k_t.unsqueeze(-1)
             pred_pre = torch.bmm(W_tilde, k_col).squeeze(-1)
-            pred = self._swiglu_like(pred_pre)
+            pred = F.silu(pred_pre) * g_t
 
-            loss = 0.5 * (pred - v_t).pow(2).sum()
+            loss = 0.5 * (pred - v_t).pow(2).mean()
             grad = torch.autograd.grad(loss, W_tilde, create_graph=False, retain_graph=False)[0]
 
             with torch.no_grad():
