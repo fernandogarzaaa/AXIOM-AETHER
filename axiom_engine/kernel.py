@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
-from torch import Tensor, nn
 import torch.nn.functional as F
+from torch import Tensor, nn
 
 from .config import AxiomConfig
 from .ttt_layer import TTTLinearLayer
 
 
 class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization."""
+
     def __init__(self, d_model: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
@@ -23,91 +25,130 @@ class RMSNorm(nn.Module):
 
 
 class SwiGLUFFN(nn.Module):
-    def __init__(self, d_model: int, multiplier: int = 4) -> None:
+    """SwiGLU-activated Feed-Forward Network.
+
+    Intermediate dimension: ``int(2 * (d_model * 4 / 3) / 2)``
+    Gate:  ``F.silu(w1(x)) * w3(x)``
+    Down:  ``w2(gate_output)``
+    """
+
+    def __init__(self, d_model: int) -> None:
         super().__init__()
-        hidden = d_model * multiplier
-        self.up = nn.Linear(d_model, 2 * hidden, bias=False)
-        self.down = nn.Linear(hidden, d_model, bias=False)
+        hidden: int = int(2 * (d_model * 4 / 3) / 2)
+        self.w1 = nn.Linear(d_model, hidden, bias=False)  # gate projection
+        self.w2 = nn.Linear(hidden, d_model, bias=False)  # down projection
+        self.w3 = nn.Linear(d_model, hidden, bias=False)  # up projection
 
     def forward(self, x: Tensor) -> Tensor:
-        x_proj = self.up(x)
-        x_gate, x_val = x_proj.chunk(2, dim=-1)
-        return self.down(F.silu(x_gate) * x_val)
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-class AxiomTTTBlock(nn.Module):
+class AxiomBlock(nn.Module):
+    """Single Pre-LN residual block: RMSNorm → TTTLinearLayer → SwiGLUFFN.
+
+    Routes to parallel prefill or step-wise decode based on the ``use_decode``
+    flag, enabling explicit branching for hardware-efficient scheduling.
+    """
+
     def __init__(self, cfg: AxiomConfig) -> None:
         super().__init__()
-        self.norm1 = RMSNorm(cfg.d_model, eps=cfg.eps)
-        self.ttt = TTTLinearLayer(cfg.d_model, lr_inner=cfg.lr_inner)
-        self.norm2 = RMSNorm(cfg.d_model, eps=cfg.eps)
-        self.ffn = SwiGLUFFN(cfg.d_model, multiplier=cfg.ffn_multiplier)
-
-    def reset_state(self) -> None:
-        self.ttt.reset_state()
+        self.norm1 = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
+        self.ttt = TTTLinearLayer(cfg.d_model, num_heads=cfg.num_heads, lr_inner=cfg.lr_inner)
+        self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
+        self.ffn = SwiGLUFFN(cfg.d_model)
 
     def forward(
         self,
         x: Tensor,
-        state: Optional[Tensor] = None,
-        return_state: bool = False,
-    ) -> Tensor | Tuple[Tensor, Tensor]:
-        ttt_out = self.ttt(self.norm1(x), state=state, return_state=True)
-        x = x + ttt_out[0]
-        x = x + self.ffn(self.norm2(x))
+        W_tilde: Optional[Tensor] = None,
+        use_decode: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        """
+        Args:
+            x:          [B, T, d_model] (prefill) or [B, 1, d_model] (decode).
+            W_tilde:    Dynamic weight state [B, H, D, D]; used only in decode mode.
+            use_decode: Selects step-wise decode (True) or parallel prefill (False).
 
-        if return_state:
-            return x, ttt_out[1]
-        return x
+        Returns:
+            Prefill: output [B, T, d_model].
+            Decode:  (output [B, 1, d_model], updated W_tilde [B, H, D, D]).
+        """
+        normed: Tensor = self.norm1(x)
+
+        if use_decode:
+            # Step-wise decode: TTT layer returns (output, updated W_tilde).
+            ttt_out, W_tilde_next = self.ttt(normed, W_tilde=W_tilde, use_decode=True)
+            x = x + ttt_out
+            x = x + self.ffn(self.norm2(x))
+            return x, W_tilde_next
+        else:
+            # Parallel prefill: TTT layer returns only the output tensor.
+            ttt_out = self.ttt(normed, use_decode=False)
+            x = x + ttt_out
+            x = x + self.ffn(self.norm2(x))
+            return x
 
 
 class AxiomTTTEngine(nn.Module):
+    """Full model stack: Embedding → N × AxiomBlock → RMSNorm → LM Head."""
+
     def __init__(self, cfg: AxiomConfig) -> None:
         super().__init__()
         self.cfg = cfg
 
         self.token_embedding = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.layers = nn.ModuleList([AxiomTTTBlock(cfg) for _ in range(cfg.n_layers)])
-        self.final_norm = RMSNorm(cfg.d_model, eps=cfg.eps)
+        self.layers = nn.ModuleList([AxiomBlock(cfg) for _ in range(cfg.n_layers)])
+        self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
     def reset_dynamic_state(self) -> None:
-        for layer in self.layers:
-            layer.reset_state()
-
-    def forward_hidden(
-        self,
-        x: Tensor,
-        states: Optional[List[Tensor]] = None,
-        return_states: bool = False,
-    ) -> Tensor | Tuple[Tensor, List[Tensor]]:
-        next_states: List[Tensor] = []
-        for i, layer in enumerate(self.layers):
-            st = None if states is None else states[i]
-            x, st_new = layer(x, state=st, return_state=True)
-            next_states.append(st_new)
-        x = self.final_norm(x)
-
-        if return_states:
-            return x, next_states
-        return x
+        """No-op: dynamic state (W_tilde) is managed externally by the inference runner."""
+        pass
 
     def forward(
         self,
         input_ids: Optional[Tensor] = None,
         inputs_embeds: Optional[Tensor] = None,
         states: Optional[List[Tensor]] = None,
+        use_decode: bool = False,
         return_states: bool = False,
-    ) -> Tensor | Tuple[Tensor, List[Tensor]]:
+    ) -> Union[Tensor, Tuple[Tensor, List[Tensor]]]:
+        """
+        Args:
+            input_ids:     [B, T] token indices (mutually exclusive with inputs_embeds).
+            inputs_embeds: [B, T, d_model] pre-computed embeddings.
+            states:        Per-layer W_tilde tensors [B, H, D, D] for decode mode.
+            use_decode:    Route all blocks to step-wise decode when True.
+            return_states: Also return the updated per-layer state list when True.
+
+        Returns:
+            logits [B, T, vocab_size] and, if return_states=True, a list of updated
+            W_tilde tensors (one per layer; empty list when use_decode=False).
+        """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError(
-                "Exactly one of input_ids or inputs_embeds must be provided, not both or neither."
+                "Exactly one of input_ids or inputs_embeds must be provided, "
+                "not both or neither."
             )
 
-        x = inputs_embeds if inputs_embeds is not None else self.token_embedding(input_ids)
-        hidden, next_states = self.forward_hidden(x, states=states, return_states=True)
-        logits = self.lm_head(hidden)
+        x: Tensor = (
+            inputs_embeds if inputs_embeds is not None else self.token_embedding(input_ids)
+        )
+
+        next_states: List[Tensor] = []
+
+        for i, block in enumerate(self.layers):
+            W_tilde_i: Optional[Tensor] = None if states is None else states[i]
+            if use_decode:
+                x, W_tilde_next = block(x, W_tilde=W_tilde_i, use_decode=True)
+                next_states.append(W_tilde_next)
+            else:
+                x = block(x, use_decode=False)
+
+        x = self.final_norm(x)
+        logits: Tensor = self.lm_head(x)
 
         if return_states:
             return logits, next_states
         return logits
+

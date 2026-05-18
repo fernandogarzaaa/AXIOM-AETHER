@@ -192,3 +192,85 @@ class JITStreamer:
             batch_size=batch_size,
             device=device,
         )
+
+
+class JITContextStreamer:
+    """High-level async context fetcher that returns packed integer token IDs.
+
+    Wraps the lower-level ``JITStreamer`` / ``NeuralSearchClient`` pipeline to
+    provide a simple ``list[int]`` interface suitable for direct use with an
+    ``nn.Embedding`` lookup table.
+
+    Retrieval pipeline
+    ------------------
+    1. Decompose the query into focused sub-queries for broader retrieval coverage.
+    2. Concurrently fetch clean markdown documents via the neural search client.
+    3. Strip HTML boilerplate and markdown noise from all retrieved documents.
+    4. Rank and deduplicate candidate lines using a BM25 + cosine hybrid scorer.
+    5. Encode the top-ranked word tokens to integer IDs via deterministic SHA-256
+       hashing, bounded to the embedding vocabulary.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        max_context_tokens: int = 1024,
+        latency_ms: int = 30,
+    ) -> None:
+        self.vocab_size = vocab_size
+        self.max_context_tokens = max_context_tokens
+        self._streamer = JITStreamer(NeuralSearchClient(latency_ms=latency_ms))
+
+    async def fetch_and_pack_context(self, user_prompt: str) -> list[int]:
+        """Fetch live context for the given prompt and return packed token IDs.
+
+        Args:
+            user_prompt: Raw user query string.
+
+        Returns:
+            A list of integer token IDs (length ≤ ``max_context_tokens``).
+            Returns ``[0]`` when no relevant tokens are found.
+        """
+        # Step 1 & 2: parallel sub-query retrieval via the search client.
+        docs = await self._streamer.collect_context(user_prompt)
+
+        # Step 3 & 4: clean, deduplicate, and rank lines across all documents.
+        query_terms = _tokenize(user_prompt)
+        query_counts = Counter(query_terms)
+
+        scored_lines: list[tuple[float, str]] = []
+        seen: set[str] = set()
+
+        for doc in docs:
+            cleaned = _clean_text(doc)
+            for line in cleaned.splitlines():
+                line_norm = line.strip().lower()
+                if not line_norm or line_norm in seen:
+                    continue
+                seen.add(line_norm)
+                line_terms = _tokenize(line_norm)
+                bm25_score = _bm25_like_score(query_terms, line_terms)
+                cos_score = _cosine_from_counts(query_counts, Counter(line_terms))
+                score = _BM25_WEIGHT * bm25_score + _COSINE_WEIGHT * cos_score
+                if score > 0:
+                    scored_lines.append((score, line_norm))
+
+        scored_lines.sort(key=lambda item: item[0], reverse=True)
+
+        # Step 5: encode top-ranked tokens to integer IDs via deterministic hashing.
+        token_ids: list[int] = []
+        for _, line in scored_lines:
+            for tok in _tokenize(line):
+                digest = hashlib.sha256(tok.encode("utf-8")).digest()
+                tok_id = (
+                    int.from_bytes(digest[:8], byteorder="little", signed=False)
+                    % self.vocab_size
+                )
+                token_ids.append(tok_id)
+                if len(token_ids) >= self.max_context_tokens:
+                    break
+            if len(token_ids) >= self.max_context_tokens:
+                break
+
+        return token_ids if token_ids else [0]
+
