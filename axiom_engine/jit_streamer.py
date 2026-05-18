@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import math
 import re
@@ -68,7 +69,8 @@ def _bm25_like_score(query_terms: Sequence[str], doc_terms: Sequence[str]) -> fl
 
 
 def _deterministic_token_vector(token: str, d_model: int) -> Tensor:
-    seed = abs(hash(token)) % (2**31)
+    digest = hashlib.sha256(token.encode("utf-8")).digest()
+    seed = int.from_bytes(digest[:8], byteorder="little", signed=False) % (2**31)
     g = torch.Generator(device="cpu")
     g.manual_seed(seed)
     vec = torch.randn(d_model, generator=g, dtype=torch.float32, device=torch.device("cpu"))

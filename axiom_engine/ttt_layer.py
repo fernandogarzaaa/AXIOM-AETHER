@@ -45,13 +45,15 @@ class TTTLinearLayer(nn.Module):
             raise ValueError(f"Expected d_model={self.d_model}, got {d_model}")
 
         if state is None:
-            W_tilde = torch.zeros(batch, d_model, d_model, device=x.device, dtype=x.dtype)
+            W_tilde = torch.zeros(
+                batch, d_model, d_model, device=x.device, dtype=x.dtype, requires_grad=True
+            )
         else:
             if state.shape != (batch, d_model, d_model):
                 raise ValueError(
                     f"state shape must be {(batch, d_model, d_model)}, got {tuple(state.shape)}"
                 )
-            W_tilde = state.clone()
+            W_tilde = state.detach().clone().requires_grad_(True)
 
         outputs = []
 
