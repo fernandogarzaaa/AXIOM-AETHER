@@ -18,7 +18,7 @@ pub struct InferenceRuntimeOptions {
 }
 
 enum TokenizerBackend {
-    Hf(Tokenizer),
+    Hf(Box<Tokenizer>),
     HashFallback,
 }
 
@@ -83,7 +83,7 @@ impl InferencePipeline {
             Some(path) => match Tokenizer::from_file(path) {
                 Ok(tok) => {
                     println!("[+] Loaded tokenizer from {path}");
-                    TokenizerBackend::Hf(tok)
+                    TokenizerBackend::Hf(Box::new(tok))
                 }
                 Err(err) => {
                     println!("[!] Warning: failed to load tokenizer at {path}: {err}");
