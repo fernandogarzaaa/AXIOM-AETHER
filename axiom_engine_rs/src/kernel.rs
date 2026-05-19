@@ -102,7 +102,7 @@ impl AxiomBlock {
         if use_decode {
             let state = w_tilde.expect("W_tilde required for decode phase.");
             let normed_x = self.ttt_norm.forward(x)?;
-            let (ttt_out, w_tilde_next) = self.ttt.forward_decode(&normed_x, state)?;
+            let (ttt_out, w_tilde_next) = self.ttt.forward_decode(&normed_x, state, None)?;
             let x = x.add(&ttt_out)?;
             let ffn_out = self.ffn.forward(&self.ffn_norm.forward(&x)?)?;
             let x = x.add(&ffn_out)?;
@@ -199,5 +199,71 @@ impl AxiomTTTEngine {
         (0..self.config.n_layers)
             .map(|_| Tensor::zeros((batch, h, d, d), candle_core::DType::F32, device))
             .collect()
+    }
+
+    /// Evaluate multiple speculative next-token branches and choose the path with
+    /// the lowest aggregate per-layer reconstruction error.
+    pub fn speculative_branch_evaluate(
+        &self,
+        tokens: &Tensor,
+        states: &Vec<Tensor>,
+        branch_candidates: Vec<Tensor>,
+    ) -> Result<usize> {
+        if branch_candidates.is_empty() {
+            return Err(candle_core::Error::Msg(
+                "speculative_branch_evaluate requires at least one candidate".into(),
+            ));
+        }
+        if states.len() != self.layers.len() {
+            return Err(candle_core::Error::Msg(format!(
+                "state count mismatch: expected {}, got {}",
+                self.layers.len(),
+                states.len()
+            )));
+        }
+
+        let (token_batch, _) = tokens.dims2()?;
+        let mut best_idx = 0usize;
+        let mut best_loss = f32::INFINITY;
+
+        for (idx, candidate) in branch_candidates.into_iter().enumerate() {
+            let (candidate_batch, _) = candidate.dims2()?;
+            if candidate_batch != token_batch {
+                return Err(candle_core::Error::Msg(format!(
+                    "candidate batch mismatch: expected {token_batch}, got {candidate_batch}"
+                )));
+            }
+
+            let mut x = self.embeddings.forward(&candidate)?;
+            let mut branch_states: Vec<Tensor> = states
+                .iter()
+                .map(|state| state.clone().contiguous())
+                .collect::<Result<Vec<_>>>()?;
+            let mut aggregate_loss = 0f32;
+
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let normed_x = layer.ttt_norm.forward(&x)?;
+                let (ttt_out, w_next, layer_loss) = layer.ttt.forward_decode_with_loss(
+                    &normed_x,
+                    &branch_states[layer_idx],
+                    Some(4),
+                )?;
+                branch_states[layer_idx] = w_next;
+                aggregate_loss += layer_loss;
+
+                let x_res = x.add(&ttt_out)?;
+                let ffn_out = layer.ffn.forward(&layer.ffn_norm.forward(&x_res)?)?;
+                x = x_res.add(&ffn_out)?;
+            }
+
+            let _ = self.output_head.forward(&self.ln_f.forward(&x)?)?;
+
+            if aggregate_loss < best_loss {
+                best_loss = aggregate_loss;
+                best_idx = idx;
+            }
+        }
+
+        Ok(best_idx)
     }
 }

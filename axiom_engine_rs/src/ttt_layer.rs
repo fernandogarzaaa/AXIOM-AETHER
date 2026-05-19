@@ -98,7 +98,27 @@ impl TTTLinearLayer {
     ///
     /// # Returns
     /// `(output [B, 1, d_model], w_tilde_next [B, H, D, D])`
-    pub fn forward_decode(&self, x: &Tensor, w_tilde: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn forward_decode(
+        &self,
+        x: &Tensor,
+        w_tilde: &Tensor,
+        inner_loop_steps: Option<usize>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (output, w_tilde_next, _) =
+            self.forward_decode_with_loss(x, w_tilde, inner_loop_steps)?;
+        Ok((output, w_tilde_next))
+    }
+
+    /// Single-token decode with adaptive inner-loop updates and scalar reconstruction loss.
+    ///
+    /// Returns `(output, updated_w_tilde, reconstruction_loss)` where reconstruction loss
+    /// is measured on the final adapted state.
+    pub fn forward_decode_with_loss(
+        &self,
+        x: &Tensor,
+        w_tilde: &Tensor,
+        inner_loop_steps: Option<usize>,
+    ) -> Result<(Tensor, Tensor, f32)> {
         let (b, _, _) = x.dims3()?;
         let h = self.config.num_heads;
         let d = self.config.head_dim;
@@ -113,19 +133,49 @@ impl TTTLinearLayer {
         let k_squared_sum = k.sqr()?.sum_keepdim(D::Minus1)?;
         let k_norm = k.broadcast_div(&k_squared_sum.broadcast_add(&eps)?.sqrt()?)?;
 
-        // Reconstruction and gradient: [B, H, D, D]
-        let pred_v = w_tilde.matmul(&k_norm.unsqueeze(3)?)?.squeeze(3)?;
-        let error = pred_v.sub(&v)?;
-        let grad = error.unsqueeze(3)?.matmul(&k_norm.unsqueeze(2)?)?;
+        let k_norm_col = k_norm.unsqueeze(3)?;
+        let k_norm_row = k_norm.unsqueeze(2)?;
 
-        // Gradient descent step on dynamic weights
+        // Adaptive gradient descent on dynamic weights.
         let lr_tensor = Tensor::new(self.config.lr_inner, x.device())?;
-        let w_tilde_next = w_tilde.sub(&grad.broadcast_mul(&lr_tensor)?)?;
+        let loss_threshold = 1e-4f32;
+        let stability_epsilon = 1e-7f32;
+        let max_additional_steps = inner_loop_steps.unwrap_or(4).min(4);
+
+        let mut w_tilde_next = w_tilde.clone();
+
+        // Baseline reconstruction loss and first update (always executed).
+        let pred_v = w_tilde_next.matmul(&k_norm_col)?.squeeze(3)?;
+        let error = pred_v.sub(&v)?;
+        let baseline_loss = error.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let grad = error.unsqueeze(3)?.matmul(&k_norm_row)?;
+        w_tilde_next = w_tilde_next.sub(&grad.broadcast_mul(&lr_tensor)?)?;
+
+        // Optional adaptive lookahead updates for hard tokens.
+        if baseline_loss > loss_threshold {
+            let mut prev_loss = baseline_loss;
+            for _ in 0..max_additional_steps {
+                let pred_v = w_tilde_next.matmul(&k_norm_col)?.squeeze(3)?;
+                let error = pred_v.sub(&v)?;
+                let loss = error.sqr()?.sum_all()?.to_scalar::<f32>()?;
+
+                if loss <= loss_threshold || (prev_loss - loss).abs() <= stability_epsilon {
+                    break;
+                }
+
+                let grad = error.unsqueeze(3)?.matmul(&k_norm_row)?;
+                w_tilde_next = w_tilde_next.sub(&grad.broadcast_mul(&lr_tensor)?)?;
+                prev_loss = loss;
+            }
+        }
 
         // Query updated weight matrix and reshape to [B, 1, d_model]
         let out_state = w_tilde_next.matmul(&q.unsqueeze(3)?)?.squeeze(3)?;
         let output = out_state.reshape((b, 1, self.config.d_model))?;
+        let final_pred = w_tilde_next.matmul(&k_norm_col)?.squeeze(3)?;
+        let final_error = final_pred.sub(&v)?;
+        let final_loss = final_error.sqr()?.sum_all()?.to_scalar::<f32>()?;
 
-        Ok((self.out_proj.forward(&output)?, w_tilde_next))
+        Ok((self.out_proj.forward(&output)?, w_tilde_next, final_loss))
     }
 }
