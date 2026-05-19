@@ -7,10 +7,12 @@ mod train;
 mod ttt_layer;
 
 use std::env;
+use std::error::Error;
 
 use candle_core::{bail, Device, Result};
 use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use inference::{InferencePipeline, InferenceRuntimeOptions};
+use tokio::io::AsyncWriteExt;
 use train::AxiomTrainer;
 
 #[derive(Debug)]
@@ -27,10 +29,12 @@ struct CliArgs {
     context_api_url: Option<String>,
     context_api_key: Option<String>,
     max_context_tokens: usize,
+    host: String,
+    port: u16,
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N]"
+    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH]"
 }
 
 fn parse_cli() -> Result<CliArgs> {
@@ -53,6 +57,11 @@ fn parse_cli() -> Result<CliArgs> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(256);
+    let mut host = env::var("AXIOM_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let mut port = env::var("AXIOM_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8080);
     let mut prompt_parts: Vec<String> = Vec::new();
 
     let mut i = 1;
@@ -147,6 +156,22 @@ fn parse_cli() -> Result<CliArgs> {
                     candle_core::Error::Msg("invalid --max-context-tokens value".into())
                 })?;
             }
+            "--host" => {
+                i += 1;
+                if i >= argv.len() {
+                    bail!("missing value for --host");
+                }
+                host = argv[i].clone();
+            }
+            "--port" => {
+                i += 1;
+                if i >= argv.len() {
+                    bail!("missing value for --port");
+                }
+                port = argv[i]
+                    .parse::<u16>()
+                    .map_err(|_| candle_core::Error::Msg("invalid --port value".into()))?;
+            }
             value => prompt_parts.push(value.to_string()),
         }
         i += 1;
@@ -171,10 +196,59 @@ fn parse_cli() -> Result<CliArgs> {
         context_api_url,
         context_api_key,
         max_context_tokens,
+        host,
+        port,
     })
 }
 
-fn main() -> Result<()> {
+async fn start_server(
+    host: &str,
+    port: u16,
+    config: AxiomConfig,
+    checkpoint_path: &str,
+) -> std::result::Result<(), Box<dyn Error>> {
+    println!("[*] Initializing system sanity check prior to binding network sockets...");
+
+    let validation_pipeline = if checkpoint_path == DEFAULT_CHECKPOINT_PATH {
+        InferencePipeline::new(config.clone(), Device::Cpu)
+    } else {
+        InferencePipeline::with_checkpoint(config.clone(), Device::Cpu, checkpoint_path)
+    };
+
+    match validation_pipeline {
+        Ok(_) => println!(
+            "[+] Sanity check passed. safetensors matrix dimensions align perfectly with {} layers.",
+            config.n_layers
+        ),
+        Err(e) => {
+            eprintln!(
+                "[!] Critical Boot Error: Failed to assemble inference pipeline from checkpoint: {:?}",
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    println!("[+] Server listening on http://{host}:{port}");
+
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            if let Err(err) = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 20\r\n\r\naxiom_engine online\n",
+                )
+                .await
+            {
+                eprintln!("[!] Failed to write response: {err}");
+            }
+        });
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = parse_cli()?;
 
     // Keep local defaults small enough for CPU experimentation.
@@ -225,7 +299,14 @@ fn main() -> Result<()> {
             let output = pipeline.generate(&prompt, args.max_new_tokens)?;
             println!("{output}");
         }
-        other => bail!("unsupported mode '{other}'. Use --mode train or --mode generate"),
+        "server" => {
+            start_server(&args.host, args.port, config, &args.checkpoint_path)
+                .await
+                .map_err(|e| candle_core::Error::Msg(format!("server startup failed: {e}")))?;
+        }
+        other => {
+            bail!("unsupported mode '{other}'. Use --mode train, --mode generate, or --mode server")
+        }
     }
 
     Ok(())
