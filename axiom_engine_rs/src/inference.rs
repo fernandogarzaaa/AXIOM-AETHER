@@ -153,7 +153,19 @@ impl InferencePipeline {
         }
     }
 
-    pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> Result<String> {
+    pub fn decode_token_ids(&self, token_ids: &[u32]) -> String {
+        self.decode(token_ids)
+    }
+
+    pub fn generate_with_callback<F>(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        mut on_token: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u32),
+    {
         let context_ids = self.streamer.fetch_and_pack_context(prompt);
         let context_tensor =
             Tensor::from_vec(context_ids.clone(), (1, context_ids.len()), &self.device)?;
@@ -168,8 +180,6 @@ impl InferencePipeline {
 
         let mut states = self.engine.init_states(1, &self.device)?;
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
-        let mut generated = Vec::with_capacity(max_new_tokens);
-
         for _ in 0..max_new_tokens {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             let (logits, next_states) = self.engine.forward(&token_tensor, Some(states), true)?;
@@ -181,10 +191,16 @@ impl InferencePipeline {
                 .squeeze(0)?
                 .to_scalar::<u32>()?;
 
-            generated.push(next_id);
+            on_token(next_id);
             last_token = next_id;
         }
 
+        Ok(())
+    }
+
+    pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> Result<String> {
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        self.generate_with_callback(prompt, max_new_tokens, |token| generated.push(token))?;
         Ok(self.decode(&generated))
     }
 }

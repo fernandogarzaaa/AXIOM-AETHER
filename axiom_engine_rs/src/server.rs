@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::{Query, State};
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -26,7 +26,15 @@ struct ChatCompletionRequest {
     #[serde(default = "default_max_new_tokens")]
     max_new_tokens: usize,
     #[serde(default)]
-    runtime_configs: Option<Value>,
+    runtime_configs: Option<RuntimeConfigs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeConfigs {
+    #[serde(default)]
+    max_new_tokens: Option<usize>,
+    #[serde(flatten)]
+    _extra: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,10 +88,12 @@ pub async fn start_server(
     pipeline: Arc<InferencePipeline>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState { pipeline };
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = cors_layer_from_env().unwrap_or_else(|| {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    });
 
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -98,6 +108,22 @@ pub async fn start_server(
     Ok(())
 }
 
+fn cors_layer_from_env() -> Option<CorsLayer> {
+    let origin = std::env::var("AXIOM_CORS_ALLOW_ORIGIN").ok()?;
+    let trimmed = origin.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return None;
+    }
+
+    let header_value = HeaderValue::from_str(trimmed).ok()?;
+    Some(
+        CorsLayer::new()
+            .allow_origin(header_value)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     Json(payload): Json<ChatCompletionRequest>,
@@ -105,9 +131,13 @@ async fn chat_completions(
     if payload.prompt.trim().is_empty() {
         return Err(ApiError::bad_request("prompt must not be empty"));
     }
-    let _ = payload.runtime_configs;
+
     let prompt = payload.prompt;
-    let max_new_tokens = payload.max_new_tokens.max(1);
+    let max_new_tokens = payload
+        .runtime_configs
+        .and_then(|cfg| cfg.max_new_tokens)
+        .unwrap_or(payload.max_new_tokens)
+        .max(1);
     let pipeline = state.pipeline.clone();
 
     let generated = tokio::task::spawn_blocking(move || pipeline.generate(&prompt, max_new_tokens))
@@ -127,32 +157,44 @@ async fn chat_stream(
     if query.prompt.trim().is_empty() {
         return Err(ApiError::bad_request("prompt must not be empty"));
     }
+
     let prompt = query.prompt;
     let max_new_tokens = query.max_new_tokens.max(1);
     let pipeline = state.pipeline.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
-    let generated = tokio::task::spawn_blocking(move || pipeline.generate(&prompt, max_new_tokens))
-        .await
-        .map_err(|err| ApiError::internal(format!("stream generation task failed: {err}")))?
-        .map_err(|err| ApiError::internal(format!("stream generation failed: {err}")))?;
+    tokio::spawn(async move {
+        let tx_for_block = tx.clone();
+        let join_result = tokio::task::spawn_blocking(move || {
+            let emit_token =
+                |token_id: u32, tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>| {
+                    let token_text = pipeline.decode_token_ids(&[token_id]);
+                    let _ = tx.blocking_send(Ok(Event::default().event("token").data(token_text)));
+                };
 
-    let mut chunks = generated
-        .split_whitespace()
-        .map(|token| token.to_string())
-        .collect::<Vec<_>>();
-    if chunks.is_empty() {
-        chunks.push(generated);
-    }
-    chunks.push(String::from("[DONE]"));
+            let generation = pipeline.generate_with_callback(&prompt, max_new_tokens, |token_id| {
+                emit_token(token_id, &tx_for_block);
+            });
+            if let Err(err) = generation {
+                let _ = tx_for_block
+                    .blocking_send(Ok(Event::default().event("error").data(err.to_string())));
+            }
+            let _ = tx_for_block.blocking_send(Ok(Event::default().event("token").data("[DONE]")));
+        })
+        .await;
 
-    let token_stream = stream::unfold((0usize, chunks), |(idx, chunks)| async move {
-        if idx >= chunks.len() {
-            return None;
+        if let Err(err) = join_result {
+            let _ = tx
+                .send(Ok(Event::default().event("error").data(err.to_string())))
+                .await;
+            let _ = tx
+                .send(Ok(Event::default().event("token").data("[DONE]")))
+                .await;
         }
-        let chunk = chunks[idx].clone();
-        tokio::time::sleep(Duration::from_millis(8)).await;
-        let event = Event::default().event("token").data(chunk);
-        Some((Ok(event), (idx + 1, chunks)))
+    });
+
+    let token_stream = stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|item| (item, rx))
     });
 
     Ok(Sse::new(token_stream).keep_alive(KeepAlive::default()))

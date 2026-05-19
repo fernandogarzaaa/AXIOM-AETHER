@@ -34,7 +34,12 @@ struct CliArgs {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N]"
+    concat!(
+        "Usage:\n",
+        "  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH]\n",
+        "  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N]\n",
+        "  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N]"
+    )
 }
 
 fn parse_cli() -> Result<CliArgs> {
