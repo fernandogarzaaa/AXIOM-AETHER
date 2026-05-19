@@ -234,11 +234,16 @@ async fn start_server(
 
     loop {
         let (mut stream, _) = listener.accept().await?;
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 20\r\n\r\naxiom_engine online\n",
-            )
-            .await?;
+        tokio::spawn(async move {
+            if let Err(err) = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 20\r\n\r\naxiom_engine online\n",
+                )
+                .await
+            {
+                eprintln!("[!] Failed to write response: {err}");
+            }
+        });
     }
 }
 
