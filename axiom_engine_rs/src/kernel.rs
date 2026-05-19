@@ -256,8 +256,6 @@ impl AxiomTTTEngine {
                 x = x_res.add(&ffn_out)?;
             }
 
-            let _ = self.output_head.forward(&self.ln_f.forward(&x)?)?;
-
             if aggregate_loss < best_loss {
                 best_loss = aggregate_loss;
                 best_idx = idx;

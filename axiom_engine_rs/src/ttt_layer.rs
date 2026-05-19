@@ -140,6 +140,7 @@ impl TTTLinearLayer {
         let lr_tensor = Tensor::new(self.config.lr_inner, x.device())?;
         let loss_threshold = 1e-4f32;
         let stability_epsilon = 1e-7f32;
+        // Hard cap to 4 speculative inner-loop updates per token step.
         let max_additional_steps = inner_loop_steps.unwrap_or(4).min(4);
 
         let mut w_tilde_next = w_tilde.clone();
@@ -147,13 +148,13 @@ impl TTTLinearLayer {
         // Baseline reconstruction loss and first update (always executed).
         let pred_v = w_tilde_next.matmul(&k_norm_col)?.squeeze(3)?;
         let error = pred_v.sub(&v)?;
-        let baseline_loss = error.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        let initial_loss = error.sqr()?.sum_all()?.to_scalar::<f32>()?;
         let grad = error.unsqueeze(3)?.matmul(&k_norm_row)?;
         w_tilde_next = w_tilde_next.sub(&grad.broadcast_mul(&lr_tensor)?)?;
 
         // Optional adaptive lookahead updates for hard tokens.
-        if baseline_loss > loss_threshold {
-            let mut prev_loss = baseline_loss;
+        if initial_loss > loss_threshold {
+            let mut prev_loss = initial_loss;
             for _ in 0..max_additional_steps {
                 let pred_v = w_tilde_next.matmul(&k_norm_col)?.squeeze(3)?;
                 let error = pred_v.sub(&v)?;
