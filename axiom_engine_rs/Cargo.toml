@@ -8,10 +8,14 @@ description = "Axiom-TTT Inference Engine – Rust implementation using candle"
 candle-core = "0.8"
 candle-nn = "0.8"
 tokio = { version = "1.35", features = ["full"] }
+axum = { version = "0.7", features = ["tokio", "macros"] }
+tower-http = { version = "0.5", features = ["cors"] }
+futures-util = "0.3"
 sha2 = "0.10.8"
 rand = "0.8.5"
 indicatif = "0.17.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokenizers = "0.15"
 urlencoding = "2.1"

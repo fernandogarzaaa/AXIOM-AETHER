@@ -3,10 +3,12 @@ mod data_gen;
 mod inference;
 mod jit_streamer;
 mod kernel;
+mod server;
 mod train;
 mod ttt_layer;
 
 use std::env;
+use std::sync::Arc;
 
 use candle_core::{bail, Device, Result};
 use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
@@ -17,6 +19,8 @@ use train::AxiomTrainer;
 struct CliArgs {
     mode: String,
     prompt: Option<String>,
+    host: String,
+    port: u16,
     checkpoint_path: String,
     epochs: usize,
     steps_per_epoch: usize,
@@ -30,7 +34,7 @@ struct CliArgs {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N]"
+    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N]"
 }
 
 fn parse_cli() -> Result<CliArgs> {
@@ -40,6 +44,11 @@ fn parse_cli() -> Result<CliArgs> {
     }
 
     let mut mode = String::from("generate");
+    let mut host = env::var("AXIOM_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let mut port: u16 = env::var("AXIOM_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8080);
     let mut checkpoint_path = DEFAULT_CHECKPOINT_PATH.to_string();
     let mut epochs: usize = 1;
     let mut steps_per_epoch: usize = 100;
@@ -117,6 +126,22 @@ fn parse_cli() -> Result<CliArgs> {
                 }
                 checkpoint_path = argv[i].clone();
             }
+            "--host" => {
+                i += 1;
+                if i >= argv.len() {
+                    bail!("missing value for --host");
+                }
+                host = argv[i].clone();
+            }
+            "--port" => {
+                i += 1;
+                if i >= argv.len() {
+                    bail!("missing value for --port");
+                }
+                port = argv[i]
+                    .parse::<u16>()
+                    .map_err(|_| candle_core::Error::Msg("invalid --port value".into()))?;
+            }
             "--tokenizer" => {
                 i += 1;
                 if i >= argv.len() {
@@ -161,6 +186,8 @@ fn parse_cli() -> Result<CliArgs> {
     Ok(CliArgs {
         mode,
         prompt,
+        host,
+        port,
         checkpoint_path,
         epochs,
         steps_per_epoch,
@@ -225,7 +252,29 @@ fn main() -> Result<()> {
             let output = pipeline.generate(&prompt, args.max_new_tokens)?;
             println!("{output}");
         }
-        other => bail!("unsupported mode '{other}'. Use --mode train or --mode generate"),
+        "server" => {
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: args.tokenizer_path,
+                context_api_url: args.context_api_url,
+                context_api_key: args.context_api_key,
+                max_context_tokens: args.max_context_tokens,
+            };
+            let pipeline = Arc::new(InferencePipeline::with_checkpoint_and_options(
+                config,
+                Device::Cpu,
+                args.checkpoint_path,
+                runtime,
+            )?);
+
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|err| candle_core::Error::Msg(format!("tokio runtime failed: {err}")))?;
+            runtime
+                .block_on(server::start_server(&args.host, args.port, pipeline))
+                .map_err(|err| candle_core::Error::Msg(format!("server failed: {err}")))?;
+        }
+        other => {
+            bail!("unsupported mode '{other}'. Use --mode train, --mode generate, or --mode server")
+        }
     }
 
     Ok(())
