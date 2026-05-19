@@ -299,9 +299,9 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| candle_core::Error::Msg(format!("server startup failed: {e}")))?;
         }
-        other => bail!(
-            "unsupported mode '{other}'. Use --mode train, --mode generate, or --mode server"
-        ),
+        other => {
+            bail!("unsupported mode '{other}'. Use --mode train, --mode generate, or --mode server")
+        }
     }
 
     Ok(())
