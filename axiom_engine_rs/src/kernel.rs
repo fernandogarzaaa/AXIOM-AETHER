@@ -138,7 +138,7 @@ impl AxiomTTTEngine {
         let mut layers = Vec::new();
         for i in 0..config.n_layers {
             layers.push(AxiomBlock::new(
-                vs.pp(&format!("layer_{i}")),
+                vs.pp(format!("layer_{i}")),
                 config.clone(),
             )?);
         }
@@ -203,10 +203,11 @@ impl AxiomTTTEngine {
 
     /// Evaluate multiple speculative next-token branches and choose the path with
     /// the lowest aggregate per-layer reconstruction error.
+    #[allow(dead_code)]
     pub fn speculative_branch_evaluate(
         &self,
         tokens: &Tensor,
-        states: &Vec<Tensor>,
+        states: &[Tensor],
         branch_candidates: Vec<Tensor>,
     ) -> Result<usize> {
         if branch_candidates.is_empty() {
