@@ -164,9 +164,7 @@ impl InferencePipeline {
         let prompt_len = prompt_ids.len();
 
         let prompt_tensor = Tensor::from_vec(prompt_ids.clone(), (1, prompt_len), &self.device)?;
-        let _ = self.engine.forward(&prompt_tensor, None, false)?;
-
-        let mut states = self.engine.init_states(1, &self.device)?;
+        let (_, mut states) = self.engine.prefill_with_state_init(&prompt_tensor)?;
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
         let mut generated = Vec::with_capacity(max_new_tokens);
 
