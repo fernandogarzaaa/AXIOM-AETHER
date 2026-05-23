@@ -11,7 +11,7 @@ use std::env;
 use std::error::Error;
 
 use candle_core::{bail, Device, Result};
-use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
+use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH, DEFAULT_LOG_SCAN_AUTO_THRESHOLD};
 use inference::{InferencePipeline, InferenceRuntimeOptions};
 use tokio::io::AsyncWriteExt;
 use train::AxiomTrainer;
@@ -194,7 +194,7 @@ fn parse_cli() -> Result<CliArgs> {
         Some(prompt_parts.join(" "))
     };
 
-    if max_context_tokens > 100_000 {
+    if max_context_tokens > DEFAULT_LOG_SCAN_AUTO_THRESHOLD {
         use_log_scan = true;
     }
 
@@ -277,7 +277,7 @@ async fn main() -> Result<()> {
         lr_inner: 1e-3,
         rms_norm_eps: 1e-6,
         use_log_scan: args.use_log_scan,
-        log_scan_auto_threshold: 100_000,
+        log_scan_auto_threshold: DEFAULT_LOG_SCAN_AUTO_THRESHOLD,
     };
 
     match args.mode.as_str() {

@@ -123,7 +123,7 @@ impl TTTLinearLayer {
 
         // Build associative per-token state and compress logarithmically.
         let token_state = k
-            .add(&v)?
+            .mul(&v)?
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, t, c))?;
@@ -138,9 +138,7 @@ impl TTTLinearLayer {
         *self.prefill_w_tilde.borrow_mut() = Some(w_tilde_init);
 
         // Project compressed context back to sequence shape for residual prefill path.
-        let compressed_context = Tensor::zeros((b, t, c), DType::F32, x.device())?
-            .broadcast_add(&compressed)?
-            .contiguous()?;
+        let compressed_context = compressed.broadcast_as((b, t, c))?.contiguous()?;
         let q_reshaped = q.transpose(1, 2)?.reshape((b, t, c))?;
         let output = q_reshaped.add(&compressed_context)?;
         self.out_proj.forward(&output)

@@ -1,5 +1,6 @@
 pub const DEFAULT_CHECKPOINT_PATH: &str = "axiom_kernel_v1.safetensors";
 pub const DEFAULT_EOS_TOKEN: u32 = 2;
+pub const DEFAULT_LOG_SCAN_AUTO_THRESHOLD: usize = 100_000;
 
 /// Static hyper-parameters for the Axiom-TTT inference engine.
 #[derive(Debug, Clone)]
@@ -30,7 +31,7 @@ impl Default for AxiomConfig {
             lr_inner: 1e-3,
             rms_norm_eps: 1e-6,
             use_log_scan: false,
-            log_scan_auto_threshold: 100_000,
+            log_scan_auto_threshold: DEFAULT_LOG_SCAN_AUTO_THRESHOLD,
         }
     }
 }

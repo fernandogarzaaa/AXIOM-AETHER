@@ -15,6 +15,7 @@ impl LogosAssociativeScanner {
         }
 
         let target_len = t.next_power_of_two();
+        // For `a ⊕ b = a + b + a*b`, the identity element is 0.
         let mut reduced = if target_len == t {
             states.clone()
         } else {
@@ -35,4 +36,3 @@ impl LogosAssociativeScanner {
         reduced.narrow(1, 0, 1)
     }
 }
-
