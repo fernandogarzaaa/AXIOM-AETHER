@@ -4,6 +4,7 @@ mod inference;
 mod jit_streamer;
 mod kernel;
 mod log_scan;
+mod memory_pool;
 mod train;
 mod ttt_layer;
 
