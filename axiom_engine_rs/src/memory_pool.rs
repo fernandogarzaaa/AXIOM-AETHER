@@ -153,10 +153,12 @@ mod tests {
         let data: Vec<f32> = (0..d_model).map(|i| i as f32 * 0.5).collect();
         let tensor = Tensor::from_vec(data.clone(), (1, d_model), &Device::Cpu).unwrap();
 
-        let path = "/tmp/test_mem_token.mem";
-        MemoryCompressor::save_memory_token(&tensor, path).expect("save failed");
+        let path = std::env::temp_dir().join("test_mem_token.mem");
+        let path_str = path.to_str().expect("temp path is valid UTF-8");
+        MemoryCompressor::save_memory_token(&tensor, path_str).expect("save failed");
 
-        let loaded = MemoryCompressor::load_memory_token(path, &Device::Cpu).expect("load failed");
+        let loaded =
+            MemoryCompressor::load_memory_token(path_str, &Device::Cpu).expect("load failed");
         assert_eq!(loaded.dims(), &[1, d_model]);
 
         let loaded_data = loaded.flatten_all().unwrap().to_vec1::<f32>().unwrap();

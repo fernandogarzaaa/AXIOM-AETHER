@@ -240,8 +240,13 @@ impl AxiomTTTEngine {
         memory_vector: &Tensor,
     ) -> Result<(Tensor, Vec<Tensor>)> {
         let (batch, _) = tokens.dims2()?;
+        if batch != 1 {
+            return Err(candle_core::Error::Msg(format!(
+                "prefill_with_state_init_and_memory only supports batch size 1, got {batch}"
+            )));
+        }
 
-        // Embed prompt tokens: [B, T, d_model]
+        // Embed prompt tokens: [1, T, d_model]
         let token_embeddings = self.embeddings.forward(tokens)?;
 
         // Unsqueeze memory vector to [1, 1, d_model] then prepend → [B, T+1, d_model].
