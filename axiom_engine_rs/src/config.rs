@@ -2,6 +2,12 @@ pub const DEFAULT_CHECKPOINT_PATH: &str = "axiom_kernel_v1.safetensors";
 pub const DEFAULT_EOS_TOKEN: u32 = 2;
 pub const DEFAULT_LOG_SCAN_AUTO_THRESHOLD: usize = 100_000;
 
+/// Reserved vocabulary ID for the `<MEM>` compressed-context token.
+///
+/// When present in a sequence, `MemoryCompressor` will extract the hidden-state
+/// activation at this position to produce a portable `[1, d_model]` memory vector.
+pub const MEM_TOKEN_ID: u32 = 32001;
+
 /// Static hyper-parameters for the Axiom-TTT inference engine.
 #[derive(Debug, Clone)]
 pub struct AxiomConfig {
