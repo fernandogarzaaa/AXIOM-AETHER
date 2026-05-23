@@ -190,6 +190,36 @@ impl AxiomTTTEngine {
         Ok((logits, out_states))
     }
 
+    /// Prefill and return per-layer decode initial states.
+    ///
+    /// When logarithmic prefill is active in a layer, it emits a compressed
+    /// `W_tilde` seed; otherwise a zero state is used for that layer.
+    pub fn prefill_with_state_init(&self, tokens: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        let (batch, _) = tokens.dims2()?;
+        let mut x = self.embeddings.forward(tokens)?;
+        let mut init_states: Vec<Tensor> = Vec::with_capacity(self.layers.len());
+        let h = self.config.num_heads;
+        let d = self.config.head_dim;
+
+        for layer in self.layers.iter() {
+            let normed_x = layer.ttt_norm.forward(&x)?;
+            let ttt_out = layer.ttt.forward_prefill(&normed_x)?;
+            let x_res = x.add(&ttt_out)?;
+            let ffn_out = layer.ffn.forward(&layer.ffn_norm.forward(&x_res)?)?;
+            x = x_res.add(&ffn_out)?;
+
+            let state = match layer.ttt.take_prefill_state() {
+                Some(state) => state,
+                None => Tensor::zeros((batch, h, d, d), candle_core::DType::F32, tokens.device())?,
+            };
+            init_states.push(state);
+        }
+
+        x = self.ln_f.forward(&x)?;
+        let logits = self.output_head.forward(&x)?;
+        Ok((logits, init_states))
+    }
+
     /// Allocate zeroed W_tilde tensors for all layers.
     ///
     /// Shape per layer: `[batch, num_heads, head_dim, head_dim]`.

@@ -1,7 +1,10 @@
+use std::cell::RefCell;
+
 use candle_core::{DType, Result, Tensor, D};
 use candle_nn::{Linear, Module, VarBuilder};
 
 use crate::config::AxiomConfig;
+use crate::log_scan::LogosAssociativeScanner;
 
 /// Multi-head linear test-time training layer.
 ///
@@ -15,6 +18,7 @@ pub struct TTTLinearLayer {
     v_proj: Linear,
     out_proj: Linear,
     config: AxiomConfig,
+    prefill_w_tilde: RefCell<Option<Tensor>>,
 }
 
 impl TTTLinearLayer {
@@ -26,6 +30,7 @@ impl TTTLinearLayer {
             v_proj: candle_nn::linear_no_bias(d, d, vs.pp("v_proj"))?,
             out_proj: candle_nn::linear_no_bias(d, d, vs.pp("out_proj"))?,
             config,
+            prefill_w_tilde: RefCell::new(None),
         })
     }
 
@@ -40,6 +45,12 @@ impl TTTLinearLayer {
     /// # Returns
     /// `[B, T, d_model]`
     pub fn forward_prefill(&self, x: &Tensor) -> Result<Tensor> {
+        let (_, t, _) = x.dims3()?;
+        if self.config.use_log_scan || t > self.config.log_scan_auto_threshold {
+            return self.forward_prefill_logarithmic(x);
+        }
+        *self.prefill_w_tilde.borrow_mut() = None;
+
         let (b, t, c) = x.dims3()?;
         let h = self.config.num_heads;
         let d = self.config.head_dim;
@@ -83,6 +94,60 @@ impl TTTLinearLayer {
         // Merge heads and project: [B, T, d_model]
         let output = context.transpose(1, 2)?.reshape((b, t, c))?;
         self.out_proj.forward(&output)
+    }
+
+    /// Logarithmic prefill branch backed by associative tree-reduction.
+    pub fn forward_prefill_logarithmic(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, t, c) = x.dims3()?;
+        let h = self.config.num_heads;
+        let d = self.config.head_dim;
+
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, t, h, d))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, t, h, d))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((b, t, h, d))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // Build associative per-token state and compress logarithmically.
+        let token_state = k
+            .add(&v)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, t, c))?;
+        let compressed = LogosAssociativeScanner::parallel_prefix_reduce(&token_state)?;
+
+        // Derive decode initial state [B, H, D, D] from compressed representation.
+        let compressed_heads = compressed.reshape((b, h, d))?;
+        let eye = Tensor::eye(d, DType::F32, x.device())?
+            .unsqueeze(0)?
+            .unsqueeze(0)?;
+        let w_tilde_init = compressed_heads.unsqueeze(3)?.broadcast_mul(&eye)?;
+        *self.prefill_w_tilde.borrow_mut() = Some(w_tilde_init);
+
+        // Project compressed context back to sequence shape for residual prefill path.
+        let compressed_context = Tensor::zeros((b, t, c), DType::F32, x.device())?
+            .broadcast_add(&compressed)?
+            .contiguous()?;
+        let q_reshaped = q.transpose(1, 2)?.reshape((b, t, c))?;
+        let output = q_reshaped.add(&compressed_context)?;
+        self.out_proj.forward(&output)
+    }
+
+    pub fn take_prefill_state(&self) -> Option<Tensor> {
+        self.prefill_w_tilde.borrow_mut().take()
     }
 
     /// Single-token decode with in-place W_tilde gradient step.

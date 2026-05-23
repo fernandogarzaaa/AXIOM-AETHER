@@ -3,6 +3,7 @@ mod data_gen;
 mod inference;
 mod jit_streamer;
 mod kernel;
+mod log_scan;
 mod train;
 mod ttt_layer;
 
@@ -31,10 +32,11 @@ struct CliArgs {
     max_context_tokens: usize,
     host: String,
     port: u16,
+    use_log_scan: bool,
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH]"
+    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH] [--use-log-scan]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N] [--use-log-scan]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH] [--use-log-scan]"
 }
 
 fn parse_cli() -> Result<CliArgs> {
@@ -62,6 +64,10 @@ fn parse_cli() -> Result<CliArgs> {
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(8080);
+    let mut use_log_scan = env::var("AXIOM_USE_LOG_SCAN")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false);
     let mut prompt_parts: Vec<String> = Vec::new();
 
     let mut i = 1;
@@ -172,6 +178,11 @@ fn parse_cli() -> Result<CliArgs> {
                     .parse::<u16>()
                     .map_err(|_| candle_core::Error::Msg("invalid --port value".into()))?;
             }
+            "--use-log-scan" => {
+                use_log_scan = true;
+                i += 1;
+                continue;
+            }
             value => prompt_parts.push(value.to_string()),
         }
         i += 1;
@@ -182,6 +193,10 @@ fn parse_cli() -> Result<CliArgs> {
     } else {
         Some(prompt_parts.join(" "))
     };
+
+    if max_context_tokens > 100_000 {
+        use_log_scan = true;
+    }
 
     Ok(CliArgs {
         mode,
@@ -198,6 +213,7 @@ fn parse_cli() -> Result<CliArgs> {
         max_context_tokens,
         host,
         port,
+        use_log_scan,
     })
 }
 
@@ -260,6 +276,8 @@ async fn main() -> Result<()> {
         vocab_size: 256,
         lr_inner: 1e-3,
         rms_norm_eps: 1e-6,
+        use_log_scan: args.use_log_scan,
+        log_scan_auto_threshold: 100_000,
     };
 
     match args.mode.as_str() {

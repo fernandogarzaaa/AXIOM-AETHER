@@ -13,6 +13,10 @@ pub struct AxiomConfig {
     /// Inner-loop learning rate for the TTT weight update.
     pub lr_inner: f32,
     pub rms_norm_eps: f32,
+    /// Force logarithmic associative scan during prefill.
+    pub use_log_scan: bool,
+    /// Auto-enable logarithmic prefill when sequence length exceeds this threshold.
+    pub log_scan_auto_threshold: usize,
 }
 
 impl Default for AxiomConfig {
@@ -25,6 +29,8 @@ impl Default for AxiomConfig {
             vocab_size: 32000,
             lr_inner: 1e-3,
             rms_norm_eps: 1e-6,
+            use_log_scan: false,
+            log_scan_auto_threshold: 100_000,
         }
     }
 }
