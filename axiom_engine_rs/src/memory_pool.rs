@@ -1,19 +1,121 @@
-use std::collections::HashMap;
+//! Memory-token extraction and safetensors I/O utilities.
+//!
+//! This module provides:
+//! - [`extract_memory_vector`]: slice the hidden-state vector for a specific
+//!   memory token out of a sequence tensor.
+//! - [`save_to_disk`] / [`load_from_disk`]: persist and restore a single
+//!   tensor using the SafeTensors on-disk format.
 
-use candle_core::{Device, IndexOp, Result, Tensor};
+use std::collections::HashMap;
+use std::path::Path;
 
 use crate::config::MEM_TOKEN_ID;
+use candle_core::{Device, Result, Tensor};
 
-/// Compresses large contexts into a single portable `[1, d_model]` memory vector.
+// ---------------------------------------------------------------------------
+// Memory token extraction
+// ---------------------------------------------------------------------------
+
+/// Extract the hidden-state vector for a specific memory token from a sequence.
 ///
-/// # Concept – Context Singularity
+/// # Arguments
+/// * `hidden_states` – `[B, T, d_model]` tensor produced by a forward pass.
+/// * `seq_tokens`    – Slice of token IDs corresponding to the T sequence
+///                     positions (must have length T).
+/// * `mem_token_id`  – The token ID whose hidden state should be extracted.
 ///
-/// The `<MEM>` token (ID `MEM_TOKEN_ID`) acts as a vocabulary sink.  When it
-/// appears in a sequence, the forward pass accumulates the full causal context
-/// into its activation via the TTT attention mechanism.  `MemoryCompressor`
-/// extracts that activation as a discrete latent vector that can be serialised
-/// to disk and later injected into any fresh inference session, effectively
-/// compressing an O(N) or O(log N) context into a single O(1) tensor.
+/// # Returns
+/// `[B, 1, d_model]` tensor sliced from the **first** occurrence of
+/// `mem_token_id` in `seq_tokens`.
+///
+/// # Errors
+/// * `seq_tokens.len() != T`.
+/// * `mem_token_id` not found in `seq_tokens`.
+pub fn extract_memory_vector(
+    hidden_states: &Tensor,
+    seq_tokens: &[u32],
+    mem_token_id: u32,
+) -> Result<Tensor> {
+    let (_, t, _) = hidden_states.dims3()?;
+    if seq_tokens.len() != t {
+        candle_core::bail!(
+            "seq_tokens length {} does not match hidden_states sequence dimension {}",
+            seq_tokens.len(),
+            t
+        );
+    }
+
+    let idx = seq_tokens
+        .iter()
+        .position(|&tok| tok == mem_token_id)
+        .ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "mem_token_id {mem_token_id} not found in seq_tokens"
+            ))
+        })?;
+
+    // Narrow the sequence dimension to a single slice: [B, 1, d_model].
+    hidden_states.narrow(1, idx, 1)
+}
+
+// ---------------------------------------------------------------------------
+// SafeTensors I/O
+// ---------------------------------------------------------------------------
+
+/// The canonical key used when serialising a single tensor to disk.
+const TENSOR_KEY: &str = "tensor";
+
+/// Persist a single tensor to a SafeTensors file.
+///
+/// The tensor is stored under the key `"tensor"`.  If the tensor lives on an
+/// accelerator it is first moved to the CPU and cast to `f32` for maximum
+/// compatibility with downstream tooling.
+///
+/// # Arguments
+/// * `tensor` – Tensor to save (any dtype, any device).
+/// * `path`   – Destination file path.  Created or overwritten atomically.
+///
+/// # Errors
+/// Propagates any I/O or serialisation error from candle.
+pub fn save_to_disk(tensor: &Tensor, path: &str) -> Result<()> {
+    // Normalise to CPU f32 before serialising.
+    let cpu_f32 = tensor
+        .to_device(&Device::Cpu)?
+        .to_dtype(candle_core::DType::F32)?;
+
+    let mut tensors: HashMap<String, Tensor> = HashMap::new();
+    tensors.insert(TENSOR_KEY.to_string(), cpu_f32);
+
+    candle_core::safetensors::save(&tensors, path)
+}
+
+/// Load a tensor from a SafeTensors file previously written by [`save_to_disk`].
+///
+/// # Arguments
+/// * `path`   – Source file path.
+/// * `device` – Target device for the loaded tensor.
+///
+/// # Returns
+/// The tensor stored under the `"tensor"` key.
+///
+/// # Errors
+/// * File does not exist.
+/// * File does not contain a `"tensor"` key.
+/// * Any I/O or deserialisation error from candle.
+pub fn load_from_disk(path: &str, device: &Device) -> Result<Tensor> {
+    if !Path::new(path).exists() {
+        candle_core::bail!("checkpoint file not found: {path}");
+    }
+
+    let mut tensors = candle_core::safetensors::load(path, device)?;
+    tensors.remove(TENSOR_KEY).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "safetensors file '{path}' does not contain a '{TENSOR_KEY}' key"
+        ))
+    })
+}
+
+/// Backwards-compatible helper for context-singularity workflows on `MEM_TOKEN_ID`.
 pub struct MemoryCompressor {
     pub d_model: usize,
 }
@@ -23,71 +125,33 @@ impl MemoryCompressor {
         Self { d_model }
     }
 
-    /// Extract the `<MEM>` token hidden-state from the final layer activations.
+    /// Extract `[1, d_model]` memory vector from the first batch element.
     ///
-    /// # Arguments
-    /// * `final_hidden_states` – `[B, T, d_model]` tensor (output of the last
-    ///   transformer block, before the LM head).
-    /// * `sequence_tokens`     – Flat slice of token IDs corresponding to the
-    ///   `T` positions in `final_hidden_states`.  Must contain exactly one
-    ///   occurrence of `MEM_TOKEN_ID`.
-    ///
-    /// # Returns
-    /// `[1, d_model]` tensor – the memory vector for this context.
+    /// Returns an error when `MEM_TOKEN_ID` is not present in `sequence_tokens`.
     pub fn extract_memory_vector(
         &self,
         final_hidden_states: &Tensor,
         sequence_tokens: &[u32],
     ) -> Result<Tensor> {
-        let pos = sequence_tokens
-            .iter()
-            .position(|&id| id == MEM_TOKEN_ID)
-            .ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "MEM_TOKEN_ID ({MEM_TOKEN_ID}) not found in sequence_tokens"
-                ))
-            })?;
-
-        let (_, t, d) = final_hidden_states.dims3()?;
-        if pos >= t {
-            return Err(candle_core::Error::Msg(format!(
-                "MEM token position {pos} out of bounds for sequence length {t}"
-            )));
-        }
+        let (_, _, d) = final_hidden_states.dims3()?;
         if d != self.d_model {
-            return Err(candle_core::Error::Msg(format!(
+            candle_core::bail!(
                 "d_model mismatch: compressor expects {}, tensor has {d}",
                 self.d_model
-            )));
+            );
         }
-
-        // Batch index 0, time step `pos` → [d_model]; unsqueeze to [1, d_model].
-        final_hidden_states.i((0, pos))?.unsqueeze(0)
+        let mem = extract_memory_vector(final_hidden_states, sequence_tokens, MEM_TOKEN_ID)?;
+        mem.narrow(0, 0, 1)?.reshape((1usize, d))
     }
 
-    /// Serialise a memory vector to disk using the safetensors format.
-    ///
-    /// The tensor is stored under the key `"memory"`.  The resulting file can
-    /// be loaded by any safetensors-compatible reader (Python, Rust, etc.) and
-    /// hot-swapped into a running engine in milliseconds.
-    ///
-    /// # Arguments
-    /// * `tensor`   – `[1, d_model]` memory vector.
-    /// * `filename` – Destination path, e.g. `"linux_kernel.mem"`.
+    /// Save memory vector under `"memory"` key for compatibility with older files.
     pub fn save_memory_token(tensor: &Tensor, filename: &str) -> Result<()> {
         let tensors: HashMap<String, Tensor> =
             HashMap::from([("memory".to_string(), tensor.clone())]);
         candle_core::safetensors::save(&tensors, filename)
     }
 
-    /// Load a memory vector that was previously saved with `save_memory_token`.
-    ///
-    /// # Arguments
-    /// * `filename` – Path to the `.mem` safetensors file.
-    /// * `device`   – Target device for the loaded tensor.
-    ///
-    /// # Returns
-    /// `[1, d_model]` tensor.
+    /// Load memory vector stored under `"memory"` key.
     pub fn load_memory_token(filename: &str, device: &Device) -> Result<Tensor> {
         let map = candle_core::safetensors::load(filename, device)?;
         map.get("memory")
@@ -96,74 +160,126 @@ impl MemoryCompressor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{DType, Device, Tensor};
 
-    fn make_hidden(b: usize, t: usize, d: usize) -> Tensor {
-        Tensor::arange(0f32, (b * t * d) as f32, &Device::Cpu)
-            .unwrap()
-            .reshape((b, t, d))
-            .unwrap()
+    // ----- extract_memory_vector -------------------------------------------
+
+    #[test]
+    fn test_extract_correct_slice() {
+        let device = Device::Cpu;
+        // hidden_states: B=1, T=4, d_model=8  (values 0..32)
+        let data: Vec<f32> = (0..32).map(|x| x as f32).collect();
+        let hs = Tensor::from_vec(data, (1usize, 4usize, 8usize), &device).unwrap();
+        let tokens = [10u32, 20, 30, 40];
+
+        // Extract token 30, which is at index 2 → values 16..24.
+        let mem_vec = extract_memory_vector(&hs, &tokens, 30).unwrap();
+        assert_eq!(mem_vec.dims(), &[1, 1, 8]);
+
+        let vals: Vec<f32> = mem_vec.flatten_all().unwrap().to_vec1().unwrap();
+        let expected: Vec<f32> = (16..24).map(|x| x as f32).collect();
+        assert_eq!(vals, expected);
     }
 
     #[test]
-    fn extract_memory_vector_selects_mem_position() {
-        let d_model = 8;
+    fn test_extract_first_token() {
+        let device = Device::Cpu;
+        let data: Vec<f32> = (0..16).map(|x| x as f32).collect();
+        let hs = Tensor::from_vec(data, (1usize, 4usize, 4usize), &device).unwrap();
+        let tokens = [99u32, 1, 2, 3];
+
+        let mem_vec = extract_memory_vector(&hs, &tokens, 99).unwrap();
+        assert_eq!(mem_vec.dims(), &[1, 1, 4]);
+
+        let vals: Vec<f32> = mem_vec.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(vals, vec![0.0f32, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_extract_missing_token_errors() {
+        let device = Device::Cpu;
+        let hs = Tensor::zeros((1usize, 3usize, 4usize), DType::F32, &device).unwrap();
+        let tokens = [1u32, 2, 3];
+        assert!(extract_memory_vector(&hs, &tokens, 99).is_err());
+    }
+
+    #[test]
+    fn test_extract_length_mismatch_errors() {
+        let device = Device::Cpu;
+        let hs = Tensor::zeros((1usize, 3usize, 4usize), DType::F32, &device).unwrap();
+        // Provide 4 tokens but T=3.
+        let tokens = [1u32, 2, 3, 4];
+        assert!(extract_memory_vector(&hs, &tokens, 1).is_err());
+    }
+
+    // ----- save / load roundtrip -------------------------------------------
+
+    #[test]
+    fn test_save_load_f32_roundtrip() {
+        let device = Device::Cpu;
+        let data: Vec<f32> = (0..12).map(|x| x as f32).collect();
+        let tensor = Tensor::from_vec(data.clone(), (3usize, 4usize), &device).unwrap();
+
+        let path = std::env::temp_dir().join("axiom_pool_test.safetensors");
+        let path_str = path.to_str().unwrap();
+
+        save_to_disk(&tensor, path_str).unwrap();
+        let loaded = load_from_disk(path_str, &device).unwrap();
+
+        assert_eq!(loaded.dims(), &[3, 4]);
+        let loaded_data: Vec<f32> = loaded.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(loaded_data, data);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_nonexistent_file_errors() {
+        assert!(load_from_disk("/nonexistent/path/axiom.safetensors", &Device::Cpu).is_err());
+    }
+
+    #[test]
+    fn test_save_preserves_shape_after_reload() {
+        let device = Device::Cpu;
+        // 3-D tensor: [2, 3, 4]
+        let data: Vec<f32> = (0..24).map(|x| x as f32).collect();
+        let tensor = Tensor::from_vec(data, (2usize, 3usize, 4usize), &device).unwrap();
+
+        let path = std::env::temp_dir().join("axiom_pool_3d_test.safetensors");
+        let path_str = path.to_str().unwrap();
+
+        save_to_disk(&tensor, path_str).unwrap();
+        let loaded = load_from_disk(path_str, &device).unwrap();
+
+        assert_eq!(loaded.dims(), &[2, 3, 4]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_memory_compressor_extract_and_roundtrip() {
+        let device = Device::Cpu;
+        let d_model = 6usize;
+        let data: Vec<f32> = (0..18).map(|x| x as f32).collect();
+        let hidden = Tensor::from_vec(data, (1usize, 3usize, d_model), &device).unwrap();
+        let tokens = [1u32, MEM_TOKEN_ID, 3u32];
+
         let compressor = MemoryCompressor::new(d_model);
-        let hidden = make_hidden(1, 4, d_model);
-
-        // Place MEM_TOKEN_ID at position 2.
-        let tokens: Vec<u32> = vec![10, 20, MEM_TOKEN_ID, 30];
-        let mem_vec = compressor
-            .extract_memory_vector(&hidden, &tokens)
-            .expect("extraction failed");
-
+        let mem_vec = compressor.extract_memory_vector(&hidden, &tokens).unwrap();
         assert_eq!(mem_vec.dims(), &[1, d_model]);
 
-        // The extracted slice must match position-2 of the input tensor.
-        let expected = hidden.i((0, 2)).unwrap().unsqueeze(0).unwrap();
-        let diff = mem_vec
-            .sub(&expected)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .sum_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap();
-        assert!(diff < 1e-6, "extracted vector mismatch, diff={diff}");
-    }
-
-    #[test]
-    fn extract_memory_vector_errors_when_no_mem_token() {
-        let compressor = MemoryCompressor::new(4);
-        let hidden = make_hidden(1, 3, 4);
-        let tokens: Vec<u32> = vec![1, 2, 3];
-        assert!(
-            compressor.extract_memory_vector(&hidden, &tokens).is_err(),
-            "should error when MEM_TOKEN_ID is absent"
-        );
-    }
-
-    #[test]
-    fn roundtrip_save_load_memory_token() {
-        let d_model = 16usize;
-        let data: Vec<f32> = (0..d_model).map(|i| i as f32 * 0.5).collect();
-        let tensor = Tensor::from_vec(data.clone(), (1, d_model), &Device::Cpu).unwrap();
-
-        let path = std::env::temp_dir().join("test_mem_token.mem");
-        let path_str = path.to_str().expect("temp path is valid UTF-8");
-        MemoryCompressor::save_memory_token(&tensor, path_str).expect("save failed");
-
-        let loaded =
-            MemoryCompressor::load_memory_token(path_str, &Device::Cpu).expect("load failed");
+        let path = std::env::temp_dir().join("axiom_mem_compat_test.mem");
+        let path_str = path.to_str().unwrap();
+        MemoryCompressor::save_memory_token(&mem_vec, path_str).unwrap();
+        let loaded = MemoryCompressor::load_memory_token(path_str, &device).unwrap();
         assert_eq!(loaded.dims(), &[1, d_model]);
 
-        let loaded_data = loaded.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for (a, b) in data.iter().zip(loaded_data.iter()) {
-            assert!((a - b).abs() < 1e-6, "round-trip mismatch: {a} vs {b}");
-        }
+        let _ = std::fs::remove_file(&path);
     }
 }

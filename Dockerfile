@@ -1,5 +1,10 @@
 FROM rust:1.75-slim AS builder
 
+# OCI image labels (used by GHCR)
+LABEL org.opencontainers.image.source="https://github.com/fernandogarzaaa/AXIOM-AETHER"
+LABEL org.opencontainers.image.description="Axiom-TTT Inference Engine — OpenAI-compatible API with online Test-Time Training"
+LABEL org.opencontainers.image.licenses="MIT"
+
 WORKDIR /usr/src/axiom_engine
 COPY . .
 
@@ -29,6 +34,7 @@ EXPOSE 8080
 
 ENV AXIOM_HOST="0.0.0.0"
 ENV AXIOM_PORT="8080"
+ENV AXIOM_DEVICE="cpu"
 ENV RUST_LOG="info"
 
 ENTRYPOINT ["/app/axiom_engine"]
