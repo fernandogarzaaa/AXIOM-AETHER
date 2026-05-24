@@ -661,7 +661,7 @@ async fn adapt(
             .lock()
             .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
         pipeline
-            .adapt_on_corpus(&req.corpus, initial_states)
+            .adapt_on_corpus_with_steps(&req.corpus, initial_states, steps_per_token)
             .map_err(|e| ApiError::Internal(format!("adapt failed: {e}")))?
     };
     metrics::add_prefilled_tokens(corpus_tokens);

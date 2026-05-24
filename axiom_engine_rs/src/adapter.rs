@@ -8,7 +8,7 @@ const DEFAULT_CHUNK_FUSED_INNER_STEPS: usize = 4;
 
 pub struct ChunkFusedTTT {
     layer: TTTLinearLayer,
-    _varmap: VarMap,
+    varmap: VarMap,
 }
 
 impl ChunkFusedTTT {
@@ -16,10 +16,7 @@ impl ChunkFusedTTT {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
         let layer = TTTLinearLayer::new(vb.pp("chunk_fused_ttt"), config)?;
-        Ok(Self {
-            layer,
-            _varmap: varmap,
-        })
+        Ok(Self { layer, varmap })
     }
 
     pub fn forward_chunk_fused(
@@ -27,6 +24,7 @@ impl ChunkFusedTTT {
         x: &Tensor,
         initial_state: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
+        let _keep_alive = &self.varmap;
         let (_, seq_len, _) = x.dims3()?;
         let mut state = initial_state.clone();
         let mut outputs = Vec::with_capacity(seq_len);

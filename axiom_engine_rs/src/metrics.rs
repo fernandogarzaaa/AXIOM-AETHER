@@ -80,8 +80,9 @@ pub fn set_quantized_sessions(count: usize) {
 }
 
 pub fn observe_prefill_latency(seconds: f64) {
+    let seconds = seconds.max(0.0);
     if let Ok(mut histogram) = HISTOGRAM_PREFILL_LATENCY.lock() {
-        histogram.observe(seconds.max(0.0));
+        histogram.observe(seconds);
     }
 }
 

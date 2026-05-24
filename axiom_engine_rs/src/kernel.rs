@@ -99,10 +99,22 @@ impl AxiomBlock {
         w_tilde: Option<&Tensor>,
         use_decode: bool,
     ) -> Result<(Tensor, Option<Tensor>)> {
+        self.forward_with_inner_loop_steps(x, w_tilde, use_decode, None)
+    }
+
+    pub fn forward_with_inner_loop_steps(
+        &self,
+        x: &Tensor,
+        w_tilde: Option<&Tensor>,
+        use_decode: bool,
+        inner_loop_steps: Option<usize>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         if use_decode {
             let state = w_tilde.expect("W_tilde required for decode phase.");
             let normed_x = self.ttt_norm.forward(x)?;
-            let (ttt_out, w_tilde_next) = self.ttt.forward_decode(&normed_x, state, None)?;
+            let (ttt_out, w_tilde_next) =
+                self.ttt
+                    .forward_decode(&normed_x, state, inner_loop_steps)?;
             let x = x.add(&ttt_out)?;
             let ffn_out = self.ffn.forward(&self.ffn_norm.forward(&x)?)?;
             let x = x.add(&ffn_out)?;
@@ -171,12 +183,23 @@ impl AxiomTTTEngine {
         states: Option<Vec<Tensor>>,
         use_decode: bool,
     ) -> Result<(Tensor, Option<Vec<Tensor>>)> {
+        self.forward_with_inner_loop_steps(tokens, states, use_decode, None)
+    }
+
+    pub fn forward_with_inner_loop_steps(
+        &self,
+        tokens: &Tensor,
+        states: Option<Vec<Tensor>>,
+        use_decode: bool,
+        inner_loop_steps: Option<usize>,
+    ) -> Result<(Tensor, Option<Vec<Tensor>>)> {
         let mut x = self.embeddings.forward(tokens)?;
         let mut next_states: Vec<Tensor> = Vec::new();
 
         for (i, layer) in self.layers.iter().enumerate() {
             let w_tilde = states.as_ref().map(|s| &s[i]);
-            let (x_next, w_next) = layer.forward(&x, w_tilde, use_decode)?;
+            let (x_next, w_next) =
+                layer.forward_with_inner_loop_steps(&x, w_tilde, use_decode, inner_loop_steps)?;
             x = x_next;
             if let Some(w) = w_next {
                 next_states.push(w);
