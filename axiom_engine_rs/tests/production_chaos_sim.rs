@@ -198,7 +198,12 @@ async fn test_production_under_chaos() {
             .unwrap(),
         ))
         .unwrap();
-    let invalid_delta_status = app.clone().oneshot(invalid_delta_req).await.unwrap().status();
+    let invalid_delta_status = app
+        .clone()
+        .oneshot(invalid_delta_req)
+        .await
+        .unwrap()
+        .status();
     assert_eq!(invalid_delta_status, StatusCode::BAD_REQUEST);
 
     // Tensor integrity probe: checkpoint several sessions and assert finite values.

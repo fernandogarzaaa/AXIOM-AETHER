@@ -162,7 +162,7 @@ impl InferencePipeline {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             let (logits, next_states) =
                 self.engine
-                    .forward(&token_tensor, Some(current_states), true)?;
+                    .forward(&token_tensor, Some(current_states.clone()), true)?;
             let candidate_states = next_states
                 .ok_or_else(|| candle_core::Error::Msg("decode must return states".into()))?;
             if session_states_are_finite(&candidate_states)? {
@@ -217,7 +217,7 @@ impl InferencePipeline {
                 let token_tensor = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
                 let (_, next_states) = self.engine.forward_with_inner_loop_steps(
                     &token_tensor,
-                    Some(current_states),
+                    Some(current_states.clone()),
                     true,
                     Some(clamped_steps),
                 )?;
@@ -261,7 +261,7 @@ impl InferencePipeline {
                 let token_tensor = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
                 let (_, next_states) =
                     self.engine
-                        .forward(&token_tensor, Some(current_states), true)?;
+                        .forward(&token_tensor, Some(current_states.clone()), true)?;
                 let candidate_states = next_states
                     .ok_or_else(|| candle_core::Error::Msg("decode must return states".into()))?;
                 if session_states_are_finite(&candidate_states)? {
@@ -435,7 +435,9 @@ impl InferencePipeline {
 
         for _ in 0..max_new_tokens {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
-            let (logits, next_states) = self.engine.forward(&token_tensor, Some(states), true)?;
+            let (logits, next_states) =
+                self.engine
+                    .forward(&token_tensor, Some(states.clone()), true)?;
             let candidate_states = next_states
                 .ok_or_else(|| candle_core::Error::Msg("decode must return states".into()))?;
             if session_states_are_finite(&candidate_states)? {
@@ -456,26 +458,26 @@ impl InferencePipeline {
             last_token = next_id;
         }
 
-        fn tensor_is_finite(tensor: &Tensor) -> Result<bool> {
-            let values = tensor
-                .to_dtype(DType::F32)?
-                .contiguous()?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            Ok(values.into_iter().all(f32::is_finite))
-        }
-
-        fn session_states_are_finite(states: &[Tensor]) -> Result<bool> {
-            for state in states {
-                if !tensor_is_finite(state)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-
         Ok(self.decode(&generated))
     }
+}
+
+fn tensor_is_finite(tensor: &Tensor) -> Result<bool> {
+    let values = tensor
+        .to_dtype(DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(values.into_iter().all(f32::is_finite))
+}
+
+fn session_states_are_finite(states: &[Tensor]) -> Result<bool> {
+    for state in states {
+        if !tensor_is_finite(state)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn fallback_decode(token_ids: &[u32]) -> String {

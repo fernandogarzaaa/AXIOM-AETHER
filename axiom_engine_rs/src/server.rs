@@ -140,7 +140,6 @@ impl SessionData {
                 "[emergency] non-finite tensor detected in merge_delta; session update discarded"
             );
             states[layer_index] = previous;
-            self.replace_states(states);
             candle_core::bail!("delta merge produced non-finite values");
         }
         states[layer_index] = merged;
@@ -202,90 +201,118 @@ impl AppState {
         Ok(())
     }
 
-    async fn enforce_lru_vram_budget(&self) -> Result<(), ApiError> {
-        loop {
-            let candidate = {
-                let sessions = self
-                    .sessions
-                    .read()
-                    .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-                let active = sessions
-                    .iter()
-                    .filter_map(|(id, session)| {
-                        if session.is_quantized() {
-                            None
-                        } else {
-                            Some((id.clone(), session.last_used))
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                if active.len() <= MAX_ACTIVE_VRAM_SESSIONS {
-                    None
-                } else {
-                    active.into_iter().min_by_key(|(_, last_used)| *last_used)
-                }
-            };
-
-            let Some((evict_session_id, baseline_last_used)) = candidate else {
-                self.refresh_session_metrics()?;
-                return Ok(());
-            };
-
-            let raw_layers = {
-                let sessions = self
-                    .sessions
-                    .read()
-                    .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-                let session = sessions.get(&evict_session_id).ok_or_else(|| {
-                    ApiError::NotFound(format!("session '{}' not found", evict_session_id))
-                })?;
-                match &session.residency {
-                    SessionResidency::Quantized(_) => continue,
-                    SessionResidency::Active(states) => states
-                        .iter()
-                        .map(|state| {
-                            let cpu_f32 = state.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                            let shape = cpu_f32.dims().to_vec();
-                            let data = cpu_f32.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-                            Ok(OffloadLayer { shape, data })
-                        })
-                        .collect::<candle_core::Result<Vec<_>>>()
-                        .map_err(|e| ApiError::Internal(format!("state staging failed: {e}")))?,
-                }
-            };
-
-            let quantized_layers = spawn_blocking(move || {
-                raw_layers
-                    .into_iter()
-                    .map(|layer| {
-                        NF4Quantizer::quantize_f32_slice(&layer.data, &layer.shape)
-                            .map_err(|e| e.to_string())
-                    })
-                    .collect::<std::result::Result<Vec<NF4QuantizedDescriptor>, String>>()
-            })
-            .await
-            .map_err(|e| ApiError::Internal(format!("state offload task join failed: {e}")))?
-            .map_err(|e| ApiError::Internal(format!("state offload quantization failed: {e}")))?;
-
-            let mut sessions = self
-                .sessions
-                .write()
-                .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-            if let Some(session) = sessions.get_mut(&evict_session_id) {
-                let still_active = !session.is_quantized();
-                let unchanged_clock = session.last_used == baseline_last_used;
-                if still_active && unchanged_clock {
-                    session.residency = SessionResidency::Quantized(quantized_layers);
-                    metrics::mark_session_quantized(&evict_session_id, true);
-                }
+    fn trigger_lru_vram_budget(&self) {
+        let sessions = self.sessions.clone();
+        tokio::spawn(async move {
+            if let Err(err) = enforce_lru_vram_budget_async(sessions).await {
+                eprintln!("[emergency] LRU budget enforcement failed: {err}");
             }
-        }
+        });
     }
 }
 
 struct OffloadLayer {
     shape: Vec<usize>,
     data: Vec<f32>,
+}
+
+async fn enforce_lru_vram_budget_async(
+    sessions: Arc<RwLock<HashMap<String, SessionData>>>,
+) -> std::result::Result<(), String> {
+    loop {
+        let candidate = {
+            let sessions_guard = sessions
+                .read()
+                .map_err(|_| "session lock poisoned".to_string())?;
+            let active = sessions_guard
+                .iter()
+                .filter_map(|(id, session)| {
+                    if session.is_quantized() {
+                        None
+                    } else {
+                        Some((id.clone(), session.last_used))
+                    }
+                })
+                .collect::<Vec<_>>();
+            if active.len() <= MAX_ACTIVE_VRAM_SESSIONS {
+                None
+            } else {
+                active.into_iter().min_by_key(|(_, last_used)| *last_used)
+            }
+        };
+
+        let Some((evict_session_id, baseline_last_used)) = candidate else {
+            refresh_session_metrics_from_sessions(&sessions)
+                .map_err(|e| format!("session metrics refresh failed: {e}"))?;
+            return Ok(());
+        };
+
+        let raw_layers = {
+            let sessions_guard = sessions
+                .read()
+                .map_err(|_| "session lock poisoned".to_string())?;
+            let Some(session) = sessions_guard.get(&evict_session_id) else {
+                continue;
+            };
+            match &session.residency {
+                SessionResidency::Quantized(_) => continue,
+                SessionResidency::Active(states) => states
+                    .iter()
+                    .map(|state| {
+                        let cpu_f32 = state.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                        let shape = cpu_f32.dims().to_vec();
+                        let data = cpu_f32.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                        Ok(OffloadLayer { shape, data })
+                    })
+                    .collect::<candle_core::Result<Vec<_>>>()
+                    .map_err(|e| format!("state staging failed: {e}"))?,
+            }
+        };
+
+        let quantized_layers = spawn_blocking(move || {
+            raw_layers
+                .into_iter()
+                .map(|layer| {
+                    NF4Quantizer::quantize_f32_slice(&layer.data, &layer.shape)
+                        .map_err(|e| e.to_string())
+                })
+                .collect::<std::result::Result<Vec<NF4QuantizedDescriptor>, String>>()
+        })
+        .await
+        .map_err(|e| format!("state offload task join failed: {e}"))?
+        .map_err(|e| format!("state offload quantization failed: {e}"))?;
+
+        let mut sessions_guard = sessions
+            .write()
+            .map_err(|_| "session lock poisoned".to_string())?;
+        if let Some(session) = sessions_guard.get_mut(&evict_session_id) {
+            let still_active = !session.is_quantized();
+            let unchanged_clock = session.last_used == baseline_last_used;
+            if still_active && unchanged_clock {
+                session.residency = SessionResidency::Quantized(quantized_layers);
+                metrics::mark_session_quantized(&evict_session_id, true);
+            }
+        }
+    }
+}
+
+fn refresh_session_metrics_from_sessions(
+    sessions: &Arc<RwLock<HashMap<String, SessionData>>>,
+) -> std::result::Result<(), String> {
+    let sessions_guard = sessions
+        .read()
+        .map_err(|_| "session lock poisoned".to_string())?;
+    let active = sessions_guard
+        .values()
+        .filter(|session| !session.is_quantized())
+        .count();
+    let quantized = sessions_guard
+        .values()
+        .filter(|session| session.is_quantized())
+        .count();
+    metrics::set_active_sessions(active);
+    metrics::set_quantized_sessions(quantized);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +562,7 @@ async fn create_completion(
     let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
 
     let text = run_generation(&state, &req.prompt, max_tokens, req.session_id.as_deref())?;
-    state.enforce_lru_vram_budget().await?;
+    state.trigger_lru_vram_budget();
 
     Ok(Json(CompletionResponse {
         id: format!("cmpl-{}", Uuid::new_v4()),
@@ -564,16 +591,12 @@ async fn create_chat_completion(
 ) -> Response {
     if req.stream.unwrap_or(false) {
         let sse = chat_completion_sse(state.clone(), req);
-        match state.enforce_lru_vram_budget().await {
-            Ok(()) => sse.into_response(),
-            Err(err) => err.into_response(),
-        }
+        state.trigger_lru_vram_budget();
+        sse.into_response()
     } else {
         let json = chat_completion_json(state.clone(), req);
-        match state.enforce_lru_vram_budget().await {
-            Ok(()) => json.into_response(),
-            Err(err) => err.into_response(),
-        }
+        state.trigger_lru_vram_budget();
+        json.into_response()
     }
 }
 
@@ -716,7 +739,7 @@ async fn create_session(
     }
     metrics::register_session(&session_id);
     state.refresh_session_metrics()?;
-    state.enforce_lru_vram_budget().await?;
+    state.trigger_lru_vram_budget();
 
     Ok(Json(CreateSessionResponse {
         session_id,
@@ -799,7 +822,7 @@ async fn adapt(
         }
     }
     state.refresh_session_metrics()?;
-    state.enforce_lru_vram_budget().await?;
+    state.trigger_lru_vram_budget();
 
     Ok(Json(AdaptResponse {
         session_id,
@@ -880,7 +903,7 @@ async fn put_checkpoint(
     metrics::register_session(&session_id);
     metrics::mark_session_quantized(&session_id, false);
     state.refresh_session_metrics()?;
-    state.enforce_lru_vram_budget().await?;
+    state.trigger_lru_vram_budget();
 
     Ok(Json(CreateSessionResponse {
         session_id,
@@ -942,7 +965,7 @@ async fn cluster_sync(
     drop(sequence_versions);
     drop(sessions);
     state.refresh_session_metrics()?;
-    state.enforce_lru_vram_budget().await?;
+    state.trigger_lru_vram_budget();
 
     Ok(StatusCode::ACCEPTED)
 }
