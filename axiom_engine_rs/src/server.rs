@@ -868,44 +868,44 @@ fn materialize_session_state(session: &mut SessionData) -> Result<(), ApiError> 
             session.states = dequantize_layer_states(quantized)?;
             session.quantized_states = None;
         }
-
-        fn checked_numel(shape: &[usize]) -> Result<usize, ApiError> {
-            shape.iter().try_fold(1usize, |acc, &dim| {
-                acc.checked_mul(dim).ok_or_else(|| {
-                    ApiError::BadRequest(format!(
-                        "shape {:?} overflows usize during element-count computation",
-                        shape
-                    ))
-                })
-            })
-        }
-
-        fn load_session_states(state: &AppState, sid: &str) -> Result<Vec<Tensor>, ApiError> {
-            {
-                let sessions = state
-                    .sessions
-                    .read()
-                    .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-                let session = sessions
-                    .get(sid)
-                    .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
-                if !session.states.is_empty() {
-                    return Ok(session.states.clone());
-                }
-            }
-
-            let mut sessions = state
-                .sessions
-                .write()
-                .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-            let session = sessions
-                .get_mut(sid)
-                .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
-            materialize_session_state(session)?;
-            Ok(session.states.clone())
-        }
     }
     Ok(())
+}
+
+fn checked_numel(shape: &[usize]) -> Result<usize, ApiError> {
+    shape.iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "shape {:?} overflows usize during element-count computation",
+                shape
+            ))
+        })
+    })
+}
+
+fn load_session_states(state: &AppState, sid: &str) -> Result<Vec<Tensor>, ApiError> {
+    {
+        let sessions = state
+            .sessions
+            .read()
+            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+        let session = sessions
+            .get(sid)
+            .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
+        if !session.states.is_empty() {
+            return Ok(session.states.clone());
+        }
+    }
+
+    let mut sessions = state
+        .sessions
+        .write()
+        .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+    let session = sessions
+        .get_mut(sid)
+        .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
+    materialize_session_state(session)?;
+    Ok(session.states.clone())
 }
 
 fn spawn_idle_quantization_worker(state: AppState) {
