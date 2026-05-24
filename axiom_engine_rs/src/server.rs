@@ -14,15 +14,18 @@
 //! | PUT    | `/v1/sessions/{id}/checkpoint`       | Restore session state from JSON          |
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use candle_core::{Device, Tensor};
+use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
@@ -52,13 +55,21 @@ struct SessionData {
     model: String,
 }
 
+/// Global server state shared across all request handlers.
+///
+/// * `pipeline` — inference pipeline; wrapped in `Mutex` because
+///   `InferencePipeline` contains `RefCell` (via `TTTLinearLayer`) which is
+///   `!Send`.  Generation itself is synchronous and does not hold the lock
+///   across `.await` points.
+/// * `sessions` — active TTT sessions keyed by UUID.  `RwLock` allows
+///   multiple simultaneous GET-style reads while mutations (create, adapt,
+///   checkpoint write) acquire an exclusive write lock.
 #[derive(Clone)]
 pub struct AppState {
-    /// Shared inference pipeline.  Wrapped in `Mutex` because `InferencePipeline`
-    /// contains `RefCell` (via `TTTLinearLayer`) which is `!Send`.
     pub pipeline: Arc<Mutex<InferencePipeline>>,
     /// Active TTT sessions keyed by UUID string.
-    sessions: Arc<Mutex<HashMap<String, SessionData>>>,
+    /// `RwLock` enables concurrent reads; mutations take an exclusive write.
+    sessions: Arc<RwLock<HashMap<String, SessionData>>>,
     /// Canonical model identifier returned in API responses.
     pub model_id: String,
 }
@@ -67,7 +78,7 @@ impl AppState {
     pub fn new(pipeline: InferencePipeline, model_id: String) -> Self {
         Self {
             pipeline: Arc::new(Mutex::new(pipeline)),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
             model_id,
         }
     }
@@ -155,6 +166,8 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<usize>,
     /// See [`CompletionRequest::session_id`].
     pub session_id: Option<String>,
+    /// When `true`, the response is an SSE stream of `chat.completion.chunk`
+    /// objects terminated by `data: [DONE]`.
     #[serde(default)]
     pub stream: Option<bool>,
 }
@@ -309,23 +322,34 @@ async fn create_completion(
 }
 
 /// `POST /v1/chat/completions` — chat completion (stateless or session-aware).
+///
+/// When `stream: true` is set in the request body, the response is an SSE
+/// stream of `chat.completion.chunk` objects (OpenAI streaming format) terminated
+/// by the sentinel `data: [DONE]\n\n`.  Clients such as Open WebUI, LangChain,
+/// and curl --no-buffer work without any code change.
+///
+/// When `stream: false` (or absent), a single JSON object is returned.
 async fn create_chat_completion(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Response {
+    if req.stream.unwrap_or(false) {
+        chat_completion_sse(state, req).into_response()
+    } else {
+        chat_completion_json(state, req).into_response()
+    }
+}
+
+// -- non-streaming JSON path ------------------------------------------------
+
+fn chat_completion_json(
+    state: AppState,
+    req: ChatCompletionRequest,
+) -> Result<Json<ChatCompletionResponse>, ApiError> {
     let max_tokens = req.max_tokens.unwrap_or(32);
     let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
-
-    // Concatenate all message contents as the prompt.
-    let prompt = req
-        .messages
-        .iter()
-        .map(|m| format!("{}: {}", m.role, m.content))
-        .collect::<Vec<_>>()
-        .join("\n");
-
+    let prompt = messages_to_prompt(&req.messages);
     let text = run_generation(&state, &prompt, max_tokens, req.session_id.as_deref())?;
-
     Ok(Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4()),
         object: "chat.completion".to_string(),
@@ -340,6 +364,76 @@ async fn create_chat_completion(
             finish_reason: "stop".to_string(),
         }],
     }))
+}
+
+// -- SSE streaming path -----------------------------------------------------
+
+/// Build an SSE response from a pre-generated text, streaming one word-piece
+/// per event to give clients the incremental token experience.
+///
+/// All generation is synchronous (the inference pipeline is CPU/GPU blocking);
+/// we generate the full text first, then stream the result as SSE chunks.
+/// This is fully OpenAI-wire-compatible: clients that open an SSE connection
+/// will see tokens arrive progressively.
+fn chat_completion_sse(
+    state: AppState,
+    req: ChatCompletionRequest,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let max_tokens = req.max_tokens.unwrap_or(32);
+    let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
+    let prompt = messages_to_prompt(&req.messages);
+
+    let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
+    let created = unix_now();
+
+    let generation_result = run_generation(&state, &prompt, max_tokens, req.session_id.as_deref());
+
+    // Build the event sequence.  On error, emit a single error event.
+    let events: Vec<Result<Event, Infallible>> = match generation_result {
+        Err(api_err) => {
+            let body = match api_err {
+                ApiError::Internal(m) | ApiError::NotFound(m) | ApiError::BadRequest(m) => m,
+            };
+            vec![Ok(Event::default().data(format!("error: {body}")))]
+        }
+        Ok(text) => {
+            // Split into word-pieces lazily; split_inclusive yields &str slices
+            // into `text` — no extra String allocation per piece.
+            let pieces: Vec<&str> = text.split_inclusive(' ').collect();
+
+            let mut events: Vec<Result<Event, Infallible>> = Vec::with_capacity(pieces.len() + 2);
+
+            for piece in pieces {
+                let chunk = serde_json::json!({
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": piece},
+                        "finish_reason": null
+                    }]
+                });
+                events.push(Ok(Event::default().data(chunk.to_string())));
+            }
+
+            // Final chunk: stop signal with empty delta.
+            let stop_chunk = serde_json::json!({
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            });
+            events.push(Ok(Event::default().data(stop_chunk.to_string())));
+            // OpenAI termination sentinel.
+            events.push(Ok(Event::default().data("[DONE]")));
+            events
+        }
+    };
+
+    Sse::new(stream::iter(events)).keep_alive(KeepAlive::default())
 }
 
 /// `POST /v1/sessions` — create a new persistent TTT session.
@@ -365,7 +459,7 @@ async fn create_session(
     {
         let mut sessions = state
             .sessions
-            .lock()
+            .write()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         sessions.insert(
             session_id.clone(),
@@ -393,7 +487,7 @@ async fn delete_session(
 ) -> Result<impl IntoResponse, ApiError> {
     let mut sessions = state
         .sessions
-        .lock()
+        .write()
         .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
 
     let deleted = sessions.remove(&session_id).is_some();
@@ -431,11 +525,11 @@ async fn adapt(
             .map_err(|e| ApiError::Internal(format!("adapt failed: {e}")))?
     };
 
-    // Persist updated states back into the session.
+    // Persist updated states back into the session (exclusive write lock).
     {
         let mut sessions = state
             .sessions
-            .lock()
+            .write()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         if let Some(session) = sessions.get_mut(&session_id) {
             session.states = updated_states;
@@ -456,9 +550,10 @@ async fn get_checkpoint(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Shared read lock — does not block other concurrent reads.
     let sessions = state
         .sessions
-        .lock()
+        .read()
         .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
 
     let session = sessions
@@ -493,7 +588,7 @@ async fn put_checkpoint(
         )));
     }
 
-    // Determine the device from an existing session or the pipeline.
+    // Determine the device from the pipeline.
     let device = {
         let pipeline = state
             .pipeline
@@ -512,7 +607,7 @@ async fn put_checkpoint(
     let now = unix_now();
     let mut sessions = state
         .sessions
-        .lock()
+        .write()
         .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
 
     sessions
@@ -540,6 +635,15 @@ async fn put_checkpoint(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Concatenate chat messages into a single prompt string.
+fn messages_to_prompt(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Run generation, optionally using and updating a named session.
 fn run_generation(
     state: &AppState,
@@ -559,11 +663,11 @@ fn run_generation(
                 .map_err(|e| ApiError::Internal(format!("generation failed: {e}")))
         }
         Some(sid) => {
-            // Stateful generation — load states, generate, store updated states.
+            // Stateful generation — load states (read lock), generate, write back.
             let initial_states = {
                 let sessions = state
                     .sessions
-                    .lock()
+                    .read()
                     .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
                 sessions
                     .get(sid)
@@ -584,7 +688,7 @@ fn run_generation(
             {
                 let mut sessions = state
                     .sessions
-                    .lock()
+                    .write()
                     .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
                 if let Some(session) = sessions.get_mut(sid) {
                     session.states = updated_states;
@@ -605,7 +709,7 @@ fn resolve_or_create_session(
     if let Some(sid) = session_id {
         let sessions = state
             .sessions
-            .lock()
+            .read()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         let states = sessions
             .get(sid)
@@ -627,7 +731,7 @@ fn resolve_or_create_session(
         let now = unix_now();
         let mut sessions = state
             .sessions
-            .lock()
+            .write()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         sessions.insert(
             new_id.clone(),
@@ -694,9 +798,9 @@ pub async fn run_server(
     println!("[+] OpenAI-compatible API endpoints:");
     println!("      GET  /v1/models");
     println!("      POST /v1/completions");
-    println!("      POST /v1/chat/completions");
-    println!("      POST /v1/sessions          (create TTT session)");
-    println!("      POST /v1/adapt             (in-place TTT adaptation)");
+    println!("      POST /v1/chat/completions         (stream:true for SSE)");
+    println!("      POST /v1/sessions                 (create TTT session)");
+    println!("      POST /v1/adapt                    (in-place TTT adaptation)");
     println!("      GET  /v1/sessions/{{id}}/checkpoint");
     println!("      PUT  /v1/sessions/{{id}}/checkpoint");
 
@@ -842,6 +946,44 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        safe_drop(pipeline_arc).await;
+    }
+
+    /// Verify that `stream: true` produces an SSE response (text/event-stream
+    /// Content-Type header and body containing `[DONE]`).
+    #[tokio::test]
+    async fn test_chat_completion_stream_returns_sse() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":2,"stream":true}"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/event-stream"),
+            "expected SSE content-type, got: {ct}"
+        );
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            body_str.contains("[DONE]"),
+            "SSE body must contain [DONE] sentinel"
+        );
         safe_drop(pipeline_arc).await;
     }
 }

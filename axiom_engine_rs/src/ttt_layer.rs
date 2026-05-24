@@ -121,26 +121,33 @@ impl TTTLinearLayer {
             .transpose(1, 2)?
             .contiguous()?;
 
-        // Build associative per-token state and compress logarithmically.
+        // Build associative per-token state.  Shape: [B, T, C].
         let token_state = k
             .mul(&v)?
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, t, c))?;
+
+        // Full Blelloch inclusive prefix scan → [B, T, C].
+        // Position i carries the cumulative combination of states[0..=i],
+        // giving each query access to its own causal context window.
         let compressed = LogosAssociativeScanner::parallel_prefix_reduce(&token_state)?;
 
-        // Derive decode initial state [B, H, D, D] from compressed representation.
-        let compressed_heads = compressed.reshape((b, h, d))?;
+        // Derive decode initial state [B, H, D, D] from the final prefix sum.
+        // Take the last sequence position: [B, T, C] → [B, C] → [B, H, D].
+        let final_state = compressed.narrow(1, t - 1, 1)?.squeeze(1)?;
+        let compressed_heads = final_state.reshape((b, h, d))?;
         let eye = Tensor::eye(d, DType::F32, x.device())?
             .unsqueeze(0)?
             .unsqueeze(0)?;
         let w_tilde_init = compressed_heads.unsqueeze(3)?.broadcast_mul(&eye)?;
         *self.prefill_w_tilde.borrow_mut() = Some(w_tilde_init);
 
-        // Project compressed context back to sequence shape for residual prefill path.
-        let compressed_context = compressed.broadcast_as((b, t, c))?.contiguous()?;
+        // Causal residual path: each query position i attends only to the
+        // prefix sum up to i (already causal from the scan).
+        // compressed: [B, T, C];  q_reshaped: [B, T, C]
         let q_reshaped = q.transpose(1, 2)?.reshape((b, t, c))?;
-        let output = q_reshaped.add(&compressed_context)?;
+        let output = q_reshaped.add(&compressed)?;
         self.out_proj.forward(&output)
     }
 
