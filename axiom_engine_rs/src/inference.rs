@@ -5,6 +5,7 @@ use candle_nn::{VarBuilder, VarMap};
 use sha2::Digest;
 use tokenizers::Tokenizer;
 
+use crate::chunk_kernel::ChunkFusedTTT;
 use crate::config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use crate::jit_streamer::JitContextStreamer;
 use crate::kernel::AxiomTTTEngine;
@@ -204,6 +205,87 @@ impl InferencePipeline {
         }
 
         Ok(current_states)
+    }
+
+    /// Adapt on corpus while routing long sequences through chunk-wise fused prefill.
+    ///
+    /// Any document with tokenized length strictly greater than `token_threshold`
+    /// uses [`ChunkFusedTTT::forward_chunk_fused`] to compute a dense block update.
+    pub fn adapt_on_corpus_with_chunk_fusion(
+        &self,
+        corpus: &[String],
+        states: Vec<Tensor>,
+        token_threshold: usize,
+        block_size: usize,
+    ) -> Result<Vec<Tensor>> {
+        let mut current_states = states;
+
+        for text in corpus {
+            let token_ids = self.encode(text);
+            if token_ids.len() > token_threshold {
+                current_states =
+                    self.adapt_long_sequence_chunk_fused(&token_ids, current_states, block_size)?;
+                continue;
+            }
+
+            for &token_id in &token_ids {
+                let token_tensor = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
+                let (_, next_states) =
+                    self.engine
+                        .forward(&token_tensor, Some(current_states), true)?;
+                current_states = next_states.expect("decode must return states");
+            }
+        }
+
+        Ok(current_states)
+    }
+
+    fn adapt_long_sequence_chunk_fused(
+        &self,
+        token_ids: &[u32],
+        mut states: Vec<Tensor>,
+        block_size: usize,
+    ) -> Result<Vec<Tensor>> {
+        if states.is_empty() {
+            return Ok(states);
+        }
+
+        let (batch, heads, head_dim, _) = states[0].dims4()?;
+        if batch != 1 {
+            candle_core::bail!("chunk-fused adaptation expects batch=1, got {batch}");
+        }
+        let seq_len = token_ids.len();
+        let inv_vocab = 1f32 / self.vocab_size as f32;
+
+        let mut q_data = Vec::with_capacity(batch * heads * seq_len * head_dim);
+        let mut k_data = Vec::with_capacity(batch * heads * seq_len * head_dim);
+        let mut v_data = Vec::with_capacity(batch * heads * seq_len * head_dim);
+        for _b in 0..batch {
+            for h in 0..heads {
+                for (t, tok) in token_ids.iter().enumerate() {
+                    let token_value = *tok as f32 * inv_vocab;
+                    for d in 0..head_dim {
+                        let dim_factor = (d + 1) as f32 / head_dim as f32;
+                        let head_factor = 1f32 + h as f32 / heads as f32;
+                        let pos_factor = 1f32 + t as f32 / seq_len as f32;
+                        q_data.push(token_value * dim_factor * head_factor);
+                        k_data.push(token_value * dim_factor * pos_factor);
+                        v_data.push(token_value * dim_factor);
+                    }
+                }
+            }
+        }
+
+        let q = Tensor::from_vec(q_data, (batch, heads, seq_len, head_dim), &self.device)?;
+        let k = Tensor::from_vec(k_data, (batch, heads, seq_len, head_dim), &self.device)?;
+        let v = Tensor::from_vec(v_data, (batch, heads, seq_len, head_dim), &self.device)?;
+        let (_, global_update) = ChunkFusedTTT::forward_chunk_fused(&q, &k, &v, block_size)?;
+
+        for layer_state in states.iter_mut() {
+            *layer_state = layer_state.add(&global_update)?;
+        }
+
+        Ok(states)
     }
 
     fn encode(&self, prompt: &str) -> Vec<u32> {
