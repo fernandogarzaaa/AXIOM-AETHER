@@ -1,4 +1,5 @@
 mod adapter;
+mod chunk_kernel;
 mod cluster;
 mod config;
 mod data_gen;
@@ -8,6 +9,7 @@ mod kernel;
 mod log_scan;
 mod memory_pool;
 mod metrics;
+mod quantization;
 mod server;
 mod train;
 mod ttt_layer;
