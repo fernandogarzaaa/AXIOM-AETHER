@@ -1,3 +1,4 @@
+mod chunk_kernel;
 mod config;
 mod data_gen;
 mod inference;
@@ -5,6 +6,7 @@ mod jit_streamer;
 mod kernel;
 mod log_scan;
 mod memory_pool;
+mod quantization;
 mod server;
 mod train;
 mod ttt_layer;
