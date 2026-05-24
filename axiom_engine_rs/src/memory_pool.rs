@@ -126,6 +126,8 @@ impl MemoryCompressor {
     }
 
     /// Extract `[1, d_model]` memory vector from the first batch element.
+    ///
+    /// Returns an error when `MEM_TOKEN_ID` is not present in `sequence_tokens`.
     pub fn extract_memory_vector(
         &self,
         final_hidden_states: &Tensor,

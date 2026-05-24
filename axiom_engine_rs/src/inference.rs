@@ -258,7 +258,7 @@ impl InferencePipeline {
     /// When `loaded_mem_token` is `Some`, the engine bypasses the standard
     /// just-in-time (JIT) context-streamer prefill and instead prepends the supplied `[1, d_model]`
     /// vector directly into the first layer's embedding sequence.  This lets the
-    /// model draw on a compressed, pre-computed context without re-tokenising or
+    /// model draw on a compressed, pre-computed context without re-tokenizing or
     /// re-processing the original document.
     ///
     /// When `loaded_mem_token` is `None` the behaviour is identical to
