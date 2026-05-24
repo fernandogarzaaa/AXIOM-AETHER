@@ -4,6 +4,8 @@ use candle_nn::{VarBuilder, VarMap};
 use crate::config::AxiomConfig;
 use crate::ttt_layer::TTTLinearLayer;
 
+const DEFAULT_CHUNK_FUSED_INNER_STEPS: usize = 4;
+
 pub struct ChunkFusedTTT {
     layer: TTTLinearLayer,
     _varmap: VarMap,
@@ -30,7 +32,9 @@ impl ChunkFusedTTT {
         let mut outputs = Vec::with_capacity(seq_len);
         for token_index in 0..seq_len {
             let token = x.narrow(1, token_index, 1)?;
-            let (output, next_state) = self.layer.forward_decode(&token, &state, Some(4))?;
+            let (output, next_state) =
+                self.layer
+                    .forward_decode(&token, &state, Some(DEFAULT_CHUNK_FUSED_INNER_STEPS))?;
             outputs.push(output);
             state = next_state;
         }
@@ -62,6 +66,8 @@ impl TTTTransformerAdapter {
         })
     }
 
+    /// `alpha` interpolates between the frozen base-model path (`1.0`) and the
+    /// adaptive TTT memory path (`0.0`) for the returned final-token state.
     pub fn forward_hybrid(
         &self,
         x: &Tensor,

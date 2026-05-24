@@ -1134,6 +1134,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_adapt_reuses_session_and_updates_metrics() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+        let session_id = "adapt-session".to_string();
+        let now = unix_now();
+        let initial_states = {
+            let pipeline = state.pipeline.lock().unwrap();
+            pipeline
+                .init_session_states()
+                .unwrap()
+                .into_iter()
+                .map(|tensor| Tensor::ones(tensor.dims(), DType::F32, &state.device).unwrap())
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut sessions = state.sessions.write().unwrap();
+            sessions.insert(
+                session_id.clone(),
+                SessionData::new_active(initial_states.clone(), now, state.model_id.clone()),
+            );
+        }
+        metrics::register_session(&session_id);
+        state.refresh_session_metrics().unwrap();
+        let tokens_before = crate::metrics::COUNTER_TOTAL_TOKENS_PREFILLED
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/adapt")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "corpus": ["hello adaptation"],
+                    "session_id": session_id,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["session_id"], session_id);
+
+        let sessions = state.sessions.read().unwrap();
+        let session = sessions.get("adapt-session").unwrap();
+        assert_eq!(session.state_count(), initial_states.len());
+        assert!(session.last_used >= now);
+        drop(sessions);
+        let tokens_after = crate::metrics::COUNTER_TOTAL_TOKENS_PREFILLED
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(tokens_after > tokens_before);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
     async fn test_chat_completion_returns_200() {
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
