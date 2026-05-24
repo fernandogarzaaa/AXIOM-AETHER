@@ -867,9 +867,12 @@ fn dequantize_layer_states(quantized: &[QuantizedLayerState]) -> Result<Vec<Tens
         let full = NF4Quantizer::dequantize_state(&layer.packed_indices, &layer.scale)
             .map_err(|e| ApiError::Internal(format!("state dequantization failed: {e}")))?;
         let total: usize = layer.original_shape.iter().product();
-        let trimmed = full.flatten_all().and_then(|t| t.narrow(0, 0, total)).map_err(|e| {
-            ApiError::Internal(format!("state dequantization shape trim failed: {e}"))
-        })?;
+        let trimmed = full
+            .flatten_all()
+            .and_then(|t| t.narrow(0, 0, total))
+            .map_err(|e| {
+                ApiError::Internal(format!("state dequantization shape trim failed: {e}"))
+            })?;
         let restored = trimmed
             .reshape(layer.original_shape.as_slice())
             .map_err(|e| ApiError::Internal(format!("state reshape failed: {e}")))?;

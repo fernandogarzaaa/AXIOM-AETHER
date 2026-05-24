@@ -101,7 +101,10 @@ impl ChunkFusedTTT {
                 global_session_weight.squeeze(1)?,
             ))
         } else {
-            Ok((fused_output.to_dtype(original_dtype)?, global_session_weight))
+            Ok((
+                fused_output.to_dtype(original_dtype)?,
+                global_session_weight,
+            ))
         }
     }
 }

@@ -1,5 +1,5 @@
-mod config;
 mod chunk_kernel;
+mod config;
 mod data_gen;
 mod inference;
 mod jit_streamer;
