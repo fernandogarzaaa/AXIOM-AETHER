@@ -696,18 +696,7 @@ fn run_generation(
         }
         Some(sid) => {
             // Stateful generation — materialize session state, generate, write back.
-            let initial_states = {
-                let mut sessions = state
-                    .sessions
-                    .write()
-                    .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-                let session = sessions
-                    .get_mut(sid)
-                    .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
-                materialize_session_state(session)?;
-                session.last_used = unix_now();
-                session.states.clone()
-            };
+            let initial_states = load_session_states(state, sid)?;
 
             let (text, updated_states) = {
                 let pipeline = state
@@ -742,16 +731,8 @@ fn resolve_or_create_session(
     session_id: Option<&str>,
 ) -> Result<(String, Vec<Tensor>), ApiError> {
     if let Some(sid) = session_id {
-        let mut sessions = state
-            .sessions
-            .write()
-            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-        let session = sessions
-            .get_mut(sid)
-            .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
-        materialize_session_state(session)?;
-        session.last_used = unix_now();
-        Ok((sid.to_string(), session.states.clone()))
+        let states = load_session_states(state, sid)?;
+        Ok((sid.to_string(), states))
     } else {
         // Auto-create a transient session.
         let states = {
@@ -866,7 +847,7 @@ fn dequantize_layer_states(quantized: &[QuantizedLayerState]) -> Result<Vec<Tens
     for layer in quantized {
         let full = NF4Quantizer::dequantize_state(&layer.packed_indices, &layer.scale)
             .map_err(|e| ApiError::Internal(format!("state dequantization failed: {e}")))?;
-        let total: usize = layer.original_shape.iter().product();
+        let total = checked_numel(&layer.original_shape)?;
         let trimmed = full
             .flatten_all()
             .and_then(|t| t.narrow(0, 0, total))
@@ -886,6 +867,42 @@ fn materialize_session_state(session: &mut SessionData) -> Result<(), ApiError> 
         if let Some(quantized) = &session.quantized_states {
             session.states = dequantize_layer_states(quantized)?;
             session.quantized_states = None;
+        }
+
+        fn checked_numel(shape: &[usize]) -> Result<usize, ApiError> {
+            shape.iter().try_fold(1usize, |acc, &dim| {
+                acc.checked_mul(dim).ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "shape {:?} overflows usize during element-count computation",
+                        shape
+                    ))
+                })
+            })
+        }
+
+        fn load_session_states(state: &AppState, sid: &str) -> Result<Vec<Tensor>, ApiError> {
+            {
+                let sessions = state
+                    .sessions
+                    .read()
+                    .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+                let session = sessions
+                    .get(sid)
+                    .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
+                if !session.states.is_empty() {
+                    return Ok(session.states.clone());
+                }
+            }
+
+            let mut sessions = state
+                .sessions
+                .write()
+                .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+            let session = sessions
+                .get_mut(sid)
+                .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
+            materialize_session_state(session)?;
+            Ok(session.states.clone())
         }
     }
     Ok(())

@@ -54,6 +54,7 @@ impl ChunkFusedTTT {
         let (b, h, t, d) = q4.dims4()?;
         let mut global_session_weight = Tensor::zeros((b, h, d, d), DType::F32, queries.device())?;
         let inv_sqrt_d = Tensor::new(1f32 / (d as f32).sqrt(), queries.device())?;
+        let mut cached_mask: Option<(usize, Tensor)> = None;
 
         let mut chunk_outputs: Vec<Tensor> = Vec::new();
         let mut start = 0usize;
@@ -69,9 +70,16 @@ impl ChunkFusedTTT {
                 .broadcast_mul(&inv_sqrt_d)?;
 
             // Causal lower-triangular mask for local chunk processing.
-            let local_mask = Tensor::tril2(len, DType::F32, queries.device())?
-                .unsqueeze(0)?
-                .unsqueeze(0)?;
+            let local_mask = match &cached_mask {
+                Some((cached_len, mask)) if *cached_len == len => mask.clone(),
+                _ => {
+                    let mask = Tensor::tril2(len, DType::F32, queries.device())?
+                        .unsqueeze(0)?
+                        .unsqueeze(0)?;
+                    cached_mask = Some((len, mask.clone()));
+                    mask
+                }
+            };
             let local_attn = gram.broadcast_mul(&local_mask)?;
 
             // Fused local context: [B, H, C, D]
