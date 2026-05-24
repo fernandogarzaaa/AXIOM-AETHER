@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::config::MEM_TOKEN_ID;
 use candle_core::{Device, Result, Tensor};
 
 // ---------------------------------------------------------------------------
@@ -114,6 +115,49 @@ pub fn load_from_disk(path: &str, device: &Device) -> Result<Tensor> {
     })
 }
 
+/// Backwards-compatible helper for context-singularity workflows on `MEM_TOKEN_ID`.
+pub struct MemoryCompressor {
+    pub d_model: usize,
+}
+
+impl MemoryCompressor {
+    pub fn new(d_model: usize) -> Self {
+        Self { d_model }
+    }
+
+    /// Extract `[1, d_model]` memory vector from the first batch element.
+    pub fn extract_memory_vector(
+        &self,
+        final_hidden_states: &Tensor,
+        sequence_tokens: &[u32],
+    ) -> Result<Tensor> {
+        let (_, _, d) = final_hidden_states.dims3()?;
+        if d != self.d_model {
+            candle_core::bail!(
+                "d_model mismatch: compressor expects {}, tensor has {d}",
+                self.d_model
+            );
+        }
+        let mem = extract_memory_vector(final_hidden_states, sequence_tokens, MEM_TOKEN_ID)?;
+        mem.narrow(0, 0, 1)?.reshape((1usize, d))
+    }
+
+    /// Save memory vector under `"memory"` key for compatibility with older files.
+    pub fn save_memory_token(tensor: &Tensor, filename: &str) -> Result<()> {
+        let tensors: HashMap<String, Tensor> =
+            HashMap::from([("memory".to_string(), tensor.clone())]);
+        candle_core::safetensors::save(&tensors, filename)
+    }
+
+    /// Load memory vector stored under `"memory"` key.
+    pub fn load_memory_token(filename: &str, device: &Device) -> Result<Tensor> {
+        let map = candle_core::safetensors::load(filename, device)?;
+        map.get("memory")
+            .cloned()
+            .ok_or_else(|| candle_core::Error::Msg("key 'memory' not found in .mem file".into()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -213,6 +257,27 @@ mod tests {
         let loaded = load_from_disk(path_str, &device).unwrap();
 
         assert_eq!(loaded.dims(), &[2, 3, 4]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_memory_compressor_extract_and_roundtrip() {
+        let device = Device::Cpu;
+        let d_model = 6usize;
+        let data: Vec<f32> = (0..18).map(|x| x as f32).collect();
+        let hidden = Tensor::from_vec(data, (1usize, 3usize, d_model), &device).unwrap();
+        let tokens = [1u32, MEM_TOKEN_ID, 3u32];
+
+        let compressor = MemoryCompressor::new(d_model);
+        let mem_vec = compressor.extract_memory_vector(&hidden, &tokens).unwrap();
+        assert_eq!(mem_vec.dims(), &[1, d_model]);
+
+        let path = std::env::temp_dir().join("axiom_mem_compat_test.mem");
+        let path_str = path.to_str().unwrap();
+        MemoryCompressor::save_memory_token(&mem_vec, path_str).unwrap();
+        let loaded = MemoryCompressor::load_memory_token(path_str, &device).unwrap();
+        assert_eq!(loaded.dims(), &[1, d_model]);
+
         let _ = std::fs::remove_file(&path);
     }
 }

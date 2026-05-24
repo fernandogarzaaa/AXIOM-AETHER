@@ -220,6 +220,63 @@ impl AxiomTTTEngine {
         Ok((logits, init_states))
     }
 
+    /// Prefill with a memory vector prepended to the token sequence.
+    ///
+    /// Behaves identically to [`prefill_with_state_init`] but injects a
+    /// pre-computed `[1, d_model]` memory vector as position 0 of the input
+    /// embedding sequence before any layer processing.  This makes the TTT
+    /// attention mechanism condition every subsequent token on the compressed
+    /// context carried by the memory vector.
+    ///
+    /// # Arguments
+    /// * `tokens`        – `[1, T]` integer prompt token indices.
+    /// * `memory_vector` – `[1, d_model]` compressed memory tensor to inject.
+    ///
+    /// # Returns
+    /// `(logits [1, T+1, vocab_size], per-layer init states)`
+    pub fn prefill_with_state_init_and_memory(
+        &self,
+        tokens: &Tensor,
+        memory_vector: &Tensor,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let (batch, _) = tokens.dims2()?;
+        if batch != 1 {
+            return Err(candle_core::Error::Msg(format!(
+                "prefill_with_state_init_and_memory only supports batch size 1, got {batch}"
+            )));
+        }
+
+        // Embed prompt tokens: [1, T, d_model]
+        let token_embeddings = self.embeddings.forward(tokens)?;
+
+        // Unsqueeze memory vector to [1, 1, d_model] then prepend → [B, T+1, d_model].
+        // The memory vector aligns with q_proj input space (d_model) in every layer.
+        let mem_prefix = memory_vector.unsqueeze(0)?; // [1, 1, d_model]
+        let mut x = Tensor::cat(&[&mem_prefix, &token_embeddings], 1)?;
+
+        let mut init_states: Vec<Tensor> = Vec::with_capacity(self.layers.len());
+        let h = self.config.num_heads;
+        let d = self.config.head_dim;
+
+        for layer in self.layers.iter() {
+            let normed_x = layer.ttt_norm.forward(&x)?;
+            let ttt_out = layer.ttt.forward_prefill(&normed_x)?;
+            let x_res = x.add(&ttt_out)?;
+            let ffn_out = layer.ffn.forward(&layer.ffn_norm.forward(&x_res)?)?;
+            x = x_res.add(&ffn_out)?;
+
+            let state = match layer.ttt.take_prefill_state() {
+                Some(state) => state,
+                None => Tensor::zeros((batch, h, d, d), candle_core::DType::F32, tokens.device())?,
+            };
+            init_states.push(state);
+        }
+
+        x = self.ln_f.forward(&x)?;
+        let logits = self.output_head.forward(&x)?;
+        Ok((logits, init_states))
+    }
+
     /// Allocate zeroed W_tilde tensors for all layers.
     ///
     /// Shape per layer: `[batch, num_heads, head_dim, head_dim]`.

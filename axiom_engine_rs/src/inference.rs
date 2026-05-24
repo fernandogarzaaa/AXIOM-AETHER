@@ -250,17 +250,48 @@ impl InferencePipeline {
     }
 
     pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> Result<String> {
-        let context_ids = self.streamer.fetch_and_pack_context(prompt);
-        let context_tensor =
-            Tensor::from_vec(context_ids.clone(), (1, context_ids.len()), &self.device)?;
-        // Prefill intentionally ignores logits; this stage primes the model before decode.
-        let _ = self.engine.forward(&context_tensor, None, false)?;
+        self.generate_with_memory(prompt, max_new_tokens, None)
+    }
 
+    /// Generation pipeline with optional memory-token injection.
+    ///
+    /// When `loaded_mem_token` is `Some`, the engine bypasses the standard JIT
+    /// context-streamer prefill and instead prepends the supplied `[1, d_model]`
+    /// vector directly into the first layer's embedding sequence.  This lets the
+    /// model draw on a compressed, pre-computed context without re-tokenising or
+    /// re-processing the original document.
+    ///
+    /// When `loaded_mem_token` is `None` the behaviour is identical to
+    /// [`generate`].
+    ///
+    /// # Arguments
+    /// * `prompt`           – User text prompt (always tokenised normally).
+    /// * `max_new_tokens`   – Maximum tokens to generate.
+    /// * `loaded_mem_token` – Optional `[1, d_model]` memory vector.
+    pub fn generate_with_memory(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        loaded_mem_token: Option<Tensor>,
+    ) -> Result<String> {
         let prompt_ids = self.encode(prompt);
         let prompt_len = prompt_ids.len();
-
         let prompt_tensor = Tensor::from_vec(prompt_ids.clone(), (1, prompt_len), &self.device)?;
-        let (_, mut states) = self.engine.prefill_with_state_init(&prompt_tensor)?;
+
+        let (_, mut states) = if let Some(ref mem) = loaded_mem_token {
+            // Memory-injection path: bypass context prefill and inject the
+            // memory vector as the foundational state modifier.
+            self.engine
+                .prefill_with_state_init_and_memory(&prompt_tensor, mem)?
+        } else {
+            // Standard path: prime the model with JIT context streamer output.
+            let context_ids = self.streamer.fetch_and_pack_context(prompt);
+            let context_tensor =
+                Tensor::from_vec(context_ids.clone(), (1, context_ids.len()), &self.device)?;
+            let _ = self.engine.forward(&context_tensor, None, false)?;
+            self.engine.prefill_with_state_init(&prompt_tensor)?
+        };
+
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
         let mut generated = Vec::with_capacity(max_new_tokens);
 
