@@ -1,3 +1,5 @@
+mod adapter;
+mod cluster;
 mod config;
 mod data_gen;
 mod inference;
@@ -5,6 +7,7 @@ mod jit_streamer;
 mod kernel;
 mod log_scan;
 mod memory_pool;
+mod metrics;
 mod server;
 mod train;
 mod ttt_layer;

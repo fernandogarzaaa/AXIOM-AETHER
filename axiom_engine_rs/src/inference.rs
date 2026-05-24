@@ -253,6 +253,10 @@ impl InferencePipeline {
         self.generate_with_memory(prompt, max_new_tokens, None)
     }
 
+    pub fn token_count(&self, text: &str) -> usize {
+        self.encode(text).len()
+    }
+
     /// Generation pipeline with optional memory-token injection.
     ///
     /// When `loaded_mem_token` is `Some`, the engine bypasses the standard
