@@ -4,9 +4,11 @@
 //!
 //! | Method | Path                                 | Description                              |
 //! |--------|--------------------------------------|------------------------------------------|
+//! | GET    | `/metrics`                           | Prometheus exposition endpoint           |
 //! | GET    | `/v1/models`                         | List available models                    |
 //! | POST   | `/v1/completions`                    | Text completion (stateless or session)   |
 //! | POST   | `/v1/chat/completions`               | Chat completion (stateless or session)   |
+//! | POST   | `/v1/cluster/sync`                   | Delta state replication merge hook       |
 //! | POST   | `/v1/sessions`                       | Create a new persistent TTT session      |
 //! | DELETE | `/v1/sessions/{id}`                  | Delete a session                         |
 //! | POST   | `/v1/adapt`                          | In-place TTT adaptation on a corpus      |
@@ -16,24 +18,24 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use tokio::time::{sleep, Duration};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
 use crate::inference::InferencePipeline;
-use crate::quantization::NF4Quantizer;
+use crate::metrics;
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -50,25 +52,102 @@ fn unix_now() -> u64 {
 // Shared application state
 // ---------------------------------------------------------------------------
 
+enum SessionResidency {
+    Active(Vec<Tensor>),
+    Quantized(Vec<Vec<u8>>),
+}
+
 struct SessionData {
-    states: Vec<Tensor>,
-    quantized_states: Option<Vec<QuantizedLayerState>>,
+    residency: SessionResidency,
     created_at: u64,
     last_used: u64,
     model: String,
 }
 
-#[derive(Clone)]
-struct QuantizedLayerState {
-    packed_indices: Tensor,
-    scale: Tensor,
-    original_shape: Vec<usize>,
-}
+impl SessionData {
+    fn new_active(states: Vec<Tensor>, created_at: u64, model: String) -> Self {
+        Self {
+            residency: SessionResidency::Active(states),
+            created_at,
+            last_used: created_at,
+            model,
+        }
+    }
 
-const IDLE_QUANTIZE_SECONDS: u64 = 60;
-const IDLE_SCAN_INTERVAL_SECONDS: u64 = 5;
-const ADAPT_CHUNK_THRESHOLD_TOKENS: usize = 512;
-const ADAPT_CHUNK_BLOCK_SIZE: usize = 64;
+    fn replace_states(&mut self, states: Vec<Tensor>) {
+        self.residency = SessionResidency::Active(states);
+    }
+
+    fn is_quantized(&self) -> bool {
+        matches!(self.residency, SessionResidency::Quantized(_))
+    }
+
+    fn state_count(&self) -> usize {
+        match &self.residency {
+            SessionResidency::Active(states) => states.len(),
+            SessionResidency::Quantized(states) => states.len(),
+        }
+    }
+
+    fn states_clone(&self) -> candle_core::Result<Vec<Tensor>> {
+        match &self.residency {
+            SessionResidency::Active(states) => Ok(states.clone()),
+            SessionResidency::Quantized(_) => {
+                candle_core::bail!("session is parked in compressed form")
+            }
+        }
+    }
+
+    fn ensure_active(&mut self, device: &Device) -> candle_core::Result<Vec<Tensor>> {
+        if let SessionResidency::Quantized(buffers) = &self.residency {
+            let mut states = Vec::with_capacity(buffers.len());
+            for buffer in buffers {
+                let mut tensors = candle_core::safetensors::load_buffer(buffer, device)?;
+                let tensor = tensors.remove("tensor").ok_or_else(|| {
+                    candle_core::Error::Msg("compressed session state missing 'tensor' key".into())
+                })?;
+                states.push(tensor.to_dtype(DType::F32)?);
+            }
+            self.residency = SessionResidency::Active(states);
+        }
+        self.states_clone()
+    }
+
+    fn merge_delta(
+        &mut self,
+        layer_index: usize,
+        delta: &Tensor,
+        device: &Device,
+    ) -> candle_core::Result<()> {
+        let mut states = self.ensure_active(device)?;
+        if layer_index >= states.len() {
+            candle_core::bail!(
+                "layer index {layer_index} out of range for {} session layers",
+                states.len()
+            );
+        }
+        states[layer_index] = states[layer_index].add(&delta.to_dtype(DType::F32)?)?;
+        self.replace_states(states);
+        Ok(())
+    }
+
+    fn park_quantized(&mut self) -> candle_core::Result<()> {
+        let states = match &self.residency {
+            SessionResidency::Active(states) => states,
+            SessionResidency::Quantized(_) => return Ok(()),
+        };
+        let mut buffers = Vec::with_capacity(states.len());
+        for state in states {
+            let fp16 = state.to_device(&Device::Cpu)?.to_dtype(DType::F16)?;
+            let bytes = safetensors::serialize([("tensor", &fp16)], &None).map_err(|err| {
+                candle_core::Error::Msg(format!("session serialization failed: {err}"))
+            })?;
+            buffers.push(bytes);
+        }
+        self.residency = SessionResidency::Quantized(buffers);
+        Ok(())
+    }
+}
 
 /// Global server state shared across all request handlers.
 ///
@@ -82,6 +161,7 @@ const ADAPT_CHUNK_BLOCK_SIZE: usize = 64;
 #[derive(Clone)]
 pub struct AppState {
     pub pipeline: Arc<Mutex<InferencePipeline>>,
+    pub device: Device,
     /// Active TTT sessions keyed by UUID string.
     /// `RwLock` enables concurrent reads; mutations take an exclusive write.
     sessions: Arc<RwLock<HashMap<String, SessionData>>>,
@@ -91,11 +171,31 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(pipeline: InferencePipeline, model_id: String) -> Self {
+        let device = pipeline.device().clone();
         Self {
             pipeline: Arc::new(Mutex::new(pipeline)),
+            device,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             model_id,
         }
+    }
+
+    fn refresh_session_metrics(&self) -> Result<(), ApiError> {
+        let sessions = self
+            .sessions
+            .read()
+            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+        let active = sessions
+            .values()
+            .filter(|session| !session.is_quantized())
+            .count();
+        let quantized = sessions
+            .values()
+            .filter(|session| session.is_quantized())
+            .count();
+        metrics::set_active_sessions(active);
+        metrics::set_quantized_sessions(quantized);
+        Ok(())
     }
 }
 
@@ -103,6 +203,7 @@ impl AppState {
 // Error type
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 enum ApiError {
     Internal(String),
     NotFound(String),
@@ -313,6 +414,18 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     Json(resp)
 }
 
+async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+    state.refresh_session_metrics()?;
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        metrics::render_metrics(),
+    )
+        .into_response())
+}
+
 /// `POST /v1/completions` — text completion (stateless or session-aware).
 async fn create_completion(
     State(state): State<AppState>,
@@ -364,7 +477,11 @@ fn chat_completion_json(
     let max_tokens = req.max_tokens.unwrap_or(32);
     let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
     let prompt = messages_to_prompt(&req.messages);
+    let prompt_tokens = count_prompt_tokens(&state, &prompt)?;
+    let started_at = Instant::now();
     let text = run_generation(&state, &prompt, max_tokens, req.session_id.as_deref())?;
+    metrics::add_prefilled_tokens(prompt_tokens);
+    metrics::observe_prefill_latency(started_at.elapsed().as_secs_f64());
     Ok(Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4()),
         object: "chat.completion".to_string(),
@@ -397,11 +514,15 @@ fn chat_completion_sse(
     let max_tokens = req.max_tokens.unwrap_or(32);
     let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
     let prompt = messages_to_prompt(&req.messages);
+    let prompt_tokens = count_prompt_tokens(&state, &prompt).unwrap_or(0);
 
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created = unix_now();
 
+    let started_at = Instant::now();
     let generation_result = run_generation(&state, &prompt, max_tokens, req.session_id.as_deref());
+    metrics::add_prefilled_tokens(prompt_tokens);
+    metrics::observe_prefill_latency(started_at.elapsed().as_secs_f64());
 
     // Build the event sequence.  On error, emit a single error event.
     let events: Vec<Result<Event, Infallible>> = match generation_result {
@@ -478,15 +599,11 @@ async fn create_session(
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         sessions.insert(
             session_id.clone(),
-            SessionData {
-                states,
-                quantized_states: None,
-                created_at: now,
-                last_used: now,
-                model: model.clone(),
-            },
+            SessionData::new_active(states, now, model.clone()),
         );
     }
+    metrics::register_session(&session_id);
+    state.refresh_session_metrics()?;
 
     Ok(Json(CreateSessionResponse {
         session_id,
@@ -507,6 +624,11 @@ async fn delete_session(
         .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
 
     let deleted = sessions.remove(&session_id).is_some();
+    drop(sessions);
+    if deleted {
+        metrics::remove_session(&session_id);
+    }
+    state.refresh_session_metrics()?;
     Ok(Json(DeleteSessionResponse {
         session_id,
         deleted,
@@ -526,25 +648,24 @@ async fn adapt(
 
     let corpus_len = req.corpus.len();
     let steps_per_token = req.steps.unwrap_or(4).clamp(1, 4);
+    let corpus_tokens = count_corpus_tokens(&state, &req.corpus)?;
 
     // Resolve or create a session.
     let (session_id, initial_states) =
         resolve_or_create_session(&state, req.session_id.as_deref())?;
 
+    let started_at = Instant::now();
     let updated_states = {
         let pipeline = state
             .pipeline
             .lock()
             .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
         pipeline
-            .adapt_on_corpus_with_chunk_fusion(
-                &req.corpus,
-                initial_states,
-                ADAPT_CHUNK_THRESHOLD_TOKENS,
-                ADAPT_CHUNK_BLOCK_SIZE,
-            )
+            .adapt_on_corpus_with_steps(&req.corpus, initial_states, steps_per_token)
             .map_err(|e| ApiError::Internal(format!("adapt failed: {e}")))?
     };
+    metrics::add_prefilled_tokens(corpus_tokens);
+    metrics::observe_prefill_latency(started_at.elapsed().as_secs_f64());
 
     // Persist updated states back into the session (exclusive write lock).
     {
@@ -553,11 +674,12 @@ async fn adapt(
             .write()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         if let Some(session) = sessions.get_mut(&session_id) {
-            session.states = updated_states;
-            session.quantized_states = None;
+            session.replace_states(updated_states);
             session.last_used = unix_now();
+            metrics::mark_session_quantized(&session_id, false);
         }
     }
+    state.refresh_session_metrics()?;
 
     Ok(Json(AdaptResponse {
         session_id,
@@ -572,35 +694,31 @@ async fn get_checkpoint(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Shared read lock — does not block other concurrent reads.
-    let sessions = state
+    let mut sessions = state
         .sessions
-        .read()
+        .write()
         .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
 
     let session = sessions
-        .get(&session_id)
+        .get_mut(&session_id)
         .ok_or_else(|| ApiError::NotFound(format!("session '{session_id}' not found")))?;
+    let created_at = session.created_at;
 
-    let dense_states = if session.states.is_empty() {
-        match &session.quantized_states {
-            Some(q) => dequantize_layer_states(q)?,
-            None => Vec::new(),
-        }
-    } else {
-        session.states.clone()
-    };
-
-    let layers = dense_states
+    let layers = session
+        .ensure_active(&state.device)
+        .map_err(|e| ApiError::Internal(format!("session export failed: {e}")))?
         .iter()
         .map(tensor_to_layer_checkpoint)
         .collect::<candle_core::Result<Vec<_>>>()
         .map_err(|e| ApiError::Internal(format!("serialisation failed: {e}")))?;
+    metrics::mark_session_quantized(&session_id, false);
+    drop(sessions);
+    state.refresh_session_metrics()?;
 
     Ok(Json(SessionCheckpoint {
         session_id: session_id.clone(),
         version: 1,
-        created_at: session.created_at,
+        created_at,
         layers,
     }))
 }
@@ -618,19 +736,10 @@ async fn put_checkpoint(
         )));
     }
 
-    // Determine the device from the pipeline.
-    let device = {
-        let pipeline = state
-            .pipeline
-            .lock()
-            .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
-        pipeline.device().clone()
-    };
-
     let states = checkpoint
         .layers
         .iter()
-        .map(|lc| layer_checkpoint_to_tensor(lc, &device))
+        .map(|lc| layer_checkpoint_to_tensor(lc, &state.device))
         .collect::<candle_core::Result<Vec<_>>>()
         .map_err(|e| ApiError::Internal(format!("deserialisation failed: {e}")))?;
 
@@ -643,17 +752,14 @@ async fn put_checkpoint(
     sessions
         .entry(session_id.clone())
         .and_modify(|s| {
-            s.states = states.clone();
-            s.quantized_states = None;
+            s.replace_states(states.clone());
             s.last_used = now;
         })
-        .or_insert_with(|| SessionData {
-            states,
-            quantized_states: None,
-            created_at: now,
-            last_used: now,
-            model: state.model_id.clone(),
-        });
+        .or_insert_with(|| SessionData::new_active(states, now, state.model_id.clone()));
+    drop(sessions);
+    metrics::register_session(&session_id);
+    metrics::mark_session_quantized(&session_id, false);
+    state.refresh_session_metrics()?;
 
     Ok(Json(CreateSessionResponse {
         session_id,
@@ -661,6 +767,37 @@ async fn put_checkpoint(
         created: now,
         model: state.model_id.clone(),
     }))
+}
+
+async fn cluster_sync(
+    State(state): State<AppState>,
+    Json(payload): Json<StateDeltaUpdate>,
+) -> Result<impl IntoResponse, ApiError> {
+    let delta = {
+        let mut tensors =
+            candle_core::safetensors::load_buffer(&payload.delta_bytes, &state.device)
+                .map_err(|e| ApiError::BadRequest(format!("invalid delta payload: {e}")))?;
+        tensors
+            .remove("tensor")
+            .ok_or_else(|| ApiError::BadRequest("delta payload missing 'tensor' key".into()))?
+    };
+
+    let mut sessions = state
+        .sessions
+        .write()
+        .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+    let session = sessions
+        .get_mut(&payload.session_id)
+        .ok_or_else(|| ApiError::NotFound(format!("session '{}' not found", payload.session_id)))?;
+    session
+        .merge_delta(payload.layer_index, &delta, &state.device)
+        .map_err(|e| ApiError::BadRequest(format!("delta merge failed: {e}")))?;
+    session.last_used = unix_now();
+    metrics::mark_session_quantized(&payload.session_id, false);
+    drop(sessions);
+    state.refresh_session_metrics()?;
+
+    Ok(StatusCode::ACCEPTED)
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +811,22 @@ fn messages_to_prompt(messages: &[ChatMessage]) -> String {
         .map(|m| format!("{}: {}", m.role, m.content))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn count_prompt_tokens(state: &AppState, prompt: &str) -> Result<usize, ApiError> {
+    let pipeline = state
+        .pipeline
+        .lock()
+        .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+    Ok(pipeline.token_count(prompt))
+}
+
+fn count_corpus_tokens(state: &AppState, corpus: &[String]) -> Result<usize, ApiError> {
+    let pipeline = state
+        .pipeline
+        .lock()
+        .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+    Ok(corpus.iter().map(|text| pipeline.token_count(text)).sum())
 }
 
 /// Run generation, optionally using and updating a named session.
@@ -695,8 +848,23 @@ fn run_generation(
                 .map_err(|e| ApiError::Internal(format!("generation failed: {e}")))
         }
         Some(sid) => {
-            // Stateful generation — materialize session state, generate, write back.
-            let initial_states = load_session_states(state, sid)?;
+            // Stateful generation — load states (write lock to allow dequantization), generate, write back.
+            let initial_states = {
+                let mut sessions = state
+                    .sessions
+                    .write()
+                    .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+                let session = sessions
+                    .get_mut(sid)
+                    .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
+                let initial_states = session.ensure_active(&state.device).map_err(|e| {
+                    ApiError::Internal(format!("session dequantization failed: {e}"))
+                })?;
+                session.last_used = unix_now();
+                metrics::mark_session_quantized(sid, false);
+                initial_states
+            };
+            state.refresh_session_metrics()?;
 
             let (text, updated_states) = {
                 let pipeline = state
@@ -714,11 +882,12 @@ fn run_generation(
                     .write()
                     .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
                 if let Some(session) = sessions.get_mut(sid) {
-                    session.states = updated_states;
-                    session.quantized_states = None;
+                    session.replace_states(updated_states);
                     session.last_used = unix_now();
+                    metrics::mark_session_quantized(sid, false);
                 }
             }
+            state.refresh_session_metrics()?;
 
             Ok(text)
         }
@@ -731,7 +900,20 @@ fn resolve_or_create_session(
     session_id: Option<&str>,
 ) -> Result<(String, Vec<Tensor>), ApiError> {
     if let Some(sid) = session_id {
-        let states = load_session_states(state, sid)?;
+        let mut sessions = state
+            .sessions
+            .write()
+            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+        let session = sessions
+            .get_mut(sid)
+            .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
+        let states = session
+            .ensure_active(&state.device)
+            .map_err(|e| ApiError::Internal(format!("session dequantization failed: {e}")))?;
+        session.last_used = unix_now();
+        metrics::mark_session_quantized(sid, false);
+        drop(sessions);
+        state.refresh_session_metrics()?;
         Ok((sid.to_string(), states))
     } else {
         // Auto-create a transient session.
@@ -752,14 +934,11 @@ fn resolve_or_create_session(
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         sessions.insert(
             new_id.clone(),
-            SessionData {
-                states: states.clone(),
-                quantized_states: None,
-                created_at: now,
-                last_used: now,
-                model: state.model_id.clone(),
-            },
+            SessionData::new_active(states.clone(), now, state.model_id.clone()),
         );
+        drop(sessions);
+        metrics::register_session(&new_id);
+        state.refresh_session_metrics()?;
         Ok((new_id, states))
     }
 }
@@ -771,9 +950,11 @@ fn resolve_or_create_session(
 /// Build the axum Router with all API routes attached.
 pub fn create_router(state: AppState) -> Router {
     Router::new()
+        .route("/metrics", get(export_metrics))
         .route("/v1/models", get(list_models))
         .route("/v1/completions", post(create_completion))
         .route("/v1/chat/completions", post(create_chat_completion))
+        .route("/v1/cluster/sync", post(cluster_sync))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/:id", delete(delete_session))
         .route("/v1/adapt", post(adapt))
@@ -809,172 +990,22 @@ pub async fn run_server(
 
     let model_id = "axiom-ttt-v1".to_string();
     let state = AppState::new(pipeline, model_id);
-    spawn_idle_quantization_worker(state.clone());
     let app = create_router(state);
 
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     println!("[+] Axiom-TTT server listening on http://{host}:{port}");
     println!("[+] OpenAI-compatible API endpoints:");
+    println!("      GET  /metrics");
     println!("      GET  /v1/models");
     println!("      POST /v1/completions");
     println!("      POST /v1/chat/completions         (stream:true for SSE)");
+    println!("      POST /v1/cluster/sync            (distributed delta merge)");
     println!("      POST /v1/sessions                 (create TTT session)");
     println!("      POST /v1/adapt                    (in-place TTT adaptation)");
     println!("      GET  /v1/sessions/{{id}}/checkpoint");
     println!("      PUT  /v1/sessions/{{id}}/checkpoint");
 
     axum::serve(listener, app).await?;
-    Ok(())
-}
-
-fn quantize_layer_states(states: &[Tensor]) -> Result<Vec<QuantizedLayerState>, ApiError> {
-    let mut quantized = Vec::with_capacity(states.len());
-    for layer in states {
-        let original_shape = layer.dims().to_vec();
-        let (packed_indices, scale) = NF4Quantizer::quantize_state(layer)
-            .map_err(|e| ApiError::Internal(format!("state quantization failed: {e}")))?;
-        quantized.push(QuantizedLayerState {
-            packed_indices,
-            scale,
-            original_shape,
-        });
-    }
-    Ok(quantized)
-}
-
-fn dequantize_layer_states(quantized: &[QuantizedLayerState]) -> Result<Vec<Tensor>, ApiError> {
-    let mut states = Vec::with_capacity(quantized.len());
-    for layer in quantized {
-        let full = NF4Quantizer::dequantize_state(&layer.packed_indices, &layer.scale)
-            .map_err(|e| ApiError::Internal(format!("state dequantization failed: {e}")))?;
-        let total = checked_numel(&layer.original_shape)?;
-        let trimmed = full
-            .flatten_all()
-            .and_then(|t| t.narrow(0, 0, total))
-            .map_err(|e| {
-                ApiError::Internal(format!("state dequantization shape trim failed: {e}"))
-            })?;
-        let restored = trimmed
-            .reshape(layer.original_shape.as_slice())
-            .map_err(|e| ApiError::Internal(format!("state reshape failed: {e}")))?;
-        states.push(restored);
-    }
-    Ok(states)
-}
-
-fn materialize_session_state(session: &mut SessionData) -> Result<(), ApiError> {
-    if session.states.is_empty() {
-        if let Some(quantized) = &session.quantized_states {
-            session.states = dequantize_layer_states(quantized)?;
-            session.quantized_states = None;
-        }
-    }
-    Ok(())
-}
-
-fn checked_numel(shape: &[usize]) -> Result<usize, ApiError> {
-    shape.iter().try_fold(1usize, |acc, &dim| {
-        acc.checked_mul(dim).ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "shape {:?} overflows usize during element-count computation",
-                shape
-            ))
-        })
-    })
-}
-
-fn load_session_states(state: &AppState, sid: &str) -> Result<Vec<Tensor>, ApiError> {
-    {
-        let sessions = state
-            .sessions
-            .read()
-            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-        let session = sessions
-            .get(sid)
-            .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
-        if !session.states.is_empty() {
-            return Ok(session.states.clone());
-        }
-    }
-
-    let mut sessions = state
-        .sessions
-        .write()
-        .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-    let session = sessions
-        .get_mut(sid)
-        .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
-    materialize_session_state(session)?;
-    Ok(session.states.clone())
-}
-
-fn is_idle_quantizable(session: &SessionData, now: u64) -> bool {
-    now.saturating_sub(session.last_used) > IDLE_QUANTIZE_SECONDS
-        && session.quantized_states.is_none()
-        && !session.states.is_empty()
-}
-
-fn spawn_idle_quantization_worker(state: AppState) {
-    tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(IDLE_SCAN_INTERVAL_SECONDS)).await;
-            if let Err(err) = quantize_idle_sessions(&state) {
-                let msg = match err {
-                    ApiError::Internal(m) | ApiError::NotFound(m) | ApiError::BadRequest(m) => m,
-                };
-                eprintln!("[!] idle session quantization skipped: {msg}");
-            }
-        }
-    });
-}
-
-fn quantize_idle_sessions(state: &AppState) -> Result<(), ApiError> {
-    let now = unix_now();
-    let stale_session_ids: Vec<String> = {
-        let sessions = state
-            .sessions
-            .read()
-            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-        sessions
-            .iter()
-            .filter(|(_, session)| is_idle_quantizable(session, now))
-            .map(|(sid, _)| sid.clone())
-            .collect()
-    };
-
-    for sid in stale_session_ids {
-        let states_snapshot = {
-            let sessions = state
-                .sessions
-                .read()
-                .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-            if let Some(session) = sessions.get(&sid) {
-                if is_idle_quantizable(session, now) {
-                    session.states.clone()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            }
-        };
-        if states_snapshot.is_empty() {
-            continue;
-        }
-
-        let quantized = quantize_layer_states(&states_snapshot)?;
-        let mut sessions = state
-            .sessions
-            .write()
-            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-        if let Some(session) = sessions.get_mut(&sid) {
-            if is_idle_quantizable(session, now) {
-                session.quantized_states = Some(quantized);
-                session.states.clear();
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -987,7 +1018,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
-    use candle_core::Device;
+    use candle_core::{DType, Device};
     use tower::ServiceExt;
 
     fn build_pipeline() -> InferencePipeline {
@@ -1103,6 +1134,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_adapt_reuses_session_and_updates_metrics() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+        let session_id = "adapt-session".to_string();
+        let now = unix_now();
+        let initial_states = {
+            let pipeline = state.pipeline.lock().unwrap();
+            pipeline
+                .init_session_states()
+                .unwrap()
+                .into_iter()
+                .map(|tensor| Tensor::ones(tensor.dims(), DType::F32, &state.device).unwrap())
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut sessions = state.sessions.write().unwrap();
+            sessions.insert(
+                session_id.clone(),
+                SessionData::new_active(initial_states.clone(), now, state.model_id.clone()),
+            );
+        }
+        metrics::register_session(&session_id);
+        state.refresh_session_metrics().unwrap();
+        let tokens_before = crate::metrics::COUNTER_TOTAL_TOKENS_PREFILLED
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/adapt")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "corpus": ["hello adaptation"],
+                    "session_id": session_id,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["session_id"], session_id);
+
+        let sessions = state.sessions.read().unwrap();
+        let session = sessions.get("adapt-session").unwrap();
+        assert_eq!(session.state_count(), initial_states.len());
+        assert!(session.last_used >= now);
+        drop(sessions);
+        let tokens_after = crate::metrics::COUNTER_TOTAL_TOKENS_PREFILLED
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(tokens_after > tokens_before);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
     async fn test_chat_completion_returns_200() {
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
@@ -1154,6 +1244,121 @@ mod tests {
             body_str.contains("[DONE]"),
             "SSE body must contain [DONE] sentinel"
         );
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_renders_prometheus_text() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("axiom_total_tokens_prefilled"));
+        assert!(body.contains("axiom_prefill_latency_seconds_bucket"));
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_cluster_sync_merges_delta_into_layer_state() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+        let session_id = "cluster-session".to_string();
+        let now = unix_now();
+        let states = {
+            let pipeline = state.pipeline.lock().unwrap();
+            pipeline.init_session_states().unwrap()
+        };
+        {
+            let mut sessions = state.sessions.write().unwrap();
+            sessions.insert(
+                session_id.clone(),
+                SessionData::new_active(states, now, state.model_id.clone()),
+            );
+        }
+        metrics::register_session(&session_id);
+        state.refresh_session_metrics().unwrap();
+
+        let delta = Tensor::ones((1usize, 2usize, 8usize, 8usize), DType::F32, &state.device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let delta_bytes = safetensors::serialize([("tensor", &delta)], &None).unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/cluster/sync")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&StateDeltaUpdate {
+                    session_id: session_id.clone(),
+                    layer_index: 0,
+                    delta_bytes,
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let sessions = state.sessions.read().unwrap();
+        let session = sessions.get(&session_id).unwrap();
+        let mut layers = session.states_clone().unwrap();
+        let layer = layers.remove(0);
+        let layer_sum = layer.sum_all().unwrap().to_scalar::<f32>().unwrap();
+        assert!(layer_sum > 0.0);
+        drop(sessions);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_quantized_session_dequantizes_on_chat_path() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let session_id = "quantized-session".to_string();
+        let now = unix_now();
+        let states = {
+            let pipeline = state.pipeline.lock().unwrap();
+            pipeline.init_session_states().unwrap()
+        };
+        {
+            let mut sessions = state.sessions.write().unwrap();
+            let mut session = SessionData::new_active(states, now, state.model_id.clone());
+            session.park_quantized().unwrap();
+            sessions.insert(session_id.clone(), session);
+        }
+        metrics::register_session(&session_id);
+        metrics::mark_session_quantized(&session_id, true);
+        state.refresh_session_metrics().unwrap();
+
+        let app = create_router(state.clone());
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 2,
+            "session_id": session_id,
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let sessions = state.sessions.read().unwrap();
+        let session = sessions.get("quantized-session").unwrap();
+        assert!(!session.is_quantized());
+        drop(sessions);
         safe_drop(pipeline_arc).await;
     }
 }

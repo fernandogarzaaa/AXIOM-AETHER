@@ -191,15 +191,28 @@ impl InferencePipeline {
     /// # Returns
     /// Updated W_tilde tensors after processing all corpus tokens.
     pub fn adapt_on_corpus(&self, corpus: &[String], states: Vec<Tensor>) -> Result<Vec<Tensor>> {
+        self.adapt_on_corpus_with_steps(corpus, states, 4)
+    }
+
+    pub fn adapt_on_corpus_with_steps(
+        &self,
+        corpus: &[String],
+        states: Vec<Tensor>,
+        inner_loop_steps: usize,
+    ) -> Result<Vec<Tensor>> {
         let mut current_states = states;
+        let clamped_steps = inner_loop_steps.clamp(1, 4);
 
         for text in corpus {
             let token_ids = self.encode(text);
             for &token_id in &token_ids {
                 let token_tensor = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
-                let (_, next_states) =
-                    self.engine
-                        .forward(&token_tensor, Some(current_states), true)?;
+                let (_, next_states) = self.engine.forward_with_inner_loop_steps(
+                    &token_tensor,
+                    Some(current_states),
+                    true,
+                    Some(clamped_steps),
+                )?;
                 current_states = next_states.expect("decode must return states");
             }
         }
@@ -333,6 +346,10 @@ impl InferencePipeline {
 
     pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> Result<String> {
         self.generate_with_memory(prompt, max_new_tokens, None)
+    }
+
+    pub fn token_count(&self, text: &str) -> usize {
+        self.encode(text).len()
     }
 
     /// Generation pipeline with optional memory-token injection.
