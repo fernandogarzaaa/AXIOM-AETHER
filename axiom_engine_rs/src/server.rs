@@ -29,6 +29,7 @@ use axum::{Json, Router};
 use candle_core::{DType, Device, Tensor};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use tokio::task::spawn_blocking;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
@@ -36,6 +37,9 @@ use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
 use crate::inference::InferencePipeline;
 use crate::metrics;
+use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
+
+const MAX_ACTIVE_VRAM_SESSIONS: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -54,7 +58,13 @@ fn unix_now() -> u64 {
 
 enum SessionResidency {
     Active(Vec<Tensor>),
-    Quantized(Vec<Vec<u8>>),
+    Quantized(Vec<NF4QuantizedDescriptor>),
+}
+
+#[derive(Clone, Copy)]
+struct SequenceState {
+    version: u64,
+    timestamp: i64,
 }
 
 struct SessionData {
@@ -99,13 +109,10 @@ impl SessionData {
     }
 
     fn ensure_active(&mut self, device: &Device) -> candle_core::Result<Vec<Tensor>> {
-        if let SessionResidency::Quantized(buffers) = &self.residency {
-            let mut states = Vec::with_capacity(buffers.len());
-            for buffer in buffers {
-                let mut tensors = candle_core::safetensors::load_buffer(buffer, device)?;
-                let tensor = tensors.remove("tensor").ok_or_else(|| {
-                    candle_core::Error::Msg("compressed session state missing 'tensor' key".into())
-                })?;
+        if let SessionResidency::Quantized(descriptors) = &self.residency {
+            let mut states = Vec::with_capacity(descriptors.len());
+            for descriptor in descriptors {
+                let tensor = NF4Quantizer::dequantize_descriptor(descriptor, device)?;
                 states.push(tensor.to_dtype(DType::F32)?);
             }
             self.residency = SessionResidency::Active(states);
@@ -126,25 +133,18 @@ impl SessionData {
                 states.len()
             );
         }
-        states[layer_index] = states[layer_index].add(&delta.to_dtype(DType::F32)?)?;
-        self.replace_states(states);
-        Ok(())
-    }
-
-    fn park_quantized(&mut self) -> candle_core::Result<()> {
-        let states = match &self.residency {
-            SessionResidency::Active(states) => states,
-            SessionResidency::Quantized(_) => return Ok(()),
-        };
-        let mut buffers = Vec::with_capacity(states.len());
-        for state in states {
-            let fp16 = state.to_device(&Device::Cpu)?.to_dtype(DType::F16)?;
-            let bytes = safetensors::serialize([("tensor", &fp16)], &None).map_err(|err| {
-                candle_core::Error::Msg(format!("session serialization failed: {err}"))
-            })?;
-            buffers.push(bytes);
+        let previous = states[layer_index].clone();
+        let merged = states[layer_index].add(&delta.to_dtype(DType::F32)?)?;
+        if !tensor_is_finite(&merged)? {
+            eprintln!(
+                "[emergency] non-finite tensor detected in merge_delta; session update discarded"
+            );
+            states[layer_index] = previous;
+            self.replace_states(states);
+            candle_core::bail!("delta merge produced non-finite values");
         }
-        self.residency = SessionResidency::Quantized(buffers);
+        states[layer_index] = merged;
+        self.replace_states(states);
         Ok(())
     }
 }
@@ -165,6 +165,9 @@ pub struct AppState {
     /// Active TTT sessions keyed by UUID string.
     /// `RwLock` enables concurrent reads; mutations take an exclusive write.
     sessions: Arc<RwLock<HashMap<String, SessionData>>>,
+    /// Session-layer replication sequencing guard:
+    /// key = "{session_id}:{layer_index}".
+    sequence_versions: Arc<RwLock<HashMap<String, SequenceState>>>,
     /// Canonical model identifier returned in API responses.
     pub model_id: String,
 }
@@ -176,6 +179,7 @@ impl AppState {
             pipeline: Arc::new(Mutex::new(pipeline)),
             device,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            sequence_versions: Arc::new(RwLock::new(HashMap::new())),
             model_id,
         }
     }
@@ -197,6 +201,91 @@ impl AppState {
         metrics::set_quantized_sessions(quantized);
         Ok(())
     }
+
+    async fn enforce_lru_vram_budget(&self) -> Result<(), ApiError> {
+        loop {
+            let candidate = {
+                let sessions = self
+                    .sessions
+                    .read()
+                    .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+                let active = sessions
+                    .iter()
+                    .filter_map(|(id, session)| {
+                        if session.is_quantized() {
+                            None
+                        } else {
+                            Some((id.clone(), session.last_used))
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if active.len() <= MAX_ACTIVE_VRAM_SESSIONS {
+                    None
+                } else {
+                    active.into_iter().min_by_key(|(_, last_used)| *last_used)
+                }
+            };
+
+            let Some((evict_session_id, baseline_last_used)) = candidate else {
+                self.refresh_session_metrics()?;
+                return Ok(());
+            };
+
+            let raw_layers = {
+                let sessions = self
+                    .sessions
+                    .read()
+                    .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+                let session = sessions.get(&evict_session_id).ok_or_else(|| {
+                    ApiError::NotFound(format!("session '{}' not found", evict_session_id))
+                })?;
+                match &session.residency {
+                    SessionResidency::Quantized(_) => continue,
+                    SessionResidency::Active(states) => states
+                        .iter()
+                        .map(|state| {
+                            let cpu_f32 = state.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                            let shape = cpu_f32.dims().to_vec();
+                            let data = cpu_f32.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                            Ok(OffloadLayer { shape, data })
+                        })
+                        .collect::<candle_core::Result<Vec<_>>>()
+                        .map_err(|e| ApiError::Internal(format!("state staging failed: {e}")))?,
+                }
+            };
+
+            let quantized_layers = spawn_blocking(move || {
+                raw_layers
+                    .into_iter()
+                    .map(|layer| {
+                        NF4Quantizer::quantize_f32_slice(&layer.data, &layer.shape)
+                            .map_err(|e| e.to_string())
+                    })
+                    .collect::<std::result::Result<Vec<NF4QuantizedDescriptor>, String>>()
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("state offload task join failed: {e}")))?
+            .map_err(|e| ApiError::Internal(format!("state offload quantization failed: {e}")))?;
+
+            let mut sessions = self
+                .sessions
+                .write()
+                .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+            if let Some(session) = sessions.get_mut(&evict_session_id) {
+                let still_active = !session.is_quantized();
+                let unchanged_clock = session.last_used == baseline_last_used;
+                if still_active && unchanged_clock {
+                    session.residency = SessionResidency::Quantized(quantized_layers);
+                    metrics::mark_session_quantized(&evict_session_id, true);
+                }
+            }
+        }
+    }
+}
+
+struct OffloadLayer {
+    shape: Vec<usize>,
+    data: Vec<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +297,7 @@ enum ApiError {
     Internal(String),
     NotFound(String),
     BadRequest(String),
+    Conflict(String),
 }
 
 impl IntoResponse for ApiError {
@@ -216,6 +306,7 @@ impl IntoResponse for ApiError {
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
         }
     }
 }
@@ -396,6 +487,15 @@ fn layer_checkpoint_to_tensor(
     Tensor::from_vec(lc.data.clone(), (total,), device)?.reshape(lc.shape.as_slice())
 }
 
+fn tensor_is_finite(tensor: &Tensor) -> candle_core::Result<bool> {
+    let values = tensor
+        .to_dtype(DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(values.into_iter().all(f32::is_finite))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -435,6 +535,7 @@ async fn create_completion(
     let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
 
     let text = run_generation(&state, &req.prompt, max_tokens, req.session_id.as_deref())?;
+    state.enforce_lru_vram_budget().await?;
 
     Ok(Json(CompletionResponse {
         id: format!("cmpl-{}", Uuid::new_v4()),
@@ -462,9 +563,17 @@ async fn create_chat_completion(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     if req.stream.unwrap_or(false) {
-        chat_completion_sse(state, req).into_response()
+        let sse = chat_completion_sse(state.clone(), req);
+        match state.enforce_lru_vram_budget().await {
+            Ok(()) => sse.into_response(),
+            Err(err) => err.into_response(),
+        }
     } else {
-        chat_completion_json(state, req).into_response()
+        let json = chat_completion_json(state.clone(), req);
+        match state.enforce_lru_vram_budget().await {
+            Ok(()) => json.into_response(),
+            Err(err) => err.into_response(),
+        }
     }
 }
 
@@ -528,7 +637,10 @@ fn chat_completion_sse(
     let events: Vec<Result<Event, Infallible>> = match generation_result {
         Err(api_err) => {
             let body = match api_err {
-                ApiError::Internal(m) | ApiError::NotFound(m) | ApiError::BadRequest(m) => m,
+                ApiError::Internal(m)
+                | ApiError::NotFound(m)
+                | ApiError::BadRequest(m)
+                | ApiError::Conflict(m) => m,
             };
             vec![Ok(Event::default().data(format!("error: {body}")))]
         }
@@ -604,6 +716,7 @@ async fn create_session(
     }
     metrics::register_session(&session_id);
     state.refresh_session_metrics()?;
+    state.enforce_lru_vram_budget().await?;
 
     Ok(Json(CreateSessionResponse {
         session_id,
@@ -627,6 +740,12 @@ async fn delete_session(
     drop(sessions);
     if deleted {
         metrics::remove_session(&session_id);
+        let mut sequence_versions = state
+            .sequence_versions
+            .write()
+            .map_err(|_| ApiError::Internal("sequence lock poisoned".into()))?;
+        let prefix = format!("{session_id}:");
+        sequence_versions.retain(|key, _| !key.starts_with(&prefix));
     }
     state.refresh_session_metrics()?;
     Ok(Json(DeleteSessionResponse {
@@ -680,6 +799,7 @@ async fn adapt(
         }
     }
     state.refresh_session_metrics()?;
+    state.enforce_lru_vram_budget().await?;
 
     Ok(Json(AdaptResponse {
         session_id,
@@ -760,6 +880,7 @@ async fn put_checkpoint(
     metrics::register_session(&session_id);
     metrics::mark_session_quantized(&session_id, false);
     state.refresh_session_metrics()?;
+    state.enforce_lru_vram_budget().await?;
 
     Ok(Json(CreateSessionResponse {
         session_id,
@@ -782,6 +903,23 @@ async fn cluster_sync(
             .ok_or_else(|| ApiError::BadRequest("delta payload missing 'tensor' key".into()))?
     };
 
+    let sequence_key = format!("{}:{}", payload.session_id, payload.layer_index);
+    let mut sequence_versions = state
+        .sequence_versions
+        .write()
+        .map_err(|_| ApiError::Internal("sequence lock poisoned".into()))?;
+    if let Some(existing) = sequence_versions.get(&sequence_key) {
+        if payload.sequence_version <= existing.version {
+            return Err(ApiError::Conflict(format!(
+                "stale delta rejected: incoming sequence_version={} current={} timestamp={} current_timestamp={}",
+                payload.sequence_version,
+                existing.version,
+                payload.timestamp,
+                existing.timestamp
+            )));
+        }
+    }
+
     let mut sessions = state
         .sessions
         .write()
@@ -794,8 +932,17 @@ async fn cluster_sync(
         .map_err(|e| ApiError::BadRequest(format!("delta merge failed: {e}")))?;
     session.last_used = unix_now();
     metrics::mark_session_quantized(&payload.session_id, false);
+    sequence_versions.insert(
+        sequence_key,
+        SequenceState {
+            version: payload.sequence_version,
+            timestamp: payload.timestamp,
+        },
+    );
+    drop(sequence_versions);
     drop(sessions);
     state.refresh_session_metrics()?;
+    state.enforce_lru_vram_budget().await?;
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -1302,6 +1449,8 @@ mod tests {
                 serde_json::to_vec(&StateDeltaUpdate {
                     session_id: session_id.clone(),
                     layer_index: 0,
+                    sequence_version: 1,
+                    timestamp: unix_now() as i64,
                     delta_bytes,
                 })
                 .unwrap(),
@@ -1321,6 +1470,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cluster_sync_rejects_out_of_order_delta() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+        let session_id = "cluster-order-session".to_string();
+        let now = unix_now();
+        let states = {
+            let pipeline = state.pipeline.lock().unwrap();
+            pipeline.init_session_states().unwrap()
+        };
+        {
+            let mut sessions = state.sessions.write().unwrap();
+            sessions.insert(
+                session_id.clone(),
+                SessionData::new_active(states, now, state.model_id.clone()),
+            );
+        }
+        metrics::register_session(&session_id);
+        state.refresh_session_metrics().unwrap();
+
+        let delta = Tensor::ones((1usize, 2usize, 8usize, 8usize), DType::F32, &state.device)
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap();
+        let delta_bytes = safetensors::serialize([("tensor", &delta)], &None).unwrap();
+        let first_req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/cluster/sync")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&StateDeltaUpdate {
+                    session_id: session_id.clone(),
+                    layer_index: 0,
+                    sequence_version: 2,
+                    timestamp: unix_now() as i64,
+                    delta_bytes: delta_bytes.clone(),
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let first_resp = app.clone().oneshot(first_req).await.unwrap();
+        assert_eq!(first_resp.status(), StatusCode::ACCEPTED);
+
+        let stale_req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/cluster/sync")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&StateDeltaUpdate {
+                    session_id: session_id.clone(),
+                    layer_index: 0,
+                    sequence_version: 1,
+                    timestamp: unix_now() as i64 - 1,
+                    delta_bytes,
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let stale_resp = app.oneshot(stale_req).await.unwrap();
+        assert_eq!(stale_resp.status(), StatusCode::CONFLICT);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
     async fn test_quantized_session_dequantizes_on_chat_path() {
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
@@ -1333,7 +1546,27 @@ mod tests {
         {
             let mut sessions = state.sessions.write().unwrap();
             let mut session = SessionData::new_active(states, now, state.model_id.clone());
-            session.park_quantized().unwrap();
+            let active = match &session.residency {
+                SessionResidency::Active(active) => active.clone(),
+                SessionResidency::Quantized(_) => Vec::new(),
+            };
+            let descriptors = active
+                .iter()
+                .map(|tensor| {
+                    let shape = tensor.dims().to_vec();
+                    let data = tensor
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                        .contiguous()
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    NF4Quantizer::quantize_f32_slice(&data, &shape).unwrap()
+                })
+                .collect::<Vec<_>>();
+            session.residency = SessionResidency::Quantized(descriptors);
             sessions.insert(session_id.clone(), session);
         }
         metrics::register_session(&session_id);

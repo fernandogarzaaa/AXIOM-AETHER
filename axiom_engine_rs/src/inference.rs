@@ -163,7 +163,15 @@ impl InferencePipeline {
             let (logits, next_states) =
                 self.engine
                     .forward(&token_tensor, Some(current_states), true)?;
-            current_states = next_states.expect("decode must return states");
+            let candidate_states = next_states
+                .ok_or_else(|| candle_core::Error::Msg("decode must return states".into()))?;
+            if session_states_are_finite(&candidate_states)? {
+                current_states = candidate_states;
+            } else {
+                eprintln!(
+                    "[emergency] non-finite state detected during generate_with_session; discarding update and restoring prior snapshot"
+                );
+            }
 
             let next_id = logits
                 .squeeze(1)?
@@ -213,7 +221,15 @@ impl InferencePipeline {
                     true,
                     Some(clamped_steps),
                 )?;
-                current_states = next_states.expect("decode must return states");
+                let candidate_states = next_states
+                    .ok_or_else(|| candle_core::Error::Msg("decode must return states".into()))?;
+                if session_states_are_finite(&candidate_states)? {
+                    current_states = candidate_states;
+                } else {
+                    eprintln!(
+                        "[emergency] non-finite state detected during corpus adaptation; discarding update and restoring prior snapshot"
+                    );
+                }
             }
         }
 
@@ -246,7 +262,15 @@ impl InferencePipeline {
                 let (_, next_states) =
                     self.engine
                         .forward(&token_tensor, Some(current_states), true)?;
-                current_states = next_states.expect("decode must return states");
+                let candidate_states = next_states
+                    .ok_or_else(|| candle_core::Error::Msg("decode must return states".into()))?;
+                if session_states_are_finite(&candidate_states)? {
+                    current_states = candidate_states;
+                } else {
+                    eprintln!(
+                        "[emergency] non-finite state detected during chunk-fusion adaptation; discarding update and restoring prior snapshot"
+                    );
+                }
             }
         }
 
@@ -293,9 +317,24 @@ impl InferencePipeline {
         let k = Tensor::from_vec(k_data, (batch, heads, seq_len, head_dim), &self.device)?;
         let v = Tensor::from_vec(v_data, (batch, heads, seq_len, head_dim), &self.device)?;
         let (_, global_update) = ChunkFusedTTT::forward_chunk_fused(&q, &k, &v, block_size)?;
+        if !tensor_is_finite(&global_update)? {
+            eprintln!(
+                "[emergency] non-finite global_update detected during chunk-fused adaptation; discarding update and restoring prior snapshot"
+            );
+            return Ok(states);
+        }
 
         for layer_state in states.iter_mut() {
-            *layer_state = layer_state.add(&global_update)?;
+            let previous = layer_state.clone();
+            let updated = layer_state.add(&global_update)?;
+            if tensor_is_finite(&updated)? {
+                *layer_state = updated;
+            } else {
+                eprintln!(
+                    "[emergency] non-finite layer update detected during chunk-fused merge; discarding update and restoring prior snapshot"
+                );
+                *layer_state = previous;
+            }
         }
 
         Ok(states)
@@ -397,7 +436,15 @@ impl InferencePipeline {
         for _ in 0..max_new_tokens {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             let (logits, next_states) = self.engine.forward(&token_tensor, Some(states), true)?;
-            states = next_states.expect("decode must return states");
+            let candidate_states = next_states
+                .ok_or_else(|| candle_core::Error::Msg("decode must return states".into()))?;
+            if session_states_are_finite(&candidate_states)? {
+                states = candidate_states;
+            } else {
+                eprintln!(
+                    "[emergency] non-finite state detected during generate_with_memory; discarding update and restoring prior snapshot"
+                );
+            }
 
             let next_id = logits
                 .squeeze(1)?
@@ -407,6 +454,24 @@ impl InferencePipeline {
 
             generated.push(next_id);
             last_token = next_id;
+        }
+
+        fn tensor_is_finite(tensor: &Tensor) -> Result<bool> {
+            let values = tensor
+                .to_dtype(DType::F32)?
+                .contiguous()?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            Ok(values.into_iter().all(f32::is_finite))
+        }
+
+        fn session_states_are_finite(states: &[Tensor]) -> Result<bool> {
+            for state in states {
+                if !tensor_is_finite(state)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
 
         Ok(self.decode(&generated))
