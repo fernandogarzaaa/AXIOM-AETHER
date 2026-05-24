@@ -249,9 +249,22 @@ impl AxiomTTTEngine {
         // Embed prompt tokens: [1, T, d_model]
         let token_embeddings = self.embeddings.forward(tokens)?;
 
-        // Unsqueeze memory vector to [1, 1, d_model] then prepend → [B, T+1, d_model].
+        let (mem_batch, mem_d_model) = memory_vector.dims2()?;
+        if mem_batch != 1 {
+            return Err(candle_core::Error::Msg(format!(
+                "memory_vector must have batch size 1, got {mem_batch}"
+            )));
+        }
+        if mem_d_model != self.config.d_model {
+            return Err(candle_core::Error::Msg(format!(
+                "memory_vector d_model mismatch: expected {}, got {mem_d_model}",
+                self.config.d_model
+            )));
+        }
+
+        // Insert sequence dimension to [1, 1, d_model] then prepend → [1, T+1, d_model].
         // The memory vector aligns with q_proj input space (d_model) in every layer.
-        let mem_prefix = memory_vector.unsqueeze(0)?; // [1, 1, d_model]
+        let mem_prefix = memory_vector.unsqueeze(1)?;
         let mut x = Tensor::cat(&[&mem_prefix, &token_embeddings], 1)?;
 
         let mut init_states: Vec<Tensor> = Vec::with_capacity(self.layers.len());
