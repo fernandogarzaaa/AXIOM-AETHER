@@ -20,7 +20,11 @@ impl ChunkFusedTTT {
         })
     }
 
-    pub fn forward_chunk_fused(&self, x: &Tensor, initial_state: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn forward_chunk_fused(
+        &self,
+        x: &Tensor,
+        initial_state: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
         let (_, seq_len, _) = x.dims3()?;
         let mut state = initial_state.clone();
         let mut outputs = Vec::with_capacity(seq_len);
@@ -132,7 +136,14 @@ mod tests {
         let x = Tensor::zeros((1usize, 3usize, 16usize), DType::F32, &device).unwrap();
         let sliding = Tensor::zeros((1usize, 4usize, 16usize), DType::F32, &device).unwrap();
         let mut session_states = (0..config.n_layers)
-            .map(|_| Tensor::zeros((1usize, config.num_heads, config.head_dim, config.head_dim), DType::F32, &device).unwrap())
+            .map(|_| {
+                Tensor::zeros(
+                    (1usize, config.num_heads, config.head_dim, config.head_dim),
+                    DType::F32,
+                    &device,
+                )
+                .unwrap()
+            })
             .collect::<Vec<_>>();
 
         let output = adapter

@@ -33,7 +33,9 @@ impl ClusterStateManager {
                     .json(&payload)
                     .send()
                     .await
-                    .map_err(|err| candle_core::Error::Msg(format!("cluster sync request failed: {err}")))?;
+                    .map_err(|err| {
+                        candle_core::Error::Msg(format!("cluster sync request failed: {err}"))
+                    })?;
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response

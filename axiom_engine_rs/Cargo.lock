@@ -111,6 +111,7 @@ dependencies = [
  "indicatif",
  "rand 0.8.6",
  "reqwest",
+ "safetensors",
  "serde",
  "serde_json",
  "sha2",

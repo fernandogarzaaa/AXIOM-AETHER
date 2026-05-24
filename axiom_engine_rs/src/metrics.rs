@@ -119,14 +119,21 @@ pub fn render_metrics() -> String {
         .lock()
         .map(|guard| guard.snapshot())
         .unwrap_or(HistogramSnapshot {
-            buckets: HISTOGRAM_BUCKETS.iter().copied().map(|bucket| (bucket, 0)).collect(),
+            buckets: HISTOGRAM_BUCKETS
+                .iter()
+                .copied()
+                .map(|bucket| (bucket, 0))
+                .collect(),
             count: 0,
             sum: 0.0,
         });
     let session_entries = SESSION_METRICS
         .lock()
         .map(|registry| {
-            let mut entries = registry.iter().map(|(id, entry)| (id.clone(), entry.clone())).collect::<Vec<_>>();
+            let mut entries = registry
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .collect::<Vec<_>>();
             entries.sort_by(|left, right| left.0.cmp(&right.0));
             entries
         })
@@ -141,11 +148,18 @@ pub fn render_metrics() -> String {
     body.push_str("# TYPE axiom_active_sessions gauge\n");
     body.push_str(&format!("axiom_active_sessions {}\n", active_sessions));
 
-    body.push_str("# HELP axiom_quantized_sessions Number of idle sessions parked in compressed form.\n");
+    body.push_str(
+        "# HELP axiom_quantized_sessions Number of idle sessions parked in compressed form.\n",
+    );
     body.push_str("# TYPE axiom_quantized_sessions gauge\n");
-    body.push_str(&format!("axiom_quantized_sessions {}\n", quantized_sessions));
+    body.push_str(&format!(
+        "axiom_quantized_sessions {}\n",
+        quantized_sessions
+    ));
 
-    body.push_str("# HELP axiom_prefill_latency_seconds Time spent inside prefill execution paths.\n");
+    body.push_str(
+        "# HELP axiom_prefill_latency_seconds Time spent inside prefill execution paths.\n",
+    );
     body.push_str("# TYPE axiom_prefill_latency_seconds histogram\n");
     for (bucket, count) in &histogram.buckets {
         body.push_str(&format!(
@@ -157,8 +171,14 @@ pub fn render_metrics() -> String {
         "axiom_prefill_latency_seconds_bucket{{le=\"+Inf\"}} {}\n",
         histogram.count
     ));
-    body.push_str(&format!("axiom_prefill_latency_seconds_sum {}\n", histogram.sum));
-    body.push_str(&format!("axiom_prefill_latency_seconds_count {}\n", histogram.count));
+    body.push_str(&format!(
+        "axiom_prefill_latency_seconds_sum {}\n",
+        histogram.sum
+    ));
+    body.push_str(&format!(
+        "axiom_prefill_latency_seconds_count {}\n",
+        histogram.count
+    ));
 
     body.push_str("# HELP axiom_session_residency Session residency states.\n");
     body.push_str("# TYPE axiom_session_residency gauge\n");

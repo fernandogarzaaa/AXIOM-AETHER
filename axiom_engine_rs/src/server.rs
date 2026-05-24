@@ -92,7 +92,9 @@ impl SessionData {
     fn states_clone(&self) -> candle_core::Result<Vec<Tensor>> {
         match &self.residency {
             SessionResidency::Active(states) => Ok(states.clone()),
-            SessionResidency::Quantized(_) => candle_core::bail!("session is parked in compressed form"),
+            SessionResidency::Quantized(_) => {
+                candle_core::bail!("session is parked in compressed form")
+            }
         }
     }
 
@@ -137,8 +139,9 @@ impl SessionData {
         let mut buffers = Vec::with_capacity(states.len());
         for state in states {
             let fp16 = state.to_device(&Device::Cpu)?.to_dtype(DType::F16)?;
-            let bytes = safetensors::serialize([("tensor", &fp16)], &None)
-                .map_err(|err| candle_core::Error::Msg(format!("session serialization failed: {err}")))?;
+            let bytes = safetensors::serialize([("tensor", &fp16)], &None).map_err(|err| {
+                candle_core::Error::Msg(format!("session serialization failed: {err}"))
+            })?;
             buffers.push(bytes);
         }
         self.residency = SessionResidency::Quantized(buffers);
@@ -182,8 +185,14 @@ impl AppState {
             .sessions
             .read()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-        let active = sessions.values().filter(|session| !session.is_quantized()).count();
-        let quantized = sessions.values().filter(|session| session.is_quantized()).count();
+        let active = sessions
+            .values()
+            .filter(|session| !session.is_quantized())
+            .count();
+        let quantized = sessions
+            .values()
+            .filter(|session| session.is_quantized())
+            .count();
         metrics::set_active_sessions(active);
         metrics::set_quantized_sessions(quantized);
         Ok(())
@@ -194,6 +203,7 @@ impl AppState {
 // Error type
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 enum ApiError {
     Internal(String),
     NotFound(String),
@@ -407,7 +417,10 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     state.refresh_session_metrics()?;
     Ok((
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         metrics::render_metrics(),
     )
         .into_response())
@@ -689,6 +702,7 @@ async fn get_checkpoint(
     let session = sessions
         .get_mut(&session_id)
         .ok_or_else(|| ApiError::NotFound(format!("session '{session_id}' not found")))?;
+    let created_at = session.created_at;
 
     let layers = session
         .ensure_active(&state.device)
@@ -704,7 +718,7 @@ async fn get_checkpoint(
     Ok(Json(SessionCheckpoint {
         session_id: session_id.clone(),
         version: 1,
-        created_at: session.created_at,
+        created_at,
         layers,
     }))
 }
@@ -760,8 +774,9 @@ async fn cluster_sync(
     Json(payload): Json<StateDeltaUpdate>,
 ) -> Result<impl IntoResponse, ApiError> {
     let delta = {
-        let mut tensors = candle_core::safetensors::load_buffer(&payload.delta_bytes, &state.device)
-            .map_err(|e| ApiError::BadRequest(format!("invalid delta payload: {e}")))?;
+        let mut tensors =
+            candle_core::safetensors::load_buffer(&payload.delta_bytes, &state.device)
+                .map_err(|e| ApiError::BadRequest(format!("invalid delta payload: {e}")))?;
         tensors
             .remove("tensor")
             .ok_or_else(|| ApiError::BadRequest("delta payload missing 'tensor' key".into()))?
@@ -842,9 +857,9 @@ fn run_generation(
                 let session = sessions
                     .get_mut(sid)
                     .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
-                let initial_states = session
-                    .ensure_active(&state.device)
-                    .map_err(|e| ApiError::Internal(format!("session dequantization failed: {e}")))?;
+                let initial_states = session.ensure_active(&state.device).map_err(|e| {
+                    ApiError::Internal(format!("session dequantization failed: {e}"))
+                })?;
                 session.last_used = unix_now();
                 metrics::mark_session_quantized(sid, false);
                 initial_states
@@ -917,7 +932,10 @@ fn resolve_or_create_session(
             .sessions
             .write()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-        sessions.insert(new_id.clone(), SessionData::new_active(states.clone(), now, state.model_id.clone()));
+        sessions.insert(
+            new_id.clone(),
+            SessionData::new_active(states.clone(), now, state.model_id.clone()),
+        );
         drop(sessions);
         metrics::register_session(&new_id);
         state.refresh_session_metrics()?;
@@ -1235,7 +1253,8 @@ mod tests {
 
         let sessions = state.sessions.read().unwrap();
         let session = sessions.get(&session_id).unwrap();
-        let layer = session.states_clone().unwrap().remove(0);
+        let mut layers = session.states_clone().unwrap();
+        let layer = layers.remove(0);
         let layer_sum = layer.sum_all().unwrap().to_scalar::<f32>().unwrap();
         assert!(layer_sum > 0.0);
         drop(sessions);
