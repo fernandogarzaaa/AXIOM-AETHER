@@ -229,25 +229,6 @@ def _get_or_create_session(session_id: Optional[str]) -> tuple[str, list]:
 async def _run_generation(prompt: str, max_tokens: int, session_id: Optional[str]) -> str:
     """Run generation in a thread pool to avoid blocking the event loop."""
     pipeline = _require_pipeline()
-
-    def _generate() -> str:
-        if session_id:
-            if session_id not in _sessions:
-                raise HTTPException(status_code=404, detail=f"session '{session_id}' not found")
-            states = _sessions[session_id]["states"]
-            text, updated = asyncio.get_event_loop().run_in_executor(  # type: ignore[union-attr]
-                None,
-                lambda: pipeline.run_generation_sync(prompt, max_tokens, states),
-            )
-            _sessions[session_id]["states"] = updated
-            _sessions[session_id]["last_used"] = int(time.time())
-            return text
-        # Stateless generation.
-        return asyncio.get_event_loop().run_in_executor(  # type: ignore[union-attr]
-            None,
-            lambda: pipeline.run_generation_sync(prompt, max_tokens, None),
-        )
-
     return await asyncio.get_event_loop().run_in_executor(
         None,
         lambda: _generate_sync(pipeline, prompt, max_tokens, session_id),
@@ -260,25 +241,23 @@ def _generate_sync(
     max_tokens: int,
     session_id: Optional[str],
 ) -> str:
-    from .inference import _allocate_w_tilde_states
+    """Synchronous generation dispatched to the blocking thread pool.
 
+    Runs on a thread-pool thread via ``asyncio.run_in_executor``; must not call
+    back into the event loop.
+    """
     if session_id:
         if session_id not in _sessions:
             raise ValueError(f"session '{session_id}' not found")
         states = _sessions[session_id]["states"]
-    else:
-        states = _allocate_w_tilde_states(pipeline.cfg, pipeline.device)
-
-    # Synchronous generation loop using the existing pipeline methods.
-    loop = asyncio.new_event_loop()
-    try:
-        text = loop.run_until_complete(
-            pipeline.run_generation(prompt, max_new_tokens=max_tokens)
+        text, updated_states = pipeline.generate_with_session_sync(
+            prompt, max_new_tokens=max_tokens, states=states
         )
-    finally:
-        loop.close()
+        _sessions[session_id]["states"] = updated_states
+        _sessions[session_id]["last_used"] = int(time.time())
+        return text
 
-    return text
+    return pipeline.generate_sync(prompt, max_new_tokens=max_tokens)
 
 
 # ---------------------------------------------------------------------------
