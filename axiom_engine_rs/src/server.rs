@@ -1,0 +1,847 @@
+//! OpenAI-compatible HTTP API server for the Axiom-TTT engine.
+//!
+//! Exposes the following endpoints:
+//!
+//! | Method | Path                                 | Description                              |
+//! |--------|--------------------------------------|------------------------------------------|
+//! | GET    | `/v1/models`                         | List available models                    |
+//! | POST   | `/v1/completions`                    | Text completion (stateless or session)   |
+//! | POST   | `/v1/chat/completions`               | Chat completion (stateless or session)   |
+//! | POST   | `/v1/sessions`                       | Create a new persistent TTT session      |
+//! | DELETE | `/v1/sessions/{id}`                  | Delete a session                         |
+//! | POST   | `/v1/adapt`                          | In-place TTT adaptation on a corpus      |
+//! | GET    | `/v1/sessions/{id}/checkpoint`       | Export session state as JSON             |
+//! | PUT    | `/v1/sessions/{id}/checkpoint`       | Restore session state from JSON          |
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post, put};
+use axum::{Json, Router};
+use candle_core::{Device, Tensor};
+use serde::{Deserialize, Serialize};
+use tower_http::cors::CorsLayer;
+use uuid::Uuid;
+
+use crate::config::AxiomConfig;
+use crate::inference::InferencePipeline;
+
+// ---------------------------------------------------------------------------
+// Helper
+// ---------------------------------------------------------------------------
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Shared application state
+// ---------------------------------------------------------------------------
+
+struct SessionData {
+    states: Vec<Tensor>,
+    created_at: u64,
+    last_used: u64,
+    model: String,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    /// Shared inference pipeline.  Wrapped in `Mutex` because `InferencePipeline`
+    /// contains `RefCell` (via `TTTLinearLayer`) which is `!Send`.
+    pub pipeline: Arc<Mutex<InferencePipeline>>,
+    /// Active TTT sessions keyed by UUID string.
+    sessions: Arc<Mutex<HashMap<String, SessionData>>>,
+    /// Canonical model identifier returned in API responses.
+    pub model_id: String,
+}
+
+impl AppState {
+    pub fn new(pipeline: InferencePipeline, model_id: String) -> Self {
+        Self {
+            pipeline: Arc::new(Mutex::new(pipeline)),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            model_id,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+enum ApiError {
+    Internal(String),
+    NotFound(String),
+    BadRequest(String),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        match self {
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible request / response types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct ModelInfo {
+    id: String,
+    object: String,
+    created: u64,
+    owned_by: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ListModelsResponse {
+    object: String,
+    data: Vec<ModelInfo>,
+}
+
+// -- /v1/completions --
+
+#[derive(Debug, Deserialize)]
+pub struct CompletionRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    pub prompt: String,
+    pub max_tokens: Option<usize>,
+    /// If provided, generation uses and updates this TTT session's W_tilde states.
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionChoice {
+    text: String,
+    index: usize,
+    finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionResponse {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<CompletionChoice>,
+}
+
+// -- /v1/chat/completions --
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatCompletionRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    pub messages: Vec<ChatMessage>,
+    pub max_tokens: Option<usize>,
+    /// See [`CompletionRequest::session_id`].
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub stream: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatChoice {
+    index: usize,
+    message: ChatMessage,
+    finish_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionResponse {
+    id: String,
+    object: String,
+    created: u64,
+    model: String,
+    choices: Vec<ChatChoice>,
+}
+
+// -- /v1/sessions --
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSessionRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateSessionResponse {
+    session_id: String,
+    object: String,
+    created: u64,
+    model: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteSessionResponse {
+    session_id: String,
+    deleted: bool,
+}
+
+// -- /v1/adapt --
+
+#[derive(Debug, Deserialize)]
+pub struct AdaptRequest {
+    /// Text examples to adapt on.
+    pub corpus: Vec<String>,
+    /// Maximum number of additional inner-loop steps per token (1–4).  Defaults to 4.
+    pub steps: Option<usize>,
+    /// Session to adapt; creates a new session if omitted.
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdaptResponse {
+    session_id: String,
+    object: String,
+    steps_per_token: usize,
+    corpus_documents: usize,
+}
+
+// -- /v1/sessions/{id}/checkpoint --
+
+/// Serialisable representation of one W_tilde layer tensor.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LayerCheckpoint {
+    /// Tensor shape, e.g. `[1, 4, 16, 16]`.
+    pub shape: Vec<usize>,
+    /// Flattened f32 values (row-major).
+    pub data: Vec<f32>,
+}
+
+/// Full serialisable session checkpoint.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionCheckpoint {
+    pub session_id: String,
+    pub version: u32,
+    pub created_at: u64,
+    pub layers: Vec<LayerCheckpoint>,
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint helpers
+// ---------------------------------------------------------------------------
+
+fn tensor_to_layer_checkpoint(t: &Tensor) -> candle_core::Result<LayerCheckpoint> {
+    let shape = t.dims().to_vec();
+    let data = t
+        .to_dtype(candle_core::DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(LayerCheckpoint { shape, data })
+}
+
+fn layer_checkpoint_to_tensor(
+    lc: &LayerCheckpoint,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    let total: usize = lc.shape.iter().product();
+    if total != lc.data.len() {
+        candle_core::bail!(
+            "checkpoint shape {:?} implies {} elements but data has {}",
+            lc.shape,
+            total,
+            lc.data.len()
+        );
+    }
+    Tensor::from_vec(lc.data.clone(), (total,), device)?.reshape(lc.shape.as_slice())
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/models` — list available models.
+async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
+    let resp = ListModelsResponse {
+        object: "list".to_string(),
+        data: vec![ModelInfo {
+            id: state.model_id.clone(),
+            object: "model".to_string(),
+            created: 0,
+            owned_by: "axiom-ttt".to_string(),
+        }],
+    };
+    Json(resp)
+}
+
+/// `POST /v1/completions` — text completion (stateless or session-aware).
+async fn create_completion(
+    State(state): State<AppState>,
+    Json(req): Json<CompletionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let max_tokens = req.max_tokens.unwrap_or(32);
+    let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
+
+    let text = run_generation(&state, &req.prompt, max_tokens, req.session_id.as_deref())?;
+
+    Ok(Json(CompletionResponse {
+        id: format!("cmpl-{}", Uuid::new_v4()),
+        object: "text_completion".to_string(),
+        created: unix_now(),
+        model,
+        choices: vec![CompletionChoice {
+            text,
+            index: 0,
+            finish_reason: "stop".to_string(),
+        }],
+    }))
+}
+
+/// `POST /v1/chat/completions` — chat completion (stateless or session-aware).
+async fn create_chat_completion(
+    State(state): State<AppState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let max_tokens = req.max_tokens.unwrap_or(32);
+    let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
+
+    // Concatenate all message contents as the prompt.
+    let prompt = req
+        .messages
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let text = run_generation(&state, &prompt, max_tokens, req.session_id.as_deref())?;
+
+    Ok(Json(ChatCompletionResponse {
+        id: format!("chatcmpl-{}", Uuid::new_v4()),
+        object: "chat.completion".to_string(),
+        created: unix_now(),
+        model,
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content: text,
+            },
+            finish_reason: "stop".to_string(),
+        }],
+    }))
+}
+
+/// `POST /v1/sessions` — create a new persistent TTT session.
+async fn create_session(
+    State(state): State<AppState>,
+    Json(req): Json<CreateSessionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
+
+    // Initialise zeroed W_tilde states.
+    let states = {
+        let pipeline = state
+            .pipeline
+            .lock()
+            .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+        pipeline
+            .init_session_states()
+            .map_err(|e| ApiError::Internal(format!("state init failed: {e}")))?
+    };
+
+    let session_id = Uuid::new_v4().to_string();
+    let now = unix_now();
+    {
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+        sessions.insert(
+            session_id.clone(),
+            SessionData {
+                states,
+                created_at: now,
+                last_used: now,
+                model: model.clone(),
+            },
+        );
+    }
+
+    Ok(Json(CreateSessionResponse {
+        session_id,
+        object: "session".to_string(),
+        created: now,
+        model,
+    }))
+}
+
+/// `DELETE /v1/sessions/{id}` — delete a session and free its W_tilde memory.
+async fn delete_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+
+    let deleted = sessions.remove(&session_id).is_some();
+    Ok(Json(DeleteSessionResponse {
+        session_id,
+        deleted,
+    }))
+}
+
+/// `POST /v1/adapt` — TTT adaptation over a text corpus.
+async fn adapt(
+    State(state): State<AppState>,
+    Json(req): Json<AdaptRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    if req.corpus.is_empty() {
+        return Err(ApiError::BadRequest(
+            "corpus must contain at least one document".into(),
+        ));
+    }
+
+    let corpus_len = req.corpus.len();
+    let steps_per_token = req.steps.unwrap_or(4).clamp(1, 4);
+
+    // Resolve or create a session.
+    let (session_id, initial_states) =
+        resolve_or_create_session(&state, req.session_id.as_deref())?;
+
+    let updated_states = {
+        let pipeline = state
+            .pipeline
+            .lock()
+            .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+        pipeline
+            .adapt_on_corpus(&req.corpus, initial_states)
+            .map_err(|e| ApiError::Internal(format!("adapt failed: {e}")))?
+    };
+
+    // Persist updated states back into the session.
+    {
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.states = updated_states;
+            session.last_used = unix_now();
+        }
+    }
+
+    Ok(Json(AdaptResponse {
+        session_id,
+        object: "adapt".to_string(),
+        steps_per_token,
+        corpus_documents: corpus_len,
+    }))
+}
+
+/// `GET /v1/sessions/{id}/checkpoint` — export session W_tilde as JSON.
+async fn get_checkpoint(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+
+    let session = sessions
+        .get(&session_id)
+        .ok_or_else(|| ApiError::NotFound(format!("session '{session_id}' not found")))?;
+
+    let layers = session
+        .states
+        .iter()
+        .map(tensor_to_layer_checkpoint)
+        .collect::<candle_core::Result<Vec<_>>>()
+        .map_err(|e| ApiError::Internal(format!("serialisation failed: {e}")))?;
+
+    Ok(Json(SessionCheckpoint {
+        session_id: session_id.clone(),
+        version: 1,
+        created_at: session.created_at,
+        layers,
+    }))
+}
+
+/// `PUT /v1/sessions/{id}/checkpoint` — restore session W_tilde from JSON.
+async fn put_checkpoint(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(checkpoint): Json<SessionCheckpoint>,
+) -> Result<impl IntoResponse, ApiError> {
+    if checkpoint.version != 1 {
+        return Err(ApiError::BadRequest(format!(
+            "unsupported checkpoint version {}",
+            checkpoint.version
+        )));
+    }
+
+    // Determine the device from an existing session or the pipeline.
+    let device = {
+        let pipeline = state
+            .pipeline
+            .lock()
+            .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+        pipeline.device().clone()
+    };
+
+    let states = checkpoint
+        .layers
+        .iter()
+        .map(|lc| layer_checkpoint_to_tensor(lc, &device))
+        .collect::<candle_core::Result<Vec<_>>>()
+        .map_err(|e| ApiError::Internal(format!("deserialisation failed: {e}")))?;
+
+    let now = unix_now();
+    let mut sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+
+    sessions
+        .entry(session_id.clone())
+        .and_modify(|s| {
+            s.states = states.clone();
+            s.last_used = now;
+        })
+        .or_insert_with(|| SessionData {
+            states,
+            created_at: now,
+            last_used: now,
+            model: state.model_id.clone(),
+        });
+
+    Ok(Json(CreateSessionResponse {
+        session_id,
+        object: "session".to_string(),
+        created: now,
+        model: state.model_id.clone(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Run generation, optionally using and updating a named session.
+fn run_generation(
+    state: &AppState,
+    prompt: &str,
+    max_tokens: usize,
+    session_id: Option<&str>,
+) -> Result<String, ApiError> {
+    match session_id {
+        None => {
+            // Stateless generation.
+            let pipeline = state
+                .pipeline
+                .lock()
+                .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+            pipeline
+                .generate(prompt, max_tokens)
+                .map_err(|e| ApiError::Internal(format!("generation failed: {e}")))
+        }
+        Some(sid) => {
+            // Stateful generation — load states, generate, store updated states.
+            let initial_states = {
+                let sessions = state
+                    .sessions
+                    .lock()
+                    .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+                sessions
+                    .get(sid)
+                    .map(|s| s.states.clone())
+                    .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?
+            };
+
+            let (text, updated_states) = {
+                let pipeline = state
+                    .pipeline
+                    .lock()
+                    .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+                pipeline
+                    .generate_with_session(prompt, max_tokens, initial_states)
+                    .map_err(|e| ApiError::Internal(format!("generation failed: {e}")))?
+            };
+
+            {
+                let mut sessions = state
+                    .sessions
+                    .lock()
+                    .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+                if let Some(session) = sessions.get_mut(sid) {
+                    session.states = updated_states;
+                    session.last_used = unix_now();
+                }
+            }
+
+            Ok(text)
+        }
+    }
+}
+
+/// Resolve an existing session or create a fresh one, returning `(session_id, states)`.
+fn resolve_or_create_session(
+    state: &AppState,
+    session_id: Option<&str>,
+) -> Result<(String, Vec<Tensor>), ApiError> {
+    if let Some(sid) = session_id {
+        let sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+        let states = sessions
+            .get(sid)
+            .map(|s| s.states.clone())
+            .ok_or_else(|| ApiError::NotFound(format!("session '{sid}' not found")))?;
+        Ok((sid.to_string(), states))
+    } else {
+        // Auto-create a transient session.
+        let states = {
+            let pipeline = state
+                .pipeline
+                .lock()
+                .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+            pipeline
+                .init_session_states()
+                .map_err(|e| ApiError::Internal(format!("state init failed: {e}")))?
+        };
+        let new_id = Uuid::new_v4().to_string();
+        let now = unix_now();
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+        sessions.insert(
+            new_id.clone(),
+            SessionData {
+                states: states.clone(),
+                created_at: now,
+                last_used: now,
+                model: state.model_id.clone(),
+            },
+        );
+        Ok((new_id, states))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Router construction
+// ---------------------------------------------------------------------------
+
+/// Build the axum Router with all API routes attached.
+pub fn create_router(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/models", get(list_models))
+        .route("/v1/completions", post(create_completion))
+        .route("/v1/chat/completions", post(create_chat_completion))
+        .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions/:id", delete(delete_session))
+        .route("/v1/adapt", post(adapt))
+        .route("/v1/sessions/:id/checkpoint", get(get_checkpoint))
+        .route("/v1/sessions/:id/checkpoint", put(put_checkpoint))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
+/// Start the HTTP server and block until it is stopped.
+pub async fn run_server(
+    host: &str,
+    port: u16,
+    config: AxiomConfig,
+    checkpoint_path: &str,
+    device: Device,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use crate::config::DEFAULT_CHECKPOINT_PATH;
+
+    println!("[*] Initializing system sanity check prior to binding network sockets...");
+
+    let pipeline = if checkpoint_path == DEFAULT_CHECKPOINT_PATH {
+        InferencePipeline::new(config.clone(), device)
+    } else {
+        InferencePipeline::with_checkpoint(config.clone(), device, checkpoint_path)
+    }
+    .map_err(|e| format!("failed to assemble inference pipeline: {e}"))?;
+
+    println!(
+        "[+] Sanity check passed. safetensors matrix dimensions align perfectly with {} layers.",
+        config.n_layers
+    );
+
+    let model_id = "axiom-ttt-v1".to_string();
+    let state = AppState::new(pipeline, model_id);
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    println!("[+] Axiom-TTT server listening on http://{host}:{port}");
+    println!("[+] OpenAI-compatible API endpoints:");
+    println!("      GET  /v1/models");
+    println!("      POST /v1/completions");
+    println!("      POST /v1/chat/completions");
+    println!("      POST /v1/sessions          (create TTT session)");
+    println!("      POST /v1/adapt             (in-place TTT adaptation)");
+    println!("      GET  /v1/sessions/{{id}}/checkpoint");
+    println!("      PUT  /v1/sessions/{{id}}/checkpoint");
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use candle_core::Device;
+    use tower::ServiceExt;
+
+    fn build_pipeline() -> InferencePipeline {
+        use crate::config::AxiomConfig;
+        use crate::inference::InferencePipeline;
+
+        let config = AxiomConfig {
+            d_model: 16,
+            n_layers: 1,
+            num_heads: 2,
+            head_dim: 8,
+            vocab_size: 64,
+            lr_inner: 1e-3,
+            rms_norm_eps: 1e-6,
+            use_log_scan: false,
+            log_scan_auto_threshold: 100_000,
+        };
+        InferencePipeline::new(config, Device::Cpu).expect("pipeline init")
+    }
+
+    /// Build AppState outside the async executor.
+    ///
+    /// `reqwest::blocking::Client` (used inside `JitContextStreamer`) creates a
+    /// temporary tokio runtime during `build()` and drops it before returning.
+    /// Dropping a runtime while already inside a tokio runtime panics.
+    /// `spawn_blocking` moves that work to a thread-pool thread where blocking
+    /// operations are allowed.
+    async fn make_test_state() -> AppState {
+        let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
+        AppState::new(pipeline, "axiom-ttt-test".to_string())
+    }
+
+    /// Drop the pipeline `Arc` on a blocking thread for the same reason.
+    async fn safe_drop(arc: std::sync::Arc<std::sync::Mutex<crate::inference::InferencePipeline>>) {
+        tokio::task::spawn_blocking(move || drop(arc))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_models_returns_200() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_session_returns_session_id() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/sessions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["session_id"].is_string());
+        assert_eq!(json["object"], "session");
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_unknown_session_returns_deleted_false() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/v1/sessions/nonexistent-id")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["deleted"], false);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_adapt_requires_nonempty_corpus() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/adapt")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"corpus":[]}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_returns_200() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let body = r#"{"messages":[{"role":"user","content":"hello"}],"max_tokens":4}"#;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        safe_drop(pipeline_arc).await;
+    }
+}

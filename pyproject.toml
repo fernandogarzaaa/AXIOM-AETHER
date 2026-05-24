@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "axiom-engine"
+version = "1.0.0"
+description = "Axiom-TTT: Online Test-Time Training Inference Engine with OpenAI-compatible API"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Fernando Garza", email = "fernandogarzaaa@users.noreply.github.com" }]
+keywords = ["ai", "llm", "test-time-training", "ttt", "inference", "openai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.0",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",  # async test client for FastAPI
+]
+
+[project.scripts]
+axiom-server = "axiom_engine.server:serve"
+
+[project.urls]
+Homepage = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
+Repository = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
+"Bug Tracker" = "https://github.com/fernandogarzaaa/AXIOM-AETHER/issues"
+
+[tool.setuptools.packages.find]
+include = ["axiom_engine*"]

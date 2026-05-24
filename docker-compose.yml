@@ -2,10 +2,13 @@ version: '3.8'
 
 services:
   axiom_engine:
+    # Published to ghcr.io via .github/workflows/docker.yml.
+    # Override with `image: ghcr.io/fernandogarzaaa/axiom-aether:latest` once the
+    # first Docker workflow run completes.
     build:
       context: .
       dockerfile: Dockerfile
-    image: axiom-ttt-engine:v1.0.0
+    image: ${AXIOM_IMAGE:-ghcr.io/fernandogarzaaa/axiom-aether:latest}
     container_name: axiom_inference_provider
     ports:
       - "${AXIOM_PORT:-8080}:8080"
@@ -15,9 +18,11 @@ services:
     environment:
       - AXIOM_HOST=0.0.0.0
       - AXIOM_PORT=8080
+      - AXIOM_DEVICE=${AXIOM_DEVICE:-cpu}
       - AXIOM_CONTEXT_API_URL=${AXIOM_CONTEXT_API_URL:-https://api.exa.ai/search}
       - AXIOM_CONTEXT_API_KEY=${AXIOM_CONTEXT_API_KEY}
       - AXIOM_MAX_CONTEXT_TOKENS=${AXIOM_MAX_CONTEXT_TOKENS:-4096}
+      - RUST_LOG=${RUST_LOG:-info}
     restart: unless-stopped
     logging:
       driver: "json-file"

@@ -110,6 +110,102 @@ impl InferencePipeline {
         })
     }
 
+    /// Return a reference to the device this pipeline runs on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Allocate zeroed W_tilde states for one batch element across all layers.
+    ///
+    /// These states are used as the initial condition for a new TTT session.
+    pub fn init_session_states(&self) -> Result<Vec<Tensor>> {
+        self.engine.init_states(1, &self.device)
+    }
+
+    /// Stateful generation: run inference while carrying an external W_tilde session.
+    ///
+    /// Unlike [`generate`], this method accepts the caller-owned TTT weight states and
+    /// returns updated states alongside the generated text.  Call this for every turn in
+    /// a persistent session so the model continuously learns from the conversation.
+    ///
+    /// # Arguments
+    /// * `prompt`          – Input text.
+    /// * `max_new_tokens`  – Maximum tokens to produce.
+    /// * `states`          – Per-layer W_tilde tensors from the current session.
+    ///
+    /// # Returns
+    /// `(generated_text, updated_states)`.
+    pub fn generate_with_session(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        states: Vec<Tensor>,
+    ) -> Result<(String, Vec<Tensor>)> {
+        let context_ids = self.streamer.fetch_and_pack_context(prompt);
+        let context_tensor =
+            Tensor::from_vec(context_ids.clone(), (1, context_ids.len()), &self.device)?;
+        // Prime context (stateless prefill to warm model internals).
+        let _ = self.engine.forward(&context_tensor, None, false)?;
+
+        let prompt_ids = self.encode(prompt);
+        let prompt_len = prompt_ids.len();
+        let prompt_tensor = Tensor::from_vec(prompt_ids.clone(), (1, prompt_len), &self.device)?;
+        // Prefill prompt without updating the session state.
+        let _ = self.engine.forward(&prompt_tensor, None, false)?;
+
+        let mut last_token = *prompt_ids.last().unwrap_or(&0);
+        let mut current_states = states;
+        let mut generated = Vec::with_capacity(max_new_tokens);
+
+        for _ in 0..max_new_tokens {
+            let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
+            let (logits, next_states) =
+                self.engine
+                    .forward(&token_tensor, Some(current_states), true)?;
+            current_states = next_states.expect("decode must return states");
+
+            let next_id = logits
+                .squeeze(1)?
+                .argmax(D::Minus1)?
+                .squeeze(0)?
+                .to_scalar::<u32>()?;
+            generated.push(next_id);
+            last_token = next_id;
+        }
+
+        Ok((self.decode(&generated), current_states))
+    }
+
+    /// In-place TTT adaptation over a text corpus.
+    ///
+    /// Runs the decode loop on every token of every corpus document, updating the
+    /// per-layer W_tilde states via the TTT gradient rule — without touching the
+    /// shared model weights.  The adapted states can then be used for generation
+    /// via [`generate_with_session`] to produce personalised output.
+    ///
+    /// # Arguments
+    /// * `corpus` – Text examples to adapt on.
+    /// * `states` – Current session W_tilde tensors.
+    ///
+    /// # Returns
+    /// Updated W_tilde tensors after processing all corpus tokens.
+    pub fn adapt_on_corpus(&self, corpus: &[String], states: Vec<Tensor>) -> Result<Vec<Tensor>> {
+        let mut current_states = states;
+
+        for text in corpus {
+            let token_ids = self.encode(text);
+            for &token_id in &token_ids {
+                let token_tensor = Tensor::from_vec(vec![token_id], (1, 1), &self.device)?;
+                let (_, next_states) =
+                    self.engine
+                        .forward(&token_tensor, Some(current_states), true)?;
+                current_states = next_states.expect("decode must return states");
+            }
+        }
+
+        Ok(current_states)
+    }
+
     fn encode(&self, prompt: &str) -> Vec<u32> {
         match &self.tokenizer {
             TokenizerBackend::Hf(tokenizer) => match tokenizer.encode(prompt, true) {

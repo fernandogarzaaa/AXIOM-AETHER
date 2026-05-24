@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "Axiom-TTT Inference Engine – Rust implementation using candle"
 
+[features]
+default = []
+# Enable NVIDIA CUDA GPU backend (requires CUDA toolkit).
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# Enable Apple Metal GPU backend (macOS / Apple Silicon only).
+metal = ["candle-core/metal", "candle-nn/metal"]
+
 [dependencies]
 candle-core = "0.8"
 candle-nn = "0.8"
@@ -12,6 +19,14 @@ sha2 = "0.10.8"
 rand = "0.8.5"
 indicatif = "0.17.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 tokenizers = "0.15"
 urlencoding = "2.1"
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"

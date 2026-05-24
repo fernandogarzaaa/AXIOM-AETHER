@@ -4,16 +4,15 @@ mod inference;
 mod jit_streamer;
 mod kernel;
 mod log_scan;
+mod server;
 mod train;
 mod ttt_layer;
 
 use std::env;
-use std::error::Error;
 
 use candle_core::{bail, Device, Result};
 use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH, DEFAULT_LOG_SCAN_AUTO_THRESHOLD};
 use inference::{InferencePipeline, InferenceRuntimeOptions};
-use tokio::io::AsyncWriteExt;
 use train::AxiomTrainer;
 
 #[derive(Debug)]
@@ -33,10 +32,37 @@ struct CliArgs {
     host: String,
     port: u16,
     use_log_scan: bool,
+    /// Compute device: "cpu", "cuda", or "metal".
+    device: String,
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH] [--use-log-scan]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N] [--use-log-scan]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH] [--use-log-scan]"
+    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH] [--use-log-scan] [--device cpu|cuda|metal]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N] [--use-log-scan] [--device cpu|cuda|metal]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH] [--use-log-scan] [--device cpu|cuda|metal]"
+}
+
+/// Resolve a `Device` from a string name.
+///
+/// CUDA and Metal support requires the crate to be compiled with the respective
+/// feature flag (`--features cuda` or `--features metal`).
+fn device_from_str(s: &str) -> Result<Device> {
+    match s {
+        "cpu" => Ok(Device::Cpu),
+        #[cfg(feature = "cuda")]
+        "cuda" => Device::new_cuda(0),
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => bail!(
+            "CUDA device requested but the 'cuda' feature is not compiled in.\n\
+             Rebuild with: cargo build --release --features cuda"
+        ),
+        #[cfg(feature = "metal")]
+        "metal" => Device::new_metal(0),
+        #[cfg(not(feature = "metal"))]
+        "metal" => bail!(
+            "Metal device requested but the 'metal' feature is not compiled in.\n\
+             Rebuild with: cargo build --release --features metal"
+        ),
+        other => bail!("unsupported device '{other}'. Valid options: cpu, cuda, metal"),
+    }
 }
 
 fn parse_cli() -> Result<CliArgs> {
@@ -68,6 +94,7 @@ fn parse_cli() -> Result<CliArgs> {
         .ok()
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
         .unwrap_or(false);
+    let mut device = env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string());
     let mut prompt_parts: Vec<String> = Vec::new();
 
     let mut i = 1;
@@ -183,6 +210,13 @@ fn parse_cli() -> Result<CliArgs> {
                 i += 1;
                 continue;
             }
+            "--device" => {
+                i += 1;
+                if i >= argv.len() {
+                    bail!("missing value for --device");
+                }
+                device = argv[i].clone();
+            }
             value => prompt_parts.push(value.to_string()),
         }
         i += 1;
@@ -214,58 +248,14 @@ fn parse_cli() -> Result<CliArgs> {
         host,
         port,
         use_log_scan,
+        device,
     })
-}
-
-async fn start_server(
-    host: &str,
-    port: u16,
-    config: AxiomConfig,
-    checkpoint_path: &str,
-) -> std::result::Result<(), Box<dyn Error>> {
-    println!("[*] Initializing system sanity check prior to binding network sockets...");
-
-    let validation_pipeline = if checkpoint_path == DEFAULT_CHECKPOINT_PATH {
-        InferencePipeline::new(config.clone(), Device::Cpu)
-    } else {
-        InferencePipeline::with_checkpoint(config.clone(), Device::Cpu, checkpoint_path)
-    };
-
-    match validation_pipeline {
-        Ok(_) => println!(
-            "[+] Sanity check passed. safetensors matrix dimensions align perfectly with {} layers.",
-            config.n_layers
-        ),
-        Err(e) => {
-            eprintln!(
-                "[!] Critical Boot Error: Failed to assemble inference pipeline from checkpoint: {:?}",
-                e
-            );
-            std::process::exit(1);
-        }
-    }
-
-    let listener = tokio::net::TcpListener::bind((host, port)).await?;
-    println!("[+] Server listening on http://{host}:{port}");
-
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        tokio::spawn(async move {
-            if let Err(err) = stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 20\r\n\r\naxiom_engine online\n",
-                )
-                .await
-            {
-                eprintln!("[!] Failed to write response: {err}");
-            }
-        });
-    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_cli()?;
+    let device = device_from_str(&args.device)?;
 
     // Keep local defaults small enough for CPU experimentation.
     let config = AxiomConfig {
@@ -286,11 +276,11 @@ async fn main() -> Result<()> {
                 && args.batch_size == 8
                 && args.seq_len == 32
             {
-                AxiomTrainer::new(config, Device::Cpu)?
+                AxiomTrainer::new(config, device)?
             } else {
                 AxiomTrainer::with_settings(
                     config,
-                    Device::Cpu,
+                    device,
                     args.checkpoint_path,
                     args.batch_size,
                     args.seq_len,
@@ -310,7 +300,7 @@ async fn main() -> Result<()> {
             };
             let pipeline = InferencePipeline::with_checkpoint_and_options(
                 config,
-                Device::Cpu,
+                device,
                 args.checkpoint_path,
                 runtime,
             )?;
@@ -318,7 +308,7 @@ async fn main() -> Result<()> {
             println!("{output}");
         }
         "server" => {
-            start_server(&args.host, args.port, config, &args.checkpoint_path)
+            server::run_server(&args.host, args.port, config, &args.checkpoint_path, device)
                 .await
                 .map_err(|e| candle_core::Error::Msg(format!("server startup failed: {e}")))?;
         }
