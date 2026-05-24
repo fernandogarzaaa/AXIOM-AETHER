@@ -55,6 +55,7 @@ impl ChunkFusedTTT {
         let mut global_session_weight = Tensor::zeros((b, h, d, d), DType::F32, queries.device())?;
         let inv_sqrt_d = Tensor::new(1f32 / (d as f32).sqrt(), queries.device())?;
         let mut cached_mask: Option<(usize, Tensor)> = None;
+        let mut cached_inv_len: Option<(usize, Tensor)> = None;
 
         let mut chunk_outputs: Vec<Tensor> = Vec::new();
         let mut start = 0usize;
@@ -87,11 +88,19 @@ impl ChunkFusedTTT {
 
             // Dense local update in chunk-local memory layout bounds.
             // Update shape: [B, H, D, D]
+            let inv_len = match &cached_inv_len {
+                Some((cached_len, inv)) if *cached_len == len => inv.clone(),
+                _ => {
+                    let inv = Tensor::new(1f32 / len as f32, queries.device())?;
+                    cached_inv_len = Some((len, inv.clone()));
+                    inv
+                }
+            };
             let local_grad = v_chunk
                 .transpose(2, 3)?
                 .contiguous()?
                 .matmul(&k_chunk)?
-                .broadcast_mul(&Tensor::new(1f32 / len as f32, queries.device())?)?;
+                .broadcast_mul(&inv_len)?;
             global_session_weight = global_session_weight.add(&local_grad)?;
 
             // Carry chunk boundary state to next chunk via global matrix.

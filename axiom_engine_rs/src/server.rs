@@ -908,6 +908,12 @@ fn load_session_states(state: &AppState, sid: &str) -> Result<Vec<Tensor>, ApiEr
     Ok(session.states.clone())
 }
 
+fn is_idle_quantizable(session: &SessionData, now: u64) -> bool {
+    now.saturating_sub(session.last_used) > IDLE_QUANTIZE_SECONDS
+        && session.quantized_states.is_none()
+        && !session.states.is_empty()
+}
+
 fn spawn_idle_quantization_worker(state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -931,11 +937,7 @@ fn quantize_idle_sessions(state: &AppState) -> Result<(), ApiError> {
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         sessions
             .iter()
-            .filter(|(_, session)| {
-                now.saturating_sub(session.last_used) > IDLE_QUANTIZE_SECONDS
-                    && session.quantized_states.is_none()
-                    && !session.states.is_empty()
-            })
+            .filter(|(_, session)| is_idle_quantizable(session, now))
             .map(|(sid, _)| sid.clone())
             .collect()
     };
@@ -947,10 +949,7 @@ fn quantize_idle_sessions(state: &AppState) -> Result<(), ApiError> {
                 .read()
                 .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
             if let Some(session) = sessions.get(&sid) {
-                if now.saturating_sub(session.last_used) > IDLE_QUANTIZE_SECONDS
-                    && session.quantized_states.is_none()
-                    && !session.states.is_empty()
-                {
+                if is_idle_quantizable(session, now) {
                     session.states.clone()
                 } else {
                     Vec::new()
@@ -969,10 +968,7 @@ fn quantize_idle_sessions(state: &AppState) -> Result<(), ApiError> {
             .write()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         if let Some(session) = sessions.get_mut(&sid) {
-            if now.saturating_sub(session.last_used) > IDLE_QUANTIZE_SECONDS
-                && session.quantized_states.is_none()
-                && !session.states.is_empty()
-            {
+            if is_idle_quantizable(session, now) {
                 session.quantized_states = Some(quantized);
                 session.states.clear();
             }
