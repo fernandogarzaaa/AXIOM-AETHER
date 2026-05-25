@@ -1,4 +1,4 @@
-use candle_core::{bail, DType, Device, Result, Tensor};
+use candle_core::{bail, DType, Result, Tensor};
 
 const NF4_BLOCK_SIZE: usize = 64;
 const NF4_PACKED_BLOCK_BYTES: usize = NF4_BLOCK_SIZE / 2;
@@ -54,28 +54,6 @@ impl NF4Quantizer {
         Ok((packed_tensor, scale_tensor))
     }
 
-    pub fn quantize_f32_slice(flat: &[f32], shape: &[usize]) -> Result<NF4QuantizedDescriptor> {
-        if flat.is_empty() {
-            bail!("cannot quantize an empty tensor");
-        }
-        let expected_len: usize = shape.iter().product();
-        if expected_len != flat.len() {
-            bail!(
-                "shape {:?} implies {} elements but slice has {}",
-                shape,
-                expected_len,
-                flat.len()
-            );
-        }
-        let (packed_indices, scales, packed_width) = Self::quantize_flat_nf4(flat)?;
-        Ok(NF4QuantizedDescriptor {
-            shape: shape.to_vec(),
-            packed_indices,
-            scales,
-            packed_width,
-        })
-    }
-
     /// Dequantize packed NF4 indices with block scales back to f32 tensor.
     ///
     /// Returns shape `[num_blocks, 64]`.
@@ -105,43 +83,6 @@ impl NF4Quantizer {
         let out = Self::dequantize_flat_nf4(num_blocks, packed_width, &packed, &scales)?;
 
         Tensor::from_vec(out, (num_blocks, packed_width * 2), packed_indices.device())
-    }
-
-    pub fn dequantize_descriptor(desc: &NF4QuantizedDescriptor, device: &Device) -> Result<Tensor> {
-        if desc.packed_width == 0 {
-            bail!("packed width must be non-zero");
-        }
-        if desc.scales.is_empty() {
-            bail!("scale list cannot be empty");
-        }
-        let num_blocks = desc.scales.len();
-        let expected_packed_len = num_blocks * desc.packed_width;
-        if desc.packed_indices.len() != expected_packed_len {
-            bail!(
-                "packed index size mismatch: expected {}, got {}",
-                expected_packed_len,
-                desc.packed_indices.len()
-            );
-        }
-        let total: usize = desc.shape.iter().product();
-        if total == 0 {
-            bail!("shape {:?} implies zero elements", desc.shape);
-        }
-        let mut dequantized = Self::dequantize_flat_nf4(
-            num_blocks,
-            desc.packed_width,
-            &desc.packed_indices,
-            &desc.scales,
-        )?;
-        if dequantized.len() < total {
-            bail!(
-                "dequantized data too small: expected at least {}, got {}",
-                total,
-                dequantized.len()
-            );
-        }
-        dequantized.truncate(total);
-        Tensor::from_vec(dequantized, (total,), device)?.reshape(desc.shape.as_slice())
     }
 
     fn quantize_flat_nf4(flat: &[f32]) -> Result<(Vec<u8>, Vec<f32>, usize)> {

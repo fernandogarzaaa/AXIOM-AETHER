@@ -116,8 +116,7 @@ impl LogosAssociativeScanner {
         // We re-read directly from the original `states` tensor (unmodified).
         // ------------------------------------------------------------------
         let mut inclusive: Vec<Tensor> = Vec::with_capacity(t);
-        for i in 0..t {
-            let excl = &arr[i];
+        for (i, excl) in arr.iter().enumerate().take(t) {
             let orig = states.narrow(1, i, 1)?.squeeze(1)?;
             let product = excl.mul(&orig)?;
             let incl = excl.add(&orig)?.add(&product)?.unsqueeze(1)?;

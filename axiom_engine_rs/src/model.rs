@@ -8,7 +8,7 @@
 //!
 //! Architecture: Embedding → N × NativeTTTBlock → RMSNorm → LM Head
 
-use candle_core::{DType, Result, Tensor, D};
+use candle_core::{DType, Result, Tensor};
 use candle_nn::{Module, VarBuilder};
 
 use crate::config::AxiomConfig;
@@ -82,7 +82,7 @@ impl AxiomTTTLM {
     pub fn forward_lm(
         &self,
         input_ids: &Tensor,
-        session_states: &mut Vec<Tensor>,
+        session_states: &mut [Tensor],
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
 
@@ -122,7 +122,7 @@ impl AxiomTTTLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, Tensor};
+    use candle_core::{Device, Tensor, D};
     use candle_nn::{VarBuilder, VarMap};
 
     fn make_model(n_layers: usize) -> (AxiomTTTLM, Device) {
@@ -159,7 +159,7 @@ mod tests {
         let (model, device) = make_model(2);
         let mut states = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 1usize), DType::U32, &device).unwrap();
-        let logits = model.forward_lm(&input_ids, &mut states).unwrap();
+        let logits = model.forward_lm(&input_ids, &mut states[..]).unwrap();
         assert_eq!(logits.dims(), &[1, 1, 32]);
     }
 
@@ -168,7 +168,7 @@ mod tests {
         let (model, device) = make_model(1);
         let mut states = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 5usize), DType::U32, &device).unwrap();
-        let logits = model.forward_lm(&input_ids, &mut states).unwrap();
+        let logits = model.forward_lm(&input_ids, &mut states[..]).unwrap();
         assert_eq!(logits.dims(), &[1, 5, 32]);
     }
 
@@ -178,7 +178,7 @@ mod tests {
         let mut states = model.init_states(&device).unwrap();
         let eye_data: Vec<f32> = states[0].flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let input_ids = Tensor::ones((1usize, 1usize), DType::U32, &device).unwrap();
-        let _ = model.forward_lm(&input_ids, &mut states).unwrap();
+        let _ = model.forward_lm(&input_ids, &mut states[..]).unwrap();
         let updated_data: Vec<f32> = states[0].flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_ne!(
             eye_data, updated_data,
@@ -191,7 +191,7 @@ mod tests {
         let (model, device) = make_model(2);
         let mut states = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 3usize), DType::U32, &device).unwrap();
-        let logits = model.forward_lm(&input_ids, &mut states).unwrap();
+        let logits = model.forward_lm(&input_ids, &mut states[..]).unwrap();
         let values: Vec<f32> = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(values.iter().all(|v| v.is_finite()));
     }
@@ -201,7 +201,7 @@ mod tests {
         let (model, device) = make_model(1);
         let mut states = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 1usize), DType::U32, &device).unwrap();
-        let logits = model.forward_lm(&input_ids, &mut states).unwrap();
+        let logits = model.forward_lm(&input_ids, &mut states[..]).unwrap();
         // logits: [1, 1, vocab_size] → squeeze(1) → [1, vocab_size] → argmax → [1]
         let next_id = logits
             .squeeze(1)

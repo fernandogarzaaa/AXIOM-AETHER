@@ -71,16 +71,14 @@ struct SessionData {
     residency: SessionResidency,
     created_at: u64,
     last_used: u64,
-    model: String,
 }
 
 impl SessionData {
-    fn new_active(states: Vec<Tensor>, created_at: u64, model: String) -> Self {
+    fn new_active(states: Vec<Tensor>, created_at: u64) -> Self {
         Self {
             residency: SessionResidency::Active(states),
             created_at,
             last_used: created_at,
-            model,
         }
     }
 
@@ -90,13 +88,6 @@ impl SessionData {
 
     fn is_quantized(&self) -> bool {
         matches!(self.residency, SessionResidency::Quantized(_))
-    }
-
-    fn state_count(&self) -> usize {
-        match &self.residency {
-            SessionResidency::Active(states) => states.len(),
-            SessionResidency::Quantized(states) => states.len(),
-        }
     }
 
     fn states_clone(&self) -> candle_core::Result<Vec<Tensor>> {
@@ -112,8 +103,35 @@ impl SessionData {
         if let SessionResidency::Quantized(descriptors) = &self.residency {
             let mut states = Vec::with_capacity(descriptors.len());
             for descriptor in descriptors {
-                let tensor = NF4Quantizer::dequantize_descriptor(descriptor, device)?;
-                states.push(tensor.to_dtype(DType::F32)?);
+                if descriptor.packed_width == 0 {
+                    candle_core::bail!("packed width must be non-zero")
+                }
+                if descriptor.scales.is_empty() {
+                    candle_core::bail!("scale list cannot be empty")
+                }
+                let num_blocks = descriptor.scales.len();
+                let packed = Tensor::from_vec(
+                    descriptor.packed_indices.clone(),
+                    (num_blocks, descriptor.packed_width),
+                    device,
+                )?;
+                let scales = Tensor::from_vec(descriptor.scales.clone(), (num_blocks,), device)?;
+                let mut data = NF4Quantizer::dequantize_state(&packed, &scales)?
+                    .to_dtype(DType::F32)?
+                    .contiguous()?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let total: usize = descriptor.shape.iter().product();
+                if data.len() < total {
+                    candle_core::bail!(
+                        "dequantized data too small: expected at least {}, got {}",
+                        total,
+                        data.len()
+                    );
+                }
+                data.truncate(total);
+                let tensor = Tensor::from_vec(data, (total,), device)?.reshape(descriptor.shape.as_slice())?;
+                states.push(tensor);
             }
             self.residency = SessionResidency::Active(states);
         }
@@ -211,11 +229,6 @@ impl AppState {
     }
 }
 
-struct OffloadLayer {
-    shape: Vec<usize>,
-    data: Vec<f32>,
-}
-
 async fn enforce_lru_vram_budget_async(
     sessions: Arc<RwLock<HashMap<String, SessionData>>>,
 ) -> std::result::Result<(), String> {
@@ -262,7 +275,7 @@ async fn enforce_lru_vram_budget_async(
                         let cpu_f32 = state.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
                         let shape = cpu_f32.dims().to_vec();
                         let data = cpu_f32.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-                        Ok(OffloadLayer { shape, data })
+                        Ok((shape, data))
                     })
                     .collect::<candle_core::Result<Vec<_>>>()
                     .map_err(|e| format!("state staging failed: {e}"))?,
@@ -272,9 +285,39 @@ async fn enforce_lru_vram_budget_async(
         let quantized_layers = spawn_blocking(move || {
             raw_layers
                 .into_iter()
-                .map(|layer| {
-                    NF4Quantizer::quantize_f32_slice(&layer.data, &layer.shape)
-                        .map_err(|e| e.to_string())
+                .map(|(shape, data)| {
+                    let total: usize = shape.iter().product();
+                    let staged = Tensor::from_vec(data, (total,), &Device::Cpu)
+                        .and_then(|t| t.reshape(shape.as_slice()))
+                        .map_err(|e| e.to_string())?;
+                    let (packed_indices, scale) =
+                        NF4Quantizer::quantize_state(&staged).map_err(|e| e.to_string())?;
+                    let (num_blocks, packed_width) =
+                        packed_indices.dims2().map_err(|e| e.to_string())?;
+                    let packed_indices = packed_indices
+                        .to_dtype(DType::U8)
+                        .and_then(|t| t.contiguous())
+                        .and_then(|t| t.flatten_all())
+                        .and_then(|t| t.to_vec1::<u8>())
+                        .map_err(|e| e.to_string())?;
+                    let scales = scale
+                        .to_dtype(DType::F32)
+                        .and_then(|t| t.contiguous())
+                        .and_then(|t| t.flatten_all())
+                        .and_then(|t| t.to_vec1::<f32>())
+                        .map_err(|e| e.to_string())?;
+                    if scales.len() != num_blocks {
+                        return Err(format!(
+                            "invalid scale length: expected {num_blocks}, got {}",
+                            scales.len()
+                        ));
+                    }
+                    Ok(NF4QuantizedDescriptor {
+                        shape,
+                        packed_indices,
+                        scales,
+                        packed_width,
+                    })
                 })
                 .collect::<std::result::Result<Vec<NF4QuantizedDescriptor>, String>>()
         })
@@ -734,7 +777,7 @@ async fn create_session(
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         sessions.insert(
             session_id.clone(),
-            SessionData::new_active(states, now, model.clone()),
+            SessionData::new_active(states, now),
         );
     }
     metrics::register_session(&session_id);
@@ -898,7 +941,7 @@ async fn put_checkpoint(
             s.replace_states(states.clone());
             s.last_used = now;
         })
-        .or_insert_with(|| SessionData::new_active(states, now, state.model_id.clone()));
+        .or_insert_with(|| SessionData::new_active(states, now));
     drop(sessions);
     metrics::register_session(&session_id);
     metrics::mark_session_quantized(&session_id, false);
@@ -1104,7 +1147,7 @@ fn resolve_or_create_session(
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         sessions.insert(
             new_id.clone(),
-            SessionData::new_active(states.clone(), now, state.model_id.clone()),
+            SessionData::new_active(states.clone(), now),
         );
         drop(sessions);
         metrics::register_session(&new_id);
@@ -1323,7 +1366,7 @@ mod tests {
             let mut sessions = state.sessions.write().unwrap();
             sessions.insert(
                 session_id.clone(),
-                SessionData::new_active(initial_states.clone(), now, state.model_id.clone()),
+                SessionData::new_active(initial_states.clone(), now),
             );
         }
         metrics::register_session(&session_id);
@@ -1351,11 +1394,16 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["session_id"], session_id);
 
-        let sessions = state.sessions.read().unwrap();
-        let session = sessions.get("adapt-session").unwrap();
-        assert_eq!(session.state_count(), initial_states.len());
-        assert!(session.last_used >= now);
-        drop(sessions);
+        {
+            let sessions = state.sessions.read().unwrap();
+            let session = sessions.get("adapt-session").unwrap();
+            let session_state_count = match &session.residency {
+                SessionResidency::Active(states) => states.len(),
+                SessionResidency::Quantized(states) => states.len(),
+            };
+            assert_eq!(session_state_count, initial_states.len());
+            assert!(session.last_used >= now);
+        }
         let tokens_after = crate::metrics::COUNTER_TOTAL_TOKENS_PREFILLED
             .load(std::sync::atomic::Ordering::Relaxed);
         assert!(tokens_after > tokens_before);
@@ -1453,7 +1501,7 @@ mod tests {
             let mut sessions = state.sessions.write().unwrap();
             sessions.insert(
                 session_id.clone(),
-                SessionData::new_active(states, now, state.model_id.clone()),
+                SessionData::new_active(states, now),
             );
         }
         metrics::register_session(&session_id);
@@ -1482,13 +1530,14 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-        let sessions = state.sessions.read().unwrap();
-        let session = sessions.get(&session_id).unwrap();
-        let mut layers = session.states_clone().unwrap();
-        let layer = layers.remove(0);
-        let layer_sum = layer.sum_all().unwrap().to_scalar::<f32>().unwrap();
+        let layer_sum = {
+            let sessions = state.sessions.read().unwrap();
+            let session = sessions.get(&session_id).unwrap();
+            let mut layers = session.states_clone().unwrap();
+            let layer = layers.remove(0);
+            layer.sum_all().unwrap().to_scalar::<f32>().unwrap()
+        };
         assert!(layer_sum > 0.0);
-        drop(sessions);
         safe_drop(pipeline_arc).await;
     }
 
@@ -1507,7 +1556,7 @@ mod tests {
             let mut sessions = state.sessions.write().unwrap();
             sessions.insert(
                 session_id.clone(),
-                SessionData::new_active(states, now, state.model_id.clone()),
+                SessionData::new_active(states, now),
             );
         }
         metrics::register_session(&session_id);
@@ -1568,7 +1617,7 @@ mod tests {
         };
         {
             let mut sessions = state.sessions.write().unwrap();
-            let mut session = SessionData::new_active(states, now, state.model_id.clone());
+            let mut session = SessionData::new_active(states, now);
             let active = match &session.residency {
                 SessionResidency::Active(active) => active.clone(),
                 SessionResidency::Quantized(_) => Vec::new(),
@@ -1611,10 +1660,11 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let sessions = state.sessions.read().unwrap();
-        let session = sessions.get("quantized-session").unwrap();
-        assert!(!session.is_quantized());
-        drop(sessions);
+        {
+            let sessions = state.sessions.read().unwrap();
+            let session = sessions.get("quantized-session").unwrap();
+            assert!(!session.is_quantized());
+        }
         safe_drop(pipeline_arc).await;
     }
 }

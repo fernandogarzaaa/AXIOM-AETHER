@@ -18,7 +18,7 @@ pub struct InferenceRuntimeOptions {
 }
 
 enum TokenizerBackend {
-    Hf(Tokenizer),
+    Hf(Box<Tokenizer>),
     HashFallback,
 }
 
@@ -83,7 +83,7 @@ impl InferencePipeline {
             Some(path) => match Tokenizer::from_file(path) {
                 Ok(tok) => {
                     println!("[+] Loaded tokenizer from {path}");
-                    TokenizerBackend::Hf(tok)
+                    TokenizerBackend::Hf(Box::new(tok))
                 }
                 Err(err) => {
                     println!("[!] Warning: failed to load tokenizer at {path}: {err}");
@@ -150,7 +150,7 @@ impl InferencePipeline {
         if !prompt_ids.is_empty() {
             let prompt_tensor =
                 Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &self.device)?;
-            let _ = self.model.forward_lm(&prompt_tensor, &mut states)?;
+            let _ = self.model.forward_lm(&prompt_tensor, &mut states[..])?;
         }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
@@ -160,7 +160,7 @@ impl InferencePipeline {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             // Snapshot states so a non-finite update can be discarded.
             let states_snapshot = states.clone();
-            let logits = self.model.forward_lm(&token_tensor, &mut states)?;
+            let logits = self.model.forward_lm(&token_tensor, &mut states[..])?;
             if !session_states_are_finite(&states)? {
                 eprintln!(
                     "[emergency] non-finite state detected during generate_with_session; \
@@ -182,23 +182,6 @@ impl InferencePipeline {
         Ok((self.decode(&generated), states))
     }
 
-    /// In-place TTT adaptation over a text corpus.
-    ///
-    /// Runs `AxiomTTTLM::forward_lm` on every document in `corpus`, updating the
-    /// per-layer W_tilde states via the native TTT gradient rule.  The adapted
-    /// states can be used for generation via [`generate_with_session`] to produce
-    /// personalised output.
-    ///
-    /// # Arguments
-    /// * `corpus` – Text examples to adapt on.
-    /// * `states` – Current session W_tilde tensors.
-    ///
-    /// # Returns
-    /// Updated W_tilde tensors after processing all corpus tokens.
-    pub fn adapt_on_corpus(&self, corpus: &[String], states: Vec<Tensor>) -> Result<Vec<Tensor>> {
-        self.adapt_on_corpus_with_steps(corpus, states, 1)
-    }
-
     /// Adaptation with a configurable inner-loop step count.
     ///
     /// The `inner_loop_steps` parameter is retained for API backward compatibility
@@ -218,7 +201,7 @@ impl InferencePipeline {
                 let tensor = Tensor::from_vec(token_ids, (1, len), &self.device)?;
                 // Snapshot for non-finite guard.
                 let snapshot = states.clone();
-                let _ = self.model.forward_lm(&tensor, &mut states)?;
+                let _ = self.model.forward_lm(&tensor, &mut states[..])?;
                 if !session_states_are_finite(&states)? {
                     eprintln!(
                         "[emergency] non-finite state detected during corpus adaptation; \
@@ -226,50 +209,6 @@ impl InferencePipeline {
                     );
                     states = snapshot;
                 }
-            }
-        }
-        Ok(states)
-    }
-
-    /// Adapt on corpus while routing long sequences through chunk-wise fused prefill.
-    ///
-    /// Documents with tokenized length strictly greater than `token_threshold`
-    /// are split into chunks of `block_size` tokens and processed together;
-    /// shorter documents use the standard per-token TTT update.
-    pub fn adapt_on_corpus_with_chunk_fusion(
-        &self,
-        corpus: &[String],
-        mut states: Vec<Tensor>,
-        token_threshold: usize,
-        block_size: usize,
-    ) -> Result<Vec<Tensor>> {
-        for text in corpus {
-            let token_ids = self.encode(text);
-            if token_ids.is_empty() {
-                continue;
-            }
-            // Both short and long sequences are handled identically by forward_lm;
-            // the TTT fast-weight update is inherently causal and online.
-            let chunk_size = if token_ids.len() > token_threshold {
-                block_size.max(1)
-            } else {
-                token_ids.len()
-            };
-            let mut start = 0;
-            while start < token_ids.len() {
-                let end = (start + chunk_size).min(token_ids.len());
-                let chunk = token_ids[start..end].to_vec();
-                let tensor = Tensor::from_vec(chunk, (1, end - start), &self.device)?;
-                let snapshot = states.clone();
-                let _ = self.model.forward_lm(&tensor, &mut states)?;
-                if !session_states_are_finite(&states)? {
-                    eprintln!(
-                        "[emergency] non-finite state detected during chunk-fusion adaptation; \
-                         discarding update and restoring prior snapshot"
-                    );
-                    states = snapshot;
-                }
-                start = end;
             }
         }
         Ok(states)
@@ -351,7 +290,7 @@ impl InferencePipeline {
         if !context_ids.is_empty() {
             let len = context_ids.len();
             let ctx = Tensor::from_vec(context_ids, (1, len), &self.device)?;
-            let _ = self.model.forward_lm(&ctx, &mut states)?;
+            let _ = self.model.forward_lm(&ctx, &mut states[..])?;
         }
 
         // Optional memory-vector injection: directly condition the initial fast-weight
@@ -384,7 +323,7 @@ impl InferencePipeline {
         if !prompt_ids.is_empty() {
             let prompt_tensor =
                 Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &self.device)?;
-            let _ = self.model.forward_lm(&prompt_tensor, &mut states)?;
+            let _ = self.model.forward_lm(&prompt_tensor, &mut states[..])?;
         }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
@@ -393,7 +332,7 @@ impl InferencePipeline {
         for _ in 0..max_new_tokens {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             let states_snapshot = states.clone();
-            let logits = self.model.forward_lm(&token_tensor, &mut states)?;
+            let logits = self.model.forward_lm(&token_tensor, &mut states[..])?;
             if !session_states_are_finite(&states)? {
                 eprintln!(
                     "[emergency] non-finite state detected during generate_with_memory; \
