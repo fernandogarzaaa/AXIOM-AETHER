@@ -1236,13 +1236,9 @@ mod tests {
         let config = AxiomConfig {
             d_model: 16,
             n_layers: 1,
-            num_heads: 2,
-            head_dim: 8,
             vocab_size: 64,
             lr_inner: 1e-3,
             rms_norm_eps: 1e-6,
-            use_log_scan: false,
-            log_scan_auto_threshold: 100_000,
         };
         InferencePipeline::new(config, Device::Cpu).expect("pipeline init")
     }

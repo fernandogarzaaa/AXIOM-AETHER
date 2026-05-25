@@ -4,7 +4,6 @@ pub mod data_gen;
 pub mod inference;
 pub mod jit_streamer;
 pub mod kernel;
-pub mod log_scan;
 pub mod memory_pool;
 pub mod metrics;
 pub mod model;

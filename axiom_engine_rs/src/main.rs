@@ -4,7 +4,6 @@ mod data_gen;
 mod inference;
 mod jit_streamer;
 mod kernel;
-mod log_scan;
 mod memory_pool;
 mod metrics;
 mod model;
@@ -16,7 +15,7 @@ mod ttt_block;
 use std::env;
 
 use candle_core::{bail, Device, Result};
-use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH, DEFAULT_LOG_SCAN_AUTO_THRESHOLD};
+use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use inference::{InferencePipeline, InferenceRuntimeOptions};
 use train::AxiomTrainer;
 
@@ -36,13 +35,12 @@ struct CliArgs {
     max_context_tokens: usize,
     host: String,
     port: u16,
-    use_log_scan: bool,
     /// Compute device: "cpu", "cuda", or "metal".
     device: String,
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH] [--use-log-scan] [--device cpu|cuda|metal]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N] [--use-log-scan] [--device cpu|cuda|metal]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH] [--use-log-scan] [--device cpu|cuda|metal]"
+    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH] [--device cpu|cuda|metal]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N] [--device cpu|cuda|metal]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH] [--device cpu|cuda|metal]"
 }
 
 /// Resolve a `Device` from a string name.
@@ -95,10 +93,6 @@ fn parse_cli() -> Result<CliArgs> {
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(8080);
-    let mut use_log_scan = env::var("AXIOM_USE_LOG_SCAN")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
-        .unwrap_or(false);
     let mut device = env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string());
     let mut prompt_parts: Vec<String> = Vec::new();
 
@@ -210,11 +204,6 @@ fn parse_cli() -> Result<CliArgs> {
                     .parse::<u16>()
                     .map_err(|_| candle_core::Error::Msg("invalid --port value".into()))?;
             }
-            "--use-log-scan" => {
-                use_log_scan = true;
-                i += 1;
-                continue;
-            }
             "--device" => {
                 i += 1;
                 if i >= argv.len() {
@@ -233,10 +222,6 @@ fn parse_cli() -> Result<CliArgs> {
         Some(prompt_parts.join(" "))
     };
 
-    if max_context_tokens > DEFAULT_LOG_SCAN_AUTO_THRESHOLD {
-        use_log_scan = true;
-    }
-
     Ok(CliArgs {
         mode,
         prompt,
@@ -252,7 +237,6 @@ fn parse_cli() -> Result<CliArgs> {
         max_context_tokens,
         host,
         port,
-        use_log_scan,
         device,
     })
 }
@@ -266,13 +250,9 @@ async fn main() -> Result<()> {
     let config = AxiomConfig {
         d_model: 64,
         n_layers: 2,
-        num_heads: 4,
-        head_dim: 16,
         vocab_size: 256,
         lr_inner: 1e-3,
         rms_norm_eps: 1e-6,
-        use_log_scan: args.use_log_scan,
-        log_scan_auto_threshold: DEFAULT_LOG_SCAN_AUTO_THRESHOLD,
     };
 
     match args.mode.as_str() {

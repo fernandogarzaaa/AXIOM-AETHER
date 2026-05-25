@@ -107,13 +107,9 @@ mod tests {
         let config = AxiomConfig {
             d_model,
             n_layers: 1,
-            num_heads: 1,
-            head_dim: d_model,
             vocab_size: 16,
             lr_inner: 1e-3,
             rms_norm_eps: 1e-6,
-            use_log_scan: false,
-            log_scan_auto_threshold: 100_000,
         };
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
