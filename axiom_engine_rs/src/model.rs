@@ -42,7 +42,7 @@ impl AxiomTTTLM {
             )?);
         }
 
-        let ln_f = RMSNorm::new(config.d_model, config.rms_norm_eps, vs.pp("ln_f"))?;
+        let ln_f = RMSNorm::new(config.d_model, config.norm_eps, vs.pp("ln_f"))?;
         let lm_head =
             candle_nn::linear_no_bias(config.d_model, config.vocab_size, vs.pp("lm_head"))?;
 
@@ -128,7 +128,7 @@ mod tests {
             n_layers,
             vocab_size: 32,
             lr_inner: 1e-3,
-            rms_norm_eps: 1e-6,
+            norm_eps: 1e-6,
         };
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);

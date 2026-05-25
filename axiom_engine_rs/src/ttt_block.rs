@@ -33,7 +33,7 @@ impl NativeTTTBlock {
             w_v: candle_nn::linear_no_bias(d, d, vs.pp("w_v"))?,
             layer_norm: candle_nn::layer_norm_no_bias(
                 d,
-                config.rms_norm_eps as f64,
+                config.norm_eps as f64,
                 vs.pp("layer_norm"),
             )?,
             config,
@@ -109,7 +109,7 @@ mod tests {
             n_layers: 1,
             vocab_size: 16,
             lr_inner: 1e-3,
-            rms_norm_eps: 1e-6,
+            norm_eps: 1e-6,
         };
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);

@@ -9,7 +9,7 @@ pub struct AxiomConfig {
     pub vocab_size: usize,
     /// Inner-loop learning rate for the TTT weight update.
     pub lr_inner: f32,
-    pub rms_norm_eps: f32,
+    pub norm_eps: f32,
 }
 
 impl Default for AxiomConfig {
@@ -19,7 +19,7 @@ impl Default for AxiomConfig {
             n_layers: 32,
             vocab_size: 32000,
             lr_inner: 1e-3,
-            rms_norm_eps: 1e-6,
+            norm_eps: 1e-6,
         }
     }
 }

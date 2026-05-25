@@ -252,7 +252,7 @@ async fn main() -> Result<()> {
         n_layers: 2,
         vocab_size: 256,
         lr_inner: 1e-3,
-        rms_norm_eps: 1e-6,
+        norm_eps: 1e-6,
     };
 
     match args.mode.as_str() {

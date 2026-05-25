@@ -14,7 +14,7 @@ fn build_pipeline() -> InferencePipeline {
         n_layers: 1,
         vocab_size: 64,
         lr_inner: 1e-3,
-        rms_norm_eps: 1e-6,
+        norm_eps: 1e-6,
     };
     InferencePipeline::new(config, Device::Cpu).expect("pipeline init")
 }
