@@ -1459,7 +1459,7 @@ mod tests {
         metrics::register_session(&session_id);
         state.refresh_session_metrics().unwrap();
 
-        let delta = Tensor::ones((1usize, 2usize, 8usize, 8usize), DType::F32, &state.device)
+        let delta = Tensor::ones((16usize, 16usize), DType::F32, &state.device)
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();
@@ -1513,7 +1513,7 @@ mod tests {
         metrics::register_session(&session_id);
         state.refresh_session_metrics().unwrap();
 
-        let delta = Tensor::ones((1usize, 2usize, 8usize, 8usize), DType::F32, &state.device)
+        let delta = Tensor::ones((16usize, 16usize), DType::F32, &state.device)
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();

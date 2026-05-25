@@ -9,9 +9,11 @@ mod kernel;
 mod log_scan;
 mod memory_pool;
 mod metrics;
+mod model;
 mod quantization;
 mod server;
 mod train;
+mod ttt_block;
 mod ttt_layer;
 
 use std::env;
