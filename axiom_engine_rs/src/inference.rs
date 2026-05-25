@@ -201,9 +201,10 @@ impl InferencePipeline {
 
     /// Adaptation with a configurable inner-loop step count.
     ///
-    /// `inner_loop_steps` is accepted for API compatibility but the native TTT
-    /// update already computes the optimal single-step gradient per token; the
-    /// parameter is currently unused and its value does not affect the output.
+    /// The `inner_loop_steps` parameter is retained for API backward compatibility
+    /// (the `/v1/adapt` endpoint accepts a `steps` field).  In the native TTT
+    /// architecture the optimal gradient step is computed automatically per token
+    /// by `forward_lm`; the value of this parameter does not alter the output.
     pub fn adapt_on_corpus_with_steps(
         &self,
         corpus: &[String],
@@ -353,29 +354,27 @@ impl InferencePipeline {
             let _ = self.model.forward_lm(&ctx, &mut states)?;
         }
 
-        // Optional memory-vector injection: treat the memory as a synthetic token
-        // passed through the projection pathway to prime the fast-weight state.
+        // Optional memory-vector injection: directly condition the initial fast-weight
+        // states using the pre-computed memory vector before processing the prompt.
+        // The memory vector [1, d_model] is formed into a [d_model, d_model] outer-product
+        // residual and added to every layer's fast-weight matrix as a scaled perturbation,
+        // priming the model with the compressed context it encodes.
         if let Some(mem) = loaded_mem_token {
-            // mem: [1, d_model]; process as a single pseudo-token.
-            let _ = self.model.forward_lm(
-                &Tensor::zeros((1, 1), candle_core::DType::U32, &self.device)?,
-                &mut states,
-            )?;
-            // Override the first layer state with the memory-conditioned update.
-            // This is a lightweight injection: the memory vector is added to the
-            // first layer's current fast-weight matrix (broadcast-compatible).
             if !states.is_empty() {
                 let d = self.model.config.d_model;
                 let mem_f32 = mem.to_dtype(candle_core::DType::F32)?;
-                // Reshape [1, d_model] → [d_model, 1] and outer-product with ones row
-                // to form a [d_model, d_model] additive residual.
+                // Reshape [1, d_model] → [d_model, 1] and outer-product with an
+                // all-ones row [1, d_model] to form a [d_model, d_model] residual.
                 let col = mem_f32.t()?.contiguous()?; // [d_model, 1]
                 let ones = Tensor::ones((1, d), candle_core::DType::F32, &self.device)?;
                 let residual = col.matmul(&ones)?; // [d_model, d_model]
                 let scale = Tensor::new(1e-3f32, &self.device)?;
-                let updated = states[0].add(&residual.broadcast_mul(&scale)?)?;
-                if tensor_is_finite(&updated)? {
-                    states[0] = updated;
+                let scaled_residual = residual.broadcast_mul(&scale)?;
+                for layer_state in states.iter_mut() {
+                    let updated = layer_state.add(&scaled_residual)?;
+                    if tensor_is_finite(&updated)? {
+                        *layer_state = updated;
+                    }
                 }
             }
         }
