@@ -9,6 +9,7 @@ use crate::chunk_kernel::ChunkFusedTTT;
 use crate::config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use crate::jit_streamer::JitContextStreamer;
 use crate::kernel::AxiomTTTEngine;
+use crate::model::AxiomTTTLM;
 
 #[derive(Clone, Debug, Default)]
 pub struct InferenceRuntimeOptions {
@@ -25,6 +26,7 @@ enum TokenizerBackend {
 
 pub struct InferencePipeline {
     engine: AxiomTTTEngine,
+    native_model: AxiomTTTLM,
     _varmap: VarMap,
     device: Device,
     vocab_size: u32,
@@ -62,8 +64,13 @@ impl InferencePipeline {
         runtime: InferenceRuntimeOptions,
     ) -> Result<Self> {
         let mut varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let engine = AxiomTTTEngine::new(vb, config.clone())?;
+        // Build the legacy engine under the root namespace.
+        let engine_vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let engine = AxiomTTTEngine::new(engine_vb, config.clone())?;
+        // Build the native TTT backbone under its own "native_ttt" namespace
+        // so its parameters never collide with the engine's.
+        let native_vb = VarBuilder::from_varmap(&varmap, DType::F32, &device).pp("native_ttt");
+        let native_model = AxiomTTTLM::new(native_vb, config.clone())?;
 
         let checkpoint = checkpoint_path.as_ref();
         if Path::new(checkpoint).exists() {
@@ -103,6 +110,7 @@ impl InferencePipeline {
 
         Ok(Self {
             engine,
+            native_model,
             _varmap: varmap,
             device,
             vocab_size: config.vocab_size as u32,
@@ -121,6 +129,15 @@ impl InferencePipeline {
     /// These states are used as the initial condition for a new TTT session.
     pub fn init_session_states(&self) -> Result<Vec<Tensor>> {
         self.engine.init_states(1, &self.device)
+    }
+
+    /// Allocate per-layer identity-matrix W̃ states via the native TTT backbone.
+    ///
+    /// Identity initialisation provides a stable, pass-through starting point
+    /// for every new session, giving the fast-weight gradient a non-trivial
+    /// signal from token one.
+    pub fn init_native_session_states(&self) -> Result<Vec<Tensor>> {
+        self.native_model.init_native_states(1, &self.device)
     }
 
     /// Stateful generation: run inference while carrying an external W_tilde session.
@@ -142,35 +159,32 @@ impl InferencePipeline {
         max_new_tokens: usize,
         states: Vec<Tensor>,
     ) -> Result<(String, Vec<Tensor>)> {
-        let context_ids = self.streamer.fetch_and_pack_context(prompt);
-        let context_tensor =
-            Tensor::from_vec(context_ids.clone(), (1, context_ids.len()), &self.device)?;
-        // Prime context (stateless prefill to warm model internals).
-        let _ = self.engine.forward(&context_tensor, None, false)?;
-
         let prompt_ids = self.encode(prompt);
-        let prompt_len = prompt_ids.len();
-        let prompt_tensor = Tensor::from_vec(prompt_ids.clone(), (1, prompt_len), &self.device)?;
-        // Prefill prompt without updating the session state.
-        let _ = self.engine.forward(&prompt_tensor, None, false)?;
+        let mut current_states = states;
+
+        // Prime the session: run all prompt tokens through forward_lm so the
+        // fast-weight states absorb the full context before generation starts.
+        for &token_id in &prompt_ids {
+            let token_tensor = Tensor::from_vec(vec![token_id], (1usize, 1usize), &self.device)?;
+            self.native_model
+                .forward_lm(&token_tensor, &mut current_states)?;
+        }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
-        let mut current_states = states;
         let mut generated = Vec::with_capacity(max_new_tokens);
 
         for _ in 0..max_new_tokens {
-            let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
-            let (logits, next_states) =
-                self.engine
-                    .forward(&token_tensor, Some(current_states.clone()), true)?;
-            let candidate_states = next_states
-                .ok_or_else(|| candle_core::Error::Msg("decode must return states".into()))?;
-            if session_states_are_finite(&candidate_states)? {
-                current_states = candidate_states;
-            } else {
+            let token_tensor = Tensor::from_vec(vec![last_token], (1usize, 1usize), &self.device)?;
+            // Snapshot current states so we can roll back on numerical instability.
+            let snapshot: Vec<Tensor> = current_states.iter().map(|t| t.clone()).collect();
+            let logits = self
+                .native_model
+                .forward_lm(&token_tensor, &mut current_states)?;
+            if !session_states_are_finite(&current_states)? {
                 eprintln!(
                     "[emergency] non-finite state detected during generate_with_session; discarding update and restoring prior snapshot"
                 );
+                current_states = snapshot;
             }
 
             let next_id = logits
@@ -384,7 +398,41 @@ impl InferencePipeline {
     }
 
     pub fn generate(&self, prompt: &str, max_new_tokens: usize) -> Result<String> {
-        self.generate_with_memory(prompt, max_new_tokens, None)
+        // Route stateless generation through the native TTT backbone with a
+        // fresh identity-matrix session so every request is fully O(1) per token.
+        let mut states = self.native_model.init_native_states(1, &self.device)?;
+        let prompt_ids = self.encode(prompt);
+
+        // Prime the native model with the full prompt sequence.
+        for &token_id in &prompt_ids {
+            let token_tensor = Tensor::from_vec(vec![token_id], (1usize, 1usize), &self.device)?;
+            self.native_model.forward_lm(&token_tensor, &mut states)?;
+        }
+
+        let mut last_token = *prompt_ids.last().unwrap_or(&0);
+        let mut generated = Vec::with_capacity(max_new_tokens);
+
+        for _ in 0..max_new_tokens {
+            let token_tensor = Tensor::from_vec(vec![last_token], (1usize, 1usize), &self.device)?;
+            let snapshot: Vec<Tensor> = states.iter().map(|t| t.clone()).collect();
+            let logits = self.native_model.forward_lm(&token_tensor, &mut states)?;
+            if !session_states_are_finite(&states)? {
+                eprintln!(
+                    "[emergency] non-finite state detected during generate; discarding update and restoring prior snapshot"
+                );
+                states = snapshot;
+            }
+
+            let next_id = logits
+                .squeeze(1)?
+                .argmax(D::Minus1)?
+                .squeeze(0)?
+                .to_scalar::<u32>()?;
+            generated.push(next_id);
+            last_token = next_id;
+        }
+
+        Ok(self.decode(&generated))
     }
 
     pub fn token_count(&self, text: &str) -> usize {

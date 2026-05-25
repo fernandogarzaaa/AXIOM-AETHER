@@ -3,3 +3,4 @@ __pycache__/
 axiom_engine_rs/target/
 
 axiom_engine_rs/*.safetensors
+target/
