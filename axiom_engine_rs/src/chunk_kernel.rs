@@ -1,7 +1,27 @@
 use candle_core::{bail, DType, Result, Tensor};
+use std::fmt;
 
 /// Chunk-fused TTT prefill kernel utilities.
 pub struct ChunkFusedTTT;
+
+#[derive(Debug)]
+pub enum EngineError {
+    InvalidTensorBounds(String),
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EngineError::InvalidTensorBounds(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl From<EngineError> for candle_core::Error {
+    fn from(value: EngineError) -> Self {
+        candle_core::Error::Msg(value.to_string())
+    }
+}
 
 impl ChunkFusedTTT {
     /// Perform chunk-wise fused prefill over Q/K/V tensors.
@@ -18,7 +38,10 @@ impl ChunkFusedTTT {
         block_size: usize,
     ) -> Result<(Tensor, Tensor)> {
         if block_size == 0 {
-            bail!("block_size must be greater than zero");
+            return Err(EngineError::InvalidTensorBounds(
+                "block_size must be greater than zero".to_string(),
+            )
+            .into());
         }
         if queries.dims() != keys.dims() || queries.dims() != values.dims() {
             bail!(
@@ -52,6 +75,12 @@ impl ChunkFusedTTT {
         };
 
         let (b, h, t, d) = q4.dims4()?;
+        if t == 0 || d == 0 || b == 0 || h == 0 {
+            return Err(EngineError::InvalidTensorBounds(format!(
+                "invalid Q tensor bounds: (b={b}, h={h}, t={t}, d={d})"
+            ))
+            .into());
+        }
         let mut global_session_weight = Tensor::zeros((b, h, d, d), DType::F32, queries.device())?;
         let inv_sqrt_d = Tensor::new(1f32 / (d as f32).sqrt(), queries.device())?;
         let mut cached_mask: Option<(usize, Tensor)> = None;
@@ -61,9 +90,22 @@ impl ChunkFusedTTT {
         let mut start = 0usize;
         while start < t {
             let len = (t - start).min(block_size);
+            if len == 0 || start + len > t {
+                return Err(EngineError::InvalidTensorBounds(format!(
+                    "invalid chunk bounds start={start} len={len} t={t}"
+                ))
+                .into());
+            }
             let q_chunk = q4.narrow(2, start, len)?.contiguous()?;
             let k_chunk = k4.narrow(2, start, len)?.contiguous()?;
             let v_chunk = v4.narrow(2, start, len)?.contiguous()?;
+            let (_, _, q_len, q_dim) = q_chunk.dims4()?;
+            if q_len != len || q_dim != d {
+                return Err(EngineError::InvalidTensorBounds(format!(
+                    "q_chunk bounds mismatch expected len={len},d={d} got len={q_len},d={q_dim}"
+                ))
+                .into());
+            }
 
             // Intra-chunk Gram matrix: [B, H, C, C]
             let gram = q_chunk
@@ -81,10 +123,10 @@ impl ChunkFusedTTT {
                     mask
                 }
             };
-            let local_attn = gram.broadcast_mul(&local_mask)?;
+            let softmax = gram.broadcast_mul(&local_mask)?;
 
             // Fused local context: [B, H, C, D]
-            let local_context = local_attn.matmul(&v_chunk)?;
+            let local_context = softmax.matmul(&v_chunk)?;
 
             // Dense local update in chunk-local memory layout bounds.
             // Update shape: [B, H, D, D]
@@ -96,19 +138,36 @@ impl ChunkFusedTTT {
                     inv
                 }
             };
-            let local_grad = v_chunk
+            let local_grads = v_chunk
                 .transpose(2, 3)?
                 .contiguous()?
                 .matmul(&k_chunk)?
                 .broadcast_mul(&inv_len)?;
-            global_session_weight = global_session_weight.add(&local_grad)?;
+            global_session_weight = global_session_weight.add(&local_grads)?;
 
             // Carry chunk boundary state to next chunk via global matrix.
             let boundary_carry = q_chunk.matmul(&global_session_weight)?;
-            chunk_outputs.push(local_context.add(&boundary_carry)?);
+            let chunk_output = local_context.add(&boundary_carry)?;
+            chunk_outputs.push(chunk_output);
+
+            drop(boundary_carry);
+            drop(local_grads);
+            drop(local_context);
+            drop(softmax);
+            drop(local_mask);
+            drop(gram);
+            drop(q_chunk);
+            drop(k_chunk);
+            drop(v_chunk);
             start += len;
         }
 
+        if chunk_outputs.is_empty() {
+            return Err(EngineError::InvalidTensorBounds(
+                "chunk-fused forward produced empty output".to_string(),
+            )
+            .into());
+        }
         let chunk_output_refs: Vec<&Tensor> = chunk_outputs.iter().collect();
         let fused_output = Tensor::cat(&chunk_output_refs, 2)?;
 
