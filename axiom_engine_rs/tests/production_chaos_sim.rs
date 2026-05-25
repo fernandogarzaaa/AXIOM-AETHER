@@ -105,7 +105,7 @@ async fn test_production_under_chaos() {
     }
 
     // 2) Out-of-order delta spike against deterministic sequence gate.
-    let delta = Tensor::ones((1usize, 2usize, 8usize, 8usize), DType::F32, &state.device)
+    let delta = Tensor::ones((16usize, 16usize), DType::F32, &state.device)
         .unwrap()
         .to_dtype(DType::F16)
         .unwrap();
