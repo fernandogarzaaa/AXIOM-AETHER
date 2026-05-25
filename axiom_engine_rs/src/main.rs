@@ -1,5 +1,3 @@
-mod adapter;
-mod chunk_kernel;
 mod cluster;
 mod config;
 mod data_gen;
