@@ -201,8 +201,8 @@ mod tests {
         let x = Tensor::ones((1usize, 1usize, 16usize), DType::F32, &device).unwrap();
         let _ = block.forward_native(&x, &mut state).unwrap();
         let state_after: Vec<f32> = state.flatten_all().unwrap().to_vec1().unwrap();
-        // With Kaiming-initialized (non-zero) projections, the gradient is non-zero
-        // and W̃ must change.
+        // candle_nn::linear_no_bias uses DEFAULT_KAIMING_NORMAL init, so projections
+        // are non-zero and the reconstruction gradient is non-trivial → W̃ must change.
         assert_ne!(
             state_before, state_after,
             "session state must be updated after a gradient step"

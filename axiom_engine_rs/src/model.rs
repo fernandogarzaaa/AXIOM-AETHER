@@ -213,17 +213,17 @@ mod tests {
     #[test]
     fn init_native_states_are_identity() {
         let (model, device) = make_model();
+        let d = model.config.head_dim;
         let states = model.init_native_states(1, &device).unwrap();
-        let eye = Tensor::eye(8usize, DType::F32, &device).unwrap();
+        let eye = Tensor::eye(d, DType::F32, &device).unwrap();
         for state in &states {
-            // Flatten to [H, D, D] then check each head sub-matrix equals I_8.
-            // Shape: [1, H=2, D=8, D=8] → compare head_0 via narrow operations.
+            // Shape: [1, H, D, D] → extract head_0 sub-matrix and compare to I_D.
             let head_0 = state
                 .narrow(0, 0, 1)
                 .unwrap()
                 .narrow(1, 0, 1)
                 .unwrap()
-                .reshape((8usize, 8usize))
+                .reshape((d, d))
                 .unwrap();
             let diff = head_0.sub(&eye).unwrap();
             let diff_norm = diff
