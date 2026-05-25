@@ -170,9 +170,8 @@ impl SessionData {
 /// Global server state shared across all request handlers.
 ///
 /// * `pipeline` — inference pipeline; wrapped in `Mutex` because
-///   `InferencePipeline` contains `RefCell` (via `TTTLinearLayer`) which is
-///   `!Send`.  Generation itself is synchronous and does not hold the lock
-///   across `.await` points.
+///   generation and adaptation mutate fast-weight state in-place and must remain
+///   serialized. Operations do not hold this lock across `.await` points.
 /// * `sessions` — active TTT sessions keyed by UUID.  `RwLock` allows
 ///   multiple simultaneous GET-style reads while mutations (create, adapt,
 ///   checkpoint write) acquire an exclusive write lock.

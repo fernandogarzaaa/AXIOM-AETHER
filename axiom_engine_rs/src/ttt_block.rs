@@ -6,10 +6,9 @@
 //! achieving O(1) memory per inference step.
 
 use candle_core::{Result, Tensor, D};
-use candle_nn::{Linear, Module, VarBuilder};
+use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 
 use crate::config::AxiomConfig;
-use crate::kernel::RMSNorm;
 
 /// Standalone causal TTT block.
 ///
@@ -20,7 +19,7 @@ pub struct NativeTTTBlock {
     w_q: Linear,
     w_k: Linear,
     w_v: Linear,
-    layer_norm: RMSNorm,
+    layer_norm: LayerNorm,
     config: AxiomConfig,
 }
 
@@ -32,7 +31,11 @@ impl NativeTTTBlock {
             w_q: candle_nn::linear_no_bias(d, d, vs.pp("w_q"))?,
             w_k: candle_nn::linear_no_bias(d, d, vs.pp("w_k"))?,
             w_v: candle_nn::linear_no_bias(d, d, vs.pp("w_v"))?,
-            layer_norm: RMSNorm::new(d, config.rms_norm_eps, vs.pp("layer_norm"))?,
+            layer_norm: candle_nn::layer_norm_no_bias(
+                d,
+                config.rms_norm_eps as f64,
+                vs.pp("layer_norm"),
+            )?,
             config,
         })
     }

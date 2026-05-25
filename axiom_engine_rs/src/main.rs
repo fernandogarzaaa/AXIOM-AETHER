@@ -12,7 +12,6 @@ mod quantization;
 mod server;
 mod train;
 mod ttt_block;
-mod ttt_layer;
 
 use std::env;
 
