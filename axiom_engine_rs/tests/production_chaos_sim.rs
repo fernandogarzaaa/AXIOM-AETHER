@@ -132,7 +132,7 @@ async fn test_production_under_chaos() {
         order_statuses.push(status);
     }
     assert!(
-        order_statuses.iter().any(|s| *s == StatusCode::CONFLICT),
+        order_statuses.contains(&StatusCode::CONFLICT),
         "expected stale delta conflict status"
     );
 

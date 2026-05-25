@@ -131,7 +131,7 @@ impl AxiomTTTEngine {
         let mut layers = Vec::new();
         for i in 0..config.n_layers {
             layers.push(AxiomBlock::new(
-                vs.pp(&format!("layer_{i}")),
+                vs.pp(format!("layer_{i}")),
                 config.clone(),
             )?);
         }

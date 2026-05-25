@@ -102,12 +102,12 @@ impl SessionData {
     fn ensure_active(&mut self, device: &Device) -> candle_core::Result<Vec<Tensor>> {
         if let SessionResidency::Quantized(descriptors) = &self.residency {
             let mut states = Vec::with_capacity(descriptors.len());
-            for descriptor in descriptors {
+            for (descriptor_idx, descriptor) in descriptors.iter().enumerate() {
                 if descriptor.packed_width == 0 {
-                    candle_core::bail!("packed width must be non-zero")
+                    candle_core::bail!("descriptor {descriptor_idx}: packed width must be non-zero")
                 }
                 if descriptor.scales.is_empty() {
-                    candle_core::bail!("scale list cannot be empty")
+                    candle_core::bail!("descriptor {descriptor_idx}: scale list cannot be empty")
                 }
                 let num_blocks = descriptor.scales.len();
                 let packed = Tensor::from_vec(
@@ -130,7 +130,8 @@ impl SessionData {
                     );
                 }
                 data.truncate(total);
-                let tensor = Tensor::from_vec(data, (total,), device)?.reshape(descriptor.shape.as_slice())?;
+                let tensor = Tensor::from_vec(data, (total,), device)?
+                    .reshape(descriptor.shape.as_slice())?;
                 states.push(tensor);
             }
             self.residency = SessionResidency::Active(states);
@@ -308,8 +309,9 @@ async fn enforce_lru_vram_budget_async(
                         .map_err(|e| e.to_string())?;
                     if scales.len() != num_blocks {
                         return Err(format!(
-                            "invalid scale length: expected {num_blocks}, got {}",
-                            scales.len()
+                            "invalid scale length for shape {:?}: expected {num_blocks}, got {}",
+                            shape,
+                            scales.len(),
                         ));
                     }
                     Ok(NF4QuantizedDescriptor {
@@ -775,10 +777,7 @@ async fn create_session(
             .sessions
             .write()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-        sessions.insert(
-            session_id.clone(),
-            SessionData::new_active(states, now),
-        );
+        sessions.insert(session_id.clone(), SessionData::new_active(states, now));
     }
     metrics::register_session(&session_id);
     state.refresh_session_metrics()?;
@@ -1145,10 +1144,7 @@ fn resolve_or_create_session(
             .sessions
             .write()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
-        sessions.insert(
-            new_id.clone(),
-            SessionData::new_active(states.clone(), now),
-        );
+        sessions.insert(new_id.clone(), SessionData::new_active(states.clone(), now));
         drop(sessions);
         metrics::register_session(&new_id);
         state.refresh_session_metrics()?;
@@ -1499,10 +1495,7 @@ mod tests {
         };
         {
             let mut sessions = state.sessions.write().unwrap();
-            sessions.insert(
-                session_id.clone(),
-                SessionData::new_active(states, now),
-            );
+            sessions.insert(session_id.clone(), SessionData::new_active(states, now));
         }
         metrics::register_session(&session_id);
         state.refresh_session_metrics().unwrap();
@@ -1554,10 +1547,7 @@ mod tests {
         };
         {
             let mut sessions = state.sessions.write().unwrap();
-            sessions.insert(
-                session_id.clone(),
-                SessionData::new_active(states, now),
-            );
+            sessions.insert(session_id.clone(), SessionData::new_active(states, now));
         }
         metrics::register_session(&session_id);
         state.refresh_session_metrics().unwrap();
@@ -1626,7 +1616,18 @@ mod tests {
                 .iter()
                 .map(|tensor| {
                     let shape = tensor.dims().to_vec();
-                    let data = tensor
+                    let (packed, scale) = NF4Quantizer::quantize_state(tensor).unwrap();
+                    let (num_blocks, packed_width) = packed.dims2().unwrap();
+                    let packed_indices = packed
+                        .to_dtype(DType::U8)
+                        .unwrap()
+                        .contiguous()
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<u8>()
+                        .unwrap();
+                    let scales = scale
                         .to_dtype(DType::F32)
                         .unwrap()
                         .contiguous()
@@ -1635,7 +1636,13 @@ mod tests {
                         .unwrap()
                         .to_vec1::<f32>()
                         .unwrap();
-                    NF4Quantizer::quantize_f32_slice(&data, &shape).unwrap()
+                    assert_eq!(scales.len(), num_blocks);
+                    NF4QuantizedDescriptor {
+                        shape,
+                        packed_indices,
+                        scales,
+                        packed_width,
+                    }
                 })
                 .collect::<Vec<_>>();
             session.residency = SessionResidency::Quantized(descriptors);

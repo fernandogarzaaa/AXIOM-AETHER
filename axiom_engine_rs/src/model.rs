@@ -37,7 +37,7 @@ impl AxiomTTTLM {
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             layers.push(NativeTTTBlock::new(
-                vs.pp(&format!("native_block_{i}")),
+                vs.pp(format!("native_block_{i}")),
                 config.clone(),
             )?);
         }
@@ -75,15 +75,11 @@ impl AxiomTTTLM {
     /// # Arguments
     /// * `input_ids`      – `[1, T]` integer token indices.
     /// * `session_states` – Per-layer `[d_model, d_model]` fast-weight tensors;
-    ///                      updated in-place after every token.
+    ///   updated in-place after every token.
     ///
     /// # Returns
     /// Logits `[1, T, vocab_size]`.
-    pub fn forward_lm(
-        &self,
-        input_ids: &Tensor,
-        session_states: &mut [Tensor],
-    ) -> Result<Tensor> {
+    pub fn forward_lm(&self, input_ids: &Tensor, session_states: &mut [Tensor]) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
 
         // Embed all tokens: [1, T, d_model].

@@ -134,7 +134,7 @@ impl InferencePipeline {
     /// * `prompt`          – Input text.
     /// * `max_new_tokens`  – Maximum tokens to produce.
     /// * `states`          – Per-layer `[d_model, d_model]` W_tilde tensors from
-    ///                       the current session.
+    ///   the current session.
     ///
     /// # Returns
     /// `(generated_text, updated_states)`.
@@ -275,8 +275,8 @@ impl InferencePipeline {
     /// * `prompt`           – User text prompt.
     /// * `max_new_tokens`   – Maximum tokens to generate.
     /// * `loaded_mem_token` – Optional `[1, d_model]` memory vector; when
-    ///                        provided it is processed through the model before
-    ///                        the prompt to prime the fast-weight states.
+    ///   provided it is processed through the model before
+    ///   the prompt to prime the fast-weight states.
     pub fn generate_with_memory(
         &self,
         prompt: &str,

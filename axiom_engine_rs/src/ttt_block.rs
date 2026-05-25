@@ -42,7 +42,7 @@ impl NativeTTTBlock {
     /// # Arguments
     /// * `x`             – `[1, d_model]` token activation.
     /// * `session_state` – `[d_model, d_model]` fast-weight matrix W_tilde,
-    ///                     updated in-place via one gradient descent step.
+    ///   updated in-place via one gradient descent step.
     ///
     /// # Returns
     /// `[1, d_model]` output after the TTT update and embedded layer normalisation.
