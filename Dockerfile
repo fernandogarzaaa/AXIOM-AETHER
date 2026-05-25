@@ -1,4 +1,4 @@
-FROM rust:1.75-slim AS builder
+FROM rust:1.82-slim AS builder
 
 # OCI image labels (used by GHCR)
 LABEL org.opencontainers.image.source="https://github.com/fernandogarzaaa/AXIOM-AETHER"
