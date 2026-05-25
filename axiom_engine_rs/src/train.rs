@@ -5,13 +5,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 use crate::config::AxiomConfig;
 use crate::config::DEFAULT_CHECKPOINT_PATH;
 use crate::data_gen::ProceduralDataset;
-use crate::kernel::AxiomTTTEngine;
+use crate::model::AxiomTTTLM;
 
 pub struct AxiomTrainer {
     config: AxiomConfig,
     device: Device,
     varmap: VarMap,
-    engine: AxiomTTTEngine,
+    model: AxiomTTTLM,
     dataset: ProceduralDataset,
     checkpoint_path: String,
     batch_size: usize,
@@ -32,14 +32,14 @@ impl AxiomTrainer {
     ) -> Result<Self> {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let engine = AxiomTTTEngine::new(vb, config.clone())?;
+        let model = AxiomTTTLM::new(vb, config.clone())?;
         let dataset = ProceduralDataset::new(config.vocab_size);
 
         Ok(Self {
             config,
             device,
             varmap,
-            engine,
+            model,
             dataset,
             checkpoint_path: checkpoint_path.into(),
             batch_size: batch_size.max(1),
@@ -68,7 +68,21 @@ impl AxiomTrainer {
                     self.dataset
                         .generate_batch(self.batch_size, self.seq_len, &self.device)?;
 
-                let (logits, _) = self.engine.forward(&inputs, None, false)?;
+                let mut batch_logits = Vec::with_capacity(self.batch_size);
+                let mut batch_targets = Vec::with_capacity(self.batch_size);
+                for batch_idx in 0..self.batch_size {
+                    let input = inputs.narrow(0, batch_idx, 1)?;
+                    let target = targets.narrow(0, batch_idx, 1)?;
+                    let mut states = self.model.init_states(&self.device)?;
+                    let logits = self.model.forward_lm(&input, &mut states[..])?;
+                    batch_logits.push(logits);
+                    batch_targets.push(target);
+                }
+
+                let logit_refs: Vec<&candle_core::Tensor> = batch_logits.iter().collect();
+                let target_refs: Vec<&candle_core::Tensor> = batch_targets.iter().collect();
+                let logits = candle_core::Tensor::cat(&logit_refs, 0)?;
+                let targets = candle_core::Tensor::cat(&target_refs, 0)?;
                 let (b, t, v) = logits.dims3()?;
                 let flat_logits = logits.reshape((b * t, v))?;
                 let flat_targets = targets.reshape((b * t,))?;
