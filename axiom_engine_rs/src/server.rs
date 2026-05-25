@@ -714,14 +714,14 @@ async fn create_session(
 ) -> Result<impl IntoResponse, ApiError> {
     let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
 
-    // Initialise zeroed W_tilde states.
+    // Initialise per-layer identity W̃ states for the native TTT backbone.
     let states = {
         let pipeline = state
             .pipeline
             .lock()
             .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
         pipeline
-            .init_session_states()
+            .init_native_session_states()
             .map_err(|e| ApiError::Internal(format!("state init failed: {e}")))?
     };
 
