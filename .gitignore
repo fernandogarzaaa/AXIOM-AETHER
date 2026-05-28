@@ -3,4 +3,7 @@ __pycache__/
 axiom_engine_rs/target/
 
 axiom_engine_rs/*.safetensors
+axiom_engine_rs/checkpoints/
+checkpoints/
+*.bin
 target/

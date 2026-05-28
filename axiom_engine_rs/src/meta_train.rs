@@ -337,10 +337,23 @@ impl MetaTrainer {
         }
 
         progress.finish_with_message("meta-training complete");
+        if let Some(parent) = std::path::Path::new(&self.checkpoint_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    candle_core::Error::Msg(format!(
+                        "could not create checkpoint dir {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+        }
         self.varmap.save(&self.checkpoint_path)?;
+        let bytes = std::fs::metadata(&self.checkpoint_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         println!(
-            "[+] Meta-train checkpoint saved to {} (final loss {:.5})",
-            self.checkpoint_path, last_loss
+            "[+] Meta-train checkpoint saved to {} ({} bytes, final loss {:.5})",
+            self.checkpoint_path, bytes, last_loss
         );
         Ok(last_loss)
     }
