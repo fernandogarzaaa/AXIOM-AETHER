@@ -30,13 +30,21 @@ use axum::{Json, Router};
 use candle_core::{DType, Device, Tensor};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::task::spawn_blocking;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+use crate::anthropic_forwarder::{
+    build_compressed_payload, partition_messages, whitespace_token_count, AnthropicForwarder,
+};
 use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
+use crate::context_compressor::{
+    adapt_session_blocking, extract_memory_vector_blocking, CompressorConfig, MemoryFingerprint,
+    TttSessionStore,
+};
 use crate::inference::InferencePipeline;
 use crate::metrics;
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
@@ -192,6 +200,16 @@ pub struct AppState {
     /// Optional Anthropic Claude backend. When `Some`, generation is
     /// routed through Claude instead of the local Axiom-TTT pipeline.
     pub claude_backend: Arc<Option<ClaudeBackend>>,
+    /// Active-compression session store: per-tenant adapted fast-weight
+    /// tensors held in a lock-free DashMap. Distinct from `sessions`
+    /// above (which serves the legacy `/v1/sessions` API); this store
+    /// is used exclusively by the `/v1/messages` compression path.
+    pub ttt_sessions: Arc<TttSessionStore>,
+    /// Outbound bridge to the real Anthropic API used by the compression
+    /// path. `None` when no `ANTHROPIC_API_KEY` is configured.
+    pub anthropic_forwarder: Arc<Option<AnthropicForwarder>>,
+    /// Static compression configuration (threshold, top-k, enabled flag).
+    pub compressor_config: Arc<CompressorConfig>,
 }
 
 impl AppState {
@@ -204,6 +222,9 @@ impl AppState {
             sequence_versions: Arc::new(RwLock::new(HashMap::new())),
             model_id,
             claude_backend: Arc::new(None),
+            ttt_sessions: Arc::new(TttSessionStore::new()),
+            anthropic_forwarder: Arc::new(None),
+            compressor_config: Arc::new(CompressorConfig::default()),
         }
     }
 
@@ -211,6 +232,24 @@ impl AppState {
     pub fn with_claude_backend(mut self, backend: Option<ClaudeBackend>) -> Self {
         self.claude_backend = Arc::new(backend);
         self
+    }
+
+    /// Install an Anthropic forwarder for the compression pipeline.
+    pub fn with_anthropic_forwarder(mut self, forwarder: Option<AnthropicForwarder>) -> Self {
+        self.anthropic_forwarder = Arc::new(forwarder);
+        self
+    }
+
+    /// Override the compressor configuration.
+    pub fn with_compressor_config(mut self, config: CompressorConfig) -> Self {
+        self.compressor_config = Arc::new(config);
+        self
+    }
+
+    /// True iff every component the compression path needs is configured:
+    /// the feature flag, the forwarder, and a key.
+    pub fn compression_active(&self) -> bool {
+        self.compressor_config.enabled && self.anthropic_forwarder.is_some()
     }
 
     fn refresh_session_metrics(&self) -> Result<(), ApiError> {
@@ -1262,17 +1301,49 @@ fn resolve_or_create_session(
 /// Drop-in target for the Anthropic SDK and Claude Code: clients that
 /// point `ANTHROPIC_BASE_URL` at this server receive responses in the
 /// native Messages format regardless of whether the local Axiom-TTT
-/// pipeline or a Claude backend produced them.
+/// pipeline, a Claude backend, or the active-compression upstream
+/// produced them.
+///
+/// When `state.compression_active()` is true, the handler:
+/// 1. Partitions the inbound messages into heavy context (above the
+///    configured token threshold) and the surviving user query.
+/// 2. Spawns a blocking task that tokenises the heavy context, runs it
+///    through the TTT layer stack to mutate W̃ in-place, and extracts
+///    a [`MemoryFingerprint`] via an associative recall pass.
+/// 3. Rebuilds the outbound JSON payload with the heavy context stripped
+///    and the fingerprint prepended to the surviving user turn.
+/// 4. POSTs the lean payload to the real Anthropic API and returns the
+///    response verbatim.
 async fn create_message(
     State(state): State<AppState>,
-    Json(req): Json<AnthropicMessagesRequest>,
+    Json(body): Json<Value>,
+) -> Response {
+    if state.compression_active() {
+        match compressed_messages_path(&state, &body).await {
+            Ok(value) => return Json(value).into_response(),
+            Err(err) => return err.into_response(),
+        }
+    }
+
+    let req: AnthropicMessagesRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => return ApiError::BadRequest(format!("invalid /v1/messages body: {e}")).into_response(),
+    };
+    local_messages_path(state, req).map_or_else(
+        |e| e.into_response(),
+        |json| json.into_response(),
+    )
+}
+
+fn local_messages_path(
+    state: AppState,
+    req: AnthropicMessagesRequest,
 ) -> Result<Json<AnthropicMessagesResponse>, ApiError> {
     let model = req.model.clone().unwrap_or_else(|| state.model_id.clone());
     let system_text = req.system.as_ref().map(|c| c.to_text());
 
     let text = match state.claude_backend.as_ref() {
         Some(backend) => {
-            // Chat-aware path preserves message structure for Claude.
             let turns: Vec<ChatTurn> = req
                 .messages
                 .iter()
@@ -1286,7 +1357,6 @@ async fn create_message(
                 .map_err(ApiError::Internal)?
         }
         None => {
-            // Local pipeline: flatten to a single prompt string.
             let mut prompt_parts: Vec<String> = Vec::new();
             if let Some(ref sys) = system_text {
                 prompt_parts.push(format!("system: {sys}"));
@@ -1324,6 +1394,197 @@ async fn create_message(
     }))
 }
 
+/// Active-compression code path: partition → adapt → recall → forward.
+async fn compressed_messages_path(state: &AppState, body: &Value) -> Result<Value, ApiError> {
+    let forwarder = state
+        .anthropic_forwarder
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("compression active but no forwarder".into()))?
+        .clone();
+
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| ApiError::BadRequest("messages[] required".into()))?;
+
+    let cfg = state.compressor_config.clone();
+    let threshold = cfg.heavy_message_threshold_tokens;
+    let top_k = cfg.recall_top_k;
+
+    let partitioned = partition_messages(&messages, threshold, whitespace_token_count);
+
+    // Resolve / create the TTT session. If the client didn't pass one
+    // we mint a transient UUID; persistent compression benefits accrue
+    // when the caller passes session_id.
+    let session_id = body
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("transient-{}", Uuid::new_v4()));
+
+    let started = Instant::now();
+    let log_heavy_count = partitioned.heavy_context.len();
+    let log_heavy_tokens: usize = partitioned
+        .heavy_context
+        .iter()
+        .map(|c| c.token_count)
+        .sum();
+
+    // Tokenise the surviving user query (for the associative recall pass)
+    // alongside the heavy context — both happen inside spawn_blocking so
+    // we don't stall the async runtime on the gradient loop.
+    let user_query_text = partitioned
+        .target_user_index
+        .and_then(|idx| partitioned.surviving.get(idx))
+        .and_then(|m| m.get("content"))
+        .map(content_to_text)
+        .unwrap_or_default();
+    let heavy_combined = partitioned
+        .heavy_context
+        .iter()
+        .map(|c| c.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let fingerprint = if partitioned.heavy_context.is_empty() {
+        // Nothing to ingest — emit a zero-context fingerprint so the
+        // outbound payload still carries the schema marker.
+        empty_fingerprint(state, &session_id, started)?
+    } else {
+        let pipeline_arc = state.pipeline.clone();
+        let store = state.ttt_sessions.clone();
+        let session_id_clone = session_id.clone();
+        let heavy_clone = heavy_combined.clone();
+        let query_clone = user_query_text.clone();
+
+        // Spawn the compute-heavy loop on a blocking thread so the Tokio
+        // runtime keeps serving other requests during the gradient steps.
+        let fp_result: Result<MemoryFingerprint, ApiError> = tokio::task::spawn_blocking(move || {
+            let pipeline = pipeline_arc
+                .lock()
+                .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+            let session = store.get_or_create(&session_id_clone, &pipeline).map_err(|e| {
+                ApiError::Internal(format!("session allocation failed: {e}"))
+            })?;
+            // tokio::sync::Mutex::blocking_lock is safe in spawn_blocking.
+            let mut session_states = session.blocking_lock();
+
+            let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
+            adapt_session_blocking(&pipeline, &mut session_states, &context_tokens).map_err(
+                |e| ApiError::Internal(format!("TTT adapt failed: {e}")),
+            )?;
+
+            let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
+            let fingerprint = extract_memory_vector_blocking(
+                &pipeline,
+                &mut session_states,
+                &query_tokens,
+                &session_id_clone,
+                context_tokens.len(),
+                started,
+                top_k,
+            )
+            .map_err(|e| ApiError::Internal(format!("memory extraction failed: {e}")))?;
+            Ok(fingerprint)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
+        fp_result?
+    };
+
+    eprintln!(
+        "[axiom-ttt] compressed session={} heavy_msgs={} heavy_tokens~{} recall_norm={:.3} elapsed_ms={}",
+        fingerprint.session_id,
+        log_heavy_count,
+        log_heavy_tokens,
+        fingerprint.recall_norm,
+        fingerprint.elapsed_ms,
+    );
+
+    let outbound = build_compressed_payload(body, &fingerprint, &partitioned);
+    // Strip session_id (and any other Axiom extensions) from the upstream payload.
+    let mut outbound = outbound;
+    if let Some(obj) = outbound.as_object_mut() {
+        obj.remove("session_id");
+    }
+
+    forwarder
+        .forward_messages_json(&outbound)
+        .await
+        .map_err(|e| ApiError::Internal(format!("anthropic upstream call failed: {e}")))
+}
+
+fn empty_fingerprint(
+    state: &AppState,
+    session_id: &str,
+    started: Instant,
+) -> Result<MemoryFingerprint, ApiError> {
+    let pipeline = state
+        .pipeline
+        .lock()
+        .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+    let n_layers = pipeline.model().config.n_layers;
+    let d_model = pipeline.model().config.d_model;
+    Ok(MemoryFingerprint {
+        schema: "axiom-ttt-context-fingerprint/v1".to_string(),
+        session_id: session_id.to_string(),
+        context_tokens_processed: 0,
+        n_layers,
+        d_model,
+        state_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        layer_frobenius_norms: vec![0.0; n_layers],
+        recall_norm: 0.0,
+        recall_l1: 0.0,
+        recall_top_k_indices: Vec::new(),
+        recall_top_k_decoded: String::new(),
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+fn content_to_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b: &Value| {
+                b.get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// `GET /v1/ttt/sessions` — count of active TTT compression sessions.
+async fn ttt_sessions_stats(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "active_sessions": state.ttt_sessions.len(),
+        "compression_active": state.compression_active(),
+        "threshold_tokens": state.compressor_config.heavy_message_threshold_tokens,
+        "recall_top_k": state.compressor_config.recall_top_k,
+    }))
+}
+
+/// `DELETE /v1/ttt/sessions/:id` — drop the W̃ tensors for one session.
+async fn ttt_session_drop(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let removed = state.ttt_sessions.drop_session(&id);
+    Json(serde_json::json!({ "session_id": id, "removed": removed }))
+}
+
+/// `DELETE /v1/ttt/sessions` — drop every TTT session.
+async fn ttt_sessions_clear(State(state): State<AppState>) -> impl IntoResponse {
+    state.ttt_sessions.clear();
+    Json(serde_json::json!({ "cleared": true }))
+}
+
 // ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
@@ -1342,6 +1603,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/adapt", post(adapt))
         .route("/v1/sessions/:id/checkpoint", get(get_checkpoint))
         .route("/v1/sessions/:id/checkpoint", put(put_checkpoint))
+        .route("/v1/ttt/sessions", get(ttt_sessions_stats))
+        .route("/v1/ttt/sessions", delete(ttt_sessions_clear))
+        .route("/v1/ttt/sessions/:id", delete(ttt_session_drop))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -1379,7 +1643,32 @@ pub async fn run_server(
             backend.model()
         );
     }
-    let state = AppState::new(pipeline, model_id).with_claude_backend(claude_backend);
+    let compressor_config = CompressorConfig::from_env();
+    let anthropic_forwarder = if compressor_config.enabled {
+        AnthropicForwarder::from_env()
+    } else {
+        None
+    };
+    if compressor_config.enabled {
+        match anthropic_forwarder.as_ref() {
+            Some(_) => println!(
+                "[+] Active-compression mode ON — heavy messages (>={} tokens) \
+                 will be absorbed locally via TTT, then forwarded with a dense \
+                 fingerprint to Anthropic (top_k={})",
+                compressor_config.heavy_message_threshold_tokens,
+                compressor_config.recall_top_k,
+            ),
+            None => println!(
+                "[!] Active-compression enabled but ANTHROPIC_API_KEY is unset — \
+                 the compression path will be skipped and requests will fall back \
+                 to the local pipeline"
+            ),
+        }
+    }
+    let state = AppState::new(pipeline, model_id)
+        .with_claude_backend(claude_backend)
+        .with_anthropic_forwarder(anthropic_forwarder)
+        .with_compressor_config(compressor_config);
     let app = create_router(state);
 
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
