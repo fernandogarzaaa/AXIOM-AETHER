@@ -28,6 +28,8 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 safetensors = "0.4"
+dashmap = "5.5"
+walkdir = "2.5"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

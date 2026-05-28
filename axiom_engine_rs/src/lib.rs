@@ -1,11 +1,14 @@
+pub mod anthropic_forwarder;
 pub mod claude_backend;
 pub mod cluster;
 pub mod config;
+pub mod context_compressor;
 pub mod data_gen;
 pub mod inference;
 pub mod jit_streamer;
 pub mod kernel;
 pub mod memory_pool;
+pub mod meta_train;
 pub mod metrics;
 pub mod model;
 pub mod quantization;

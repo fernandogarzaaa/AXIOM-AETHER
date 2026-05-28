@@ -248,6 +248,29 @@ impl InferencePipeline {
         }
     }
 
+    /// Public tokenizer access — encodes text into vocabulary token IDs.
+    pub fn encode_text(&self, prompt: &str) -> Vec<u32> {
+        self.encode(prompt)
+    }
+
+    /// Public tokenizer access — decodes token IDs back to text.
+    pub fn decode_tokens(&self, token_ids: &[u32]) -> String {
+        self.decode(token_ids)
+    }
+
+    /// Borrow the underlying TTT language model. Used by the context
+    /// compressor to drive forward_lm with externally-held session states.
+    pub fn model(&self) -> &AxiomTTTLM {
+        &self.model
+    }
+
+    /// Whether the active tokenizer is a real HuggingFace model rather than
+    /// the SHA-256 hash fallback. Distillation fingerprints use this flag
+    /// to decide whether to decode the top-k recall indices as text.
+    pub fn has_real_tokenizer(&self) -> bool {
+        matches!(self.tokenizer, TokenizerBackend::Hf(_))
+    }
+
     fn decode(&self, token_ids: &[u32]) -> String {
         match &self.tokenizer {
             TokenizerBackend::Hf(tokenizer) => tokenizer

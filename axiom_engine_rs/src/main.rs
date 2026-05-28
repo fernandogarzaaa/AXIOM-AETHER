@@ -1,11 +1,14 @@
+mod anthropic_forwarder;
 mod claude_backend;
 mod cluster;
 mod config;
+mod context_compressor;
 mod data_gen;
 mod inference;
 mod jit_streamer;
 mod kernel;
 mod memory_pool;
+mod meta_train;
 mod metrics;
 mod model;
 mod quantization;
@@ -298,8 +301,51 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| candle_core::Error::Msg(format!("server startup failed: {e}")))?;
         }
+        "meta-train" => {
+            // Phase 4: train projection matrices on raw repo files so
+            // the online TTT updates produce well-conditioned, non-degenerate
+            // hidden states that the context compressor can read out.
+            let repo_root = std::env::current_dir().map_err(|e| {
+                candle_core::Error::Msg(format!("could not resolve repo root: {e}"))
+            })?;
+            let max_files: usize = std::env::var("AXIOM_META_TRAIN_MAX_FILES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512);
+            let max_sequences: usize = std::env::var("AXIOM_META_TRAIN_MAX_SEQS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096);
+            let seed: u64 = std::env::var("AXIOM_META_TRAIN_SEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(42);
+            let lr: f64 = std::env::var("AXIOM_META_TRAIN_LR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1e-4);
+            let mut trainer = meta_train::MetaTrainer::build(
+                config,
+                device,
+                repo_root,
+                args.checkpoint_path,
+                args.batch_size,
+                args.seq_len,
+                max_files,
+                max_sequences,
+                seed,
+            )?;
+            println!(
+                "[+] Meta-training dataset: {} windows from local repo files (seq_len={})",
+                trainer.dataset_len(),
+                args.seq_len
+            );
+            trainer.run(args.epochs, args.steps_per_epoch, lr)?;
+        }
         other => {
-            bail!("unsupported mode '{other}'. Use --mode train, --mode generate, or --mode server")
+            bail!(
+                "unsupported mode '{other}'. Use --mode train | generate | server | meta-train"
+            )
         }
     }
 
