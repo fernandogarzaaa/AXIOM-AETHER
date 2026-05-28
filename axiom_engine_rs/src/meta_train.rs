@@ -74,8 +74,31 @@ impl RepoFileDataset {
     /// windows. Uses the same SHA-256-hash tokenizer the engine falls
     /// back to when no HF tokenizer is loaded — keeps the meta-training
     /// objective consistent with what the inference path sees.
+    #[allow(dead_code)] // single-root convenience used by lib callers + tests
     pub fn build(
         root: impl AsRef<Path>,
+        vocab_size: u32,
+        seq_len: usize,
+        max_files: usize,
+        max_sequences: usize,
+        seed: u64,
+    ) -> std::io::Result<Self> {
+        Self::build_multi(
+            &[root.as_ref().to_path_buf()],
+            vocab_size,
+            seq_len,
+            max_files,
+            max_sequences,
+            seed,
+        )
+    }
+
+    /// Like [`build`](Self::build) but crawls several source trees,
+    /// aggregating their files into one corpus. Used by the production
+    /// data harvester to pull from the repo, vendored dependencies, and
+    /// any extra code directories at once.
+    pub fn build_multi(
+        roots: &[PathBuf],
         vocab_size: u32,
         seq_len: usize,
         max_files: usize,
@@ -98,33 +121,36 @@ impl RepoFileDataset {
             ));
         }
         let mut files: Vec<PathBuf> = Vec::new();
-        for entry in WalkDir::new(root.as_ref())
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| !is_excluded_dir(e.path()))
-            .flatten()
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let ext = entry
-                .path()
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if !DEFAULT_INCLUDED_EXTENSIONS
-                .iter()
-                .any(|allowed| *allowed == ext)
+        'roots: for root in roots {
+            for entry in WalkDir::new(root)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|e| !is_excluded_dir(e.path()))
+                .flatten()
             {
-                continue;
-            }
-            files.push(entry.path().to_path_buf());
-            if files.len() >= max_files {
-                break;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let ext = entry
+                    .path()
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if !DEFAULT_INCLUDED_EXTENSIONS
+                    .iter()
+                    .any(|allowed| *allowed == ext)
+                {
+                    continue;
+                }
+                files.push(entry.path().to_path_buf());
+                if files.len() >= max_files {
+                    break 'roots;
+                }
             }
         }
         files.sort();
+        files.dedup();
 
         let mut sequences: Vec<Vec<u32>> = Vec::new();
         for path in &files {
@@ -234,6 +260,40 @@ fn hash_tokenize(text: &str, vocab_size: u32) -> Vec<u32> {
 // Trainer
 // ---------------------------------------------------------------------------
 
+/// Cosine learning-rate schedule for a meta-training run.
+///
+/// Both the outer meta-learning rate α (the AdamW step on the projection
+/// matrices / LM head) and the inner test-time learning rate η (the
+/// per-token W̃ update inside `forward_native`) are annealed from a start
+/// value to a floor following a half-cosine over the full step budget.
+#[derive(Debug, Clone, Copy)]
+pub struct LrSchedule {
+    /// Outer AdamW learning rate at step 0.
+    pub alpha_start: f64,
+    /// Outer AdamW learning-rate floor at the final step.
+    pub alpha_end: f64,
+    /// Inner TTT learning rate η at step 0.
+    pub eta_start: f32,
+    /// Inner TTT learning-rate floor η at the final step.
+    pub eta_end: f32,
+}
+
+impl LrSchedule {
+    /// Cosine-annealed value at fractional progress `p` in `[0, 1]`.
+    fn cosine(start: f64, end: f64, p: f64) -> f64 {
+        let p = p.clamp(0.0, 1.0);
+        end + 0.5 * (start - end) * (1.0 + (std::f64::consts::PI * p).cos())
+    }
+
+    fn alpha_at(&self, p: f64) -> f64 {
+        Self::cosine(self.alpha_start, self.alpha_end, p)
+    }
+
+    fn eta_at(&self, p: f64) -> f32 {
+        Self::cosine(self.eta_start as f64, self.eta_end as f64, p) as f32
+    }
+}
+
 /// Meta-trainer for projection matrices on a repo-derived corpus.
 pub struct MetaTrainer {
     config: AxiomConfig,
@@ -246,6 +306,7 @@ pub struct MetaTrainer {
 }
 
 impl MetaTrainer {
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         config: AxiomConfig,
         device: Device,
@@ -257,12 +318,38 @@ impl MetaTrainer {
         max_sequences: usize,
         seed: u64,
     ) -> Result<Self> {
+        Self::build_multi(
+            config,
+            device,
+            vec![repo_root.as_ref().to_path_buf()],
+            checkpoint_path,
+            batch_size,
+            seq_len,
+            max_files,
+            max_sequences,
+            seed,
+        )
+    }
+
+    /// Build a trainer whose dataset is harvested from several source trees.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_multi(
+        config: AxiomConfig,
+        device: Device,
+        roots: Vec<PathBuf>,
+        checkpoint_path: impl Into<String>,
+        batch_size: usize,
+        seq_len: usize,
+        max_files: usize,
+        max_sequences: usize,
+        seed: u64,
+    ) -> Result<Self> {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let model = AxiomTTTLM::new(vb, config.clone())?;
 
-        let dataset = RepoFileDataset::build(
-            repo_root,
+        let dataset = RepoFileDataset::build_multi(
+            &roots,
             config.vocab_size as u32,
             seq_len,
             max_files,
@@ -273,8 +360,8 @@ impl MetaTrainer {
 
         if dataset.is_empty() {
             candle_core::bail!(
-                "meta-train dataset is empty after scanning repo files; \
-                 try --max-files higher or run from the repo root"
+                "meta-train dataset is empty after scanning source files; \
+                 try --max-files higher or point at directories with code"
             );
         }
 
@@ -294,26 +381,62 @@ impl MetaTrainer {
         self.dataset.len()
     }
 
-    /// Run `epochs * steps_per_epoch` optimiser steps and save the
-    /// checkpoint at the end.
+    /// Run `epochs * steps_per_epoch` optimiser steps at a fixed outer
+    /// learning rate (η left at the configured default) and save the
+    /// checkpoint at the end. Kept for callers that don't need scheduling.
     pub fn run(&mut self, epochs: usize, steps_per_epoch: usize, lr: f64) -> Result<f32> {
+        let eta = self.model.inner_lr();
+        let schedule = LrSchedule {
+            alpha_start: lr,
+            alpha_end: lr,
+            eta_start: eta,
+            eta_end: eta,
+        };
+        self.run_with_schedule(epochs, steps_per_epoch, schedule)
+    }
+
+    /// Run the full multi-epoch schedule with cosine decay on both the
+    /// outer meta-learning rate α and the inner test-time rate η.
+    ///
+    /// Prints a rolling meta-loss (EMA) decay line per epoch plus the live
+    /// α / η values, then serialises the converged parameters to the
+    /// configured checkpoint path.
+    pub fn run_with_schedule(
+        &mut self,
+        epochs: usize,
+        steps_per_epoch: usize,
+        schedule: LrSchedule,
+    ) -> Result<f32> {
         let mut optim = AdamW::new(
             self.varmap.all_vars(),
             ParamsAdamW {
-                lr,
+                lr: schedule.alpha_start,
                 ..ParamsAdamW::default()
             },
         )?;
 
-        let total_steps = (epochs * steps_per_epoch) as u64;
+        let total_steps = (epochs * steps_per_epoch).max(1) as u64;
         let progress = ProgressBar::new(total_steps);
         let style = ProgressStyle::with_template("{bar:40.cyan/blue} {pos:>6}/{len:6} | {msg}")
             .unwrap_or_else(|_| ProgressStyle::default_bar());
         progress.set_style(style);
 
+        // Exponential moving average of the meta-loss for a smooth decay read.
+        let mut ema_loss: Option<f32> = None;
+        let ema_beta = 0.9f32;
         let mut last_loss = f32::NAN;
+        let mut global_step: u64 = 0;
+
         for epoch in 0..epochs {
+            let mut epoch_loss_sum = 0.0f32;
             for _step in 0..steps_per_epoch {
+                // Cosine-annealed learning rates for this step.
+                let p = global_step as f64 / total_steps as f64;
+                let alpha = schedule.alpha_at(p);
+                let eta = schedule.eta_at(p);
+                optim.set_learning_rate(alpha);
+                self.model.set_inner_lr(eta);
+
                 let (inputs, targets) = self.dataset.next_batch(self.batch_size, &self.device)?;
 
                 let mut batch_logits = Vec::with_capacity(self.batch_size);
@@ -339,20 +462,52 @@ impl MetaTrainer {
                 optim.backward_step(&loss)?;
 
                 last_loss = loss.to_scalar::<f32>()?;
+                epoch_loss_sum += last_loss;
+                ema_loss = Some(match ema_loss {
+                    Some(prev) => ema_beta * prev + (1.0 - ema_beta) * last_loss,
+                    None => last_loss,
+                });
                 progress.set_message(format!(
-                    "epoch {}/{} | loss {:.5} | files-seq {} | d_model {} layers {}",
+                    "epoch {}/{} | loss {:.5} | ema {:.5} | α {:.2e} η {:.2e}",
                     epoch + 1,
                     epochs,
                     last_loss,
-                    self.dataset.len(),
-                    self.config.d_model,
-                    self.config.n_layers
+                    ema_loss.unwrap_or(last_loss),
+                    alpha,
+                    eta,
                 ));
                 progress.inc(1);
+                global_step += 1;
             }
+
+            // Rolling meta-loss decay line, visible even when piped (non-TTY).
+            let steps_f = steps_per_epoch.max(1) as f32;
+            let p_end = global_step as f64 / total_steps as f64;
+            let d_model = self.config.d_model;
+            let n_layers = self.config.n_layers;
+            progress.suspend(|| {
+                println!(
+                    "[meta] epoch {}/{} | L_meta(avg)={:.5} | L_meta(ema)={:.5} | α={:.3e} η={:.3e} | d_model={} layers={}",
+                    epoch + 1,
+                    epochs,
+                    epoch_loss_sum / steps_f,
+                    ema_loss.unwrap_or(last_loss),
+                    schedule.alpha_at(p_end),
+                    schedule.eta_at(p_end),
+                    d_model,
+                    n_layers,
+                );
+            });
         }
 
         progress.finish_with_message("meta-training complete");
+        self.save_checkpoint_verified(last_loss)?;
+        Ok(last_loss)
+    }
+
+    /// Create the parent dir if needed, serialise the varmap, and verify
+    /// the bytes actually landed on disk.
+    fn save_checkpoint_verified(&self, last_loss: f32) -> Result<()> {
         if let Some(parent) = std::path::Path::new(&self.checkpoint_path).parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -364,14 +519,21 @@ impl MetaTrainer {
             }
         }
         self.varmap.save(&self.checkpoint_path)?;
-        let bytes = std::fs::metadata(&self.checkpoint_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        println!(
-            "[+] Meta-train checkpoint saved to {} ({} bytes, final loss {:.5})",
-            self.checkpoint_path, bytes, last_loss
-        );
-        Ok(last_loss)
+        match std::fs::metadata(&self.checkpoint_path) {
+            Ok(meta) => println!(
+                "[+] Meta-train checkpoint written and verified: {} ({} bytes, final loss {:.5})",
+                self.checkpoint_path,
+                meta.len(),
+                last_loss
+            ),
+            Err(e) => {
+                return Err(candle_core::Error::Msg(format!(
+                    "checkpoint save reported success but file is missing at {}: {e}",
+                    self.checkpoint_path
+                )))
+            }
+        }
+        Ok(())
     }
 }
 

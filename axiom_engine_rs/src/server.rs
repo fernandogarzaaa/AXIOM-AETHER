@@ -1555,7 +1555,7 @@ fn empty_fingerprint(
     let n_layers = pipeline.model().config.n_layers;
     let d_model = pipeline.model().config.d_model;
     Ok(MemoryFingerprint {
-        schema: "axiom-ttt-context-fingerprint/v1".to_string(),
+        schema: "axiom-ttt-context-fingerprint/v2".to_string(),
         session_id: session_id.to_string(),
         context_tokens_processed: 0,
         n_layers,

@@ -6,7 +6,7 @@
 //! light user turn. Asserts that the upstream payload received by the
 //! mock has:
 //!   * the raw heavy text stripped,
-//!   * an AXIOM-TTT-CONTEXT-FINGERPRINT block prepended,
+//!   * an <axiom_context_fingerprint> block prepended,
 //!   * the original user query preserved.
 
 use std::net::SocketAddr;
@@ -144,15 +144,19 @@ async fn compression_strips_heavy_context_and_forwards_lean_payload() {
         "heavy raw text must NOT reach the upstream API"
     );
     assert!(
-        combined.contains("AXIOM-TTT-CONTEXT-FINGERPRINT"),
+        combined.contains("<axiom_context_fingerprint "),
         "fingerprint block must be present in upstream payload"
+    );
+    assert!(
+        combined.contains("</axiom_context_fingerprint>"),
+        "fingerprint block must be well-formed (closing tag present)"
     );
     assert!(
         combined.contains("summarise that codebase in one sentence"),
         "user query must survive into upstream payload"
     );
     assert!(
-        combined.contains("context_tokens_processed="),
+        combined.contains("tokens_compressed="),
         "fingerprint must report ingested-token count"
     );
 }
