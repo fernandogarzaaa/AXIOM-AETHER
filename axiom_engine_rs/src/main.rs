@@ -1,3 +1,4 @@
+mod claude_backend;
 mod cluster;
 mod config;
 mod data_gen;

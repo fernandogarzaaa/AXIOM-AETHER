@@ -8,6 +8,7 @@
 //! | GET    | `/v1/models`                         | List available models                    |
 //! | POST   | `/v1/completions`                    | Text completion (stateless or session)   |
 //! | POST   | `/v1/chat/completions`               | Chat completion (stateless or session)   |
+//! | POST   | `/v1/messages`                       | Anthropic Messages API (Claude clients)  |
 //! | POST   | `/v1/cluster/sync`                   | Delta state replication merge hook       |
 //! | POST   | `/v1/sessions`                       | Create a new persistent TTT session      |
 //! | DELETE | `/v1/sessions/{id}`                  | Delete a session                         |
@@ -33,6 +34,7 @@ use tokio::task::spawn_blocking;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
 use crate::inference::InferencePipeline;
@@ -187,6 +189,9 @@ pub struct AppState {
     sequence_versions: Arc<RwLock<HashMap<String, SequenceState>>>,
     /// Canonical model identifier returned in API responses.
     pub model_id: String,
+    /// Optional Anthropic Claude backend. When `Some`, generation is
+    /// routed through Claude instead of the local Axiom-TTT pipeline.
+    pub claude_backend: Arc<Option<ClaudeBackend>>,
 }
 
 impl AppState {
@@ -198,7 +203,14 @@ impl AppState {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             sequence_versions: Arc::new(RwLock::new(HashMap::new())),
             model_id,
+            claude_backend: Arc::new(None),
         }
+    }
+
+    /// Install a Claude backend on this app state, replacing any existing one.
+    pub fn with_claude_backend(mut self, backend: Option<ClaudeBackend>) -> Self {
+        self.claude_backend = Arc::new(backend);
+        self
     }
 
     fn refresh_session_metrics(&self) -> Result<(), ApiError> {
@@ -506,6 +518,89 @@ struct AdaptResponse {
     object: String,
     steps_per_token: usize,
     corpus_documents: usize,
+}
+
+// -- /v1/messages (Anthropic Messages API) --
+
+/// Anthropic accepts message ``content`` either as a bare string or as a
+/// list of typed blocks. We deserialise into [`AnthropicContent::Blocks`]
+/// or [`AnthropicContent::Text`] and flatten with [`AnthropicContent::to_text`].
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AnthropicContent {
+    Text(String),
+    Blocks(Vec<AnthropicInputBlock>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicInputBlock {
+    #[serde(rename = "type", default)]
+    block_type: String,
+    #[serde(default)]
+    text: String,
+}
+
+impl AnthropicContent {
+    fn to_text(&self) -> String {
+        match self {
+            AnthropicContent::Text(s) => s.clone(),
+            AnthropicContent::Blocks(blocks) => blocks
+                .iter()
+                .filter(|b| b.block_type == "text" || b.block_type.is_empty())
+                .map(|b| b.text.clone())
+                .collect::<Vec<_>>()
+                .concat(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicMessagesRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_anthropic_max_tokens")]
+    pub max_tokens: usize,
+    pub messages: Vec<AnthropicInputMessage>,
+    #[serde(default)]
+    pub system: Option<AnthropicContent>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+fn default_anthropic_max_tokens() -> usize {
+    1024
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicInputMessage {
+    pub role: String,
+    pub content: AnthropicContent,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicOutputBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicUsage {
+    input_tokens: usize,
+    output_tokens: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicMessagesResponse {
+    id: String,
+    #[serde(rename = "type")]
+    response_type: String,
+    role: String,
+    content: Vec<AnthropicOutputBlock>,
+    model: String,
+    stop_reason: String,
+    stop_sequence: Option<String>,
+    usage: AnthropicUsage,
 }
 
 // -- /v1/sessions/{id}/checkpoint --
@@ -1041,12 +1136,23 @@ fn count_corpus_tokens(state: &AppState, corpus: &[String]) -> Result<usize, Api
 }
 
 /// Run generation, optionally using and updating a named session.
+///
+/// When a Claude backend is installed on [`AppState`], generation is
+/// routed to Anthropic and the local TTT lifecycle is skipped. Sessions
+/// still exist so the wire contract holds, but `/v1/adapt` cannot
+/// influence the remote model.
 fn run_generation(
     state: &AppState,
     prompt: &str,
     max_tokens: usize,
     session_id: Option<&str>,
 ) -> Result<String, ApiError> {
+    if let Some(backend) = state.claude_backend.as_ref() {
+        return backend
+            .generate(prompt, max_tokens)
+            .map_err(ApiError::Internal);
+    }
+
     match session_id {
         None => {
             // Stateless generation.
@@ -1151,6 +1257,73 @@ fn resolve_or_create_session(
     }
 }
 
+/// `POST /v1/messages` — Anthropic Messages API endpoint.
+///
+/// Drop-in target for the Anthropic SDK and Claude Code: clients that
+/// point `ANTHROPIC_BASE_URL` at this server receive responses in the
+/// native Messages format regardless of whether the local Axiom-TTT
+/// pipeline or a Claude backend produced them.
+async fn create_message(
+    State(state): State<AppState>,
+    Json(req): Json<AnthropicMessagesRequest>,
+) -> Result<Json<AnthropicMessagesResponse>, ApiError> {
+    let model = req.model.clone().unwrap_or_else(|| state.model_id.clone());
+    let system_text = req.system.as_ref().map(|c| c.to_text());
+
+    let text = match state.claude_backend.as_ref() {
+        Some(backend) => {
+            // Chat-aware path preserves message structure for Claude.
+            let turns: Vec<ChatTurn> = req
+                .messages
+                .iter()
+                .map(|m| ChatTurn {
+                    role: m.role.clone(),
+                    content: m.content.to_text(),
+                })
+                .collect();
+            backend
+                .generate_chat(&turns, req.max_tokens, system_text.clone())
+                .map_err(ApiError::Internal)?
+        }
+        None => {
+            // Local pipeline: flatten to a single prompt string.
+            let mut prompt_parts: Vec<String> = Vec::new();
+            if let Some(ref sys) = system_text {
+                prompt_parts.push(format!("system: {sys}"));
+            }
+            for msg in &req.messages {
+                prompt_parts.push(format!("{}: {}", msg.role, msg.content.to_text()));
+            }
+            let prompt = prompt_parts.join("\n");
+            run_generation(&state, &prompt, req.max_tokens, req.session_id.as_deref())?
+        }
+    };
+
+    let input_tokens: usize = req
+        .messages
+        .iter()
+        .map(|m| m.content.to_text().split_whitespace().count())
+        .sum();
+    let output_tokens = text.split_whitespace().count();
+
+    Ok(Json(AnthropicMessagesResponse {
+        id: format!("msg_{}", Uuid::new_v4().simple()),
+        response_type: "message".to_string(),
+        role: "assistant".to_string(),
+        content: vec![AnthropicOutputBlock {
+            block_type: "text".to_string(),
+            text,
+        }],
+        model,
+        stop_reason: "end_turn".to_string(),
+        stop_sequence: None,
+        usage: AnthropicUsage {
+            input_tokens,
+            output_tokens,
+        },
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
@@ -1162,6 +1335,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/completions", post(create_completion))
         .route("/v1/chat/completions", post(create_chat_completion))
+        .route("/v1/messages", post(create_message))
         .route("/v1/cluster/sync", post(cluster_sync))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/:id", delete(delete_session))
@@ -1197,16 +1371,25 @@ pub async fn run_server(
     );
 
     let model_id = "axiom-ttt-v1".to_string();
-    let state = AppState::new(pipeline, model_id);
+    let claude_backend = ClaudeBackend::from_env();
+    if let Some(ref backend) = claude_backend {
+        println!(
+            "[+] Claude backend active — generation routed to model={} \
+             (TTT adapt is a no-op in this mode)",
+            backend.model()
+        );
+    }
+    let state = AppState::new(pipeline, model_id).with_claude_backend(claude_backend);
     let app = create_router(state);
 
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     println!("[+] Axiom-TTT server listening on http://{host}:{port}");
-    println!("[+] OpenAI-compatible API endpoints:");
+    println!("[+] OpenAI- and Anthropic-compatible API endpoints:");
     println!("      GET  /metrics");
     println!("      GET  /v1/models");
     println!("      POST /v1/completions");
     println!("      POST /v1/chat/completions         (stream:true for SSE)");
+    println!("      POST /v1/messages                 (Anthropic Messages API)");
     println!("      POST /v1/cluster/sync            (distributed delta merge)");
     println!("      POST /v1/sessions                 (create TTT session)");
     println!("      POST /v1/adapt                    (in-place TTT adaptation)");

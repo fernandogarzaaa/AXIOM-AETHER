@@ -122,6 +122,70 @@ class InferencePipeline:
 
         return self.tokenizer.decode(generated)
 
+    # ------------------------------------------------------------------
+    # Synchronous variants (used by the FastAPI server thread-pool path)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _generate_core_sync(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        states: Optional[List[Tensor]] = None,
+    ) -> tuple[str, List[Tensor]]:
+        """Synchronous prefill + autoregressive decode.
+
+        Skips the async JIT context fetch — server callers run inside a
+        thread-pool executor that cannot drive ``asyncio.run`` safely.
+        """
+        prompt_ids = self.tokenizer.encode(prompt)
+        if not prompt_ids:
+            prompt_ids = [0]
+
+        prompt_tensor = torch.tensor([prompt_ids], device=self.device, dtype=torch.long)
+        self.model(input_ids=prompt_tensor, use_decode=False, return_states=False)
+
+        if states is None:
+            states = _allocate_w_tilde_states(self.cfg, self.device)
+
+        last_token = torch.tensor([[prompt_ids[-1]]], device=self.device, dtype=torch.long)
+        logits, states = self.model(
+            input_ids=last_token,
+            states=states,
+            use_decode=True,
+            return_states=True,
+        )
+        generated: List[int] = [int(torch.argmax(logits[:, -1, :], dim=-1).item())]
+
+        for _ in range(max(0, max_new_tokens - 1)):
+            step = torch.tensor([[generated[-1]]], device=self.device, dtype=torch.long)
+            logits, states = self.model(
+                input_ids=step,
+                states=states,
+                use_decode=True,
+                return_states=True,
+            )
+            generated.append(int(torch.argmax(logits[:, -1, :], dim=-1).item()))
+
+        return self.tokenizer.decode(generated), states
+
+    def generate_sync(self, prompt: str, max_new_tokens: int = 32) -> str:
+        """Stateless synchronous generation."""
+        text, states = self._generate_core_sync(prompt, max_new_tokens, states=None)
+        del states
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return text
+
+    def generate_with_session_sync(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        states: List[Tensor],
+    ) -> tuple[str, List[Tensor]]:
+        """Stateful synchronous generation — returns (text, updated W_tilde states)."""
+        return self._generate_core_sync(prompt, max_new_tokens, states=states)
+
 
 class AxiomInferenceRunner:
     """CLI-facing inference runner; delegates to InferencePipeline internally."""
