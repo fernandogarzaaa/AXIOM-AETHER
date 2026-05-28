@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::anthropic_forwarder::{
     build_compressed_payload, partition_messages, whitespace_token_count, AnthropicForwarder,
+    ForwarderError,
 };
 use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
@@ -420,6 +421,10 @@ enum ApiError {
     NotFound(String),
     BadRequest(String),
     Conflict(String),
+    /// Upstream (Anthropic) failure. Carries the upstream status code so the
+    /// client can distinguish auth/rate-limit/server errors and the message
+    /// body for diagnostics.
+    Upstream { status: u16, message: String },
 }
 
 impl IntoResponse for ApiError {
@@ -429,6 +434,13 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+            ApiError::Upstream { status, message } => {
+                // Pass the upstream status through when it's a valid client/
+                // server code; otherwise surface a 502 Bad Gateway.
+                let code = StatusCode::from_u16(status)
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                (code, message).into_response()
+            }
         }
     }
 }
@@ -842,6 +854,9 @@ fn chat_completion_sse(
                 | ApiError::NotFound(m)
                 | ApiError::BadRequest(m)
                 | ApiError::Conflict(m) => m,
+                ApiError::Upstream { status, message } => {
+                    format!("upstream {status}: {message}")
+                }
             };
             vec![Ok(Event::default().data(format!("error: {body}")))]
         }
@@ -1513,7 +1528,19 @@ async fn compressed_messages_path(state: &AppState, body: &Value) -> Result<Valu
     forwarder
         .forward_messages_json(&outbound)
         .await
-        .map_err(|e| ApiError::Internal(format!("anthropic upstream call failed: {e}")))
+        .map_err(|e| match e {
+            // Surface the real upstream status (401/429/5xx) to the client.
+            ForwarderError::Upstream { status, body } => ApiError::Upstream {
+                status,
+                message: format!("anthropic upstream {status}: {body}"),
+            },
+            // Network/decode failures mean we never got a usable response →
+            // 502 Bad Gateway rather than a misleading 500.
+            other => ApiError::Upstream {
+                status: StatusCode::BAD_GATEWAY.as_u16(),
+                message: format!("anthropic upstream call failed: {other}"),
+            },
+        })
 }
 
 fn empty_fingerprint(

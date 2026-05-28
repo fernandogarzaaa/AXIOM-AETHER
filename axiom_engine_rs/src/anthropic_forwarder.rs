@@ -8,9 +8,10 @@
 //! heavy text from the outbound JSON, and prepends the fingerprint
 //! to the surviving user prompt before forwarding to Anthropic.
 //!
-//! All HTTP is `reqwest` async (non-blocking). Streaming responses
-//! are piped back to the caller as the bytes arrive — never buffered
-//! in full.
+//! All HTTP is `reqwest` async (non-blocking). The current
+//! `forward_messages_json` path buffers the upstream JSON body in full
+//! before returning — appropriate for non-streaming Messages calls. A
+//! streaming-passthrough variant is not implemented yet.
 
 use std::time::Duration;
 
