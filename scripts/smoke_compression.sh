@@ -140,7 +140,7 @@ if grep -q "fn_chunk_399" "$CAPTURE_PATH"; then
 else
     echo "    OK: raw heavy text stripped from outbound payload"
 fi
-if grep -q "AXIOM-TTT-CONTEXT-FINGERPRINT" "$CAPTURE_PATH"; then
+if grep -q "<axiom_context_fingerprint " "$CAPTURE_PATH"; then
     echo "    OK: fingerprint block present in outbound payload"
 else
     echo "    FAIL: fingerprint missing from outbound payload"

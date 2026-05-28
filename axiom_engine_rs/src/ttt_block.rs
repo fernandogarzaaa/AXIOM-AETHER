@@ -5,6 +5,9 @@
 //! performs one self-supervised gradient step on W_tilde before producing output,
 //! achieving O(1) memory per inference step.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
 use candle_core::{Result, Tensor, D};
 use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 
@@ -20,12 +23,30 @@ pub struct NativeTTTBlock {
     w_k: Linear,
     w_v: Linear,
     layer_norm: LayerNorm,
-    config: AxiomConfig,
+    /// Inner test-time learning rate η, stored as raw f32 bits so it can be
+    /// adjusted at runtime (e.g. cosine decay during meta-training) and
+    /// shared across all layers without rebuilding the model. Read on every
+    /// `forward_native` step.
+    inner_lr: Arc<AtomicU32>,
 }
 
 impl NativeTTTBlock {
-    /// Construct a new block, allocating all projection and normalisation weights.
+    /// Construct a new block with its own private inner-lr cell initialised
+    /// from `config.lr_inner`.
+    #[allow(dead_code)] // used by the lib path + tests; the bin builds via the model
     pub fn new(vs: VarBuilder, config: AxiomConfig) -> Result<Self> {
+        let inner_lr = Arc::new(AtomicU32::new(config.lr_inner.to_bits()));
+        Self::new_with_shared_lr(vs, config, inner_lr)
+    }
+
+    /// Construct a block that reads its inner learning rate from a shared
+    /// atomic cell — used by `AxiomTTTLM` so a single `set_inner_lr` call
+    /// retunes every layer at once.
+    pub fn new_with_shared_lr(
+        vs: VarBuilder,
+        config: AxiomConfig,
+        inner_lr: Arc<AtomicU32>,
+    ) -> Result<Self> {
         let d = config.d_model;
         Ok(Self {
             w_q: candle_nn::linear_no_bias(d, d, vs.pp("w_q"))?,
@@ -36,7 +57,7 @@ impl NativeTTTBlock {
                 config.norm_eps as f64,
                 vs.pp("layer_norm"),
             )?,
-            config,
+            inner_lr,
         })
     }
 
@@ -83,7 +104,9 @@ impl NativeTTTBlock {
         let grad = error.unsqueeze(1)?.matmul(&k)?;
 
         // W_tilde update: W_tilde ← W_tilde − η · grad
-        let lr = Tensor::new(self.config.lr_inner, session_state.device())?;
+        // η is read live from the shared atomic so meta-training can decay it.
+        let eta = f32::from_bits(self.inner_lr.load(Ordering::Relaxed));
+        let lr = Tensor::new(eta, session_state.device())?;
         let updated_state = session_state.sub(&grad.broadcast_mul(&lr)?)?;
         *session_state = updated_state.clone();
         // ------------------------------------------------------------------------

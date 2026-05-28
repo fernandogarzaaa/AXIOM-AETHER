@@ -348,7 +348,7 @@ mod tests {
             ws,
         );
         let fp = MemoryFingerprint {
-            schema: "axiom-ttt-context-fingerprint/v1".into(),
+            schema: "axiom-ttt-context-fingerprint/v2".into(),
             session_id: "sess-z".into(),
             context_tokens_processed: 0,
             n_layers: 1,
@@ -365,7 +365,8 @@ mod tests {
         let messages = payload["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         let content = messages[0]["content"].as_str().unwrap();
-        assert!(content.starts_with("[AXIOM-TTT-CONTEXT-FINGERPRINT"));
+        assert!(content.starts_with("<axiom_context_fingerprint "));
+        assert!(content.contains("</axiom_context_fingerprint>"));
         assert!(content.contains("summarise the diff please"));
     }
 
@@ -381,7 +382,7 @@ mod tests {
         let partitioned = partition_messages(original["messages"].as_array().unwrap(), 50, ws);
         assert!(partitioned.surviving.is_empty());
         let fp = MemoryFingerprint {
-            schema: "axiom-ttt-context-fingerprint/v1".into(),
+            schema: "axiom-ttt-context-fingerprint/v2".into(),
             session_id: "sess-q".into(),
             context_tokens_processed: 400,
             n_layers: 1,
@@ -398,7 +399,8 @@ mod tests {
         let messages = payload["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         let content = messages[0]["content"].as_str().unwrap();
-        assert!(content.contains("AXIOM-TTT-CONTEXT-FINGERPRINT"));
+        assert!(content.contains("<axiom_context_fingerprint "));
+        assert!(content.contains("tokens_compressed=\"400\""));
         assert!(!content.contains("tok399")); // raw heavy text was stripped
     }
 }

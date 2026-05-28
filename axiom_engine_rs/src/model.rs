@@ -8,6 +8,9 @@
 //!
 //! Architecture: Embedding → N × NativeTTTBlock → RMSNorm → LM Head
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
 use candle_core::{DType, Result, Tensor};
 use candle_nn::{Module, VarBuilder};
 
@@ -25,6 +28,9 @@ pub struct AxiomTTTLM {
     ln_f: RMSNorm,
     lm_head: candle_nn::Linear,
     pub config: AxiomConfig,
+    /// Shared inner test-time learning rate η (raw f32 bits) read by every
+    /// `NativeTTTBlock`. Adjusting it retunes the whole stack at once.
+    inner_lr: Arc<AtomicU32>,
 }
 
 impl AxiomTTTLM {
@@ -34,11 +40,16 @@ impl AxiomTTTLM {
         let embeddings =
             candle_nn::embedding(config.vocab_size, config.d_model, vs.pp("embeddings"))?;
 
+        // One shared inner-lr cell, initialised from config, handed to every
+        // layer so meta-training can decay η across the whole stack.
+        let inner_lr = Arc::new(AtomicU32::new(config.lr_inner.to_bits()));
+
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
-            layers.push(NativeTTTBlock::new(
+            layers.push(NativeTTTBlock::new_with_shared_lr(
                 vs.pp(format!("native_block_{i}")),
                 config.clone(),
+                inner_lr.clone(),
             )?);
         }
 
@@ -52,7 +63,19 @@ impl AxiomTTTLM {
             ln_f,
             lm_head,
             config,
+            inner_lr,
         })
+    }
+
+    /// Set the inner test-time learning rate η used by every TTT layer on
+    /// subsequent `forward_native` / `forward_lm` calls.
+    pub fn set_inner_lr(&self, eta: f32) {
+        self.inner_lr.store(eta.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Current inner test-time learning rate η.
+    pub fn inner_lr(&self) -> f32 {
+        f32::from_bits(self.inner_lr.load(Ordering::Relaxed))
     }
 
     /// Allocate per-layer identity fast-weight matrices as initial session states.

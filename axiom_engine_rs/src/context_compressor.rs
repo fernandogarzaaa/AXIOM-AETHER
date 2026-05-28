@@ -142,9 +142,15 @@ pub struct MemoryFingerprint {
 }
 
 impl MemoryFingerprint {
-    /// Format the fingerprint as a labelled text block suitable for
-    /// prepending to a user prompt. Documents its own schema so the
-    /// downstream LLM can interpret it as context metadata.
+    /// Format the fingerprint as a strict XML/Markdown block suitable for
+    /// prepending to a downstream frontier-model prompt.
+    ///
+    /// The block carries (a) machine-readable recall-layout fields and
+    /// (b) explicit decode instructions telling the downstream model how
+    /// to interpret the compressed semantic horizon. The outer element is
+    /// a single, well-formed `<axiom_context_fingerprint>` tag with
+    /// `session_id` / `tokens_compressed` attributes so the model can
+    /// reliably locate the boundaries.
     pub fn to_prompt_block(&self) -> String {
         let layer_norm_summary = if self.layer_frobenius_norms.len() <= 8 {
             format!("{:?}", self.layer_frobenius_norms)
@@ -162,23 +168,40 @@ impl MemoryFingerprint {
         let decoded_line = if self.recall_top_k_decoded.is_empty() {
             String::new()
         } else {
-            format!("\nrecall_top_k_decoded={:?}", self.recall_top_k_decoded)
+            format!("recall_top_k_decoded={:?}\n", self.recall_top_k_decoded)
         };
+        // NOTE: `state_hash=` is intentionally emitted at the start of its
+        // own line so external tooling can grep the snapshot id verbatim.
         format!(
-            "[AXIOM-TTT-CONTEXT-FINGERPRINT schema={schema}]\n\
-             session={session}\n\
-             context_tokens_processed={tokens}\n\
-             layers={layers} d_model={d}\n\
-             layer_frobenius_norms={norms}\n\
+            "<axiom_context_fingerprint session_id=\"{session}\" tokens_compressed=\"{tokens}\" schema=\"{schema}\">\n\
+             <recall_layout>\n\
              associative_recall_norm={norm:.6}\n\
              associative_recall_l1={l1:.6}\n\
-             recall_top_k_indices={top:?}{decoded}\n\
+             recall_top_k_indices={top:?}\n\
+             {decoded}layers={layers} d_model={d}\n\
+             layer_frobenius_norms={norms}\n\
              state_hash={hash}\n\
              compression_ms={ms}\n\
-             [/AXIOM-TTT-CONTEXT-FINGERPRINT]",
-            schema = self.schema,
+             </recall_layout>\n\
+             <decode_instructions>\n\
+             The block above is a lossy neural compression of prior heavy context that was\n\
+             ingested locally through online test-time training (TTT). It is NOT raw text:\n\
+             the original tokens were streamed through per-session fast-weight matrices (W̃),\n\
+             and `recall_top_k_indices` are the vocabulary ids the adapted state most strongly\n\
+             predicts when queried — i.e. a distilled semantic pointer into that context.\n\
+             To decode: (1) treat `recall_top_k_decoded` (when present) and the top-k ids as\n\
+             the salient topics/entities of the compressed material; (2) use\n\
+             `associative_recall_norm` as a confidence signal — values near 0 mean weak recall,\n\
+             higher magnitudes mean a sharp, well-conditioned memory; (3) `state_hash` uniquely\n\
+             identifies this W̃ snapshot for this session, so identical hashes imply identical\n\
+             absorbed context. Infer the user's intent over this compressed horizon and answer\n\
+             the query that follows this block. If recall confidence is low, ask a brief\n\
+             clarifying question rather than hallucinating the compressed content.\n\
+             </decode_instructions>\n\
+             </axiom_context_fingerprint>",
             session = self.session_id,
             tokens = self.context_tokens_processed,
+            schema = self.schema,
             layers = self.n_layers,
             d = self.d_model,
             norms = layer_norm_summary,
@@ -293,7 +316,7 @@ pub fn extract_memory_vector_blocking(
     let _ = final_logits.argmax(D::Minus1).ok();
 
     Ok(MemoryFingerprint {
-        schema: "axiom-ttt-context-fingerprint/v1".to_string(),
+        schema: "axiom-ttt-context-fingerprint/v2".to_string(),
         session_id: session_id.to_string(),
         context_tokens_processed,
         n_layers,
@@ -445,7 +468,7 @@ mod tests {
     #[test]
     fn fingerprint_to_prompt_block_is_well_formed() {
         let fp = MemoryFingerprint {
-            schema: "axiom-ttt-context-fingerprint/v1".into(),
+            schema: "axiom-ttt-context-fingerprint/v2".into(),
             session_id: "sess-y".into(),
             context_tokens_processed: 1234,
             n_layers: 4,
@@ -459,12 +482,18 @@ mod tests {
             elapsed_ms: 42,
         };
         let block = fp.to_prompt_block();
-        assert!(block.contains("AXIOM-TTT-CONTEXT-FINGERPRINT"));
-        assert!(block.contains("session=sess-y"));
-        assert!(block.contains("context_tokens_processed=1234"));
+        // Well-formed XML envelope with locating attributes.
+        assert!(block.starts_with("<axiom_context_fingerprint "));
+        assert!(block.contains("session_id=\"sess-y\""));
+        assert!(block.contains("tokens_compressed=\"1234\""));
+        assert!(block.contains("schema=\"axiom-ttt-context-fingerprint/v2\""));
+        // Recall layout + decode-instruction sections present.
+        assert!(block.contains("<recall_layout>"));
+        assert!(block.contains("</recall_layout>"));
+        assert!(block.contains("<decode_instructions>"));
         assert!(block.contains("state_hash=sha256:deadbeef"));
         assert!(block.contains("alpha beta gamma"));
-        assert!(block.ends_with("[/AXIOM-TTT-CONTEXT-FINGERPRINT]"));
+        assert!(block.trim_end().ends_with("</axiom_context_fingerprint>"));
     }
 
     #[test]
