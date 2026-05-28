@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 from .claude_backend import ClaudeBackend, ClaudeMessage, backend_from_env
 from .config import AxiomConfig
 from .inference import InferencePipeline, _allocate_w_tilde_states
+from .response_cache import ResponseCache, cache_from_env, fingerprint
 
 logger = logging.getLogger("axiom.server")
 
@@ -43,11 +44,12 @@ _pipeline: Optional[InferencePipeline] = None
 _sessions: Dict[str, Dict[str, Any]] = {}
 _model_id = "axiom-ttt-v1"
 _claude_backend: Optional[ClaudeBackend] = None
+_response_cache: Optional[ResponseCache] = None
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global _pipeline, _claude_backend
+    global _pipeline, _claude_backend, _response_cache
     cfg = AxiomConfig()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("[+] Loading Axiom-TTT pipeline on %s", device)
@@ -60,6 +62,15 @@ async def lifespan(application: FastAPI):
             "(TTT adapt is a no-op in this mode)",
             _claude_backend.model,
         )
+    _response_cache = cache_from_env()
+    if _response_cache is not None:
+        path = _response_cache.persist_path
+        suffix = f" (persisted to {path})" if path else ""
+        logger.info(
+            "[+] Response cache active — fingerprint LRU, max_entries=%d%s",
+            _response_cache.max_entries,
+            suffix,
+        )
     logger.info("[+] Axiom-TTT server ready — model_id=%s", _model_id)
     yield
     logger.info("[*] Shutting down Axiom-TTT server")
@@ -69,6 +80,12 @@ def set_claude_backend(backend: Optional[ClaudeBackend]) -> None:
     """Test / programmatic hook to install (or clear) a Claude backend."""
     global _claude_backend
     _claude_backend = backend
+
+
+def set_response_cache(cache: Optional[ResponseCache]) -> None:
+    """Test / programmatic hook to install (or clear) the response cache."""
+    global _response_cache
+    _response_cache = cache
 
 
 # ---------------------------------------------------------------------------
@@ -279,27 +296,55 @@ def _get_or_create_session(session_id: Optional[str]) -> tuple[str, list]:
     return new_id, states
 
 
+def _cache_key_prompt(prompt: str, max_tokens: int) -> str:
+    return fingerprint(model=_model_id, max_tokens=max_tokens, prompt=prompt)
+
+
+def _cache_key_chat(
+    messages: List[ClaudeMessage],
+    max_tokens: int,
+    system: Optional[str],
+) -> str:
+    return fingerprint(
+        model=_model_id,
+        max_tokens=max_tokens,
+        messages=[{"role": m.role, "content": m.content} for m in messages],
+        system=system,
+    )
+
+
 async def _run_generation(prompt: str, max_tokens: int, session_id: Optional[str]) -> str:
     """Run generation in a thread pool to avoid blocking the event loop.
 
     When a Claude backend is installed, generation is routed there instead
-    of the local TTT pipeline. Session bookkeeping still runs so the wire
-    format stays consistent across both modes.
+    of the local TTT pipeline. The response cache (if active) wraps either
+    path; session-aware requests bypass the cache because the response
+    depends on per-session W̃ state.
     """
+    cacheable = session_id is None and _response_cache is not None
+    cache_key = _cache_key_prompt(prompt, max_tokens) if cacheable else None
+    if cache_key is not None:
+        cached = _response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
     if _claude_backend is not None:
         if session_id is not None:
-            # Touch the session for compatibility (even though TTT is a no-op here).
             _get_or_create_session(session_id)
-        return await asyncio.get_event_loop().run_in_executor(
+        text = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: _claude_backend.generate(prompt, max_tokens),
         )
+    else:
+        pipeline = _require_pipeline()
+        text = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _generate_sync(pipeline, prompt, max_tokens, session_id),
+        )
 
-    pipeline = _require_pipeline()
-    return await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: _generate_sync(pipeline, prompt, max_tokens, session_id),
-    )
+    if cache_key is not None:
+        _response_cache.put(cache_key, text)
+    return text
 
 
 async def _run_chat_generation(
@@ -309,24 +354,35 @@ async def _run_chat_generation(
     system: Optional[str] = None,
 ) -> str:
     """Chat-aware generation; preserves message structure for the Claude backend."""
+    cacheable = session_id is None and _response_cache is not None
+    cache_key = _cache_key_chat(messages, max_tokens, system) if cacheable else None
+    if cache_key is not None:
+        cached = _response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
     if _claude_backend is not None:
         if session_id is not None:
             _get_or_create_session(session_id)
-        return await asyncio.get_event_loop().run_in_executor(
+        text = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: _claude_backend.generate_chat(messages, max_tokens, system=system),
         )
+    else:
+        pipeline = _require_pipeline()
+        prompt_parts = []
+        if system:
+            prompt_parts.append(f"system: {system}")
+        prompt_parts.extend(f"{m.role}: {m.content}" for m in messages)
+        prompt = "\n".join(prompt_parts)
+        text = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _generate_sync(pipeline, prompt, max_tokens, session_id),
+        )
 
-    pipeline = _require_pipeline()
-    prompt_parts = []
-    if system:
-        prompt_parts.append(f"system: {system}")
-    prompt_parts.extend(f"{m.role}: {m.content}" for m in messages)
-    prompt = "\n".join(prompt_parts)
-    return await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: _generate_sync(pipeline, prompt, max_tokens, session_id),
-    )
+    if cache_key is not None:
+        _response_cache.put(cache_key, text)
+    return text
 
 
 def _generate_sync(
@@ -365,6 +421,31 @@ async def list_models() -> ListModelsResponse:
     return ListModelsResponse(
         data=[ModelInfo(id=_model_id)]
     )
+
+
+@app.get("/v1/cache/stats")
+async def cache_stats() -> dict:
+    """Return response-cache hit/miss counters.
+
+    Returns ``{"enabled": false}`` when no cache is configured. Otherwise
+    reports ``entries``, ``hits``, ``misses``, and ``hit_rate``.
+    """
+    if _response_cache is None:
+        return {"enabled": False}
+    payload = _response_cache.stats().to_dict()
+    payload["enabled"] = True
+    payload["max_entries"] = _response_cache.max_entries
+    return payload
+
+
+@app.delete("/v1/cache")
+async def cache_clear() -> dict:
+    """Drop all cached responses. No-op (returns ``cleared=False``) when
+    no cache is configured."""
+    if _response_cache is None:
+        return {"cleared": False}
+    _response_cache.clear()
+    return {"cleared": True}
 
 
 @app.post("/v1/completions", response_model=CompletionResponse)
