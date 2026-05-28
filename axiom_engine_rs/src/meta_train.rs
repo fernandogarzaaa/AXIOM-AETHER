@@ -82,6 +82,21 @@ impl RepoFileDataset {
         max_sequences: usize,
         seed: u64,
     ) -> std::io::Result<Self> {
+        // Fail fast on degenerate inputs that would otherwise panic later:
+        // `step_by(seq_len)` panics on 0, and `hash_tokenize` divides by
+        // `vocab_size`.
+        if seq_len == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seq_len must be greater than 0",
+            ));
+        }
+        if vocab_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "vocab_size must be greater than 0",
+            ));
+        }
         let mut files: Vec<PathBuf> = Vec::new();
         for entry in WalkDir::new(root.as_ref())
             .follow_links(false)
@@ -122,7 +137,8 @@ impl RepoFileDataset {
                 Err(_) => continue,
             };
             let tokens = hash_tokenize(&text, vocab_size);
-            // Slide a window of seq_len+1 over the token stream.
+            // Chop the token stream into non-overlapping (stride = seq_len)
+            // windows of length seq_len+1 (inputs + shifted target).
             if tokens.len() < seq_len + 1 {
                 continue;
             }
@@ -337,10 +353,23 @@ impl MetaTrainer {
         }
 
         progress.finish_with_message("meta-training complete");
+        if let Some(parent) = std::path::Path::new(&self.checkpoint_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    candle_core::Error::Msg(format!(
+                        "could not create checkpoint dir {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+        }
         self.varmap.save(&self.checkpoint_path)?;
+        let bytes = std::fs::metadata(&self.checkpoint_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         println!(
-            "[+] Meta-train checkpoint saved to {} (final loss {:.5})",
-            self.checkpoint_path, last_loss
+            "[+] Meta-train checkpoint saved to {} ({} bytes, final loss {:.5})",
+            self.checkpoint_path, bytes, last_loss
         );
         Ok(last_loss)
     }

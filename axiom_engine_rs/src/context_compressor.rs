@@ -69,10 +69,16 @@ impl TttSessionStore {
         if let Some(s) = self.sessions.get(session_id) {
             return Ok(s.clone());
         }
+        // Build the fresh state outside the map, then insert-if-absent
+        // atomically via the entry API so two concurrent first-touch requests
+        // for the same session can't both insert and clobber each other's W̃.
         let states = pipeline.init_session_states()?;
         let arc = Arc::new(AsyncMutex::new(states));
-        self.sessions.insert(session_id.to_string(), arc.clone());
-        Ok(arc)
+        let entry = self
+            .sessions
+            .entry(session_id.to_string())
+            .or_insert(arc);
+        Ok(entry.value().clone())
     }
 
     /// Number of live sessions; used by the metrics + stats endpoints.
@@ -230,7 +236,23 @@ pub fn extract_memory_vector_blocking(
     let d_model = pipeline.model().config.d_model;
     let device = pipeline.device();
 
-    // Deterministic state hash over every layer's W̃.
+    // Associative recall: project query through the adapted state. This
+    // `forward_lm` mutates `states` in place (one more TTT step per query
+    // token), so the hash/norms below are computed AFTER it to stay
+    // consistent with the state actually left stored for the next request.
+    let recall_query: Vec<u32> = if query_token_ids.is_empty() {
+        vec![0]
+    } else {
+        query_token_ids.to_vec()
+    };
+    let q_len = recall_query.len();
+    let q_input = Tensor::from_vec(recall_query.clone(), (1, q_len), device)?;
+    let logits = pipeline.model().forward_lm(&q_input, states)?; // [1, T, vocab]
+    // Take the final-token logit vector.
+    let final_logits = logits.narrow(1, q_len - 1, 1)?.squeeze(1)?.squeeze(0)?;
+    let final_vec: Vec<f32> = final_logits.to_vec1::<f32>()?;
+
+    // Deterministic state hash + Frobenius norms over the post-recall W̃.
     let mut hasher = Sha256::new();
     let mut layer_frobenius_norms: Vec<f32> = Vec::with_capacity(n_layers);
     for layer in states.iter() {
@@ -243,19 +265,6 @@ pub fn extract_memory_vector_blocking(
         layer_frobenius_norms.push(sq_sum.sqrt());
     }
     let state_hash = format!("sha256:{:x}", hasher.finalize());
-
-    // Associative recall: project query through the adapted state.
-    let recall_query: Vec<u32> = if query_token_ids.is_empty() {
-        vec![0]
-    } else {
-        query_token_ids.to_vec()
-    };
-    let q_len = recall_query.len();
-    let q_input = Tensor::from_vec(recall_query.clone(), (1, q_len), device)?;
-    let logits = pipeline.model().forward_lm(&q_input, states)?; // [1, T, vocab]
-    // Take the final-token logit vector.
-    let final_logits = logits.narrow(1, q_len - 1, 1)?.squeeze(1)?.squeeze(0)?;
-    let final_vec: Vec<f32> = final_logits.to_vec1::<f32>()?;
 
     let recall_norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
     let recall_l1: f32 = final_vec.iter().map(|x| x.abs()).sum();

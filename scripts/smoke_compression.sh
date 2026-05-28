@@ -69,7 +69,20 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8765 \
 AXIOM_PID=$!
 trap 'kill "$AXIOM_PID" "$MOCK_PID" 2>/dev/null || true; pkill -P $$ 2>/dev/null || true' EXIT
 
-until curl -sf http://127.0.0.1:8766/v1/models > /dev/null 2>&1; do sleep 0.5; done
+READY=0
+for _ in $(seq 1 60); do
+    if curl -sf http://127.0.0.1:8766/v1/models > /dev/null 2>&1; then
+        READY=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$READY" -ne 1 ]; then
+    echo "FAIL: Axiom server never became ready on :8766 within 30s"
+    echo "--- axiom server log ---"
+    cat "$AXIOM_LOG"
+    exit 1
+fi
 echo "==> Axiom up; compression-mode banner from server log:"
 grep -E "Active-compression|listening" "$AXIOM_LOG" | sed 's/^/    /'
 
