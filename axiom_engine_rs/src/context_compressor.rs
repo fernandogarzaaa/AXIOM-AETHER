@@ -91,9 +91,20 @@ impl TttSessionStore {
         self.sessions.is_empty()
     }
 
-    /// Drop a single session (frees its W̃ tensors).
-    pub fn drop_session(&self, session_id: &str) -> bool {
-        self.sessions.remove(session_id).is_some()
+    /// Remove a single session and return its state handle, so the caller can
+    /// (e.g.) EMA-merge the adapted W̃ into a master before it is freed.
+    pub fn take_session(&self, session_id: &str) -> Option<SessionStates> {
+        self.sessions.remove(session_id).map(|(_, states)| states)
+    }
+
+    /// Snapshot handles to every live session without removing them. Cheap —
+    /// clones `Arc`s only. Used to flush all sessions into the master vibe on
+    /// graceful shutdown.
+    pub fn snapshot_handles(&self) -> Vec<(String, SessionStates)> {
+        self.sessions
+            .iter()
+            .map(|kv| (kv.key().clone(), kv.value().clone()))
+            .collect()
     }
 
     /// Drop every session.
@@ -413,7 +424,7 @@ mod tests {
 
         let _ = store.get_or_create("sess-b", &pipeline).unwrap();
         assert_eq!(store.len(), 2);
-        assert!(store.drop_session("sess-a"));
+        assert!(store.take_session("sess-a").is_some());
         assert_eq!(store.len(), 1);
     }
 

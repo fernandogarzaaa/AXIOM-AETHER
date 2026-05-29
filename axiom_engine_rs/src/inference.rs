@@ -67,9 +67,12 @@ impl InferencePipeline {
         let checkpoint = checkpoint_path.as_ref();
         if Path::new(checkpoint).exists() {
             varmap.load(checkpoint)?;
-            println!("[+] Loaded checkpoint from {checkpoint}");
+            // Diagnostics go to stderr: stdout is reserved as a pure protocol
+            // channel for `--mode mcp` (JSON-RPC stdio). The HTTP server prints
+            // its own banner separately.
+            eprintln!("[+] Loaded checkpoint from {checkpoint}");
         } else {
-            println!(
+            eprintln!(
                 "[!] Warning: No pre-trained checkpoint found. Initializing with baseline random weights."
             );
         }
@@ -82,11 +85,11 @@ impl InferencePipeline {
         {
             Some(path) => match Tokenizer::from_file(path) {
                 Ok(tok) => {
-                    println!("[+] Loaded tokenizer from {path}");
+                    eprintln!("[+] Loaded tokenizer from {path}");
                     TokenizerBackend::Hf(Box::new(tok))
                 }
                 Err(err) => {
-                    println!("[!] Warning: failed to load tokenizer at {path}: {err}");
+                    eprintln!("[!] Warning: failed to load tokenizer at {path}: {err}");
                     TokenizerBackend::HashFallback
                 }
             },

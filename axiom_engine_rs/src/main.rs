@@ -7,6 +7,7 @@ mod data_gen;
 mod inference;
 mod jit_streamer;
 mod kernel;
+mod mcp_stdio;
 mod memory_pool;
 mod meta_train;
 mod metrics;
@@ -15,6 +16,7 @@ mod quantization;
 mod server;
 mod train;
 mod ttt_block;
+mod vibe_memory;
 
 use std::env;
 
@@ -301,6 +303,14 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| candle_core::Error::Msg(format!("server startup failed: {e}")))?;
         }
+        "mcp" => {
+            // Native MCP server over JSON-RPC 2.0 stdio. Runs as a dedicated
+            // process (separate from the HTTP proxy) so stdout stays a pure
+            // protocol channel; all diagnostics go to stderr.
+            mcp_stdio::run_stdio_server(config, device, args.checkpoint_path)
+                .await
+                .map_err(|e| candle_core::Error::Msg(format!("mcp server failed: {e}")))?;
+        }
         "meta-train" => {
             // Phase 4: train projection matrices on raw repo files so
             // the online TTT updates produce well-conditioned, non-degenerate
@@ -344,7 +354,7 @@ async fn main() -> Result<()> {
         }
         other => {
             bail!(
-                "unsupported mode '{other}'. Use --mode train | generate | server | meta-train"
+                "unsupported mode '{other}'. Use --mode train | generate | server | mcp | meta-train"
             )
         }
     }

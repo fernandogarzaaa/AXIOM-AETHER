@@ -44,11 +44,12 @@ use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
 use crate::context_compressor::{
     adapt_session_blocking, extract_memory_vector_blocking, CompressorConfig, MemoryFingerprint,
-    TttSessionStore,
+    SessionStates, TttSessionStore,
 };
 use crate::inference::InferencePipeline;
 use crate::metrics;
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
+use crate::vibe_memory::MasterVibe;
 
 const MAX_ACTIVE_VRAM_SESSIONS: usize = 32;
 
@@ -211,6 +212,10 @@ pub struct AppState {
     pub anthropic_forwarder: Arc<Option<AnthropicForwarder>>,
     /// Static compression configuration (threshold, top-k, enabled flag).
     pub compressor_config: Arc<CompressorConfig>,
+    /// Optional persistent "vibe memory". When `Some`, adapted session W̃
+    /// states are EMA-merged into the master and serialised on session
+    /// drop / clear / graceful shutdown (the automatic merge trigger).
+    pub master_vibe: Arc<Mutex<Option<MasterVibe>>>,
 }
 
 impl AppState {
@@ -226,6 +231,51 @@ impl AppState {
             ttt_sessions: Arc::new(TttSessionStore::new()),
             anthropic_forwarder: Arc::new(None),
             compressor_config: Arc::new(CompressorConfig::default()),
+            master_vibe: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Install (or clear) the persistent vibe-memory master.
+    pub fn with_master_vibe(mut self, vibe: Option<MasterVibe>) -> Self {
+        self.master_vibe = Arc::new(Mutex::new(vibe));
+        self
+    }
+
+    /// EMA-merge one session handle's adapted W̃ into the master vibe and
+    /// persist it. No-op when vibe memory is disabled. Reads the session
+    /// states asynchronously, then performs the (sync, tiny) commit without
+    /// holding the std mutex across an `.await`.
+    async fn flush_session_to_vibe(&self, handle: &SessionStates) {
+        // Cheap clone of the per-layer tensors out from under the async lock.
+        let states = { handle.lock().await.clone() };
+        if let Ok(mut guard) = self.master_vibe.lock() {
+            if let Some(vibe) = guard.as_mut() {
+                if let Err(e) = vibe.commit_and_save(&states) {
+                    eprintln!("[vibe] auto-commit skipped: {e}");
+                }
+            }
+        }
+    }
+
+    /// Flush every live session into the master vibe (used on graceful
+    /// shutdown). Each session is committed in turn; the EMA naturally
+    /// accumulates them.
+    pub async fn flush_all_sessions_to_vibe(&self) {
+        let enabled = self
+            .master_vibe
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        let handles = self.ttt_sessions.snapshot_handles();
+        if handles.is_empty() {
+            return;
+        }
+        eprintln!("[vibe] flushing {} live session(s) into master vibe", handles.len());
+        for (_, handle) in handles {
+            self.flush_session_to_vibe(&handle).await;
         }
     }
 
@@ -1643,12 +1693,22 @@ async fn ttt_session_drop(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let removed = state.ttt_sessions.drop_session(&id);
+    // Automatic merge trigger: fold the adapted W̃ into the master vibe before
+    // the session's tensors are freed.
+    let removed = match state.ttt_sessions.take_session(&id) {
+        Some(handle) => {
+            state.flush_session_to_vibe(&handle).await;
+            true
+        }
+        None => false,
+    };
     Json(serde_json::json!({ "session_id": id, "removed": removed }))
 }
 
 /// `DELETE /v1/ttt/sessions` — drop every TTT session.
 async fn ttt_sessions_clear(State(state): State<AppState>) -> impl IntoResponse {
+    // Flush all live sessions into the master vibe before clearing.
+    state.flush_all_sessions_to_vibe().await;
     state.ttt_sessions.clear();
     Json(serde_json::json!({ "cleared": true }))
 }
@@ -1691,9 +1751,9 @@ pub async fn run_server(
     println!("[*] Initializing system sanity check prior to binding network sockets...");
 
     let pipeline = if checkpoint_path == DEFAULT_CHECKPOINT_PATH {
-        InferencePipeline::new(config.clone(), device)
+        InferencePipeline::new(config.clone(), device.clone())
     } else {
-        InferencePipeline::with_checkpoint(config.clone(), device, checkpoint_path)
+        InferencePipeline::with_checkpoint(config.clone(), device.clone(), checkpoint_path)
     }
     .map_err(|e| format!("failed to assemble inference pipeline: {e}"))?;
 
@@ -1747,10 +1807,31 @@ pub async fn run_server(
             ),
         }
     }
+    // Persistent vibe memory (automatic EMA merge on session drop/clear/
+    // shutdown). Enabled by default; set AXIOM_VIBE=0 to disable all
+    // master-vibe persistence in the proxy.
+    let vibe_enabled = std::env::var("AXIOM_VIBE").map(|v| v != "0").unwrap_or(true);
+    let master_vibe = if vibe_enabled {
+        let v = MasterVibe::from_env(config.n_layers, config.d_model, &device);
+        println!(
+            "[+] Persistent vibe memory ON — sessions EMA-merge into {} on drop/clear/shutdown \
+             (decay={}). Set AXIOM_VIBE=0 to disable.",
+            v.path().display(),
+            v.decay()
+        );
+        Some(v)
+    } else {
+        println!("[+] Persistent vibe memory OFF (AXIOM_VIBE=0)");
+        None
+    };
+
     let state = AppState::new(pipeline, model_id)
         .with_claude_backend(claude_backend)
         .with_anthropic_forwarder(anthropic_forwarder)
-        .with_compressor_config(compressor_config);
+        .with_compressor_config(compressor_config)
+        .with_master_vibe(master_vibe);
+    // Keep a handle for the graceful-shutdown flush (AppState is cheaply Clone).
+    let shutdown_state = state.clone();
     let app = create_router(state);
 
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
@@ -1767,8 +1848,21 @@ pub async fn run_server(
     println!("      GET  /v1/sessions/{{id}}/checkpoint");
     println!("      PUT  /v1/sessions/{{id}}/checkpoint");
 
-    axum::serve(listener, app).await?;
-    Ok(())
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            // Wait for Ctrl-C / SIGTERM, then flush all live sessions into the
+            // persistent master vibe so accumulated structure survives restart.
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("[+] shutdown signal received — flushing vibe memory");
+            shutdown_state.flush_all_sessions_to_vibe().await;
+        })
+        .await?;
+
+    // The pipeline owns a `reqwest::blocking::Client` whose internal runtime
+    // must not be dropped from within this async context. We are intentionally
+    // terminating, so exit the process directly and let the OS reclaim memory
+    // rather than running destructors on the async runtime.
+    std::process::exit(0);
 }
 
 // ---------------------------------------------------------------------------
