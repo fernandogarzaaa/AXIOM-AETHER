@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -1331,10 +1331,19 @@ fn resolve_or_create_session(
 ///    response verbatim.
 async fn create_message(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    // A client (e.g. the Claude CLI) can pin a deterministic TTT session by
+    // sending `X-Axiom-Session-Id`. This takes precedence over any body
+    // `session_id`, since real Anthropic clients never put session_id in the
+    // body. Both fall back to a transient UUID when absent.
+    let session_override = headers
+        .get("x-axiom-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     if state.compression_active() {
-        match compressed_messages_path(&state, &body).await {
+        match compressed_messages_path(&state, &body, session_override.as_deref()).await {
             Ok(value) => return Json(value).into_response(),
             Err(err) => return err.into_response(),
         }
@@ -1410,7 +1419,11 @@ fn local_messages_path(
 }
 
 /// Active-compression code path: partition → adapt → recall → forward.
-async fn compressed_messages_path(state: &AppState, body: &Value) -> Result<Value, ApiError> {
+async fn compressed_messages_path(
+    state: &AppState,
+    body: &Value,
+    session_override: Option<&str>,
+) -> Result<Value, ApiError> {
     let forwarder = state
         .anthropic_forwarder
         .as_ref()
@@ -1430,13 +1443,17 @@ async fn compressed_messages_path(state: &AppState, body: &Value) -> Result<Valu
 
     let partitioned = partition_messages(&messages, threshold, whitespace_token_count);
 
-    // Resolve / create the TTT session. If the client didn't pass one
-    // we mint a transient UUID; persistent compression benefits accrue
-    // when the caller passes session_id.
-    let session_id = body
-        .get("session_id")
-        .and_then(Value::as_str)
+    // Resolve / create the TTT session. Precedence: the X-Axiom-Session-Id
+    // header (passed in as session_override), then a body `session_id`, then
+    // a minted transient UUID. Persistent compression benefits accrue only
+    // when the caller pins a stable id via one of the first two.
+    let session_id = session_override
         .map(str::to_string)
+        .or_else(|| {
+            body.get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| format!("transient-{}", Uuid::new_v4()));
 
     let started = Instant::now();

@@ -266,6 +266,70 @@ async fn ttt_session_state_persists_across_calls() {
 }
 
 #[tokio::test]
+async fn x_axiom_session_id_header_pins_deterministic_session() {
+    // A request carrying the `X-Axiom-Session-Id` header but NO body
+    // `session_id` must land in a session named by the header — not a
+    // minted `transient-*` UUID. This is what lets a real Anthropic client
+    // (which never sets a body session_id) accrue persistent fast-weights.
+    let (mock_addr, _captured) = start_mock_anthropic().await;
+    let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
+    let forwarder =
+        AnthropicForwarder::new("test-key".to_string(), Some(format!("http://{mock_addr}")));
+    let cfg = CompressorConfig {
+        enabled: true,
+        heavy_message_threshold_tokens: 20,
+        recall_top_k: 4,
+    };
+    let state = AppState::new(pipeline, "axiom-header".to_string())
+        .with_anthropic_forwarder(Some(forwarder))
+        .with_compressor_config(cfg);
+    let app = create_router(state);
+
+    let heavy: String = (0..50).map(|i| format!("h{i}")).collect::<Vec<_>>().join(" ");
+    let req_body = json!({
+        "max_tokens": 4,
+        "messages": [
+            {"role": "user", "content": heavy},
+            {"role": "user", "content": "go"}
+        ]
+        // NOTE: deliberately no body session_id — only the header pins it.
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-axiom-session-id", "pinned-by-header")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The named session must exist and be deletable by that exact name.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/v1/ttt/sessions/pinned-by-header")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["removed"], true,
+        "header value must name the live session (no transient UUID)"
+    );
+}
+
+#[tokio::test]
 async fn ttt_session_admin_endpoints_reflect_live_state() {
     let (mock_addr, _captured) = start_mock_anthropic().await;
     let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
