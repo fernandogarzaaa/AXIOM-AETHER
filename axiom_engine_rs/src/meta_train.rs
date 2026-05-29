@@ -23,9 +23,12 @@
 //!     --checkpoint axiom_kernel_v1.safetensors
 //! ```
 //!
-//! The trainer reads `.rs`, `.py`, `.md`, `.toml`, `.yaml`, `.yml`,
-//! `.json` files under the current working directory (excluding common
-//! build/cache dirs) and slices them into fixed-length sequences.
+//! The trainer reads a multi-paradigm set of source extensions —
+//! `.rs`, `.py`, `.go`, `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, plus
+//! `.md`, `.toml`, `.yaml`, `.yml`, `.json`, `.txt` — under the given roots
+//! (excluding common build/cache dirs) and slices them into fixed-length
+//! sequences. Tokens are hashed into a fixed `vocab_size` (256) bucket space,
+//! so a wider corpus increases token-space *coverage*, not dimensionality.
 
 use std::path::{Path, PathBuf};
 
@@ -40,8 +43,14 @@ use walkdir::WalkDir;
 use crate::config::AxiomConfig;
 use crate::model::AxiomTTTLM;
 
-const DEFAULT_INCLUDED_EXTENSIONS: &[&str] =
-    &["rs", "py", "md", "toml", "yaml", "yml", "json", "txt"];
+const DEFAULT_INCLUDED_EXTENSIONS: &[&str] = &[
+    // Systems / backend
+    "rs", "py", "go",
+    // TypeScript / JavaScript family
+    "ts", "tsx", "js", "jsx", "mjs", "cjs",
+    // Docs / config (structural priors)
+    "md", "toml", "yaml", "yml", "json", "txt",
+];
 
 const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
     "target",
