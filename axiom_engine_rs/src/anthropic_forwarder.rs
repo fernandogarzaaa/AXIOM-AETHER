@@ -24,16 +24,34 @@ use crate::context_compressor::MemoryFingerprint;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
+/// Auth / relay headers captured from the inbound client request.
+///
+/// This is what lets the proxy serve BOTH credential models without ever
+/// holding a long-lived secret of its own:
+///   * **API-key clients** send `x-api-key` (or the proxy injects its own).
+///   * **Subscription clients** (Claude Pro/Max via Claude Code) authenticate
+///     with an OAuth bearer token in `Authorization` plus an `anthropic-beta`
+///     `oauth-*` flag. We relay those verbatim.
+#[derive(Clone, Debug, Default)]
+pub struct ClientAuth {
+    pub authorization: Option<String>,
+    pub x_api_key: Option<String>,
+    pub anthropic_version: Option<String>,
+    pub anthropic_beta: Option<String>,
+}
+
 /// Active outbound bridge. Cheap to clone (Arc-internal `reqwest::Client`).
 #[derive(Clone)]
 pub struct AnthropicForwarder {
-    api_key: String,
+    /// Optional proxy-owned key. `None` in auth-passthrough mode, where the
+    /// proxy relies entirely on the inbound client's own credentials.
+    api_key: Option<String>,
     base_url: String,
     client: Client,
 }
 
 impl AnthropicForwarder {
-    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+    pub fn new(api_key: Option<String>, base_url: Option<String>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -45,29 +63,69 @@ impl AnthropicForwarder {
         }
     }
 
-    /// Env-driven activation. Returns `Some(forwarder)` only when
-    /// `ANTHROPIC_API_KEY` is set. The compression-mode flag is
-    /// checked separately by [`CompressorConfig::from_env`].
+    /// Env-driven activation. Always returns `Some(forwarder)` so the
+    /// compression path is usable in two modes:
+    ///   * **API-key mode** — `ANTHROPIC_API_KEY` is set; the proxy injects it
+    ///     as `x-api-key` whenever the client supplies no auth of its own.
+    ///   * **Auth-passthrough mode** — no env key (e.g. a Claude *subscription*
+    ///     that authenticates via OAuth). The proxy relays the client's own
+    ///     `Authorization` / `x-api-key` headers upstream verbatim.
+    /// The compression-mode flag is checked separately by
+    /// [`CompressorConfig::from_env`].
     pub fn from_env() -> Option<Self> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").ok()?;
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty());
         let base_url = std::env::var("ANTHROPIC_BASE_URL").ok();
         Some(Self::new(api_key, base_url))
     }
 
+    /// Whether the proxy holds its own API key (vs. pure auth-passthrough).
+    pub fn has_own_key(&self) -> bool {
+        self.api_key.is_some()
+    }
+
     /// POST to `/v1/messages` on the real Anthropic API.
+    ///
+    /// Auth precedence (so OAuth subscriptions and API keys both work):
+    ///   1. Client `Authorization` bearer (subscription/OAuth) — relayed
+    ///      verbatim; `x-api-key` is deliberately NOT sent alongside it.
+    ///   2. Client `x-api-key` — relayed verbatim.
+    ///   3. Proxy's own `ANTHROPIC_API_KEY` — injected as `x-api-key`.
     ///
     /// Returns the raw JSON response when the upstream call succeeds.
     pub async fn forward_messages_json(
         &self,
         payload: &Value,
+        auth: &ClientAuth,
     ) -> Result<Value, ForwarderError> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let response = self
+        let mut request = self
             .client
             .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
+            .header(
+                "anthropic-version",
+                auth.anthropic_version.as_deref().unwrap_or(ANTHROPIC_VERSION),
+            );
+
+        // Relay beta feature flags. The Claude Code subscription/OAuth path
+        // requires its `oauth-*` beta flag to reach the upstream untouched.
+        if let Some(beta) = auth.anthropic_beta.as_deref() {
+            request = request.header("anthropic-beta", beta);
+        }
+
+        if let Some(authz) = auth.authorization.as_deref() {
+            request = request.header("authorization", authz);
+        } else if let Some(key) = auth.x_api_key.as_deref() {
+            request = request.header("x-api-key", key);
+        } else if let Some(key) = self.api_key.as_deref() {
+            request = request.header("x-api-key", key);
+        } else {
+            return Err(ForwarderError::MissingAuth);
+        }
+
+        let response = request
             .json(payload)
             .send()
             .await
@@ -90,6 +148,8 @@ pub enum ForwarderError {
     Network(String),
     Decode(String),
     Upstream { status: u16, body: String },
+    /// Neither the client nor the proxy supplied any usable credential.
+    MissingAuth,
 }
 
 impl std::fmt::Display for ForwarderError {
@@ -100,6 +160,11 @@ impl std::fmt::Display for ForwarderError {
             ForwarderError::Upstream { status, body } => {
                 write!(f, "upstream {status}: {body}")
             }
+            ForwarderError::MissingAuth => write!(
+                f,
+                "no upstream credential: client sent no Authorization/x-api-key \
+                 and the proxy has no ANTHROPIC_API_KEY configured"
+            ),
         }
     }
 }

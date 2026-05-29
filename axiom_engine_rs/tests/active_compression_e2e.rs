@@ -82,7 +82,7 @@ async fn compression_strips_heavy_context_and_forwards_lean_payload() {
 
     let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
     let forwarder = AnthropicForwarder::new(
-        "test-key".to_string(),
+        Some("test-key".to_string()),
         Some(format!("http://{mock_addr}")),
     );
     let compressor_config = CompressorConfig {
@@ -200,7 +200,7 @@ async fn ttt_session_state_persists_across_calls() {
 
     let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
     let forwarder = AnthropicForwarder::new(
-        "test-key".to_string(),
+        Some("test-key".to_string()),
         Some(format!("http://{mock_addr}")),
     );
     let cfg = CompressorConfig {
@@ -274,7 +274,7 @@ async fn x_axiom_session_id_header_pins_deterministic_session() {
     let (mock_addr, _captured) = start_mock_anthropic().await;
     let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
     let forwarder =
-        AnthropicForwarder::new("test-key".to_string(), Some(format!("http://{mock_addr}")));
+        AnthropicForwarder::new(Some("test-key".to_string()), Some(format!("http://{mock_addr}")));
     let cfg = CompressorConfig {
         enabled: true,
         heavy_message_threshold_tokens: 20,
@@ -334,7 +334,7 @@ async fn ttt_session_admin_endpoints_reflect_live_state() {
     let (mock_addr, _captured) = start_mock_anthropic().await;
     let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
     let forwarder = AnthropicForwarder::new(
-        "test-key".to_string(),
+        Some("test-key".to_string()),
         Some(format!("http://{mock_addr}")),
     );
     let cfg = CompressorConfig {

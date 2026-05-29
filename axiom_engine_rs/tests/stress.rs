@@ -112,7 +112,7 @@ async fn high_concurrency_multitenant_sessions_stay_isolated_and_clean() {
 
     let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
     let forwarder =
-        AnthropicForwarder::new("test-key".to_string(), Some(format!("http://{mock_addr}")));
+        AnthropicForwarder::new(Some("test-key".to_string()), Some(format!("http://{mock_addr}")));
     let cfg = CompressorConfig {
         enabled: true,
         heavy_message_threshold_tokens: 400,

@@ -75,9 +75,12 @@ if [ ! -x "$BIN" ]; then
 fi
 
 if [ "${AXIOM_TTT_COMPRESS}" = "1" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "[start_axiom] WARNING: compression is ON but ANTHROPIC_API_KEY is unset."
-    echo "[start_axiom]          The forwarder will be disabled and /v1/messages will"
-    echo "[start_axiom]          fall back to local toy generation (no upstream call)."
+    echo "[start_axiom] No ANTHROPIC_API_KEY set -> AUTH-PASSTHROUGH mode."
+    echo "[start_axiom]   The proxy holds no key of its own and relays each client's"
+    echo "[start_axiom]   own Authorization / x-api-key headers upstream. This is the"
+    echo "[start_axiom]   correct mode for a Claude SUBSCRIPTION (Claude Code OAuth):"
+    echo "[start_axiom]   point a client shell's ANTHROPIC_BASE_URL at this proxy and"
+    echo "[start_axiom]   its OAuth bearer token is forwarded to Anthropic for you."
 fi
 
 LOG_FILE="${AXIOM_LOG_FILE:-$REPO_ROOT/axiom_server.log}"

@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use crate::anthropic_forwarder::{
     build_compressed_payload, partition_messages, whitespace_token_count, AnthropicForwarder,
-    ForwarderError,
+    ClientAuth, ForwarderError,
 };
 use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
@@ -1343,7 +1343,25 @@ async fn create_message(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     if state.compression_active() {
-        match compressed_messages_path(&state, &body, session_override.as_deref()).await {
+        // Capture the client's own credentials so we can relay them upstream.
+        // This is what makes the proxy work for a Claude *subscription*
+        // (OAuth bearer) as well as for raw API-key clients — the proxy never
+        // needs to hold a key of its own.
+        let header_str = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let client_auth = ClientAuth {
+            authorization: header_str("authorization"),
+            x_api_key: header_str("x-api-key"),
+            anthropic_version: header_str("anthropic-version"),
+            anthropic_beta: header_str("anthropic-beta"),
+        };
+        match compressed_messages_path(&state, &body, session_override.as_deref(), &client_auth)
+            .await
+        {
             Ok(value) => return Json(value).into_response(),
             Err(err) => return err.into_response(),
         }
@@ -1423,6 +1441,7 @@ async fn compressed_messages_path(
     state: &AppState,
     body: &Value,
     session_override: Option<&str>,
+    client_auth: &ClientAuth,
 ) -> Result<Value, ApiError> {
     let forwarder = state
         .anthropic_forwarder
@@ -1543,13 +1562,18 @@ async fn compressed_messages_path(
     }
 
     forwarder
-        .forward_messages_json(&outbound)
+        .forward_messages_json(&outbound, client_auth)
         .await
         .map_err(|e| match e {
             // Surface the real upstream status (401/429/5xx) to the client.
             ForwarderError::Upstream { status, body } => ApiError::Upstream {
                 status,
                 message: format!("anthropic upstream {status}: {body}"),
+            },
+            // No credential at all → 401 so the client knows to authenticate.
+            ForwarderError::MissingAuth => ApiError::Upstream {
+                status: StatusCode::UNAUTHORIZED.as_u16(),
+                message: format!("{e}"),
             },
             // Network/decode failures mean we never got a usable response →
             // 502 Bad Gateway rather than a misleading 500.
@@ -1695,15 +1719,29 @@ pub async fn run_server(
     };
     if compressor_config.enabled {
         match anthropic_forwarder.as_ref() {
-            Some(_) => println!(
-                "[+] Active-compression mode ON — heavy messages (>={} tokens) \
-                 will be absorbed locally via TTT, then forwarded with a dense \
-                 fingerprint to Anthropic (top_k={})",
-                compressor_config.heavy_message_threshold_tokens,
-                compressor_config.recall_top_k,
-            ),
+            Some(fwd) => {
+                println!(
+                    "[+] Active-compression mode ON — heavy messages (>={} tokens) \
+                     will be absorbed locally via TTT, then forwarded with a dense \
+                     fingerprint to Anthropic (top_k={})",
+                    compressor_config.heavy_message_threshold_tokens,
+                    compressor_config.recall_top_k,
+                );
+                if fwd.has_own_key() {
+                    println!(
+                        "[+] Upstream auth: proxy-owned ANTHROPIC_API_KEY (injected as \
+                         x-api-key when the client sends none)."
+                    );
+                } else {
+                    println!(
+                        "[+] Upstream auth: PASSTHROUGH — no proxy key set; the client's \
+                         own Authorization/x-api-key headers are relayed upstream. This is \
+                         the correct mode for a Claude subscription (OAuth via Claude Code)."
+                    );
+                }
+            }
             None => println!(
-                "[!] Active-compression enabled but ANTHROPIC_API_KEY is unset — \
+                "[!] Active-compression enabled but the forwarder failed to construct — \
                  the compression path will be skipped and requests will fall back \
                  to the local pipeline"
             ),
