@@ -63,6 +63,171 @@ cargo build --release
 
 ---
 
+## Local Claude Code Integration
+
+This section documents how to wire Axiom-TTT as the **local inference and context-compression layer for Claude Code** on your own machine. Every Claude Code request is routed through the proxy, which strips heavy context, trains it into fast-weight tensors (W̃), and forwards a lean compressed payload upstream — reducing billed input tokens while keeping the model's effective context window large.
+
+> **Platform note:** instructions below target Windows + Git Bash. Linux/macOS users can adapt the auto-start step to a systemd user unit or a launchd plist; the rest is identical.
+
+---
+
+### Step 1 — Build the release binary
+
+```bash
+git clone https://github.com/fernandogarzaaa/AXIOM-AETHER
+cd AXIOM-AETHER/axiom_engine_rs
+cargo build --release
+# Binary lands at: axiom_engine_rs/target/release/axiom_engine(.exe)
+```
+
+Requires Rust 1.78+ (`rustup update stable`).
+
+---
+
+### Step 2 — Train your production checkpoint
+
+The proxy ships with a **random-init toy model** (d_model=64, 2 layers). To get meaningful context compression (`recall_norm > 0`), train the meta-projection matrices on your local codebase first. The `harvest` binary crawls source trees and runs an outer-loop TTT meta-training schedule:
+
+```bash
+# From repo root — crawl the engine source (fast, ~2 min on CPU)
+mkdir -p checkpoints
+AXIOM_HARVEST_EPOCHS=5 \
+AXIOM_HARVEST_CHECKPOINT="$PWD/checkpoints/axiom_production.bin" \
+cargo run --release --manifest-path axiom_engine_rs/Cargo.toml --bin harvest \
+  -- "$PWD/axiom_engine_rs/src"
+
+# To sweep a larger corpus (your whole codebase, vendored deps):
+AXIOM_HARVEST_EPOCHS=8 AXIOM_HARVEST_STEPS=400 \
+AXIOM_HARVEST_CHECKPOINT="$PWD/checkpoints/axiom_production.bin" \
+cargo run --release --manifest-path axiom_engine_rs/Cargo.toml --bin harvest \
+  -- "$PWD/axiom_engine_rs/src" "$HOME/your-other-projects"
+```
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `AXIOM_HARVEST_EPOCHS` | 6 | Number of outer-loop epochs |
+| `AXIOM_HARVEST_STEPS` | 300 | Steps per epoch |
+| `AXIOM_HARVEST_ALPHA_START` | 3e-3 | Meta-LR cosine start |
+| `AXIOM_HARVEST_ALPHA_END` | 1e-5 | Meta-LR cosine end |
+| `AXIOM_HARVEST_CHECKPOINT` | `./checkpoints/axiom_production.bin` | Output path |
+
+The training log shows per-epoch `L_meta(avg)` — a well-converged run stabilises around 3.0–3.5 for the default corpus size. Once `axiom_production.bin` exists, `start_axiom.sh` picks it up automatically on the next boot.
+
+---
+
+### Step 3 — Boot the proxy
+
+```bash
+# From repo root — binds 127.0.0.1:3000, upstream = real Anthropic API
+./start_axiom.sh
+```
+
+The script:
+- Pins `ANTHROPIC_BASE_URL` to `https://api.anthropic.com` on the **server** side (preventing infinite-loop self-forwarding).
+- Loads `checkpoints/axiom_production.bin` if present, otherwise warns and falls back to random init.
+- Enables compression by default (`AXIOM_TTT_COMPRESS=1`, threshold 200 tokens).
+- Tees all output to `axiom_server.log`.
+
+You need `ANTHROPIC_API_KEY` exported in the shell that runs `start_axiom.sh`:
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+./start_axiom.sh
+```
+
+---
+
+### Step 4 — Auto-start at logon (Windows, no admin required)
+
+Create a hidden VBS launcher in your per-user Startup folder so the proxy starts automatically on every logon:
+
+```vbs
+' Save as:
+' %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\AxiomTTTProxy.vbs
+
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run """C:\Program Files\Git\bin\bash.exe"" -lc " & _
+  """cd /c/Users/YOUR_USERNAME/AXIOM-AETHER && " & _
+  "./start_axiom.sh >> /c/Users/YOUR_USERNAME/AXIOM-AETHER/axiom_boot.log 2>&1""", 0, False
+```
+
+Replace `YOUR_USERNAME` with your Windows username. Window style `0` = hidden (no terminal pops up).
+
+> **Admin users:** `axiom_autostart_task.xml` in the repo root is a Task Scheduler definition with `RestartOnFailure` (3×/1 min). Register it with:
+> ```
+> schtasks /Create /TN "AxiomTTTProxy" /XML axiom_autostart_task.xml /F
+> ```
+
+---
+
+### Step 5 — Route Claude Code through the proxy
+
+**Option A — Per-shell opt-in (safest, recommended while evaluating):**
+
+```bash
+# In a NEW shell (not the one running the proxy):
+source ./axiom.env
+claude "your prompt here"   # routes through Axiom on 127.0.0.1:3000
+```
+
+**Option B — Global default (Claude Code always uses Axiom):**
+
+Add an `env` block to `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3000",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Axiom-Session-Id: your-session-id"
+  }
+}
+```
+
+> ⚠️ If the proxy is not running when you open Claude Code, every request will fail to connect on port 3000. Use Option A until auto-start is confirmed working across reboots, then switch to Option B.
+
+**Deterministic sessions (fast-weight accumulation across turns):**
+
+The proxy keys each session's W̃ tensor by `X-Axiom-Session-Id`. Pin a stable ID per logical project so the fast weights compound across calls instead of resetting:
+
+```bash
+# Pin by project
+AXIOM_SESSION_ID=my-project source ./axiom.env
+```
+
+Header precedence on the server: `X-Axiom-Session-Id` header > `session_id` body field > transient UUID.
+
+---
+
+### Step 6 — Verify and measure token savings
+
+A non-billable measurement tool is included. It stands up a local mock upstream, fires a heavy payload through the proxy, and compares original vs compressed token counts:
+
+```bash
+# Proxy must be running on :3000 first
+node scripts/token_savings_test.js
+
+# Example output:
+# {
+#   "original_input_tokens": 610,
+#   "outbound_input_tokens": 189,
+#   "tokens_saved": 421,
+#   "compression_ratio_pct": 69
+# }
+```
+
+Token counts use the same whitespace-splitting proxy the server uses internally (`whitespace_token_count` in `anthropic_forwarder.rs`), so the numbers align with the `[axiom-ttt]` server log lines.
+
+---
+
+### Revert to direct Anthropic routing
+
+```bash
+cp ~/.claude/settings.json.bak ~/.claude/settings.json
+```
+
+The backup is created automatically the first time the env block is injected. Restoring it removes the proxy redirect; Claude Code talks to `api.anthropic.com` directly again.
+
+---
+
 ## API Reference
 
 The server implements a drop-in replacement for the OpenAI Chat Completions API.
