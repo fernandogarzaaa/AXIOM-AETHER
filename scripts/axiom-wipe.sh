@@ -124,7 +124,8 @@ cmd_list() {
         log "no backups in $BACKUP_DIR"
     fi
     if [ -f "$VIBE_PATH" ]; then
-        log "live vibe: $VIBE_PATH ($(wc -c < "$VIBE_PATH") bytes)"
+        log "live vibe: $VIBE_PATH"
+        log "  size: $(wc -c < "$VIBE_PATH") bytes | modified: $(date -r "$VIBE_PATH" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?')"
     else
         log "live vibe: none at $VIBE_PATH"
     fi
