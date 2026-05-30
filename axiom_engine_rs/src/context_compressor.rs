@@ -246,6 +246,17 @@ pub fn adapt_session_blocking(
     let device = pipeline.device();
     let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), device)?;
     let _logits = pipeline.model().forward_lm(&input, states)?;
+
+    // Autograd truncation: detach each updated W̃ from its op-graph so history
+    // does not accumulate across windows/calls. Without this, streaming a large
+    // corpus builds a graph as deep as the token count; dropping that chain
+    // recurses past the stack limit and crashes (observed on a 24k-token
+    // saturation run). The TTT update is closed-form (see `forward_native` —
+    // no `.backward()`), so the state VALUE is unchanged and nothing that is
+    // ever backpropagated is lost. `detach` is infallible in candle 0.8.
+    for state in states.iter_mut() {
+        *state = state.detach();
+    }
     Ok(())
 }
 
