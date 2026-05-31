@@ -12,6 +12,7 @@ pub mod memory_pool;
 pub mod meta_train;
 pub mod metrics;
 pub mod model;
+pub mod model_meta;
 pub mod quantization;
 pub mod search_ingest;
 pub mod server;
