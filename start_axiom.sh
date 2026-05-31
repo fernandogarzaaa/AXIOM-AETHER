@@ -47,6 +47,23 @@ export AXIOM_TTT_COMPRESS="${AXIOM_TTT_COMPRESS:-1}"
 export AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS="${AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS:-512}"
 export AXIOM_TTT_COMPRESS_TOP_K="${AXIOM_TTT_COMPRESS_TOP_K:-32}"
 
+# --- Production BPE model (Objective 1.3 swap) -----------------------------
+# Officially deprecate the legacy 256-character-hash model: when the scaled BPE
+# artifacts are present, the proxy runs the d_model=256 / n_layers=4 / BPE-vocab
+# semantic model with the calibrated deterministic drift gate. Falls back to the
+# legacy model automatically if the artifacts are missing.
+PROD_BPE_CKPT="$REPO_ROOT/checkpoints/axiom_production_bpe.bin"
+PROD_BPE_TOK="$REPO_ROOT/checkpoints/axiom_bpe.json"
+if [ -f "$PROD_BPE_CKPT" ] && [ -f "$PROD_BPE_TOK" ]; then
+    export AXIOM_PRODUCTION_BPE=1
+    export AXIOM_TOKENIZER="$PROD_BPE_TOK"
+    export AXIOM_BPE_CKPT="$PROD_BPE_CKPT"
+    export AXIOM_DRIFT_THRESHOLD="${AXIOM_DRIFT_THRESHOLD:-7.03}"
+    echo "[start_axiom] Production model: BPE semantic (d_model=256, n_layers=4, drift_gate=$AXIOM_DRIFT_THRESHOLD)"
+else
+    echo "[start_axiom] Production model: legacy 256-hash (BPE artifacts not found)"
+fi
+
 # The server's outbound bridge uses this to reach the REAL API.
 export ANTHROPIC_BASE_URL="$UPSTREAM"
 
