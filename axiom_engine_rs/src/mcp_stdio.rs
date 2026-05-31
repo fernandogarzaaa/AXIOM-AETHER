@@ -30,7 +30,7 @@ use candle_core::{Device, Tensor};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
+use crate::config::AxiomConfig;
 use crate::context_compressor::{adapt_session_blocking, extract_memory_vector_blocking};
 use crate::inference::InferencePipeline;
 use crate::vibe_memory::MasterVibe;
@@ -79,12 +79,15 @@ pub async fn run_stdio_server(
         let cfg = config.clone();
         let dev = device.clone();
         let ckpt = checkpoint_path.clone();
+        // BPE tokenizer via AXIOM_TOKENIZER (falls back to hash tokenizer when unset).
+        let tokenizer_path =
+            std::env::var("AXIOM_TOKENIZER").ok().filter(|p| !p.trim().is_empty());
         tokio::task::spawn_blocking(move || {
-            if ckpt == DEFAULT_CHECKPOINT_PATH {
-                InferencePipeline::new(cfg, dev)
-            } else {
-                InferencePipeline::with_checkpoint(cfg, dev, &ckpt)
-            }
+            let runtime = crate::inference::InferenceRuntimeOptions {
+                tokenizer_path,
+                ..Default::default()
+            };
+            InferencePipeline::with_checkpoint_and_options(cfg, dev, &ckpt, runtime)
         })
         .await
         .map_err(|e| format!("pipeline build join error: {e}"))?
@@ -96,10 +99,11 @@ pub async fn run_stdio_server(
     if prime && !vibe.is_initialized() {
         eprintln!("[mcp] AXIOM_VIBE_PRIME=1 set but no master vibe yet; sessions start from identity until first commit");
     }
+    // Default to the BPE-calibrated deterministic gate (7.03); override via env.
     let drift_threshold = std::env::var("AXIOM_DRIFT_THRESHOLD")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(6.0);
+        .unwrap_or(7.03);
     let top_k = std::env::var("AXIOM_TTT_COMPRESS_TOP_K")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())

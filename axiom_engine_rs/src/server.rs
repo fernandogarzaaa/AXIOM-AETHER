@@ -1746,15 +1746,23 @@ pub async fn run_server(
     checkpoint_path: &str,
     device: Device,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    use crate::config::DEFAULT_CHECKPOINT_PATH;
-
     println!("[*] Initializing system sanity check prior to binding network sockets...");
 
-    let pipeline = if checkpoint_path == DEFAULT_CHECKPOINT_PATH {
-        InferencePipeline::new(config.clone(), device.clone())
-    } else {
-        InferencePipeline::with_checkpoint(config.clone(), device.clone(), checkpoint_path)
-    }
+    // BPE tokenizer wiring: when AXIOM_TOKENIZER points at a tokenizer.json the
+    // pipeline encodes with the real BPE vocab; otherwise it falls back to the
+    // legacy hash tokenizer. with_checkpoint_and_options tolerates a missing
+    // checkpoint (warns + random init), so the DEFAULT_CHECKPOINT_PATH special
+    // case is no longer needed.
+    let runtime = crate::inference::InferenceRuntimeOptions {
+        tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok().filter(|p| !p.trim().is_empty()),
+        ..Default::default()
+    };
+    let pipeline = InferencePipeline::with_checkpoint_and_options(
+        config.clone(),
+        device.clone(),
+        checkpoint_path,
+        runtime,
+    )
     .map_err(|e| format!("failed to assemble inference pipeline: {e}"))?;
 
     println!(

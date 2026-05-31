@@ -53,6 +53,47 @@ fn usage() -> &'static str {
 ///
 /// CUDA and Metal support requires the crate to be compiled with the respective
 /// feature flag (`--features cuda` or `--features metal`).
+/// Objective 1.3: production model selection, SAFETY-GATED.
+///
+/// The live proxy only switches from the legacy 256-hash model to the scaled
+/// BPE model when `AXIOM_PRODUCTION_BPE=1` AND the tokenizer artifact exists —
+/// so it can never accidentally serve an unbaked model. On activation it sets
+/// `AXIOM_TOKENIZER` (consumed by run_server / mcp_stdio) and returns the scaled
+/// config (vocab read from the tokenizer) plus the BPE checkpoint path.
+fn resolve_production_model(legacy: AxiomConfig, default_ckpt: &str) -> (AxiomConfig, String) {
+    let enabled = std::env::var("AXIOM_PRODUCTION_BPE").map(|v| v == "1").unwrap_or(false);
+    if !enabled {
+        return (legacy, default_ckpt.to_string());
+    }
+    let bpe = std::env::var("AXIOM_TOKENIZER")
+        .unwrap_or_else(|_| "checkpoints/axiom_bpe.json".to_string());
+    let ckpt = std::env::var("AXIOM_BPE_CKPT")
+        .unwrap_or_else(|_| "checkpoints/axiom_production_bpe.bin".to_string());
+    if !std::path::Path::new(&bpe).exists() {
+        eprintln!("[axiom] AXIOM_PRODUCTION_BPE=1 but tokenizer '{bpe}' missing — staying on legacy model");
+        return (legacy, default_ckpt.to_string());
+    }
+    match tokenizers::Tokenizer::from_file(&bpe) {
+        Ok(tok) => {
+            let vocab = tok.get_vocab_size(true);
+            std::env::set_var("AXIOM_TOKENIZER", &bpe);
+            eprintln!("[axiom] PRODUCTION MODEL = BPE (vocab {vocab}, d_model 256, n_layers 4); checkpoint {ckpt}");
+            let cfg = AxiomConfig {
+                d_model: 256,
+                n_layers: 4,
+                vocab_size: vocab,
+                lr_inner: 1e-3,
+                norm_eps: 1e-6,
+            };
+            (cfg, ckpt)
+        }
+        Err(e) => {
+            eprintln!("[axiom] failed to load tokenizer '{bpe}' ({e}) — staying on legacy model");
+            (legacy, default_ckpt.to_string())
+        }
+    }
+}
+
 fn device_from_str(s: &str) -> Result<Device> {
     match s {
         // Phase 2.4: prefer CUDA when available, fall back to CPU gracefully.
@@ -303,7 +344,8 @@ async fn main() -> Result<()> {
             println!("{output}");
         }
         "server" => {
-            server::run_server(&args.host, args.port, config, &args.checkpoint_path, device)
+            let (cfg, ckpt) = resolve_production_model(config.clone(), &args.checkpoint_path);
+            server::run_server(&args.host, args.port, cfg, &ckpt, device)
                 .await
                 .map_err(|e| candle_core::Error::Msg(format!("server startup failed: {e}")))?;
         }
@@ -311,7 +353,8 @@ async fn main() -> Result<()> {
             // Native MCP server over JSON-RPC 2.0 stdio. Runs as a dedicated
             // process (separate from the HTTP proxy) so stdout stays a pure
             // protocol channel; all diagnostics go to stderr.
-            mcp_stdio::run_stdio_server(config, device, args.checkpoint_path)
+            let (cfg, ckpt) = resolve_production_model(config.clone(), &args.checkpoint_path);
+            mcp_stdio::run_stdio_server(cfg, device, ckpt)
                 .await
                 .map_err(|e| candle_core::Error::Msg(format!("mcp server failed: {e}")))?;
         }
