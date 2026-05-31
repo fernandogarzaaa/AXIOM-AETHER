@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     let vocab: usize = std::env::var("AXIOM_BPE_VOCAB")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8000);
+        .unwrap_or(16000);
     let out = std::env::var("AXIOM_BPE_OUT").unwrap_or_else(|_| {
         repo.join("checkpoints/axiom_bpe.json")
             .to_string_lossy()
@@ -52,11 +52,23 @@ fn main() -> Result<()> {
         let _ = std::fs::create_dir_all(parent);
     }
 
+    // Prefer the crawled corpus dir (shards) when present; else repo source.
+    let corpus_dir = std::env::var("AXIOM_CORPUS_OUT")
+        .unwrap_or_else(|_| repo.join("checkpoints/corpus").to_string_lossy().into());
     let mut files = Vec::new();
-    collect_rs(&repo.join("axiom_engine_rs/src"), &mut files);
-    collect_rs(&repo.join("axiom_engine_rs/tests"), &mut files);
-    collect_rs(&repo.join("tests"), &mut files);
-    eprintln!("[bpe] corpus: {} Rust files; target vocab={vocab}", files.len());
+    if std::path::Path::new(&corpus_dir).exists() {
+        for e in std::fs::read_dir(&corpus_dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("txt") {
+                files.push(p.to_string_lossy().to_string());
+            }
+        }
+    }
+    if files.is_empty() {
+        collect_rs(&repo.join("axiom_engine_rs/src"), &mut files);
+        collect_rs(&repo.join("tests"), &mut files);
+    }
+    eprintln!("[bpe] corpus: {} file(s); target vocab={vocab}", files.len());
     if files.is_empty() {
         return Err("no .rs corpus files found".into());
     }
