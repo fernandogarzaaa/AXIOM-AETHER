@@ -3,6 +3,7 @@ pub mod claude_backend;
 pub mod cluster;
 pub mod config;
 pub mod context_compressor;
+pub mod corpus;
 pub mod data_gen;
 pub mod inference;
 pub mod jit_streamer;
