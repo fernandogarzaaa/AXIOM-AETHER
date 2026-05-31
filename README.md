@@ -52,6 +52,25 @@ a **real semantic stack**:
 New surfaces: **native MCP server**, **persistent "vibe memory"** + `axiom-wipe`,
 a **hybrid pre-commit quality gate** (`axiom-guard`), and a **JIT search node**.
 
+### Update — Semantic v3 (converged, validated, auto-deployed)
+
+A pipeline-first upgrade to a *properly converged* model (see
+`docs/superpowers/specs/2026-05-31-smarter-core-model-design.md` and the plan):
+
+| Area | v3 |
+|---|---|
+| Tokenizer | ByteLevel BPE retrained on a crawled multi-language corpus, **vocab 16,000** |
+| Training | `train_semantic` now does a **95/5 train/val split with early-stopping on held-out CE** (not memorization), **auto-sizes** the model to free VRAM, and writes a **`*.meta.json` sidecar** (dims/vocab/val_ce) |
+| Converged model | **d_model=128, n_layers=2, val_ce ≈ 3.93** (held-out) — live in the proxy, dims auto-loaded from the sidecar |
+| Drift separation | clean ℒ ≤ 7.28 vs anomaly ℒ 8.38 → **margin +1.10** (was +0.58); recalibrated gate **7.83** (`eval_model` → `axiom_drift_gate.txt`) |
+| New tooling | `corpus_crawl` (on-disk deduped corpus), `eval_model` (acceptance suite), `model_meta`/`corpus` lib modules |
+| Deploy | `start_axiom.sh` auto-activates the BPE model + reads dims from the sidecar + the recalibrated gate |
+
+> **Hardware note:** the d128 model is the converged **CPU-phase** result — on this
+> box (RTX 2060 6 GB, ~8 GB RAM free, small page file) CPU training OOMs above
+> ~d128. Scaling to **d256–d512** (the auto-sizer is ready for it) needs the GPU,
+> which requires a candle 0.9 / CUDA-13 build — the documented next step.
+
 ---
 
 ## Quick Start
