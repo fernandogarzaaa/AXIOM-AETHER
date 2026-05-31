@@ -61,8 +61,8 @@ A pipeline-first upgrade to a *properly converged* model (see
 |---|---|
 | Tokenizer | ByteLevel BPE retrained on a crawled multi-language corpus, **vocab 16,000** |
 | Training | `train_semantic` now does a **95/5 train/val split with early-stopping on held-out CE** (not memorization), **auto-sizes** the model to free VRAM, and writes a **`*.meta.json` sidecar** (dims/vocab/val_ce) |
-| Converged model | **d_model=128, n_layers=2, val_ce ≈ 3.93** (held-out) — live in the proxy, dims auto-loaded from the sidecar |
-| Drift separation | clean ℒ ≤ 7.28 vs anomaly ℒ 8.38 → **margin +1.10** (was +0.58); recalibrated gate **7.83** (`eval_model` → `axiom_drift_gate.txt`) |
+| Converged model | **d_model=128, n_layers=2, val_ce ≈ 4.10** (held-out, 30k-token run, best-checkpointed at the val minimum) — live in the proxy, dims auto-loaded from the sidecar |
+| Drift separation | clean ℒ **3.26–4.93** vs anomaly ℒ **7.96** → **margin +3.03** (vs +0.58 for the old memorized model); held-out code CE **5.52**; recalibrated gate **6.44** (`eval_model` → `axiom_drift_gate.txt`) |
 | New tooling | `corpus_crawl` (on-disk deduped corpus), `eval_model` (acceptance suite), `model_meta`/`corpus` lib modules |
 | Deploy | `start_axiom.sh` auto-activates the BPE model + reads dims from the sidecar + the recalibrated gate |
 
