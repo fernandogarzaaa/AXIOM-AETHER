@@ -2,7 +2,7 @@
 # GitHub Container Registry (ghcr.io) on every push to main and on version tags.
 #
 # Image: ghcr.io/fernandogarzaaa/axiom-aether:latest
-# Platforms: linux/amd64, linux/arm64
+# Platforms: linux/amd64 (arm64 dropped — QEMU-emulated candle builds too slow for CI)
 
 name: Publish Docker Image
 
@@ -58,7 +58,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # arm64 dropped: QEMU-emulated candle release builds are impractically
+          # slow (30+ min, often timing out). Re-add via native ARM runners if needed.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
