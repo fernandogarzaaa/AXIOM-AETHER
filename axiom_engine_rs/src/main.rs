@@ -55,6 +55,10 @@ fn usage() -> &'static str {
 /// feature flag (`--features cuda` or `--features metal`).
 fn device_from_str(s: &str) -> Result<Device> {
     match s {
+        // Phase 2.4: prefer CUDA when available, fall back to CPU gracefully.
+        // `cuda_if_available` returns CPU when the `cuda` feature is not compiled
+        // in or no device/driver is present — never errors.
+        "auto" => Ok(Device::cuda_if_available(0).unwrap_or(Device::Cpu)),
         "cpu" => Ok(Device::Cpu),
         #[cfg(feature = "cuda")]
         "cuda" => Device::new_cuda(0),
