@@ -77,14 +77,15 @@ fn resolve_production_model(legacy: AxiomConfig, default_ckpt: &str) -> (AxiomCo
         Ok(tok) => {
             let vocab = tok.get_vocab_size(true);
             std::env::set_var("AXIOM_TOKENIZER", &bpe);
-            eprintln!("[axiom] PRODUCTION MODEL = BPE (vocab {vocab}, d_model 256, n_layers 4); checkpoint {ckpt}");
-            let cfg = AxiomConfig {
-                d_model: 256,
-                n_layers: 4,
-                vocab_size: vocab,
-                lr_inner: 1e-3,
-                norm_eps: 1e-6,
-            };
+            // Prefer dims from the checkpoint sidecar so any baked size loads;
+            // fall back to the original 256/4 when no sidecar is present.
+            let (d_model, n_layers, lr_inner, norm_eps) =
+                match axiom_engine::model_meta::ModelMeta::load(&ckpt) {
+                    Some(m) => (m.d_model, m.n_layers, m.lr_inner, m.norm_eps),
+                    None => (256, 4, 1e-3, 1e-6),
+                };
+            eprintln!("[axiom] PRODUCTION MODEL = BPE (vocab {vocab}, d_model {d_model}, n_layers {n_layers}); checkpoint {ckpt}");
+            let cfg = AxiomConfig { d_model, n_layers, vocab_size: vocab, lr_inner, norm_eps };
             (cfg, ckpt)
         }
         Err(e) => {

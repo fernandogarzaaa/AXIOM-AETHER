@@ -58,8 +58,14 @@ if [ -f "$PROD_BPE_CKPT" ] && [ -f "$PROD_BPE_TOK" ]; then
     export AXIOM_PRODUCTION_BPE=1
     export AXIOM_TOKENIZER="$PROD_BPE_TOK"
     export AXIOM_BPE_CKPT="$PROD_BPE_CKPT"
-    export AXIOM_DRIFT_THRESHOLD="${AXIOM_DRIFT_THRESHOLD:-7.03}"
-    echo "[start_axiom] Production model: BPE semantic (d_model=256, n_layers=4, drift_gate=$AXIOM_DRIFT_THRESHOLD)"
+    # Prefer the eval-recalibrated drift gate when eval_model wrote one.
+    GATE_FILE="$REPO_ROOT/checkpoints/axiom_drift_gate.txt"
+    if [ -f "$GATE_FILE" ]; then
+        export AXIOM_DRIFT_THRESHOLD="$(cat "$GATE_FILE")"
+    else
+        export AXIOM_DRIFT_THRESHOLD="${AXIOM_DRIFT_THRESHOLD:-7.03}"
+    fi
+    echo "[start_axiom] Production model: BPE semantic (dims from sidecar, drift_gate=$AXIOM_DRIFT_THRESHOLD)"
 else
     echo "[start_axiom] Production model: legacy 256-hash (BPE artifacts not found)"
 fi
