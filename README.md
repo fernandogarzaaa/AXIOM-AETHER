@@ -61,15 +61,16 @@ A pipeline-first upgrade to a *properly converged* model (see
 |---|---|
 | Tokenizer | ByteLevel BPE retrained on a crawled multi-language corpus, **vocab 16,000** |
 | Training | `train_semantic` now does a **95/5 train/val split with early-stopping on held-out CE** (not memorization), **auto-sizes** the model to free VRAM, and writes a **`*.meta.json` sidecar** (dims/vocab/val_ce) |
-| Converged model | **d_model=128, n_layers=2, val_ce ≈ 4.10** (held-out, 30k-token run, best-checkpointed at the val minimum) — live in the proxy, dims auto-loaded from the sidecar |
-| Drift separation | clean ℒ **3.26–4.93** vs anomaly ℒ **7.96** → **margin +3.03** (vs +0.58 for the old memorized model); held-out code CE **5.52**; recalibrated gate **6.44** (`eval_model` → `axiom_drift_gate.txt`) |
+| Converged model | **d_model=256, n_layers=4, val_ce ≈ 3.18** (held-out, 90k-token / 40 MB-corpus run, best-checkpointed at the val minimum) — live in the proxy, dims auto-loaded from the sidecar |
+| Drift separation | clean ℒ **4.12–4.20** vs anomaly ℒ **7.23** → **margin +3.04** (vs +0.58 for the old memorized model); held-out code CE **3.47** (down from 5.52 at d128 — the larger model *generalizes* far better); recalibrated gate **5.72** (`eval_model` → `axiom_drift_gate.txt`) |
 | New tooling | `corpus_crawl` (on-disk deduped corpus), `eval_model` (acceptance suite), `model_meta`/`corpus` lib modules |
 | Deploy | `start_axiom.sh` auto-activates the BPE model + reads dims from the sidecar + the recalibrated gate |
 
-> **Hardware note:** the d128 model is the converged **CPU-phase** result — on this
-> box (RTX 2060 6 GB, ~8 GB RAM free, small page file) CPU training OOMs above
-> ~d128. Scaling to **d256–d512** (the auto-sizer is ready for it) needs the GPU,
-> which requires a candle 0.9 / CUDA-13 build — the documented next step.
+> **Hardware note:** d256/4L is the live **CPU-phase** model. On this box (RTX 2060
+> 6 GB, 20 GB RAM) d256 trained cleanly once a reboot cleared the Windows
+> commit-limit pressure that had been OOMing it (~5.2 s/step, ~3 h run). Scaling to
+> **d512** (the auto-sizer is ready for it) is feasible on CPU but multi-hour; the
+> GPU path needs a candle 0.9 / CUDA-13 build — the documented next step.
 
 ---
 
@@ -166,15 +167,17 @@ and trains in strict ≤512-token detached windows to bound VRAM/RAM.
 The script:
 - Runs in **PASSTHROUGH** mode (no key needed for a Claude subscription).
 - **Auto-activates the BPE semantic model** (d_model=256, n_layers=4, drift gate
-  `AXIOM_DRIFT_THRESHOLD=7.03`) when `checkpoints/axiom_production_bpe.bin` +
-  `axiom_bpe.json` exist; otherwise falls back to the legacy model.
+  read from `checkpoints/axiom_drift_gate.txt` — currently **5.72**, falling back to
+  `AXIOM_DRIFT_THRESHOLD=7.03` if the file is absent) when
+  `checkpoints/axiom_production_bpe.bin` + `axiom_bpe.json` exist; otherwise falls
+  back to the legacy model.
 - Enables compression (`AXIOM_TTT_COMPRESS=1`) and tees logs to
   `axiom_server.log`.
 
 Boot banner confirms the active model:
 ```
-[start_axiom] Production model: BPE semantic (d_model=256, n_layers=4, drift_gate=7.03)
-[axiom] PRODUCTION MODEL = BPE (vocab 5068, d_model 256, n_layers 4)
+[start_axiom] Production model: BPE semantic (d_model=256, n_layers=4, drift_gate=5.72)
+[axiom] PRODUCTION MODEL = BPE (vocab 16000, d_model 256, n_layers 4)
 [+] Axiom-TTT server listening on http://127.0.0.1:3000
 ```
 
