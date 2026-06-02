@@ -5,13 +5,19 @@
 //! performs one self-supervised gradient step on W_tilde before producing output,
 //! achieving O(1) memory per inference step.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use candle_core::{Result, Tensor, D};
 use candle_nn::{LayerNorm, Linear, Module, VarBuilder};
 
 use crate::config::AxiomConfig;
+
+/// Element-magnitude backstop applied to the fast-weight matrix when
+/// stabilization is enabled. Generous enough not to distort healthy dynamics
+/// (states stay O(1) with normalized keys), tight enough that a runaway can
+/// never reach `f32` overflow / NaN. Sync-free (no device round-trip).
+const STAB_CLAMP: f32 = 10.0;
 
 /// Standalone causal TTT block.
 ///
@@ -28,6 +34,12 @@ pub struct NativeTTTBlock {
     /// shared across all layers without rebuilding the model. Read on every
     /// `forward_native` step.
     inner_lr: Arc<AtomicU32>,
+    /// When true, the fast-weight update L2-normalizes the key (bounding the
+    /// per-step update to ~η regardless of weight scale) and element-clamps the
+    /// state. This keeps deep/wide models (d384, d512+) from diverging to NaN.
+    /// Off by default so the converged d256 path is byte-identical. Shared like
+    /// `inner_lr` so one `set_stabilize` retunes the whole stack.
+    stabilize: Arc<AtomicBool>,
 }
 
 impl NativeTTTBlock {
@@ -36,7 +48,8 @@ impl NativeTTTBlock {
     #[allow(dead_code)] // used by the lib path + tests; the bin builds via the model
     pub fn new(vs: VarBuilder, config: AxiomConfig) -> Result<Self> {
         let inner_lr = Arc::new(AtomicU32::new(config.lr_inner.to_bits()));
-        Self::new_with_shared_lr(vs, config, inner_lr)
+        let stabilize = Arc::new(AtomicBool::new(false));
+        Self::new_with_shared_lr(vs, config, inner_lr, stabilize)
     }
 
     /// Construct a block that reads its inner learning rate from a shared
@@ -46,6 +59,7 @@ impl NativeTTTBlock {
         vs: VarBuilder,
         config: AxiomConfig,
         inner_lr: Arc<AtomicU32>,
+        stabilize: Arc<AtomicBool>,
     ) -> Result<Self> {
         let d = config.d_model;
         Ok(Self {
@@ -58,6 +72,7 @@ impl NativeTTTBlock {
                 vs.pp("layer_norm"),
             )?,
             inner_lr,
+            stabilize,
         })
     }
 
@@ -88,8 +103,21 @@ impl NativeTTTBlock {
         let v = self.w_v.forward(x)?;
 
         // --- Fast-weight gradient step ------------------------------------------
+        let stabilize = self.stabilize.load(Ordering::Relaxed);
+
+        // Effective key. When stabilization is on, L2-normalize it: this bounds
+        // the per-step growth of ‖W_tilde‖ to ~(1+η) instead of (1+η·‖k‖²), which
+        // is what makes d384/d512 diverge as the learned W_k weights grow.
+        let k_eff = if stabilize {
+            let norm = k.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?; // [1, 1]
+            let norm = norm.affine(1.0, 1e-6)?; // + eps (avoid /0)
+            k.broadcast_div(&norm)?
+        } else {
+            k.clone()
+        };
+
         // k_col: [d_model, 1]  (transpose of the [1, d_model] key)
-        let k_col = k.t()?.contiguous()?;
+        let k_col = k_eff.t()?.contiguous()?;
 
         // pred: [d_model, d_model] × [d_model, 1] → [d_model, 1] → squeeze → [d_model]
         let pred = session_state.matmul(&k_col)?.squeeze(D::Minus1)?;
@@ -101,13 +129,17 @@ impl NativeTTTBlock {
         let error = pred.sub(&v_vec)?;
 
         // Outer product: [d_model, 1] × [1, d_model] → [d_model, d_model]
-        let grad = error.unsqueeze(1)?.matmul(&k)?;
+        let grad = error.unsqueeze(1)?.matmul(&k_eff)?;
 
         // W_tilde update: W_tilde ← W_tilde − η · grad
         // η is read live from the shared atomic so meta-training can decay it.
         let eta = f32::from_bits(self.inner_lr.load(Ordering::Relaxed));
         let lr = Tensor::new(eta, session_state.device())?;
-        let updated_state = session_state.sub(&grad.broadcast_mul(&lr)?)?;
+        let mut updated_state = session_state.sub(&grad.broadcast_mul(&lr)?)?;
+        if stabilize {
+            // Sync-free element backstop: a hard ceiling that NaN can never breach.
+            updated_state = updated_state.clamp(-STAB_CLAMP, STAB_CLAMP)?;
+        }
         *session_state = updated_state.clone();
         // ------------------------------------------------------------------------
 
@@ -174,5 +206,27 @@ mod tests {
         let output = block.forward_native(&x, &mut state).unwrap();
         let values: Vec<f32> = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(values.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_stabilized_path_survives_blowup() {
+        // Large-magnitude input + a long window: the raw (unnormalized) update
+        // explodes here; the stabilized path must stay finite and bounded.
+        let d = 32usize;
+        let (block, device) = make_block(d);
+        block.stabilize.store(true, Ordering::Relaxed);
+        let x = Tensor::randn(0f32, 10f32, (1usize, d), &device).unwrap();
+        let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+        for _ in 0..512 {
+            let out = block.forward_native(&x, &mut state).unwrap();
+            let ov: Vec<f32> = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert!(ov.iter().all(|v| v.is_finite()), "stabilized output went non-finite");
+        }
+        // The element clamp must hold the state inside [-STAB_CLAMP, STAB_CLAMP].
+        let sv: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            sv.iter().all(|v| v.abs() <= STAB_CLAMP + 1e-3),
+            "state exceeded the stabilization clamp"
+        );
     }
 }

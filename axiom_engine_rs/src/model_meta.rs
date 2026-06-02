@@ -21,6 +21,11 @@ pub struct ModelMeta {
     pub val_ce: f32,
     /// Tokenizer file this model was trained against.
     pub tokenizer: String,
+    /// Whether this checkpoint was trained with inner-loop stabilization
+    /// (normalized keys + state clamp). The proxy/eval must run it the same way.
+    /// `#[serde(default)]` → old sidecars (no field) load as `false`.
+    #[serde(default)]
+    pub stabilize: bool,
 }
 
 impl ModelMeta {
@@ -118,6 +123,7 @@ mod tests {
             norm_eps: 1e-6,
             val_ce: 3.21,
             tokenizer: "t.json".into(),
+            stabilize: true,
         };
         let ckpt = std::env::temp_dir().join("axiom_meta_test.bin");
         let ckpt = ckpt.to_string_lossy().to_string();

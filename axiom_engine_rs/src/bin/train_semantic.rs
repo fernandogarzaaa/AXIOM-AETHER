@@ -122,6 +122,12 @@ fn run() {
     let grad_clip = env_f64("AXIOM_GRAD_CLIP", 1.0);
     let warmup = env_usize("AXIOM_WARMUP_STEPS", 100);
     let log_every = env_usize("AXIOM_LOG_EVERY", 0);
+    // Inner-loop stabilization (normalized keys + state clamp): required for
+    // deep/wide models (d384, d512+) to stay finite. Recorded in the sidecar so
+    // the proxy runs the checkpoint the same way it was trained.
+    let stabilize = std::env::var("AXIOM_TTT_STABILIZE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
 
@@ -160,6 +166,8 @@ fn run() {
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = AxiomTTTLM::new(vb, config.clone()).expect("build model");
+    model.set_stabilize(stabilize);
+    eprintln!("[train] inner-loop stabilization: {stabilize}");
 
     // RESUME: continue from an existing checkpoint when dims match.
     if Path::new(&ckpt).exists() {
@@ -301,6 +309,7 @@ fn run() {
                 norm_eps: 1e-6,
                 val_ce: best_val,
                 tokenizer: bpe.clone(),
+                stabilize,
             }
             .save(&ckpt);
         } else {

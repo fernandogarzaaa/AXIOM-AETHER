@@ -71,6 +71,16 @@ impl InferencePipeline {
             // channel for `--mode mcp` (JSON-RPC stdio). The HTTP server prints
             // its own banner separately.
             eprintln!("[+] Loaded checkpoint from {checkpoint}");
+            // Run the checkpoint with the same inner-loop stabilization it was
+            // trained with (recorded in the sidecar). Missing/old sidecar → off,
+            // so existing models (e.g. the d256 production checkpoint) are
+            // byte-identical to before.
+            if let Some(meta) = crate::model_meta::ModelMeta::load(checkpoint) {
+                if meta.stabilize {
+                    model.set_stabilize(true);
+                    eprintln!("[+] Inner-loop stabilization ENABLED (per sidecar)");
+                }
+            }
         } else {
             eprintln!(
                 "[!] Warning: No pre-trained checkpoint found. Initializing with baseline random weights."

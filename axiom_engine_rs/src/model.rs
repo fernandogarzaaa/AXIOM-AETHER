@@ -8,7 +8,7 @@
 //!
 //! Architecture: Embedding → N × NativeTTTBlock → RMSNorm → LM Head
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use candle_core::{DType, Result, Tensor};
@@ -31,6 +31,10 @@ pub struct AxiomTTTLM {
     /// Shared inner test-time learning rate η (raw f32 bits) read by every
     /// `NativeTTTBlock`. Adjusting it retunes the whole stack at once.
     inner_lr: Arc<AtomicU32>,
+    /// Shared stabilization flag read by every `NativeTTTBlock`. When on, the
+    /// fast-weight update normalizes keys + clamps state so deep/wide models
+    /// stay finite. Off by default (existing checkpoints unchanged).
+    stabilize: Arc<AtomicBool>,
 }
 
 impl AxiomTTTLM {
@@ -43,6 +47,8 @@ impl AxiomTTTLM {
         // One shared inner-lr cell, initialised from config, handed to every
         // layer so meta-training can decay η across the whole stack.
         let inner_lr = Arc::new(AtomicU32::new(config.lr_inner.to_bits()));
+        // Shared stabilization flag (off by default → existing models unchanged).
+        let stabilize = Arc::new(AtomicBool::new(false));
 
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
@@ -50,6 +56,7 @@ impl AxiomTTTLM {
                 vs.pp(format!("native_block_{i}")),
                 config.clone(),
                 inner_lr.clone(),
+                stabilize.clone(),
             )?);
         }
 
@@ -64,7 +71,20 @@ impl AxiomTTTLM {
             lm_head,
             config,
             inner_lr,
+            stabilize,
         })
+    }
+
+    /// Enable/disable inner-loop stabilization (normalized keys + state clamp)
+    /// across every layer. Must match how the checkpoint was trained — the
+    /// proxy sets this from the model's sidecar (`ModelMeta::stabilize`).
+    pub fn set_stabilize(&self, on: bool) {
+        self.stabilize.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether inner-loop stabilization is currently enabled.
+    pub fn stabilize(&self) -> bool {
+        self.stabilize.load(Ordering::Relaxed)
     }
 
     /// Set the inner test-time learning rate η used by every TTT layer on
