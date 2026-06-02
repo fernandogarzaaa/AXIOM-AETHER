@@ -47,6 +47,21 @@ export AXIOM_TTT_COMPRESS="${AXIOM_TTT_COMPRESS:-1}"
 export AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS="${AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS:-512}"
 export AXIOM_TTT_COMPRESS_TOP_K="${AXIOM_TTT_COMPRESS_TOP_K:-32}"
 
+# --- Compute device: GPU-first, CPU fallback -------------------------------
+# Default to "auto": the engine selects CUDA when the `cuda` feature is compiled
+# in AND a GPU + runtime libraries are available, else it falls back to CPU
+# gracefully (cuda_if_available in main.rs never errors). Force with
+# AXIOM_DEVICE=cpu (e.g. to keep the display GPU idle) or AXIOM_DEVICE=cuda.
+export AXIOM_DEVICE="${AXIOM_DEVICE:-auto}"
+# If a local CUDA 12.6 toolkit is present (the GPU build links cudarc against it),
+# put its runtime libraries on PATH so they load at device-init time. Skipped
+# harmlessly on machines without it — AXIOM_DEVICE=auto then just uses CPU.
+AXIOM_CUDA_HOME="${AXIOM_CUDA_HOME:-$HOME/cuda-12.6}"
+if [ -d "$AXIOM_CUDA_HOME/bin" ]; then
+    export PATH="$AXIOM_CUDA_HOME/bin:$AXIOM_CUDA_HOME/nvvm/bin:$PATH"
+    export CUDA_PATH="$AXIOM_CUDA_HOME"
+fi
+
 # --- Production BPE model (Objective 1.3 swap) -----------------------------
 # Officially deprecate the legacy 256-character-hash model: when the scaled BPE
 # artifacts are present, the proxy runs the d_model=256 / n_layers=4 / BPE-vocab
@@ -112,6 +127,11 @@ echo "[start_axiom] Launching Axiom-TTT proxy"
 echo "[start_axiom]   bind        : http://$HOST:$PORT"
 echo "[start_axiom]   upstream    : $ANTHROPIC_BASE_URL"
 echo "[start_axiom]   compression : $AXIOM_TTT_COMPRESS (threshold=$AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS tokens, top_k=$AXIOM_TTT_COMPRESS_TOP_K)"
+if [ -d "$AXIOM_CUDA_HOME/bin" ]; then
+    echo "[start_axiom]   device      : $AXIOM_DEVICE (GPU-first; CUDA 12.6 toolkit on PATH, CPU fallback)"
+else
+    echo "[start_axiom]   device      : $AXIOM_DEVICE (no local CUDA toolkit — CPU unless system CUDA present)"
+fi
 echo "[start_axiom]   log         : $LOG_FILE"
 echo
 

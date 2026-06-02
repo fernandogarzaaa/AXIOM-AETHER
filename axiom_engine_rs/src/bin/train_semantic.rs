@@ -117,6 +117,11 @@ fn run() {
     let win = env_usize("AXIOM_TRAIN_WIN", 128);
     let max_tokens = env_usize("AXIOM_MAX_TOKENS", 2_000_000);
     let patience = env_usize("AXIOM_PATIENCE", 3);
+    // Stability controls (matter for deep/wide models like d512/8L that otherwise
+    // diverge to NaN): global gradient-norm clip + linear LR warmup.
+    let grad_clip = env_f64("AXIOM_GRAD_CLIP", 1.0);
+    let warmup = env_usize("AXIOM_WARMUP_STEPS", 100);
+    let log_every = env_usize("AXIOM_LOG_EVERY", 0);
 
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
 
@@ -209,22 +214,66 @@ fn run() {
             let mut states = model.init_states(&device).unwrap();
             let input = Tensor::from_vec(w[..n - 1].to_vec(), (1, n - 1), &device).unwrap();
             // OOM-resilient step: on a memory failure, skip this window gracefully.
+            // Also NaN-guarded + grad-clipped + LR-warmed to keep deep models stable.
             let stepped = (|| -> candle_core::Result<f32> {
+                // Linear LR warmup over the first `warmup` steps.
+                if warmup > 0 && step < warmup {
+                    opt.set_learning_rate(lr * (step + 1) as f64 / warmup as f64);
+                } else if step == warmup {
+                    opt.set_learning_rate(lr);
+                }
                 let logits = model.forward_lm(&input, &mut states)?;
                 let l2d = logits.squeeze(0)?.reshape((n - 1, vocab))?;
                 let tgt = Tensor::from_vec(w[1..].to_vec(), (n - 1,), &device)?;
                 let loss = candle_nn::loss::cross_entropy(&l2d, &tgt)?;
-                opt.backward_step(&loss)?;
-                loss.to_scalar::<f32>()
+                let lval = loss.to_scalar::<f32>()?;
+                // Skip poisoned steps: never let a NaN/inf gradient touch the weights.
+                if !lval.is_finite() {
+                    return Ok(lval);
+                }
+                let mut grads = loss.backward()?;
+                if grad_clip > 0.0 {
+                    // Global L2 norm across all parameter grads, then scale if over budget.
+                    let vars = varmap.all_vars();
+                    let mut total = 0f64;
+                    for v in &vars {
+                        if let Some(g) = grads.get(v.as_tensor()) {
+                            total += g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+                        }
+                    }
+                    let norm = total.sqrt();
+                    if norm.is_finite() && norm > grad_clip {
+                        let scale = grad_clip / (norm + 1e-6);
+                        for v in &vars {
+                            if let Some(g) = grads.get(v.as_tensor()) {
+                                let clipped = (g * scale)?;
+                                grads.insert(v.as_tensor(), clipped);
+                            }
+                        }
+                    }
+                }
+                opt.step(&grads)?;
+                Ok(lval)
             })();
             match stepped {
-                Ok(l) => {
+                Ok(l) if l.is_finite() => {
                     sum += l;
                     cnt += 1;
                 }
+                Ok(l) => eprintln!("[train]   WARN non-finite loss ({l}) at step {step} — skipped"),
                 Err(e) => eprintln!("[train] step skipped (mem?): {e}"),
             }
             step += 1;
+            // Step-level heartbeat so long GPU runs are observable before the
+            // first per-epoch eval (set AXIOM_LOG_EVERY>0 to enable).
+            if log_every > 0 && step % log_every == 0 {
+                eprintln!(
+                    "[train]   step {} loss~{:.4} ({:.0}s)",
+                    step,
+                    sum / cnt.max(1) as f32,
+                    t0.elapsed().as_secs_f32()
+                );
+            }
             if step >= step_cap {
                 eprintln!("[train] step cap {step_cap} hit");
                 break 'train;
