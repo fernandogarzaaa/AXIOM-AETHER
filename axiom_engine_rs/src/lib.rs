@@ -5,6 +5,7 @@ pub mod config;
 pub mod context_compressor;
 pub mod corpus;
 pub mod data_gen;
+pub mod hardware;
 pub mod inference;
 pub mod jit_streamer;
 pub mod kernel;

@@ -8,6 +8,7 @@ use tokenizers::Tokenizer;
 use crate::config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use crate::jit_streamer::JitContextStreamer;
 use crate::model::AxiomTTTLM;
+use crate::model_meta::ModelMeta;
 
 #[derive(Clone, Debug, Default)]
 pub struct InferenceRuntimeOptions {
@@ -75,7 +76,7 @@ impl InferencePipeline {
             // trained with (recorded in the sidecar). Missing/old sidecar → off,
             // so existing models (e.g. the d256 production checkpoint) are
             // byte-identical to before.
-            if let Some(meta) = crate::model_meta::ModelMeta::load(checkpoint) {
+            if let Some(meta) = ModelMeta::load(checkpoint) {
                 if meta.stabilize {
                     model.set_stabilize(true);
                     eprintln!("[+] Inner-loop stabilization ENABLED (per sidecar)");

@@ -4,6 +4,7 @@ mod cluster;
 mod config;
 mod context_compressor;
 mod data_gen;
+mod hardware;
 mod inference;
 mod jit_streamer;
 mod kernel;
@@ -12,6 +13,7 @@ mod memory_pool;
 mod meta_train;
 mod metrics;
 mod model;
+mod model_meta;
 mod quantization;
 mod server;
 mod train;
@@ -95,12 +97,39 @@ fn resolve_production_model(legacy: AxiomConfig, default_ckpt: &str) -> (AxiomCo
     }
 }
 
+/// Resolve `--device auto` using the hardware co-tenancy guard rather than a
+/// blind `cuda_if_available`. This is the crash fix: when a training job already
+/// holds the GPU, the proxy is steered to CPU so the two cannot OOM each other.
+/// Falls back to CPU when the `cuda` feature is absent or CUDA init fails.
+fn resolve_auto_device() -> Device {
+    let profile = hardware::detect();
+    let rec = hardware::recommend(&profile);
+    eprintln!("[axiom] auto-device: {} ({})", rec.proxy_device, rec.reason);
+    match rec.proxy_device {
+        hardware::DeviceChoice::Cuda => match try_new_cuda() {
+            Some(dev) => dev,
+            None => {
+                eprintln!("[axiom] auto-device: CUDA unavailable at init — using CPU");
+                Device::Cpu
+            }
+        },
+        hardware::DeviceChoice::Cpu => Device::Cpu,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn try_new_cuda() -> Option<Device> {
+    Device::new_cuda(0).ok()
+}
+#[cfg(not(feature = "cuda"))]
+fn try_new_cuda() -> Option<Device> {
+    None
+}
+
 fn device_from_str(s: &str) -> Result<Device> {
     match s {
-        // Phase 2.4: prefer CUDA when available, fall back to CPU gracefully.
-        // `cuda_if_available` returns CPU when the `cuda` feature is not compiled
-        // in or no device/driver is present — never errors.
-        "auto" => Ok(Device::cuda_if_available(0).unwrap_or(Device::Cpu)),
+        // Hardware-aware auto: honours the co-tenancy guard (see resolve_auto_device).
+        "auto" => Ok(resolve_auto_device()),
         "cpu" => Ok(Device::Cpu),
         #[cfg(feature = "cuda")]
         "cuda" => Device::new_cuda(0),
@@ -296,6 +325,18 @@ fn parse_cli() -> Result<CliArgs> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_cli()?;
+
+    // `doctor` reports the hardware profile + recommended config and exits. It
+    // needs no model or device, so handle it before device resolution. This is
+    // the open-source self-diagnosis entry point: a user runs it once to see
+    // exactly what Axiom will do on their machine and why.
+    if args.mode == "doctor" {
+        let profile = hardware::detect();
+        let rec = hardware::recommend(&profile);
+        print!("{}", hardware::report(&profile, &rec));
+        return Ok(());
+    }
+
     let device = device_from_str(&args.device)?;
 
     // Keep local defaults small enough for CPU experimentation.
@@ -402,7 +443,7 @@ async fn main() -> Result<()> {
         }
         other => {
             bail!(
-                "unsupported mode '{other}'. Use --mode train | generate | server | mcp | meta-train"
+                "unsupported mode '{other}'. Use --mode train | generate | server | mcp | meta-train | doctor"
             )
         }
     }

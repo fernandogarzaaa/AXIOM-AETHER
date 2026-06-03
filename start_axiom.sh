@@ -16,7 +16,9 @@
 # upstream to the real Anthropic API and ignores any inherited client value.
 # Client redirection belongs in a SEPARATE shell — see axiom.env.
 #
-set -euo pipefail
+set -uo pipefail
+# Note: -e intentionally omitted — the watchdog loop below needs to survive
+# crashes and restart the binary without the script itself exiting.
 
 # --- Resolve paths ---------------------------------------------------------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,7 +54,25 @@ export AXIOM_TTT_COMPRESS_TOP_K="${AXIOM_TTT_COMPRESS_TOP_K:-32}"
 # in AND a GPU + runtime libraries are available, else it falls back to CPU
 # gracefully (cuda_if_available in main.rs never errors). Force with
 # AXIOM_DEVICE=cpu (e.g. to keep the display GPU idle) or AXIOM_DEVICE=cuda.
-export AXIOM_DEVICE="${AXIOM_DEVICE:-auto}"
+export AXIOM_DEVICE="${AXIOM_DEVICE:-cpu}"
+# Default cpu: the proxy's BPE model is tiny (34MB) and latency is fine on CPU.
+# GPU is reserved for training workloads. Override with AXIOM_DEVICE=cuda when
+# the machine is idle (not training) to benchmark GPU-accelerated compression.
+#
+# --- OOM guard: refuse to run on GPU if training has >70% VRAM in use ------
+if [ "${AXIOM_DEVICE}" = "cuda" ]; then
+    VRAM_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    VRAM_TOTAL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    if [ -n "$VRAM_USED" ] && [ -n "$VRAM_TOTAL" ] && [ "$VRAM_TOTAL" -gt 0 ]; then
+        VRAM_PCT=$(( VRAM_USED * 100 / VRAM_TOTAL ))
+        if [ "$VRAM_PCT" -gt 70 ]; then
+            echo "[start_axiom] WARNING: GPU memory ${VRAM_PCT}% used (${VRAM_USED}/${VRAM_TOTAL}MiB) — switching to CPU to avoid OOM"
+            export AXIOM_DEVICE=cpu
+        else
+            echo "[start_axiom] GPU memory OK: ${VRAM_PCT}% used — proceeding with CUDA"
+        fi
+    fi
+fi
 # If a local CUDA 12.6 toolkit is present (the GPU build links cudarc against it),
 # put its runtime libraries on PATH so they load at device-init time. Skipped
 # harmlessly on machines without it — AXIOM_DEVICE=auto then just uses CPU.
@@ -135,6 +155,30 @@ fi
 echo "[start_axiom]   log         : $LOG_FILE"
 echo
 
-# Tee so the compression metric lines ([axiom-ttt] ... recall_norm=...) are
-# visible live AND captured for the smoke test to inspect.
-exec "$BIN" --mode server --host "$HOST" --port "$PORT" "${CKPT_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+# --- Watchdog: restart on crash, fall back to CPU if CUDA fails -----------
+# Tee so compression metric lines are visible live AND captured for smoke tests.
+# On each exit we check the log for CUDA errors and switch device to cpu if
+# found — this means a driver update can never permanently brick the proxy.
+_WATCH_DEVICE="$AXIOM_DEVICE"
+_ATTEMPT=0
+while true; do
+    _ATTEMPT=$((_ATTEMPT + 1))
+    export AXIOM_DEVICE="$_WATCH_DEVICE"
+    echo "[watchdog] Starting axiom_engine (attempt #$_ATTEMPT, device=$AXIOM_DEVICE)"
+
+    "$BIN" --mode server --host "$HOST" --port "$PORT" "${CKPT_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
+    _EXIT="${PIPESTATUS[0]}"
+
+    echo "[watchdog] axiom_engine exited (code=$_EXIT) at $(date)"
+
+    # Detect CUDA failure and fall back to CPU for the next attempt
+    if [ "$_WATCH_DEVICE" != "cpu" ]; then
+        if grep -qE "CUDA_ERROR|cuda error|DriverError|pipeline lock poisoned" "$LOG_FILE" 2>/dev/null; then
+            echo "[watchdog] CUDA error detected in log — switching to CPU for next run"
+            _WATCH_DEVICE=cpu
+        fi
+    fi
+
+    echo "[watchdog] Restarting in 3 seconds..."
+    sleep 3
+done
