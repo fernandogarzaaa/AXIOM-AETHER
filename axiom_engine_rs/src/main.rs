@@ -322,8 +322,22 @@ fn parse_cli() -> Result<CliArgs> {
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // candle's autograd backward pass recurses deeply. The default ~2 MB tokio
+    // worker stack overflows the moment the /v1/messages compression path runs
+    // the TTT model over heavy context — which silently killed every real
+    // compression (the train_semantic binary already uses a 1 GiB stack for the
+    // same model for exactly this reason). Build the runtime with a large worker
+    // stack so compression is safe on real inputs.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(256 * 1024 * 1024) // 256 MB per worker
+        .build()
+        .map_err(|e| candle_core::Error::Msg(format!("tokio runtime build failed: {e}")))?;
+    runtime.block_on(run_main())
+}
+
+async fn run_main() -> Result<()> {
     let args = parse_cli()?;
 
     // `doctor` reports the hardware profile + recommended config and exits. It
