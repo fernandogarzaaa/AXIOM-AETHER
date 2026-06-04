@@ -54,10 +54,12 @@ export AXIOM_TTT_COMPRESS_TOP_K="${AXIOM_TTT_COMPRESS_TOP_K:-32}"
 # in AND a GPU + runtime libraries are available, else it falls back to CPU
 # gracefully (cuda_if_available in main.rs never errors). Force with
 # AXIOM_DEVICE=cpu (e.g. to keep the display GPU idle) or AXIOM_DEVICE=cuda.
-export AXIOM_DEVICE="${AXIOM_DEVICE:-cpu}"
-# Default cpu: the proxy's BPE model is tiny (34MB) and latency is fine on CPU.
-# GPU is reserved for training workloads. Override with AXIOM_DEVICE=cuda when
-# the machine is idle (not training) to benchmark GPU-accelerated compression.
+export AXIOM_DEVICE="${AXIOM_DEVICE:-auto}"
+# Default "auto": the hardware co-tenancy guard (src/hardware.rs) decides. It
+# keeps the proxy on CPU whenever a training job already holds the GPU (the fix
+# for VRAM OOM contention on small cards), and only takes CUDA on an idle GPU
+# with real headroom. Force a role with AXIOM_DEVICE=cpu|cuda. Run
+# `axiom_engine --mode doctor` to see the live recommendation and why.
 #
 # --- OOM guard: refuse to run on GPU if training has >70% VRAM in use ------
 if [ "${AXIOM_DEVICE}" = "cuda" ]; then
