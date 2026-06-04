@@ -37,6 +37,25 @@ if [ "$RESULT" != "PASS" ]; then
     exit 2
 fi
 
+# --- Quality guard: only promote if the new model BEATS the incumbent -------
+# Acceptance PASS only proves the model can still separate clean vs anomaly. It
+# does NOT prove the new model is better overall. Compare held-out val_ce (lower
+# is better) against the current production sidecar and refuse a regression.
+# (This guard was added after an undertrained d384 with a WORSE val_ce slipped
+# through the PASS-only gate and got promoted.)
+NEW_CE="$(python -c "import json;print(json.load(open(r'${D384%.bin}.meta.json'))['val_ce'])" 2>/dev/null)"
+OLD_CE="$(python -c "import json;print(json.load(open(r'${PROD%.bin}.meta.json'))['val_ce'])" 2>/dev/null)"
+log "quality check: new val_ce=$NEW_CE  vs  incumbent val_ce=$OLD_CE (lower = better)"
+if [ -z "$NEW_CE" ] || [ -z "$OLD_CE" ]; then
+    log "ABORT: could not read val_ce from a sidecar — refusing to promote blindly."
+    exit 4
+fi
+if ! python -c "import sys; sys.exit(0 if float('$NEW_CE') < float('$OLD_CE') else 1)" 2>/dev/null; then
+    log "new model val_ce ($NEW_CE) is NOT better than incumbent ($OLD_CE) — keeping current production. No changes."
+    exit 3
+fi
+log "new model BEATS incumbent — proceeding with promotion."
+
 # --- Promote: back up d256, swap in d384 -----------------------------------
 TS="$(date +%Y%m%d-%H%M%S)"
 log "PASS — backing up d256 to axiom_production_bpe.d256.$TS.bak"
