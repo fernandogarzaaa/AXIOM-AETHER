@@ -58,6 +58,22 @@ def is_training():
         return False
 
 
+def gpu_stats():
+    """Live GPU utilization / VRAM / temp via nvidia-smi. Changes every poll, so
+    it gives real-time proof the GPU is working even between score updates."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        util, used, total, temp = [x.strip() for x in out.split(",")]
+        return {"util": int(util), "vram_used": int(used),
+                "vram_total": int(total), "temp": int(temp)}
+    except Exception:
+        return None
+
+
 def promotion_state():
     """Read the promote watcher log for a final verdict, if any."""
     try:
@@ -133,6 +149,7 @@ def build_status():
         "start": START_LOSS,
         "points": pts[-200:],   # cap payload
         "epochs": epochs,
+        "gpu": gpu_stats(),
     }
 
 
@@ -181,6 +198,19 @@ svg{width:100%;height:200px;display:block}
   </div>
 </div>
 
+<div class=card id=gpucard>
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+    <span style="font-weight:600">Engine activity <small style="color:var(--dim)">— live, right now</small></span>
+    <span id=gpuwork style="color:var(--good);font-size:13px">working</span>
+  </div>
+  <div class=bar><i id=gpufill style="width:0%;background:linear-gradient(90deg,#4ade80,#fbbf24)"></i></div>
+  <div class=grid style="margin-top:14px">
+    <div class=stat><b id=gpuutil>—</b><span>GPU effort</span></div>
+    <div class=stat><b id=gpumem>—</b><span>memory in use</span></div>
+    <div class=stat><b id=gputemp>—</b><span>temperature</span></div>
+  </div>
+</div>
+
 <div class=card>
   <div id=chart></div>
   <div class=legend><span><i style="background:#6ea8ff"></i>Axiom's score over time</span>
@@ -220,6 +250,17 @@ async function tick(){
   document.getElementById('chart').innerHTML=draw(s.points,s.target,s.start)
   const dot=document.getElementById('dot'),st=document.getElementById('state')
   if(s.running){dot.className='dot';st.textContent='training now'}else{dot.className='dot idle';st.textContent='not running'}
+  const g=s.gpu,card=document.getElementById('gpucard')
+  if(g){card.style.display='block'
+   document.getElementById('gpuutil').textContent=g.util+'%'
+   document.getElementById('gpumem').textContent=(g.vram_used/1024).toFixed(1)+' GB'
+   document.getElementById('gputemp').textContent=g.temp+'°C'
+   document.getElementById('gpufill').style.width=g.util+'%'
+   const w=document.getElementById('gpuwork')
+   if(g.util>=40){w.textContent='working hard';w.style.color='#4ade80'}
+   else if(g.util>0){w.textContent='ticking over';w.style.color='#fbbf24'}
+   else{w.textContent='idle';w.style.color='#8a93a6'}
+  } else {card.style.display='none'}
  }catch(e){}
 }
 tick();setInterval(tick,3000)
