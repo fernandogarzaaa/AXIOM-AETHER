@@ -18,6 +18,7 @@ pub mod model_meta;
 pub mod quantization;
 pub mod search_ingest;
 pub mod server;
+pub mod skeleton;
 pub mod train;
 pub mod ttt_block;
 pub mod vibe_memory;

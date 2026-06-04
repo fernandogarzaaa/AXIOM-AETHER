@@ -309,7 +309,32 @@ pub fn build_compressed_payload(
     partitioned: &PartitionedMessages,
 ) -> Value {
     let mut payload = original.clone();
-    let fingerprint_block = fingerprint.to_prompt_block();
+
+    // Claude-readable compression: ship a compact structural skeleton of the
+    // heavy context (signatures kept, bodies dropped) instead of the opaque
+    // neural fingerprint. Axiom's TTT capability is unaffected — the session
+    // already absorbed the context (adapt_session); the drift signal
+    // (recall_norm + state_hash) rides along as digest attributes. Falls back to
+    // the neural schema marker only when there is no heavy text to skeletonize.
+    let heavy_text = partitioned
+        .heavy_context
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let original_tokens: usize = partitioned.heavy_context.iter().map(|c| c.token_count).sum();
+    let fingerprint_block = if heavy_text.trim().is_empty() {
+        fingerprint.to_prompt_block()
+    } else {
+        crate::skeleton::build_digest(
+            &heavy_text,
+            &fingerprint.session_id,
+            original_tokens,
+            fingerprint.recall_norm,
+            &fingerprint.state_hash,
+            3, // doc-line cap tuned to ~80% reduction
+        )
+    };
 
     let mut messages = partitioned.surviving.clone();
     match partitioned.target_user_index {

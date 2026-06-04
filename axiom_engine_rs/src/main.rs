@@ -16,6 +16,7 @@ mod model;
 mod model_meta;
 mod quantization;
 mod server;
+mod skeleton;
 mod train;
 mod ttt_block;
 mod vibe_memory;
