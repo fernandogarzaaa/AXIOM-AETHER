@@ -66,11 +66,22 @@ A pipeline-first upgrade to a *properly converged* model (see
 | New tooling | `corpus_crawl` (on-disk deduped corpus), `eval_model` (acceptance suite), `model_meta`/`corpus` lib modules |
 | Deploy | `start_axiom.sh` auto-activates the BPE model + reads dims from the sidecar + the recalibrated gate |
 
-> **Hardware note:** d256/4L is the live **CPU-phase** model. On this box (RTX 2060
-> 6 GB, 20 GB RAM) d256 trained cleanly once a reboot cleared the Windows
-> commit-limit pressure that had been OOMing it (~5.2 s/step, ~3 h run). Scaling to
-> **d512** (the auto-sizer is ready for it) is feasible on CPU but multi-hour; the
-> GPU path needs a candle 0.9 / CUDA-13 build — the documented next step.
+> **Hardware note:** d256/4L is the live model. The GPU training path **works on
+> CUDA 12.6** (a d384/6L run trained on an RTX 2060 at ~12 s/step). `candle 0.9 /
+> CUDA-13` remains blocked upstream — `cudarc 0.13` does not support CUDA 13.x —
+> so CUDA 12.6 is the supported GPU toolchain.
+
+### Update — Semantic v4 (compression that actually works, and is Claude-readable)
+
+The compression path had two latent problems; both are fixed, and the result is
+verified end-to-end through the proxy:
+
+| Area | v4 |
+|---|---|
+| **Compression now fires** | The `/v1/messages` compression ran the TTT model on a tokio worker whose default ~2 MB stack overflowed on candle's deep backward recursion — silently closing the connection, so `heavy_msgs` was **always 0**. The runtime now builds workers with a **256 MB stack**; real heavy context compresses for the first time. |
+| **Claude-readable digest** | The opaque neural fingerprint (vocab indices + Frobenius norms) is meaningless to a *different* model, so compressing real code made answers worse. Axiom now ships a **structural skeleton** — doc summary + imports + declaration signatures, bodies elided — that Claude can actually read. Axiom's TTT capability is untouched (the session still absorbs the context); the drift signal (`recall_norm` + `state_hash`) rides along as digest attributes. **~80 % smaller on the wire, still answerable.** (`src/skeleton.rs`) |
+| **Multi-language + prose-safe** | The skeletonizer covers Rust/Go/Python/JS-TS/Java/C#, detects brace-language methods with no leading keyword, excludes control-flow headers, and falls back to a head+tail **prose excerpt** for non-code so plain text is never erased. |
+| **Hardware auto-optimization** | `src/hardware.rs` + `--mode doctor`: detects GPU/VRAM/CPU/RAM and recommends safe per-role devices. A **co-tenancy guard** keeps the proxy on CPU whenever a training job holds the GPU — the fix for VRAM OOM contention on small cards. `--device auto` honours it. |
 
 ---
 
@@ -359,6 +370,8 @@ Key env: `AXIOM_PRODUCTION_BPE`, `AXIOM_TOKENIZER`, `AXIOM_BPE_CKPT`,
 | Kernels / RMSNorm | `kernel.rs`, `chunk_kernel.rs` |
 | Inference pipeline + tokenizer | `inference.rs` |
 | Context compression | `context_compressor.rs` |
+| Claude-readable digest (skeleton) | `skeleton.rs` |
+| Hardware profile + co-tenancy guard | `hardware.rs` |
 | Anthropic forwarder (passthrough) | `anthropic_forwarder.rs` |
 | Native MCP server | `mcp_stdio.rs` |
 | Persistent vibe memory (EMA) | `vibe_memory.rs` |
