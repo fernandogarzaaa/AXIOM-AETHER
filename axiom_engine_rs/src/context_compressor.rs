@@ -406,6 +406,67 @@ impl Default for CompressorConfig {
     }
 }
 
+/// Runtime-mutable compression controls + live counters. Seeded from
+/// [`CompressorConfig`] at startup, then a dashboard can retune the proxy without
+/// a restart (`POST /v1/config`) and watch it work (`GET /v1/config`).
+#[derive(Debug)]
+pub struct CompressionControls {
+    enabled: std::sync::atomic::AtomicBool,
+    threshold_tokens: std::sync::atomic::AtomicUsize,
+    requests_total: std::sync::atomic::AtomicU64,
+    messages_compressed: std::sync::atomic::AtomicU64,
+    bytes_in: std::sync::atomic::AtomicU64,
+    bytes_out: std::sync::atomic::AtomicU64,
+}
+
+impl CompressionControls {
+    pub fn from_config(cfg: &CompressorConfig) -> Self {
+        use std::sync::atomic::*;
+        Self {
+            enabled: AtomicBool::new(cfg.enabled),
+            threshold_tokens: AtomicUsize::new(cfg.heavy_message_threshold_tokens),
+            requests_total: AtomicU64::new(0),
+            messages_compressed: AtomicU64::new(0),
+            bytes_in: AtomicU64::new(0),
+            bytes_out: AtomicU64::new(0),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_enabled(&self, v: bool) {
+        self.enabled.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn threshold(&self) -> usize {
+        self.threshold_tokens.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_threshold(&self, v: usize) {
+        self.threshold_tokens.store(v.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record one compression request: a count of heavy messages absorbed, and
+    /// the original vs forwarded payload byte sizes (for live savings stats).
+    pub fn record(&self, heavy_count: u64, bytes_in: u64, bytes_out: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.requests_total.fetch_add(1, Relaxed);
+        self.messages_compressed.fetch_add(heavy_count, Relaxed);
+        self.bytes_in.fetch_add(bytes_in, Relaxed);
+        self.bytes_out.fetch_add(bytes_out, Relaxed);
+    }
+
+    /// (requests, messages_compressed, bytes_in, bytes_out)
+    pub fn counters(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.requests_total.load(Relaxed),
+            self.messages_compressed.load(Relaxed),
+            self.bytes_in.load(Relaxed),
+            self.bytes_out.load(Relaxed),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

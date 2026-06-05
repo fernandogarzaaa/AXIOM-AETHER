@@ -43,8 +43,8 @@ use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
 use crate::context_compressor::{
-    adapt_session_blocking, extract_memory_vector_blocking, CompressorConfig, MemoryFingerprint,
-    SessionStates, TttSessionStore,
+    adapt_session_blocking, extract_memory_vector_blocking, CompressionControls, CompressorConfig,
+    MemoryFingerprint, SessionStates, TttSessionStore,
 };
 use crate::inference::InferencePipeline;
 use crate::metrics;
@@ -220,6 +220,9 @@ pub struct AppState {
     /// round-trip can expand a dropped symbol body on demand (`POST /v1/expand`).
     /// Soft-bounded (cleared past a cap) since sessions are transient.
     pub source_store: Arc<RwLock<HashMap<String, String>>>,
+    /// Runtime-mutable compression controls + live counters. Lets a dashboard
+    /// retune the threshold / on-off without a restart (`/v1/config`).
+    pub controls: Arc<CompressionControls>,
 }
 
 impl AppState {
@@ -237,6 +240,7 @@ impl AppState {
             compressor_config: Arc::new(CompressorConfig::default()),
             master_vibe: Arc::new(Mutex::new(None)),
             source_store: Arc::new(RwLock::new(HashMap::new())),
+            controls: Arc::new(CompressionControls::from_config(&CompressorConfig::default())),
         }
     }
 
@@ -308,16 +312,19 @@ impl AppState {
         self
     }
 
-    /// Override the compressor configuration.
+    /// Override the compressor configuration. Also seeds the runtime controls so
+    /// the live threshold / on-off state starts from the configured values.
     pub fn with_compressor_config(mut self, config: CompressorConfig) -> Self {
+        self.controls = Arc::new(CompressionControls::from_config(&config));
         self.compressor_config = Arc::new(config);
         self
     }
 
     /// True iff every component the compression path needs is configured:
-    /// the feature flag, the forwarder, and a key.
+    /// the (runtime) feature flag and the forwarder. The enabled flag is read
+    /// from the live controls so a dashboard can toggle it without a restart.
     pub fn compression_active(&self) -> bool {
-        self.compressor_config.enabled && self.anthropic_forwarder.is_some()
+        self.controls.enabled() && self.anthropic_forwarder.is_some()
     }
 
     fn refresh_session_metrics(&self) -> Result<(), ApiError> {
@@ -1524,7 +1531,9 @@ async fn compressed_messages_path(
         .ok_or_else(|| ApiError::BadRequest("messages[] required".into()))?;
 
     let cfg = state.compressor_config.clone();
-    let threshold = cfg.heavy_message_threshold_tokens;
+    // Threshold is read live from the runtime controls so a dashboard can retune
+    // it without a restart; top_k stays a startup constant.
+    let threshold = state.controls.threshold();
     let top_k = cfg.recall_top_k;
 
     let partitioned = partition_messages(&messages, threshold, whitespace_token_count);
@@ -1633,6 +1642,12 @@ async fn compressed_messages_path(
     if let Some(obj) = outbound.as_object_mut() {
         obj.remove("session_id");
     }
+
+    // Record live compression stats for the dashboard: original vs forwarded
+    // payload size and how many heavy messages were absorbed this request.
+    let bytes_in = serde_json::to_string(body).map(|s| s.len() as u64).unwrap_or(0);
+    let bytes_out = serde_json::to_string(&outbound).map(|s| s.len() as u64).unwrap_or(0);
+    state.controls.record(log_heavy_count as u64, bytes_in, bytes_out);
 
     forwarder
         .forward_messages_json(&outbound, client_auth)
@@ -1758,6 +1773,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/ttt/sessions", delete(ttt_sessions_clear))
         .route("/v1/ttt/sessions/:id", delete(ttt_session_drop))
         .route("/v1/expand", post(expand_symbol_handler))
+        .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -1815,6 +1831,83 @@ async fn expand_symbol_handler(
         )
             .into_response(),
     }
+}
+
+/// Map a friendly compression "level" to a per-message threshold (whitespace
+/// words). Higher compression = lower threshold (more messages qualify).
+fn level_to_threshold(level: &str) -> Option<usize> {
+    match level.to_ascii_lowercase().as_str() {
+        "high" => Some(80),     // aggressive — even medium pastes compress
+        "medium" => Some(200),  // conservative default — large pastes
+        "low" => Some(400),     // only very large pastes
+        _ => None,
+    }
+}
+
+/// Derive the closest friendly level name from the current threshold (for GET).
+fn threshold_to_level(t: usize) -> &'static str {
+    if t <= 120 {
+        "high"
+    } else if t <= 300 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+/// `GET /v1/config` — live compression state + counters for the dashboard.
+async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
+    let (requests, msgs, bytes_in, bytes_out) = state.controls.counters();
+    let enabled = state.controls.enabled();
+    let threshold = state.controls.threshold();
+    let savings_pct = if bytes_in > 0 {
+        (1.0 - (bytes_out as f64 / bytes_in as f64)) * 100.0
+    } else {
+        0.0
+    };
+    Json(serde_json::json!({
+        "enabled": enabled,
+        "level": if enabled { threshold_to_level(threshold) } else { "off" },
+        "threshold_tokens": threshold,
+        "recall_top_k": state.compressor_config.recall_top_k,
+        "forwarder_ready": state.anthropic_forwarder.is_some(),
+        "compression_active": state.compression_active(),
+        "counters": {
+            "requests": requests,
+            "messages_compressed": msgs,
+            "bytes_in": bytes_in,
+            "bytes_out": bytes_out,
+            "savings_pct": (savings_pct * 10.0).round() / 10.0,
+        }
+    }))
+}
+
+/// `POST /v1/config` — retune compression live (no restart). Accepts any of:
+/// `{"level":"off|low|medium|high"}`, `{"enabled":bool}`, `{"threshold_tokens":N}`.
+async fn post_config(State(state): State<AppState>, Json(body): Json<Value>) -> impl IntoResponse {
+    if let Some(level) = body.get("level").and_then(Value::as_str) {
+        if level.eq_ignore_ascii_case("off") {
+            state.controls.set_enabled(false);
+        } else if let Some(t) = level_to_threshold(level) {
+            state.controls.set_threshold(t);
+            state.controls.set_enabled(true);
+        }
+    }
+    if let Some(enabled) = body.get("enabled").and_then(Value::as_bool) {
+        state.controls.set_enabled(enabled);
+    }
+    if let Some(t) = body.get("threshold_tokens").and_then(Value::as_u64) {
+        state.controls.set_threshold(t as usize);
+    }
+    // Echo back the resulting live state.
+    let enabled = state.controls.enabled();
+    let threshold = state.controls.threshold();
+    Json(serde_json::json!({
+        "ok": true,
+        "enabled": enabled,
+        "level": if enabled { threshold_to_level(threshold) } else { "off" },
+        "threshold_tokens": threshold,
+    }))
 }
 
 /// Start the HTTP server and block until it is stopped.
