@@ -182,6 +182,106 @@ original_tokens=\"{original_tokens}\" recall_norm=\"{recall_norm:.3}\" state=\"{
     )
 }
 
+/// Leading-whitespace width of a line (tabs count as 4) — for indent matching.
+fn indent_of(line: &str) -> usize {
+    let mut w = 0;
+    for ch in line.chars() {
+        match ch {
+            ' ' => w += 1,
+            '\t' => w += 4,
+            _ => break,
+        }
+    }
+    w
+}
+
+/// True if `name` appears in `line` as a whole identifier (not a substring of a
+/// larger identifier).
+fn contains_symbol(line: &str, name: &str) -> bool {
+    let bytes = line.as_bytes();
+    let nb = name.as_bytes();
+    if nb.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    while let Some(pos) = line[i..].find(name) {
+        let start = i + pos;
+        let end = start + name.len();
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Capture a declaration's full block starting at `start`. Brace-delimited blocks
+/// are brace-matched; Python-style `:` headers use indentation; otherwise the
+/// single declaration line is returned. (Braces inside strings/comments are not
+/// specially handled — a known approximation.)
+fn capture_block(lines: &[&str], start: usize) -> String {
+    let first = lines[start];
+    if first.contains('{') {
+        let mut depth: i32 = 0;
+        let mut out: Vec<&str> = Vec::new();
+        for line in &lines[start..] {
+            out.push(line);
+            for ch in line.chars() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                }
+            }
+            if depth <= 0 && line.contains('}') {
+                break;
+            }
+        }
+        out.join("\n")
+    } else if first.trim_end().ends_with(':') {
+        let base = indent_of(first);
+        let mut out: Vec<&str> = vec![first];
+        for line in &lines[start + 1..] {
+            if line.trim().is_empty() {
+                out.push(line);
+                continue;
+            }
+            if indent_of(line) <= base {
+                break;
+            }
+            out.push(line);
+        }
+        // Trim trailing blank lines.
+        while out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+            out.pop();
+        }
+        out.join("\n")
+    } else {
+        first.to_string()
+    }
+}
+
+/// Extract the full declaration + body of `name` from `source`. Returns None when
+/// no declaration of that symbol is found. This is the retrieval half of the
+/// skeleton round-trip: the digest drops bodies, and the proxy can expand any one
+/// back on demand from the stored source.
+pub fn expand_symbol(source: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if (is_decl(t) || looks_like_signature(t)) && contains_symbol(line, name) {
+            return Some(capture_block(&lines, i));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +385,38 @@ impl Point {
         let txt = "Just a short note, nothing structural here.";
         let d = build_digest(txt, "s", 10, 0.0, "h", 3);
         assert!(d.contains("Just a short note"));
+    }
+
+    #[test]
+    fn expand_brace_symbol_returns_full_body() {
+        let body = expand_symbol(SAMPLE, "add").unwrap();
+        assert!(body.contains("pub fn add(a: i32, b: i32) -> i32 {"));
+        assert!(body.contains("let s = a + b;"));
+        assert!(body.trim_end().ends_with('}'));
+    }
+
+    #[test]
+    fn expand_python_uses_indentation() {
+        let src = "class Foo:\n    def bar(self, x):\n        y = x * 2\n        return y\n\ndef other():\n    pass\n";
+        let body = expand_symbol(src, "bar").unwrap();
+        assert!(body.contains("def bar(self, x):"));
+        assert!(body.contains("return y"));
+        // must stop before the next top-level def
+        assert!(!body.contains("def other"));
+    }
+
+    #[test]
+    fn expand_unknown_symbol_is_none() {
+        assert!(expand_symbol(SAMPLE, "does_not_exist").is_none());
+    }
+
+    #[test]
+    fn expand_matches_whole_identifier_only() {
+        // "add" must not match inside "readd" or "address"
+        let src = "fn readd() {\n  q()\n}\nfn add() {\n  real()\n}\n";
+        let body = expand_symbol(src, "add").unwrap();
+        assert!(body.contains("fn add()"));
+        assert!(body.contains("real()"));
+        assert!(!body.contains("readd"));
     }
 }

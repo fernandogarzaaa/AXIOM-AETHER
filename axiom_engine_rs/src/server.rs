@@ -216,6 +216,10 @@ pub struct AppState {
     /// states are EMA-merged into the master and serialised on session
     /// drop / clear / graceful shutdown (the automatic merge trigger).
     pub master_vibe: Arc<Mutex<Option<MasterVibe>>>,
+    /// Original heavy-context source per session, kept so the skeleton
+    /// round-trip can expand a dropped symbol body on demand (`POST /v1/expand`).
+    /// Soft-bounded (cleared past a cap) since sessions are transient.
+    pub source_store: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl AppState {
@@ -232,6 +236,19 @@ impl AppState {
             anthropic_forwarder: Arc::new(None),
             compressor_config: Arc::new(CompressorConfig::default()),
             master_vibe: Arc::new(Mutex::new(None)),
+            source_store: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Store the original heavy source for a session so `/v1/expand` can later
+    /// retrieve a dropped symbol body. Soft-bounded: clears past 256 entries
+    /// (transient sessions; approximate eviction is acceptable here).
+    pub fn store_source(&self, session_id: &str, source: String) {
+        if let Ok(mut map) = self.source_store.write() {
+            if map.len() >= 256 {
+                map.clear();
+            }
+            map.insert(session_id.to_string(), source);
         }
     }
 
@@ -1604,6 +1621,12 @@ async fn compressed_messages_path(
         fingerprint.elapsed_ms,
     );
 
+    // Keep the original heavy source so a dropped symbol body can be expanded
+    // on demand via POST /v1/expand (the skeleton round-trip).
+    if !heavy_combined.trim().is_empty() {
+        state.store_source(&session_id, heavy_combined.clone());
+    }
+
     let outbound = build_compressed_payload(body, &fingerprint, &partitioned);
     // Strip session_id (and any other Axiom extensions) from the upstream payload.
     let mut outbound = outbound;
@@ -1734,8 +1757,64 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/ttt/sessions", get(ttt_sessions_stats))
         .route("/v1/ttt/sessions", delete(ttt_sessions_clear))
         .route("/v1/ttt/sessions/:id", delete(ttt_session_drop))
+        .route("/v1/expand", post(expand_symbol_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// `POST /v1/expand` — the retrieval half of the skeleton round-trip. Given a
+/// `session_id` and a `symbol` name, return the full declaration + body that the
+/// digest dropped. Body: `{"session_id": "...", "symbol": "..."}`.
+async fn expand_symbol_handler(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let session_id = body.get("session_id").and_then(Value::as_str).unwrap_or("");
+    let symbol = body.get("symbol").and_then(Value::as_str).unwrap_or("");
+    if session_id.is_empty() || symbol.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "session_id and symbol are required"})),
+        )
+            .into_response();
+    }
+
+    let source = state
+        .source_store
+        .read()
+        .ok()
+        .and_then(|m| m.get(session_id).cloned());
+
+    let Some(source) = source else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no stored source for session_id (expired or never compressed)",
+                "session_id": session_id,
+            })),
+        )
+            .into_response();
+    };
+
+    match crate::skeleton::expand_symbol(&source, symbol) {
+        Some(block) => Json(serde_json::json!({
+            "session_id": session_id,
+            "symbol": symbol,
+            "found": true,
+            "body": block,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "session_id": session_id,
+                "symbol": symbol,
+                "found": false,
+                "error": "symbol not found in stored source",
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// Start the HTTP server and block until it is stopped.
