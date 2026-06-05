@@ -46,7 +46,13 @@ esac
 # Compression is the whole point of the proxy, so default it ON. Override with
 # AXIOM_TTT_COMPRESS=0 to run a pure passthrough.
 export AXIOM_TTT_COMPRESS="${AXIOM_TTT_COMPRESS:-1}"
-export AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS="${AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS:-512}"
+# Threshold is per-message, counted in whitespace words (≈4× undercount vs BPE).
+# 200 words ≈ ~800 real tokens: only genuinely large pastes (whole files, big
+# code blocks) compress; normal conversation passes through untouched. This is
+# the conservative "see it working" setting — the skeleton excels on the large
+# code that crosses it, and `axiom_expand` recovers any dropped body on demand.
+# Raise back to 512+ (or set AXIOM_TTT_COMPRESS=0) to revert.
+export AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS="${AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS:-200}"
 export AXIOM_TTT_COMPRESS_TOP_K="${AXIOM_TTT_COMPRESS_TOP_K:-32}"
 
 # --- Compute device: GPU-first, CPU fallback -------------------------------
