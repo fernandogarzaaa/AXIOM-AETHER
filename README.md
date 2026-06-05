@@ -9,8 +9,8 @@ It runs three ways, all from one Rust binary + a few bundled scripts:
 
 1. **Local context-compression proxy** for Claude Code — strips heavy context,
    absorbs it into fast-weight tensors, forwards a lean fingerprinted payload.
-2. **Native MCP server** (`--mode mcp`) exposing `axiom_compress_path` and
-   `axiom_evaluate_drift` tools over JSON-RPC stdio.
+2. **Native MCP server** (`--mode mcp`) exposing `axiom_compress_path`,
+   `axiom_evaluate_drift`, and `axiom_expand` tools over JSON-RPC stdio.
 3. **JIT search-reasoning node** — scrapes the live web, absorbs results via
    online TTT, and emits a dense `<axiom_search_fingerprint>` semantic pointer.
 
@@ -246,6 +246,7 @@ stdio (stdout is pure protocol; all logs go to stderr).
 |---|---|---|
 | `axiom_compress_path` | `path` | absorbs a dir/file through local TTT, returns the `<axiom_context_fingerprint>` block, and commits the session into the persistent master vibe |
 | `axiom_evaluate_drift` | `code_content` | cross-entropy of the code vs current fast-weights; a loss spike past `AXIOM_DRIFT_THRESHOLD` (default **7.03**) returns `isError: true` |
+| `axiom_expand` | `symbol`, `session_id` | the retrieval half of the skeleton round-trip: returns the **full source body** of a symbol that compression dropped from an `<axiom_context_digest>`. HTTP-calls the proxy's `POST /v1/expand` (`AXIOM_PROXY_URL`, default `127.0.0.1:3000`) |
 
 ---
 
@@ -309,6 +310,7 @@ GET  /v1/models
 POST /v1/completions
 POST /v1/chat/completions
 POST /v1/messages                 (Anthropic Messages API — compression path)
+POST /v1/expand                   (expand a dropped symbol body: {session_id, symbol})
 POST /v1/sessions                 (create persistent W̃ session)
 POST /v1/adapt                    (in-place TTT adaptation over a corpus)
 GET  /v1/sessions/{id}/checkpoint  PUT …/checkpoint   DELETE /v1/sessions/{id}

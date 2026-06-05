@@ -128,7 +128,7 @@ pub async fn run_stdio_server(
     };
 
     eprintln!(
-        "[mcp] ready — tools: axiom_compress_path, axiom_evaluate_drift \
+        "[mcp] ready — tools: axiom_compress_path, axiom_evaluate_drift, axiom_expand \
          (prime={prime}, drift_threshold={drift_threshold})"
     );
 
@@ -243,6 +243,24 @@ fn tools_list() -> Value {
                     },
                     "required": ["code_content"]
                 }
+            },
+            {
+                "name": "axiom_expand",
+                "description": "Retrieve the full source body of a symbol that Axiom's context compression dropped from a session digest. When you see an <axiom_context_digest> skeleton (signatures kept, bodies elided) and need a specific implementation, call this with the symbol name and the digest's session id to get the actual code back.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": {
+                            "type": "string",
+                            "description": "Name of the function / struct / class / type to expand."
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "The session id from the digest's session=\"...\" attribute. Defaults to the standard dev session if omitted."
+                        }
+                    },
+                    "required": ["symbol"]
+                }
             }
         ]
     })
@@ -292,7 +310,61 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 }
             }
         }
+        "axiom_expand" => {
+            let Some(symbol) = args.get("symbol").and_then(Value::as_str) else {
+                return error_response(id, -32602, "axiom_expand requires string 'symbol'");
+            };
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("axiom-dev-session")
+                .to_string();
+            let symbol = symbol.to_string();
+            let outcome =
+                tokio::task::spawn_blocking(move || expand_symbol_blocking(&session_id, &symbol))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            match outcome {
+                Ok((text, is_err)) => success_response(id, tool_text_result(&text, is_err)),
+                Err(e) => {
+                    eprintln!("[mcp] axiom_expand failed: {e}");
+                    success_response(id, tool_text_result(&format!("expand failed: {e}"), true))
+                }
+            }
+        }
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
+    }
+}
+
+/// `axiom_expand` worker — HTTP-calls the running proxy's `POST /v1/expand` to
+/// retrieve a dropped symbol body. The MCP server is a separate process from the
+/// proxy, so it reaches it over the loopback API. Override the proxy location
+/// with `AXIOM_PROXY_URL` (default `http://127.0.0.1:3000`).
+/// Returns `(text, is_error)`.
+fn expand_symbol_blocking(session_id: &str, symbol: &str) -> Result<(String, bool), String> {
+    let base = std::env::var("AXIOM_PROXY_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+    let url = format!("{}/v1/expand", base.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&json!({ "session_id": session_id, "symbol": symbol }))
+        .send()
+        .map_err(|e| format!("could not reach Axiom proxy at {url}: {e}"))?;
+    let status = resp.status();
+    let body: Value = resp
+        .json()
+        .map_err(|e| format!("bad response from proxy ({status}): {e}"))?;
+    if body.get("found").and_then(Value::as_bool).unwrap_or(false) {
+        let code = body.get("body").and_then(Value::as_str).unwrap_or("").to_string();
+        Ok((code, false))
+    } else {
+        let err = body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("symbol not found")
+            .to_string();
+        Ok((format!("could not expand '{symbol}' (HTTP {status}): {err}"), true))
     }
 }
 
@@ -474,13 +546,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tools_list_exposes_two_tools_with_schemas() {
+    fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
+        assert!(names.contains(&"axiom_expand"));
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object");
             assert!(t["inputSchema"]["required"].is_array());
