@@ -43,7 +43,12 @@ fn run() {
         .unwrap_or_else(|_| repo().join("checkpoints/pairs.jsonl").to_string_lossy().into());
     let tok = Tokenizer::from_file(&bpe).expect("tokenizer");
     let vocab = tok.get_vocab_size(true);
-    let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+    // AXIOM_EMB_DEVICE=cpu forces CPU (avoids the GPU entirely — no contention
+    // with any other GPU job); default "auto" = CUDA if available.
+    let device = match std::env::var("AXIOM_EMB_DEVICE").as_deref() {
+        Ok("cpu") => Device::Cpu,
+        _ => Device::cuda_if_available(0).unwrap_or(Device::Cpu),
+    };
     eprintln!("[emb] device={}", if device.is_cuda() { "CUDA:0" } else { "CPU" });
 
     let cfg = EncoderConfig {
@@ -72,6 +77,12 @@ fn run() {
         p.positive.hash(&mut h);
         h.finish()
     });
+    // Optional cap (AXIOM_EMB_MAX_PAIRS) — keeps a CPU run feasible; 0 = all.
+    let cap = envu("AXIOM_EMB_MAX_PAIRS", 0);
+    if cap > 0 && pairs.len() > cap {
+        pairs.truncate(cap);
+        eprintln!("[emb] capped to {cap} pairs (AXIOM_EMB_MAX_PAIRS)");
+    }
     let split = (pairs.len() as f32 * 0.9) as usize;
     let (train, val) = pairs.split_at(split);
     eprintln!("[emb] pairs train={} val={}", train.len(), val.len());
