@@ -8,6 +8,27 @@ use candle_core::{Result, Tensor, D};
 use candle_nn::{Module, VarBuilder};
 use serde::{Deserialize, Serialize};
 
+/// RMSNorm with gamma initialized to ONES (candle's `vs.get` zero-inits, which
+/// would zero a from-scratch model's output). `candle_nn::layer_norm` silently
+/// breaks autograd in this candle build, so we roll our own differentiable norm.
+pub struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNorm {
+    pub fn new(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get_with_hints(dim, "weight", candle_nn::Init::Const(1.0))?;
+        Ok(Self { weight, eps })
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
+        let eps = Tensor::new(self.eps as f32, x.device())?;
+        let normed = x.broadcast_div(&variance.broadcast_add(&eps)?.sqrt()?)?;
+        normed.broadcast_mul(&self.weight)
+    }
+}
+
 /// Static hyper-parameters for the encoder.
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -123,20 +144,22 @@ impl SelfAttention {
 /// One transformer encoder block: self-attention + FFN, each residual + LayerNorm.
 pub struct EncoderBlock {
     attn: SelfAttention,
-    norm1: candle_nn::LayerNorm,
+    norm1: RmsNorm,
     ff1: candle_nn::Linear,
     ff2: candle_nn::Linear,
-    norm2: candle_nn::LayerNorm,
+    norm2: RmsNorm,
 }
 
 impl EncoderBlock {
     pub fn new(vb: VarBuilder, cfg: &EncoderConfig) -> Result<Self> {
         Ok(Self {
             attn: SelfAttention::new(vb.pp("attn"), cfg.d_model, cfg.n_heads)?,
-            norm1: candle_nn::layer_norm(cfg.d_model, cfg.norm_eps, vb.pp("norm1"))?,
+            // candle_nn::layer_norm silently breaks autograd in this candle build;
+            // RMSNorm (kernel.rs) is the in-house, proven-differentiable norm.
+            norm1: RmsNorm::new(cfg.d_model, cfg.norm_eps, vb.pp("norm1"))?,
             ff1: candle_nn::linear(cfg.d_model, cfg.ffn_dim, vb.pp("ff1"))?,
             ff2: candle_nn::linear(cfg.ffn_dim, cfg.d_model, vb.pp("ff2"))?,
-            norm2: candle_nn::layer_norm(cfg.d_model, cfg.norm_eps, vb.pp("norm2"))?,
+            norm2: RmsNorm::new(cfg.d_model, cfg.norm_eps, vb.pp("norm2"))?,
         })
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -152,7 +175,7 @@ pub struct BiEncoder {
     tok_emb: candle_nn::Embedding,
     pos_emb: candle_nn::Embedding,
     blocks: Vec<EncoderBlock>,
-    norm_f: candle_nn::LayerNorm,
+    norm_f: RmsNorm,
     pub config: EncoderConfig,
 }
 
@@ -164,7 +187,7 @@ impl BiEncoder {
         for i in 0..config.n_layers {
             blocks.push(EncoderBlock::new(vb.pp(format!("block_{i}")), &config)?);
         }
-        let norm_f = candle_nn::layer_norm(config.d_model, config.norm_eps, vb.pp("norm_f"))?;
+        let norm_f = RmsNorm::new(config.d_model, config.norm_eps, vb.pp("norm_f"))?;
         Ok(Self { tok_emb, pos_emb, blocks, norm_f, config })
     }
 
@@ -290,6 +313,26 @@ mod tests {
         assert_eq!(v.dims(), &[16]);
         let n: f32 = v.sqr().unwrap().sum_all().unwrap().sqrt().unwrap().to_scalar().unwrap();
         assert!((n - 1.0).abs() < 1e-4, "norm {n}");
+    }
+
+    #[test]
+    fn encode_is_differentiable_wrt_all_params() {
+        // Regression: every encoder Var must receive a gradient. (candle_nn's
+        // layer_norm silently severed autograd here — we use RMSNorm instead.)
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let cfg = EncoderConfig {
+            vocab_size: 64, d_model: 16, n_layers: 2, n_heads: 4,
+            ffn_dim: 32, max_seq: 32, norm_eps: 1e-5,
+        };
+        let enc = BiEncoder::new(vb, cfg).unwrap();
+        let ids = enc.ids_tensor(&[1, 2, 3, 4], &dev).unwrap();
+        let loss = enc.encode(&ids).unwrap().sqr().unwrap().sum_all().unwrap();
+        let g = loss.backward().unwrap();
+        let vars = vm.all_vars();
+        let with_grad = vars.iter().filter(|v| g.get(v.as_tensor()).is_some()).count();
+        assert_eq!(with_grad, vars.len(), "all {} encoder params must get grad, got {}", vars.len(), with_grad);
     }
 
     #[test]
