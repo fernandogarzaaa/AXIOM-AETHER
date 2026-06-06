@@ -32,7 +32,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::config::AxiomConfig;
 use crate::context_compressor::{adapt_session_blocking, extract_memory_vector_blocking};
+use crate::embedder::embed_text;
 use crate::inference::InferencePipeline;
+use crate::memory_recall::{recall, RecallParams};
+use crate::memory_store::{now_secs, MemoryKind, MemoryRecord, MemoryStore};
 use crate::vibe_memory::MasterVibe;
 
 /// MCP protocol revision we advertise in the `initialize` handshake.
@@ -51,6 +54,8 @@ const DRIFT_MAX_TOKENS: usize = 512;
 struct McpContext {
     pipeline: Arc<Mutex<InferencePipeline>>,
     vibe: Arc<Mutex<MasterVibe>>,
+    /// Tier-2 lossless memory store (Phase 2.0): JSONL records per scope.
+    memory: Arc<Mutex<MemoryStore>>,
     /// When true, new tool sessions start from the master vibe instead of
     /// identity (opt-in via `AXIOM_VIBE_PRIME=1`).
     prime: bool,
@@ -117,9 +122,17 @@ pub async fn run_stdio_server(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1_048_576); // 1 MiB
 
+    // Tier-2 memory store root (Phase 2.0). Override with AXIOM_MEMORY_DIR.
+    let memory_dir =
+        std::env::var("AXIOM_MEMORY_DIR").unwrap_or_else(|_| "checkpoints/memory".to_string());
+    let memory = MemoryStore::open(&memory_dir)
+        .map_err(|e| format!("failed to open memory store at {memory_dir}: {e}"))?;
+    eprintln!("[mcp] memory store at {memory_dir}");
+
     let ctx = McpContext {
         pipeline: Arc::new(Mutex::new(pipeline)),
         vibe: Arc::new(Mutex::new(vibe)),
+        memory: Arc::new(Mutex::new(memory)),
         prime,
         drift_threshold,
         top_k,
@@ -128,7 +141,8 @@ pub async fn run_stdio_server(
     };
 
     eprintln!(
-        "[mcp] ready — tools: axiom_compress_path, axiom_evaluate_drift, axiom_expand \
+        "[mcp] ready — tools: axiom_compress_path, axiom_evaluate_drift, axiom_expand, \
+         axiom_remember, axiom_recall, axiom_forget \
          (prime={prime}, drift_threshold={drift_threshold})"
     );
 
@@ -261,6 +275,43 @@ fn tools_list() -> Value {
                     },
                     "required": ["symbol"]
                 }
+            },
+            {
+                "name": "axiom_remember",
+                "description": "Persist a memory (a decision, a fix, a convention, a snippet) into Axiom's long-term store so it can be recalled in future sessions. Use for things worth keeping: 'we chose X over Y because Z', a hard-won bug fix, a project convention.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string", "description": "The memory content to store, verbatim." },
+                        "kind": { "type": "string", "enum": ["decision","code","conversation","fix"], "description": "Optional category (default: conversation)." },
+                        "scope": { "type": "string", "description": "Optional scope: 'personal' (default) for conventions that follow you, or 'project:<name>' for repo-specific memory." }
+                    },
+                    "required": ["text"]
+                }
+            },
+            {
+                "name": "axiom_recall",
+                "description": "Search Axiom's long-term memory for content relevant to a query and return the exact stored text (never a paraphrase). Use to answer 'what did we decide about X?', 'have I solved this before?', 'what's my convention for Y?'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "What to recall." },
+                        "scope": { "type": "string", "description": "Optional project scope to include alongside 'personal'." }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "axiom_forget",
+                "description": "Remove a memory by its id (from an axiom_recall result) so it is no longer recalled. Tombstones the record; the original line stays in the append-only log but is excluded from all future recall.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "The memory id to forget." },
+                        "scope": { "type": "string", "description": "Scope the id belongs to (default 'personal')." }
+                    },
+                    "required": ["id"]
+                }
             }
         ]
     })
@@ -330,6 +381,55 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     eprintln!("[mcp] axiom_expand failed: {e}");
                     success_response(id, tool_text_result(&format!("expand failed: {e}"), true))
                 }
+            }
+        }
+        "axiom_remember" => {
+            let Some(text) = args.get("text").and_then(Value::as_str) else {
+                return error_response(id, -32602, "axiom_remember requires string 'text'");
+            };
+            let text = text.to_string();
+            let kind = args.get("kind").and_then(Value::as_str).unwrap_or("conversation").to_string();
+            let scope = args.get("scope").and_then(Value::as_str).unwrap_or("personal").to_string();
+            let ctx = ctx.clone();
+            let outcome =
+                tokio::task::spawn_blocking(move || remember_blocking(&text, &kind, &scope, &ctx))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            match outcome {
+                Ok(msg) => success_response(id, tool_text_result(&msg, false)),
+                Err(e) => success_response(id, tool_text_result(&format!("remember failed: {e}"), true)),
+            }
+        }
+        "axiom_recall" => {
+            let Some(query) = args.get("query").and_then(Value::as_str) else {
+                return error_response(id, -32602, "axiom_recall requires string 'query'");
+            };
+            let query = query.to_string();
+            let scope = args.get("scope").and_then(Value::as_str).map(|s| s.to_string());
+            let ctx = ctx.clone();
+            let outcome =
+                tokio::task::spawn_blocking(move || recall_blocking(&query, scope.as_deref(), &ctx))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            match outcome {
+                Ok(report) => success_response(id, tool_text_result(&report, false)),
+                Err(e) => success_response(id, tool_text_result(&format!("recall failed: {e}"), true)),
+            }
+        }
+        "axiom_forget" => {
+            let Some(mem_id) = args.get("id").and_then(Value::as_str) else {
+                return error_response(id, -32602, "axiom_forget requires string 'id'");
+            };
+            let mem_id = mem_id.to_string();
+            let scope = args.get("scope").and_then(Value::as_str).unwrap_or("personal").to_string();
+            let ctx = ctx.clone();
+            let outcome =
+                tokio::task::spawn_blocking(move || forget_blocking(&mem_id, &scope, &ctx))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            match outcome {
+                Ok(msg) => success_response(id, tool_text_result(&msg, false)),
+                Err(e) => success_response(id, tool_text_result(&format!("forget failed: {e}"), true)),
             }
         }
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
@@ -514,6 +614,99 @@ fn evaluate_drift_blocking(code: &str, ctx: &McpContext) -> Result<(String, bool
     Ok((report, is_drift))
 }
 
+/// `axiom_remember` worker. Embeds the text, scores its drift (salience), and
+/// appends a record to the chosen scope. Returns the new memory id.
+fn remember_blocking(text: &str, kind: &str, scope: &str, ctx: &McpContext) -> Result<String, String> {
+    let pipeline = ctx.pipeline.lock().map_err(|_| "pipeline lock poisoned".to_string())?;
+    let embedding = embed_text(&pipeline, text).map_err(|e| e.to_string())?;
+    // Salience = drift cross-entropy (reuses the evaluate path's signal cheaply).
+    let drift = drift_score(&pipeline, text).unwrap_or(0.0);
+    drop(pipeline);
+
+    let kind = match kind {
+        "decision" => MemoryKind::Decision,
+        "code" => MemoryKind::Code,
+        "fix" => MemoryKind::Fix,
+        _ => MemoryKind::Conversation,
+    };
+    let id = short_hash(&format!("{scope}|{}|{text}", now_secs()));
+    let rec = MemoryRecord {
+        id: id.clone(),
+        scope: scope.to_string(),
+        ts: now_secs(),
+        kind,
+        body: text.to_string(),
+        embedding,
+        drift_at_ingest: drift,
+        supersedes: None,
+        tombstone: false,
+    };
+    let store = ctx.memory.lock().map_err(|_| "memory lock poisoned".to_string())?;
+    store.append(&rec).map_err(|e| e.to_string())?;
+    Ok(format!("remembered id={id} scope={scope} (salience drift={drift:.2})"))
+}
+
+/// `axiom_recall` worker. Embeds the query and searches `personal` ∪ optional
+/// project scope, returning a readable list of exact stored bodies + ids.
+fn recall_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result<String, String> {
+    let pipeline = ctx.pipeline.lock().map_err(|_| "pipeline lock poisoned".to_string())?;
+    let q_emb = embed_text(&pipeline, query).map_err(|e| e.to_string())?;
+    drop(pipeline);
+
+    let mut scopes = vec!["personal".to_string()];
+    if let Some(s) = scope {
+        if s != "personal" {
+            scopes.push(s.to_string());
+        }
+    }
+    let store = ctx.memory.lock().map_err(|_| "memory lock poisoned".to_string())?;
+    let hits = recall(&store, &scopes, &q_emb, &RecallParams::default());
+    if hits.is_empty() {
+        return Ok("no relevant memories found".to_string());
+    }
+    let mut out = String::from("<axiom_recall>\n");
+    for h in &hits {
+        out.push_str(&format!(
+            "• [{:.2}] id={} scope={} ts={}\n  {}\n",
+            h.score, h.record.id, h.record.scope, h.record.ts, h.record.body
+        ));
+    }
+    out.push_str("</axiom_recall>");
+    Ok(out)
+}
+
+/// `axiom_forget` worker. Tombstones an id in its scope.
+fn forget_blocking(mem_id: &str, scope: &str, ctx: &McpContext) -> Result<String, String> {
+    let store = ctx.memory.lock().map_err(|_| "memory lock poisoned".to_string())?;
+    store.tombstone(scope, mem_id).map_err(|e| e.to_string())?;
+    Ok(format!("forgot id={mem_id} scope={scope}"))
+}
+
+/// Cross-entropy of `text` against current fast-weights — used as a salience
+/// score at ingest. Mirrors `evaluate_drift_blocking` but returns the raw loss.
+fn drift_score(pipeline: &InferencePipeline, text: &str) -> Result<f32, String> {
+    let mut ids = pipeline.encode_text(text);
+    if ids.len() < 2 {
+        return Ok(0.0);
+    }
+    ids.truncate(DRIFT_MAX_TOKENS);
+    let n = ids.len();
+    let device = pipeline.device();
+    let mut states = pipeline.init_session_states().map_err(|e| e.to_string())?;
+    let input =
+        Tensor::from_vec(ids[..n - 1].to_vec(), (1, n - 1), device).map_err(|e| e.to_string())?;
+    let logits = pipeline.model().forward_lm(&input, &mut states).map_err(|e| e.to_string())?;
+    let vocab = pipeline.model().config.vocab_size;
+    let logits_2d = logits
+        .squeeze(0)
+        .and_then(|t| t.reshape((n - 1, vocab)))
+        .map_err(|e| e.to_string())?;
+    let targets =
+        Tensor::from_vec(ids[1..].to_vec(), (n - 1,), device).map_err(|e| e.to_string())?;
+    let loss = candle_nn::loss::cross_entropy(&logits_2d, &targets).map_err(|e| e.to_string())?;
+    loss.to_scalar::<f32>().map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC helpers
 // ---------------------------------------------------------------------------
@@ -549,7 +742,7 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 6);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
@@ -558,6 +751,16 @@ mod tests {
             assert_eq!(t["inputSchema"]["type"], "object");
             assert!(t["inputSchema"]["required"].is_array());
         }
+    }
+
+    #[test]
+    fn tools_list_includes_memory_tools() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"axiom_remember"));
+        assert!(names.contains(&"axiom_recall"));
+        assert!(names.contains(&"axiom_forget"));
     }
 
     #[test]
