@@ -69,6 +69,17 @@ fn run() {
 
     let mut pairs = read_pairs_jsonl(&pairs_path);
     assert!(pairs.len() >= bs * 2, "need >= {} pairs; got {}", bs * 2, pairs.len());
+    // Oversample synthetic (question->content) pairs so they aren't drowned out by
+    // mined doc<->body pairs — the eval task is NL-question->content, which only
+    // the synthetic anchors teach. AXIOM_EMB_SYNTH_OVERSAMPLE=K duplicates them K-1x.
+    let oversample = envu("AXIOM_EMB_SYNTH_OVERSAMPLE", 1);
+    if oversample > 1 {
+        let synth: Vec<_> = pairs.iter().filter(|p| p.source == "synthetic").cloned().collect();
+        for _ in 1..oversample {
+            pairs.extend(synth.iter().cloned());
+        }
+        eprintln!("[emb] oversampled {} synthetic pairs {oversample}x", synth.len());
+    }
     // Deterministic shuffle so a batch spans many files (meaningful in-batch negatives).
     pairs.sort_by_key(|p| {
         use std::hash::{Hash, Hasher};
