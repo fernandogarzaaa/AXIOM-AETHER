@@ -27,7 +27,26 @@ pub fn pool_and_normalize(hidden: &Tensor) -> Result<Vec<f32>> {
     Ok(pooled_vec.into_iter().map(|x| x / norm).collect())
 }
 
-/// Embed `text` into an L2-normalized `[d_model]` vector.
+/// Take the LAST token's hidden state from a `[1, T, d_model]` tensor and
+/// L2-normalize it into a `[d_model]` unit vector.
+///
+/// For an autoregressive TTT model the final token has absorbed the whole
+/// sequence through the per-layer `W̃` state, so its hidden state is a stronger
+/// summary than a mean-pool (which tends to cancel out). Empirically this beats
+/// mean-pooling on the recall eval, so it is the default for `embed_text`.
+pub fn pool_last_normalize(hidden: &Tensor) -> Result<Vec<f32>> {
+    let t = hidden.dim(1)?;
+    let idx = if t == 0 { 0 } else { t - 1 };
+    let last = hidden.narrow(1, idx, 1)?.squeeze(1)?.squeeze(0)?; // [d_model]
+    let v = last.to_vec1::<f32>()?;
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        return Ok(v);
+    }
+    Ok(v.into_iter().map(|x| x / norm).collect())
+}
+
+/// Embed `text` into an L2-normalized `[d_model]` vector (last-token pooling).
 pub fn embed_text(pipeline: &InferencePipeline, text: &str) -> Result<Vec<f32>> {
     let device = pipeline.device();
     let mut ids = pipeline.encode_text(text);
@@ -42,7 +61,7 @@ pub fn embed_text(pipeline: &InferencePipeline, text: &str) -> Result<Vec<f32>> 
 
     // [1, T, d_model] final normed hidden states.
     let hidden = pipeline.model().forward_hidden(&input, &mut states)?;
-    pool_and_normalize(&hidden)
+    pool_last_normalize(&hidden)
 }
 
 #[cfg(test)]
@@ -81,6 +100,18 @@ mod tests {
         assert!((v[0] - 0.6).abs() < 1e-5);
         assert!((v[1] - 0.8).abs() < 1e-5);
         assert!(v[2].abs() < 1e-5);
+    }
+
+    #[test]
+    fn pool_last_normalize_takes_final_token() {
+        // hidden [1, 2, 3]: token0 (1,0,0), token1 (0,3,4) → last (0,3,4)
+        // → norm 5 → normalized (0, 0.6, 0.8).
+        let h = Tensor::from_vec(vec![1f32, 0., 0., 0., 3., 4.], (1, 2, 3), &Device::Cpu).unwrap();
+        let v = pool_last_normalize(&h).unwrap();
+        assert_eq!(v.len(), 3);
+        assert!(v[0].abs() < 1e-5);
+        assert!((v[1] - 0.6).abs() < 1e-5);
+        assert!((v[2] - 0.8).abs() < 1e-5);
     }
 
     #[test]
