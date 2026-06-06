@@ -12,6 +12,7 @@ pub mod jit_streamer;
 pub mod kernel;
 pub mod mcp_stdio;
 pub mod memory_pool;
+pub mod memory_recall;
 pub mod memory_store;
 pub mod meta_train;
 pub mod metrics;
