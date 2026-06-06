@@ -76,6 +76,21 @@ fn main() {
             }
         };
 
+    // Prefer the trained contrastive embedder (Phase 2.0.1) when present.
+    let emb_ckpt =
+        std::env::var("AXIOM_EMB_CKPT").unwrap_or_else(|_| "checkpoints/axiom_embedder.bin".to_string());
+    let trained = axiom_engine::embedder::EmbeddingModel::load(&emb_ckpt, Device::Cpu);
+    eprintln!(
+        "[eval_recall] embedder: {}",
+        if trained.is_some() { "TRAINED contrastive" } else { "TTT pooling (no axiom_embedder.bin)" }
+    );
+    let embed = |text: &str| -> Vec<f32> {
+        match &trained {
+            Some(e) => e.embed(text).unwrap(),
+            None => embed_text(&pipeline, text).unwrap(),
+        }
+    };
+
     let mut root = std::env::temp_dir();
     root.push(format!("axiom_eval_recall_{}", now_secs()));
     let store = MemoryStore::open(&root).unwrap();
@@ -90,7 +105,7 @@ fn main() {
     ];
     let mut seed_embs: Vec<(&str, Vec<f32>)> = Vec::new();
     for (label, body) in seeds {
-        let emb = embed_text(&pipeline, body).unwrap();
+        let emb = embed(body);
         seed_embs.push((label, emb.clone()));
         let rec = MemoryRecord {
             id: label.to_string(),
@@ -119,7 +134,7 @@ fn main() {
     let mut hits_at_1 = 0usize;
     let mut hits_at_k = 0usize;
     for (q, expected) in queries {
-        let q_emb = embed_text(&pipeline, q).unwrap();
+        let q_emb = embed(q);
         let results =
             recall(&store, &["personal".to_string()], &q_emb, &RecallParams { min_score: 0.0, k });
         let ids: Vec<&str> = results.iter().map(|h| h.record.id.as_str()).collect();
@@ -150,7 +165,7 @@ fn main() {
     let mut c_hits_at_1 = 0usize;
     let mut c_hits_at_k = 0usize;
     for (q, expected) in queries {
-        let q_emb = embed_text(&pipeline, q).unwrap();
+        let q_emb = embed(q);
         let q_c = center_renorm(&q_emb, &mean);
         let mut scored: Vec<(f32, &str)> = centered_seeds
             .iter()
@@ -173,7 +188,7 @@ fn main() {
     println!("precision@{k} = {cpk:.2}");
 
     // --- Diagnostic: are the embeddings actually distinct per input? --------
-    let q_embs: Vec<Vec<f32>> = queries.iter().map(|(q, _)| embed_text(&pipeline, q).unwrap()).collect();
+    let q_embs: Vec<Vec<f32>> = queries.iter().map(|(q, _)| embed(q)).collect();
     let mut q_pair_sum = 0.0f32;
     let mut q_pairs = 0usize;
     for i in 0..q_embs.len() {

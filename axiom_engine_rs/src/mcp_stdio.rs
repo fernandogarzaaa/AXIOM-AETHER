@@ -32,7 +32,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::config::AxiomConfig;
 use crate::context_compressor::{adapt_session_blocking, extract_memory_vector_blocking};
-use crate::embedder::embed_text;
+use crate::embedder::{embed_text, EmbeddingModel};
 use crate::inference::InferencePipeline;
 use crate::memory_recall::{recall, RecallParams};
 use crate::memory_store::{now_secs, MemoryKind, MemoryRecord, MemoryStore};
@@ -56,6 +56,8 @@ struct McpContext {
     vibe: Arc<Mutex<MasterVibe>>,
     /// Tier-2 lossless memory store (Phase 2.0): JSONL records per scope.
     memory: Arc<Mutex<MemoryStore>>,
+    /// Trained contrastive embedder (Phase 2.0.1); None → pipeline TTT fallback.
+    embedder: Option<Arc<EmbeddingModel>>,
     /// When true, new tool sessions start from the master vibe instead of
     /// identity (opt-in via `AXIOM_VIBE_PRIME=1`).
     prime: bool,
@@ -129,10 +131,20 @@ pub async fn run_stdio_server(
         .map_err(|e| format!("failed to open memory store at {memory_dir}: {e}"))?;
     eprintln!("[mcp] memory store at {memory_dir}");
 
+    // Phase 2.0.1 trained embedder (CPU for the MCP path). Absent → TTT fallback.
+    let embedder_ckpt =
+        std::env::var("AXIOM_EMB_CKPT").unwrap_or_else(|_| "checkpoints/axiom_embedder.bin".to_string());
+    let embedder = EmbeddingModel::load(&embedder_ckpt, Device::Cpu).map(Arc::new);
+    eprintln!(
+        "[mcp] contrastive embedder: {}",
+        if embedder.is_some() { "loaded" } else { "absent (pipeline fallback)" }
+    );
+
     let ctx = McpContext {
         pipeline: Arc::new(Mutex::new(pipeline)),
         vibe: Arc::new(Mutex::new(vibe)),
         memory: Arc::new(Mutex::new(memory)),
+        embedder,
         prime,
         drift_threshold,
         top_k,
@@ -614,14 +626,25 @@ fn evaluate_drift_blocking(code: &str, ctx: &McpContext) -> Result<(String, bool
     Ok((report, is_drift))
 }
 
+/// Embed via the trained contrastive encoder when present, else the pipeline
+/// (TTT pooling). The single embedding entry point for remember + recall.
+fn embed_query(text: &str, ctx: &McpContext) -> Result<Vec<f32>, String> {
+    if let Some(e) = &ctx.embedder {
+        return e.embed(text).map_err(|err| err.to_string());
+    }
+    let pipeline = ctx.pipeline.lock().map_err(|_| "pipeline lock poisoned".to_string())?;
+    embed_text(&pipeline, text).map_err(|err| err.to_string())
+}
+
 /// `axiom_remember` worker. Embeds the text, scores its drift (salience), and
 /// appends a record to the chosen scope. Returns the new memory id.
 fn remember_blocking(text: &str, kind: &str, scope: &str, ctx: &McpContext) -> Result<String, String> {
-    let pipeline = ctx.pipeline.lock().map_err(|_| "pipeline lock poisoned".to_string())?;
-    let embedding = embed_text(&pipeline, text).map_err(|e| e.to_string())?;
+    let embedding = embed_query(text, ctx)?;
     // Salience = drift cross-entropy (reuses the evaluate path's signal cheaply).
-    let drift = drift_score(&pipeline, text).unwrap_or(0.0);
-    drop(pipeline);
+    let drift = {
+        let pipeline = ctx.pipeline.lock().map_err(|_| "pipeline lock poisoned".to_string())?;
+        drift_score(&pipeline, text).unwrap_or(0.0)
+    };
 
     let kind = match kind {
         "decision" => MemoryKind::Decision,
@@ -649,9 +672,7 @@ fn remember_blocking(text: &str, kind: &str, scope: &str, ctx: &McpContext) -> R
 /// `axiom_recall` worker. Embeds the query and searches `personal` ∪ optional
 /// project scope, returning a readable list of exact stored bodies + ids.
 fn recall_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result<String, String> {
-    let pipeline = ctx.pipeline.lock().map_err(|_| "pipeline lock poisoned".to_string())?;
-    let q_emb = embed_text(&pipeline, query).map_err(|e| e.to_string())?;
-    drop(pipeline);
+    let q_emb = embed_query(query, ctx)?;
 
     let mut scopes = vec!["personal".to_string()];
     if let Some(s) = scope {

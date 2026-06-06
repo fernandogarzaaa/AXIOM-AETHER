@@ -1,8 +1,10 @@
 //! Axiom-as-embedder: turn text into a dense, L2-normalized vector by
 //! mean-pooling the model's final hidden states. No external embedding model.
 
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::{VarBuilder, VarMap};
 
+use crate::encoder::{BiEncoder, EmbedderMeta, EncoderConfig};
 use crate::inference::InferencePipeline;
 
 /// Max tokens fed through the model for a single embedding. Bounds compute and
@@ -64,11 +66,61 @@ pub fn embed_text(pipeline: &InferencePipeline, text: &str) -> Result<Vec<f32>> 
     pool_last_normalize(&hidden)
 }
 
+/// A loaded contrastive bidirectional encoder + tokenizer — the Phase-2.0.1
+/// embedder. Produced by `train_embedder` into `axiom_embedder.bin`.
+pub struct EmbeddingModel {
+    encoder: BiEncoder,
+    tokenizer: tokenizers::Tokenizer,
+    device: Device,
+    _varmap: VarMap,
+}
+
+impl EmbeddingModel {
+    /// Load from `axiom_embedder.bin` (+ sidecar) and its tokenizer. Returns
+    /// `None` if the artifact, sidecar, or tokenizer is absent (→ caller falls
+    /// back to the TTT pooling path).
+    pub fn load(checkpoint: &str, device: Device) -> Option<Self> {
+        if !std::path::Path::new(checkpoint).exists() {
+            return None;
+        }
+        let meta = EmbedderMeta::load(checkpoint)?;
+        let tokenizer = tokenizers::Tokenizer::from_file(&meta.tokenizer).ok()?;
+        let cfg = EncoderConfig {
+            vocab_size: meta.vocab_size,
+            d_model: meta.d_model,
+            n_layers: meta.n_layers,
+            n_heads: meta.n_heads,
+            ffn_dim: meta.ffn_dim,
+            max_seq: meta.max_seq,
+            norm_eps: 1e-5,
+        };
+        let mut varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let encoder = BiEncoder::new(vb, cfg).ok()?;
+        varmap.load(checkpoint).ok()?;
+        Some(Self { encoder, tokenizer, device, _varmap: varmap })
+    }
+
+    /// Embed `text` into an L2-normalized `[d_model]` vector via the encoder.
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let ids =
+            self.tokenizer.encode(text, false).map(|e| e.get_ids().to_vec()).unwrap_or_default();
+        let t = self.encoder.ids_tensor(&ids, &self.device)?;
+        self.encoder.encode(&t)?.to_vec1::<f32>()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::AxiomConfig;
     use candle_core::Device;
+
+    #[test]
+    fn embedding_model_absent_returns_none() {
+        let none = EmbeddingModel::load("____no_embedder____.bin", Device::Cpu);
+        assert!(none.is_none());
+    }
 
     fn tiny_pipeline() -> InferencePipeline {
         // No checkpoint on disk → random init; fine for shape/determinism tests.
