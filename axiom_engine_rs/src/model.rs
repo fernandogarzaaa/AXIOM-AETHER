@@ -108,7 +108,9 @@ impl AxiomTTTLM {
             .collect()
     }
 
-    /// Autoregressive forward pass over a token sequence.
+    /// Autoregressive forward pass returning the final normed hidden states
+    /// (after `ln_f`, before the LM head): `[1, T, d_model]`. This is the
+    /// representation used for embeddings (mean-pooled into a dense vector).
     ///
     /// Tokens are processed one at a time.  For each token every `NativeTTTBlock`
     /// performs a self-supervised fast-weight update and produces its hidden
@@ -119,10 +121,11 @@ impl AxiomTTTLM {
     /// * `input_ids`      – `[1, T]` integer token indices.
     /// * `session_states` – Per-layer `[d_model, d_model]` fast-weight tensors;
     ///   updated in-place after every token.
-    ///
-    /// # Returns
-    /// Logits `[1, T, vocab_size]`.
-    pub fn forward_lm(&self, input_ids: &Tensor, session_states: &mut [Tensor]) -> Result<Tensor> {
+    pub fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        session_states: &mut [Tensor],
+    ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
 
         // Embed all tokens: [1, T, d_model].
@@ -152,8 +155,15 @@ impl AxiomTTTLM {
         let refs: Vec<&Tensor> = unsqueezed.iter().collect();
         let sequence_output = Tensor::cat(&refs, 1)?;
 
-        // Final RMSNorm + LM head → [1, T, vocab_size].
-        let normed = self.ln_f.forward(&sequence_output)?;
+        // Final RMSNorm → [1, T, d_model].
+        self.ln_f.forward(&sequence_output)
+    }
+
+    /// Autoregressive forward pass over a token sequence → logits
+    /// `[1, T, vocab_size]`. Equivalent to `lm_head(forward_hidden(..))`; the
+    /// hidden-state computation lives in [`Self::forward_hidden`].
+    pub fn forward_lm(&self, input_ids: &Tensor, session_states: &mut [Tensor]) -> Result<Tensor> {
+        let normed = self.forward_hidden(input_ids, session_states)?;
         self.lm_head.forward(&normed)
     }
 }
@@ -248,5 +258,29 @@ mod tests {
             .to_scalar::<u32>()
             .unwrap();
         assert!(next_id < 32, "argmax token id must be in vocabulary range");
+    }
+
+    #[test]
+    fn test_forward_hidden_shape() {
+        let (model, device) = make_model(2);
+        let mut states = model.init_states(&device).unwrap();
+        let input_ids = Tensor::zeros((1usize, 4usize), DType::U32, &device).unwrap();
+        let hidden = model.forward_hidden(&input_ids, &mut states[..]).unwrap();
+        // [1, T, d_model] — d_model is 16 in make_model
+        assert_eq!(hidden.dims(), &[1, 4, 16]);
+    }
+
+    #[test]
+    fn test_forward_lm_equals_lm_head_of_hidden() {
+        // forward_lm must remain logits = lm_head(forward_hidden) after refactor.
+        let (model, device) = make_model(1);
+        let mut s1 = model.init_states(&device).unwrap();
+        let mut s2 = model.init_states(&device).unwrap();
+        let input_ids = Tensor::zeros((1usize, 3usize), DType::U32, &device).unwrap();
+        let logits = model.forward_lm(&input_ids, &mut s1[..]).unwrap();
+        assert_eq!(logits.dims(), &[1, 3, 32]); // vocab_size = 32
+        // hidden path produces values of the right shape
+        let hidden = model.forward_hidden(&input_ids, &mut s2[..]).unwrap();
+        assert_eq!(hidden.dims(), &[1, 3, 16]);
     }
 }
