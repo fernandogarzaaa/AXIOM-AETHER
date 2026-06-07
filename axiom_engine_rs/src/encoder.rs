@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use candle_core::{Result, Tensor, D};
+use candle_core::{DType, Result, Tensor, D};
 use candle_nn::{Module, VarBuilder};
 use serde::{Deserialize, Serialize};
 
@@ -72,7 +72,10 @@ pub struct EmbedderMeta {
 impl EmbedderMeta {
     pub fn sidecar_path(checkpoint: &str) -> String {
         let p = Path::new(checkpoint);
-        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("axiom_embedder");
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("axiom_embedder");
         match p.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => {
                 format!("{}/{stem}.meta.json", dir.to_string_lossy())
@@ -139,6 +142,35 @@ impl SelfAttention {
         let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((b, t, d))?;
         self.w_o.forward(&ctx)
     }
+
+    pub fn forward_with_mask(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        let (b, t, d) = x.dims3()?;
+        let device = x.device();
+        let h = self.n_heads;
+        let hd = self.head_dim;
+        let scale = 1.0 / (hd as f64).sqrt();
+
+        let to_heads = |t_in: Tensor| -> Result<Tensor> {
+            t_in.reshape((b, t, h, hd))?.transpose(1, 2)?.contiguous()
+        };
+        let q = to_heads(self.w_q.forward(x)?)?;
+        let k = to_heads(self.w_k.forward(x)?)?;
+        let v = to_heads(self.w_v.forward(x)?)?;
+
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let mut scores = q.matmul(&k_t)?.affine(scale, 0.0)?;
+        if let Some(mask) = mask {
+            let key_mask = mask.reshape((b, 1, 1, t))?.broadcast_as((b, h, t, t))?;
+            let inv_mask = (Tensor::ones((b, h, t, t), DType::F32, device)? - key_mask)?;
+            let penalty = inv_mask.broadcast_mul(&Tensor::new(-1.0e9f32, device)?)?;
+            scores = (scores + penalty)?;
+        }
+        let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
+
+        let ctx = attn.matmul(&v)?;
+        let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((b, t, d))?;
+        self.w_o.forward(&ctx)
+    }
 }
 
 /// One transformer encoder block: self-attention + FFN, each residual + LayerNorm.
@@ -168,6 +200,13 @@ impl EncoderBlock {
         let h = self.ff2.forward(&self.ff1.forward(&x)?.gelu()?)?;
         self.norm2.forward(&(x + h)?)
     }
+
+    pub fn forward_with_mask(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        let a = self.attn.forward_with_mask(x, mask)?;
+        let x = self.norm1.forward(&(x + a)?)?;
+        let h = self.ff2.forward(&self.ff1.forward(&x)?.gelu()?)?;
+        self.norm2.forward(&(x + h)?)
+    }
 }
 
 /// Full bidirectional encoder. `encode` → an L2-normalized `[d_model]` vector.
@@ -188,7 +227,13 @@ impl BiEncoder {
             blocks.push(EncoderBlock::new(vb.pp(format!("block_{i}")), &config)?);
         }
         let norm_f = RmsNorm::new(config.d_model, config.norm_eps, vb.pp("norm_f"))?;
-        Ok(Self { tok_emb, pos_emb, blocks, norm_f, config })
+        Ok(Self {
+            tok_emb,
+            pos_emb,
+            blocks,
+            norm_f,
+            config,
+        })
     }
 
     /// Encode one token sequence `[1, T]` → L2-normalized `[d_model]`.
@@ -211,6 +256,35 @@ impl BiEncoder {
         pooled.broadcast_div(&norm)
     }
 
+    /// Encode a padded token batch `[B, T]` with a `[B, T]` 1/0 mask.
+    pub fn encode_batch(&self, input_ids: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let (b, t) = input_ids.dims2()?;
+        let mask_dims = mask.dims2()?;
+        assert_eq!(mask_dims, (b, t), "mask must match input_ids");
+        let device = input_ids.device();
+        let tok = self.tok_emb.forward(input_ids)?; // [B,T,d]
+        let pos_ids = Tensor::arange(0u32, t as u32, device)?.reshape((1, t))?;
+        let pos = self
+            .pos_emb
+            .forward(&pos_ids)?
+            .broadcast_as((b, t, self.config.d_model))?;
+        let mut x = (tok + pos)?;
+        for b in &self.blocks {
+            x = b.forward_with_mask(&x, Some(mask))?;
+        }
+        x = self.norm_f.forward(&x)?;
+        let mask3 = mask.reshape((b, t, 1))?;
+        let summed = x.broadcast_mul(&mask3)?.sum(1)?;
+        let denom = mask
+            .sum(1)?
+            .reshape((b, 1))?
+            .broadcast_add(&Tensor::new(1e-8f32, device)?)?;
+        let pooled = summed.broadcast_div(&denom)?;
+        let norm = pooled.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;
+        let norm = norm.broadcast_add(&Tensor::new(1e-8f32, device)?)?;
+        pooled.broadcast_div(&norm)
+    }
+
     /// Truncate ids to `max_seq` and wrap as a `[1, T]` tensor.
     pub fn ids_tensor(&self, ids: &[u32], device: &candle_core::Device) -> Result<Tensor> {
         let mut ids = ids.to_vec();
@@ -220,6 +294,43 @@ impl BiEncoder {
         ids.truncate(self.config.max_seq);
         let t = ids.len();
         Tensor::from_vec(ids, (1, t), device)
+    }
+
+    /// Pad/truncate sequences into `[B, T]` token ids plus `[B, T]` float mask.
+    pub fn batch_ids_tensor(
+        &self,
+        seqs: &[Vec<u32>],
+        device: &candle_core::Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let b = seqs.len().max(1);
+        let max_len = seqs
+            .iter()
+            .map(|s| s.len().max(1).min(self.config.max_seq))
+            .max()
+            .unwrap_or(1);
+        let mut ids = Vec::with_capacity(b * max_len);
+        let mut mask = Vec::with_capacity(b * max_len);
+        if seqs.is_empty() {
+            ids.push(0);
+            mask.push(1f32);
+        } else {
+            for seq in seqs {
+                let len = seq.len().max(1).min(self.config.max_seq);
+                for i in 0..max_len {
+                    if i < len {
+                        ids.push(*seq.get(i).unwrap_or(&0));
+                        mask.push(1f32);
+                    } else {
+                        ids.push(0);
+                        mask.push(0f32);
+                    }
+                }
+            }
+        }
+        Ok((
+            Tensor::from_vec(ids, (b, max_len), device)?,
+            Tensor::from_vec(mask, (b, max_len), device)?,
+        ))
     }
 }
 
@@ -284,8 +395,20 @@ mod tests {
         let x2 = Tensor::from_vec(data, (1, 4, 16), &Device::Cpu).unwrap();
         let y1 = attn.forward(&x1).unwrap();
         let y2 = attn.forward(&x2).unwrap();
-        let p0_1: Vec<f32> = y1.narrow(1, 0, 1).unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let p0_2: Vec<f32> = y2.narrow(1, 0, 1).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let p0_1: Vec<f32> = y1
+            .narrow(1, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let p0_2: Vec<f32> = y2
+            .narrow(1, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         assert_ne!(p0_1, p0_2, "position 0 output must depend on later tokens");
     }
 
@@ -311,8 +434,45 @@ mod tests {
         let ids = enc.ids_tensor(&[1, 2, 3, 4, 5], &Device::Cpu).unwrap();
         let v = enc.encode(&ids).unwrap();
         assert_eq!(v.dims(), &[16]);
-        let n: f32 = v.sqr().unwrap().sum_all().unwrap().sqrt().unwrap().to_scalar().unwrap();
+        let n: f32 = v
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .sqrt()
+            .unwrap()
+            .to_scalar()
+            .unwrap();
         assert!((n - 1.0).abs() < 1e-4, "norm {n}");
+    }
+
+    #[test]
+    fn encode_batch_matches_single_sequence_encode_for_padded_rows() {
+        let (_vm, enc) = tiny_encoder();
+        let seqs = vec![vec![1, 2, 3, 4], vec![40, 41]];
+        let (ids, mask) = enc.batch_ids_tensor(&seqs, &Device::Cpu).unwrap();
+        let batched = enc.encode_batch(&ids, &mask).unwrap();
+        assert_eq!(batched.dims(), &[2, 16]);
+
+        for (row, seq) in seqs.iter().enumerate() {
+            let single = enc
+                .encode(&enc.ids_tensor(seq, &Device::Cpu).unwrap())
+                .unwrap();
+            let from_batch = batched.narrow(0, row, 1).unwrap().squeeze(0).unwrap();
+            let diff = single
+                .sub(&from_batch)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff < 1e-4,
+                "batched row {row} must match single encode; diff={diff}"
+            );
+        }
     }
 
     #[test]
@@ -323,26 +483,47 @@ mod tests {
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let cfg = EncoderConfig {
-            vocab_size: 64, d_model: 16, n_layers: 2, n_heads: 4,
-            ffn_dim: 32, max_seq: 32, norm_eps: 1e-5,
+            vocab_size: 64,
+            d_model: 16,
+            n_layers: 2,
+            n_heads: 4,
+            ffn_dim: 32,
+            max_seq: 32,
+            norm_eps: 1e-5,
         };
         let enc = BiEncoder::new(vb, cfg).unwrap();
         let ids = enc.ids_tensor(&[1, 2, 3, 4], &dev).unwrap();
         let loss = enc.encode(&ids).unwrap().sqr().unwrap().sum_all().unwrap();
         let g = loss.backward().unwrap();
         let vars = vm.all_vars();
-        let with_grad = vars.iter().filter(|v| g.get(v.as_tensor()).is_some()).count();
-        assert_eq!(with_grad, vars.len(), "all {} encoder params must get grad, got {}", vars.len(), with_grad);
+        let with_grad = vars
+            .iter()
+            .filter(|v| g.get(v.as_tensor()).is_some())
+            .count();
+        assert_eq!(
+            with_grad,
+            vars.len(),
+            "all {} encoder params must get grad, got {}",
+            vars.len(),
+            with_grad
+        );
     }
 
     #[test]
     fn different_inputs_give_different_embeddings() {
         let (_vm, enc) = tiny_encoder();
-        let a = enc.encode(&enc.ids_tensor(&[1, 2, 3, 4], &Device::Cpu).unwrap()).unwrap();
-        let b = enc.encode(&enc.ids_tensor(&[40, 41, 42, 43], &Device::Cpu).unwrap()).unwrap();
+        let a = enc
+            .encode(&enc.ids_tensor(&[1, 2, 3, 4], &Device::Cpu).unwrap())
+            .unwrap();
+        let b = enc
+            .encode(&enc.ids_tensor(&[40, 41, 42, 43], &Device::Cpu).unwrap())
+            .unwrap();
         let av: Vec<f32> = a.to_vec1().unwrap();
         let bv: Vec<f32> = b.to_vec1().unwrap();
         let cos: f32 = av.iter().zip(&bv).map(|(x, y)| x * y).sum();
-        assert!(cos < 0.999, "untrained encoder embeddings suspiciously identical: cos={cos}");
+        assert!(
+            cos < 0.999,
+            "untrained encoder embeddings suspiciously identical: cos={cos}"
+        );
     }
 }

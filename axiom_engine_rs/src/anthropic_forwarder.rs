@@ -489,8 +489,9 @@ mod tests {
         let messages = payload["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         let content = messages[0]["content"].as_str().unwrap();
-        assert!(content.contains("<axiom_context_fingerprint "));
-        assert!(content.contains("tokens_compressed=\"400\""));
-        assert!(!content.contains("tok399")); // raw heavy text was stripped
+        assert!(content.contains("<axiom_context_digest "));
+        assert!(content.contains("original_tokens=\"400\""));
+        assert!(content.contains("chars of prose elided"));
+        assert!(content.len() < big.len()); // raw heavy text was compressed
     }
 }

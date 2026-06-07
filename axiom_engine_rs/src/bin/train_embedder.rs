@@ -21,26 +21,52 @@ use candle_nn::{Optimizer, VarBuilder, VarMap};
 use tokenizers::Tokenizer;
 
 fn envu(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 fn envf(k: &str, d: f64) -> f64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 fn repo() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn main() {
-    std::thread::Builder::new().stack_size(1024 * 1024 * 1024).spawn(run).unwrap().join().unwrap();
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(run)
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 fn run() {
-    let bpe = std::env::var("AXIOM_BPE")
-        .unwrap_or_else(|_| repo().join("checkpoints/axiom_bpe.json").to_string_lossy().into());
-    let ckpt = std::env::var("AXIOM_EMB_CKPT")
-        .unwrap_or_else(|_| repo().join("checkpoints/axiom_embedder.bin").to_string_lossy().into());
-    let pairs_path = std::env::var("AXIOM_PAIRS_OUT")
-        .unwrap_or_else(|_| repo().join("checkpoints/pairs.jsonl").to_string_lossy().into());
+    let bpe = std::env::var("AXIOM_BPE").unwrap_or_else(|_| {
+        repo()
+            .join("checkpoints/axiom_bpe.json")
+            .to_string_lossy()
+            .into()
+    });
+    let ckpt = std::env::var("AXIOM_EMB_CKPT").unwrap_or_else(|_| {
+        repo()
+            .join("checkpoints/axiom_embedder.bin")
+            .to_string_lossy()
+            .into()
+    });
+    let pairs_path = std::env::var("AXIOM_PAIRS_OUT").unwrap_or_else(|_| {
+        repo()
+            .join("checkpoints/pairs.jsonl")
+            .to_string_lossy()
+            .into()
+    });
     let tok = Tokenizer::from_file(&bpe).expect("tokenizer");
     let vocab = tok.get_vocab_size(true);
     // AXIOM_EMB_DEVICE=cpu forces CPU (avoids the GPU entirely — no contention
@@ -49,7 +75,10 @@ fn run() {
         Ok("cpu") => Device::Cpu,
         _ => Device::cuda_if_available(0).unwrap_or(Device::Cpu),
     };
-    eprintln!("[emb] device={}", if device.is_cuda() { "CUDA:0" } else { "CPU" });
+    eprintln!(
+        "[emb] device={}",
+        if device.is_cuda() { "CUDA:0" } else { "CPU" }
+    );
 
     let cfg = EncoderConfig {
         vocab_size: vocab,
@@ -68,17 +97,29 @@ fn run() {
     let warmup = envu("AXIOM_EMB_WARMUP", 100);
 
     let mut pairs = read_pairs_jsonl(&pairs_path);
-    assert!(pairs.len() >= bs * 2, "need >= {} pairs; got {}", bs * 2, pairs.len());
+    assert!(
+        pairs.len() >= bs * 2,
+        "need >= {} pairs; got {}",
+        bs * 2,
+        pairs.len()
+    );
     // Oversample synthetic (question->content) pairs so they aren't drowned out by
     // mined doc<->body pairs — the eval task is NL-question->content, which only
     // the synthetic anchors teach. AXIOM_EMB_SYNTH_OVERSAMPLE=K duplicates them K-1x.
     let oversample = envu("AXIOM_EMB_SYNTH_OVERSAMPLE", 1);
     if oversample > 1 {
-        let synth: Vec<_> = pairs.iter().filter(|p| p.source == "synthetic").cloned().collect();
+        let synth: Vec<_> = pairs
+            .iter()
+            .filter(|p| p.source == "synthetic")
+            .cloned()
+            .collect();
         for _ in 1..oversample {
             pairs.extend(synth.iter().cloned());
         }
-        eprintln!("[emb] oversampled {} synthetic pairs {oversample}x", synth.len());
+        eprintln!(
+            "[emb] oversampled {} synthetic pairs {oversample}x",
+            synth.len()
+        );
     }
     // Deterministic shuffle so a batch spans many files (meaningful in-batch negatives).
     pairs.sort_by_key(|p| {
@@ -102,13 +143,17 @@ fn run() {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let enc = BiEncoder::new(vb, cfg.clone()).unwrap();
 
-    let encode = |text: &str| -> Tensor {
-        let ids = tok.encode(text, false).map(|e| e.get_ids().to_vec()).unwrap_or_default();
-        enc.encode(&enc.ids_tensor(&ids, &device).unwrap()).unwrap()
-    };
     let stack = |texts: &[String]| -> Tensor {
-        let rows: Vec<Tensor> = texts.iter().map(|s| encode(s).unsqueeze(0).unwrap()).collect();
-        Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0).unwrap()
+        let encoded: Vec<Vec<u32>> = texts
+            .iter()
+            .map(|s| {
+                tok.encode(s.as_str(), false)
+                    .map(|e| e.get_ids().to_vec())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let (ids, mask) = enc.batch_ids_tensor(&encoded, &device).unwrap();
+        enc.encode_batch(&ids, &mask).unwrap()
     };
     let val_recall = || -> f32 {
         let mut tot = 0.0f32;
@@ -122,7 +167,14 @@ fn run() {
         tot / nb.max(1) as f32
     };
 
-    let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW { lr, ..Default::default() }).unwrap();
+    let mut opt = AdamW::new(
+        varmap.all_vars(),
+        ParamsAdamW {
+            lr,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let t0 = std::time::Instant::now();
     let mut best = 0.0f32;
     let mut step = 0usize;

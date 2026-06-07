@@ -140,7 +140,9 @@ impl NativeTTTBlock {
             // Sync-free element backstop: a hard ceiling that NaN can never breach.
             updated_state = updated_state.clamp(-STAB_CLAMP, STAB_CLAMP)?;
         }
-        *session_state = updated_state.clone();
+        // The session state is an inference cache, not a BPTT tape. Detaching it
+        // here prevents long prompts from retaining one Candle op node per token.
+        *session_state = updated_state.detach();
         // ------------------------------------------------------------------------
 
         // output = q × W_tilde : [1, d_model] × [d_model, d_model] → [1, d_model]
@@ -220,7 +222,10 @@ mod tests {
         for _ in 0..512 {
             let out = block.forward_native(&x, &mut state).unwrap();
             let ov: Vec<f32> = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            assert!(ov.iter().all(|v| v.is_finite()), "stabilized output went non-finite");
+            assert!(
+                ov.iter().all(|v| v.is_finite()),
+                "stabilized output went non-finite"
+            );
         }
         // The element clamp must hold the state inside [-STAB_CLAMP, STAB_CLAMP].
         let sv: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();

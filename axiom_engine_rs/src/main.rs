@@ -3,17 +3,24 @@ mod claude_backend;
 mod cluster;
 mod config;
 mod context_compressor;
+mod contrastive;
+mod corpus;
 mod data_gen;
+mod embedder;
+mod encoder;
 mod hardware;
 mod inference;
 mod jit_streamer;
 mod kernel;
 mod mcp_stdio;
 mod memory_pool;
+mod memory_recall;
+mod memory_store;
 mod meta_train;
 mod metrics;
 mod model;
 mod model_meta;
+mod pairs;
 mod quantization;
 mod server;
 mod skeleton;
@@ -64,7 +71,9 @@ fn usage() -> &'static str {
 /// `AXIOM_TOKENIZER` (consumed by run_server / mcp_stdio) and returns the scaled
 /// config (vocab read from the tokenizer) plus the BPE checkpoint path.
 fn resolve_production_model(legacy: AxiomConfig, default_ckpt: &str) -> (AxiomConfig, String) {
-    let enabled = std::env::var("AXIOM_PRODUCTION_BPE").map(|v| v == "1").unwrap_or(false);
+    let enabled = std::env::var("AXIOM_PRODUCTION_BPE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     if !enabled {
         return (legacy, default_ckpt.to_string());
     }
@@ -88,7 +97,13 @@ fn resolve_production_model(legacy: AxiomConfig, default_ckpt: &str) -> (AxiomCo
                     None => (256, 4, 1e-3, 1e-6),
                 };
             eprintln!("[axiom] PRODUCTION MODEL = BPE (vocab {vocab}, d_model {d_model}, n_layers {n_layers}); checkpoint {ckpt}");
-            let cfg = AxiomConfig { d_model, n_layers, vocab_size: vocab, lr_inner, norm_eps };
+            let cfg = AxiomConfig {
+                d_model,
+                n_layers,
+                vocab_size: vocab,
+                lr_inner,
+                norm_eps,
+            };
             (cfg, ckpt)
         }
         Err(e) => {

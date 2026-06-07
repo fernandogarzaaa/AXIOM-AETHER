@@ -2327,7 +2327,7 @@ mod tests {
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();
-        let delta_bytes = safetensors::serialize([("tensor", &delta)], &None).unwrap();
+        let delta_bytes = safetensors::serialize([("tensor", &delta)], None).unwrap();
         let req = Request::builder()
             .method(Method::POST)
             .uri("/v1/cluster/sync")
@@ -2379,7 +2379,7 @@ mod tests {
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();
-        let delta_bytes = safetensors::serialize([("tensor", &delta)], &None).unwrap();
+        let delta_bytes = safetensors::serialize([("tensor", &delta)], None).unwrap();
         let first_req = Request::builder()
             .method(Method::POST)
             .uri("/v1/cluster/sync")
