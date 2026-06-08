@@ -341,14 +341,19 @@ pub fn build_compressed_payload(
     let fingerprint_block = if heavy_text.trim().is_empty() {
         fingerprint.to_prompt_block()
     } else {
-        crate::skeleton::build_digest(
+        let digest = crate::skeleton::build_digest(
             &heavy_text,
             &fingerprint.session_id,
             original_tokens,
             fingerprint.recall_norm,
             &fingerprint.state_hash,
             3, // doc-line cap tuned to ~80% reduction
-        )
+        );
+        if digest.contains("kind=\"structural-skeleton\"") {
+            structural_fingerprint_block(fingerprint, &digest)
+        } else {
+            opaque_fingerprint_block(fingerprint)
+        }
     };
 
     let mut messages = partitioned.surviving.clone();
@@ -368,6 +373,49 @@ pub fn build_compressed_payload(
 
     payload["messages"] = Value::Array(messages);
     payload
+}
+
+fn opaque_fingerprint_block(fingerprint: &MemoryFingerprint) -> String {
+    format!(
+        "<axiom_context_fingerprint session_id=\"{session}\" tokens_compressed=\"{tokens}\" \
+schema=\"{schema}\" mode=\"opaque-ttt\">\n\
+state_hash={hash}\n\
+associative_recall_norm={norm:.6}\n\
+associative_recall_l1={l1:.6}\n\
+recall_top_k_indices={top:?}\n\
+layers={layers} d_model={d}\n\
+compression_ms={ms}\n\
+raw_context=elided\n\
+</axiom_context_fingerprint>",
+        session = fingerprint.session_id,
+        tokens = fingerprint.context_tokens_processed,
+        schema = fingerprint.schema,
+        hash = fingerprint.state_hash,
+        norm = fingerprint.recall_norm,
+        l1 = fingerprint.recall_l1,
+        top = fingerprint.recall_top_k_indices,
+        layers = fingerprint.n_layers,
+        d = fingerprint.d_model,
+        ms = fingerprint.elapsed_ms,
+    )
+}
+
+fn structural_fingerprint_block(fingerprint: &MemoryFingerprint, digest: &str) -> String {
+    format!(
+        "<axiom_context_fingerprint session_id=\"{session}\" tokens_compressed=\"{tokens}\" \
+schema=\"{schema}\" mode=\"structural-digest\">\n\
+state_hash={hash}\n\
+associative_recall_norm={norm:.6}\n\
+recall_top_k_indices={top:?}\n\
+{digest}\n\
+</axiom_context_fingerprint>",
+        session = fingerprint.session_id,
+        tokens = fingerprint.context_tokens_processed,
+        schema = fingerprint.schema,
+        hash = fingerprint.state_hash,
+        norm = fingerprint.recall_norm,
+        top = fingerprint.recall_top_k_indices,
+    )
 }
 
 fn prepend_to_user_content(msg: &mut Value, prepend_text: &str) {
@@ -510,9 +558,52 @@ mod tests {
         let messages = payload["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         let content = messages[0]["content"].as_str().unwrap();
-        assert!(content.contains("<axiom_context_digest "));
-        assert!(content.contains("original_tokens=\"400\""));
-        assert!(content.contains("chars of prose elided"));
+        assert!(content.starts_with("<axiom_context_fingerprint "));
+        assert!(content.contains("tokens_compressed=\"400\""));
+        assert!(content.contains("state_hash=sha256:abcd"));
+        assert!(content.contains("raw_context=elided"));
+        assert!(!content.contains("tok399"));
         assert!(content.len() < big.len()); // raw heavy text was compressed
+    }
+
+    #[test]
+    fn build_compressed_payload_wraps_structural_digest_for_code() {
+        let code = r#"
+use std::collections::HashMap;
+pub fn run() -> usize {
+    let mut values = HashMap::new();
+    values.insert("secret_body", 1usize);
+    values.len()
+}
+"#;
+        let original = json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": code}],
+        });
+        let partitioned = partition_messages(original["messages"].as_array().unwrap(), 10, ws);
+        assert!(partitioned.surviving.is_empty());
+        let fp = MemoryFingerprint {
+            schema: "axiom-ttt-context-fingerprint/v2".into(),
+            session_id: "sess-code".into(),
+            context_tokens_processed: 32,
+            n_layers: 1,
+            d_model: 4,
+            state_hash: "sha256:c0de".into(),
+            layer_frobenius_norms: vec![1.0],
+            recall_norm: 1.0,
+            recall_l1: 1.0,
+            recall_top_k_indices: vec![1, 2],
+            recall_top_k_decoded: "".into(),
+            elapsed_ms: 1,
+        };
+        let payload = build_compressed_payload(&original, &fp, &partitioned);
+        let content = payload["messages"][0]["content"].as_str().unwrap();
+        assert!(content.starts_with("<axiom_context_fingerprint "));
+        assert!(content.contains("mode=\"structural-digest\""));
+        assert!(content.contains("<axiom_context_digest "));
+        assert!(content.contains("fn run"));
+        assert!(content.contains("usize"));
+        assert!(!content.contains("secret_body"));
     }
 }

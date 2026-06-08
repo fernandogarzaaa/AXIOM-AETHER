@@ -12,6 +12,7 @@ mod hardware;
 mod inference;
 mod jit_streamer;
 mod kernel;
+mod lsp;
 mod mcp_stdio;
 mod memory_pool;
 mod memory_recall;
@@ -23,12 +24,14 @@ mod model_meta;
 mod openai_forwarder;
 mod pairs;
 mod quantization;
+mod sandbox;
 mod server;
 mod skeleton;
 mod swarm_router;
 mod train;
 mod ttt_block;
 mod vibe_memory;
+mod weight_merge;
 
 use std::env;
 
@@ -58,7 +61,7 @@ struct CliArgs {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH] [--device cpu|cuda|metal]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N] [--device cpu|cuda|metal]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH] [--device cpu|cuda|metal]"
+    "Usage:\n  cargo run --release -- --mode train [--epochs N] [--steps-per-epoch N] [--batch-size N] [--seq-len N] [--checkpoint PATH] [--device cpu|cuda|metal]\n  cargo run --release -- --mode generate \"your prompt\" [--max-new-tokens N] [--checkpoint PATH] [--tokenizer PATH] [--context-api-url URL] [--context-api-key KEY] [--max-context-tokens N] [--device cpu|cuda|metal]\n  cargo run --release -- --mode server [--host HOST] [--port PORT] [--checkpoint PATH] [--device cpu|cuda|metal]\n  cargo run --release -- --lsp [--checkpoint PATH] [--tokenizer PATH] [--device cpu|cuda|metal]"
 }
 
 /// Resolve a `Device` from a string name.
@@ -198,6 +201,9 @@ fn parse_cli() -> Result<CliArgs> {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
+            "--lsp" => {
+                mode = "lsp".to_string();
+            }
             "--mode" => {
                 i += 1;
                 if i >= argv.len() {
@@ -432,6 +438,20 @@ async fn run_main() -> Result<()> {
                 .await
                 .map_err(|e| candle_core::Error::Msg(format!("mcp server failed: {e}")))?;
         }
+        "lsp" => {
+            let (cfg, ckpt) = resolve_production_model(config.clone(), &args.checkpoint_path);
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: args.tokenizer_path,
+                context_api_url: None,
+                context_api_key: None,
+                max_context_tokens: args.max_context_tokens,
+            };
+            let pipeline =
+                InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            lsp::run_lsp_server(pipeline)
+                .await
+                .map_err(|e| candle_core::Error::Msg(format!("lsp server failed: {e}")))?;
+        }
         "meta-train" => {
             // Phase 4: train projection matrices on raw repo files so
             // the online TTT updates produce well-conditioned, non-degenerate
@@ -475,7 +495,7 @@ async fn run_main() -> Result<()> {
         }
         other => {
             bail!(
-                "unsupported mode '{other}'. Use --mode train | generate | server | mcp | meta-train | doctor"
+                "unsupported mode '{other}'. Use --mode train | generate | server | mcp | lsp | meta-train | doctor"
             )
         }
     }

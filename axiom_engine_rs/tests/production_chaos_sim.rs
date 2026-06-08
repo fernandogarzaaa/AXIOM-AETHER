@@ -105,7 +105,7 @@ async fn test_production_under_chaos() {
         .unwrap()
         .to_dtype(DType::F16)
         .unwrap();
-    let delta_bytes = safetensors::serialize([("tensor", &delta)], &None).unwrap();
+    let delta_bytes = safetensors::serialize([("tensor", &delta)], None).unwrap();
     let mut order_statuses = Vec::new();
     for (sequence_version, timestamp) in [(3u64, 300i64), (2, 200), (4, 400), (4, 399)] {
         let req = Request::builder()

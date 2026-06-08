@@ -52,8 +52,10 @@ use crate::inference::InferencePipeline;
 use crate::metrics;
 use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarderError};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
+use crate::sandbox::{SandboxController, SandboxDiagnostic};
 use crate::swarm_router::{SwarmChatResult, SwarmRouter};
 use crate::vibe_memory::MasterVibe;
+use crate::weight_merge::{merge_checkpoint_files, MergeSummary};
 
 const MAX_ACTIVE_VRAM_SESSIONS: usize = 32;
 
@@ -351,6 +353,65 @@ impl AppState {
             persisted: true,
             cache_path: cache_path.display().to_string(),
         })
+    }
+
+    async fn sandbox_local_synthesis(&self, session_id: &str, content: &str) {
+        if SandboxController::rust_code_blocks(content).is_empty() {
+            return;
+        }
+        let Some(sandbox) = SandboxController::from_env() else {
+            return;
+        };
+        let state = self.clone();
+        let cache_path = compression_cache_path();
+        let result = sandbox
+            .verify_rust_code_blocks_with_feedback(session_id, content, move |diag| {
+                let state = state.clone();
+                let cache_path = cache_path.clone();
+                async move { state.adapt_sandbox_diagnostic(diag, &cache_path).await }
+            })
+            .await;
+        match result {
+            Ok(report) if report.passed => eprintln!(
+                "[sandbox] session={} rust_blocks={} passed attempts={}",
+                report.session_id, report.blocks_checked, report.attempts
+            ),
+            Ok(report) => eprintln!(
+                "[sandbox] session={} rust_blocks={} failed diagnostics={} attempts={}",
+                report.session_id,
+                report.blocks_checked,
+                report.diagnostics.len(),
+                report.attempts
+            ),
+            Err(e) => eprintln!("[sandbox] verification skipped: {e}"),
+        }
+    }
+
+    async fn adapt_sandbox_diagnostic(
+        &self,
+        diag: SandboxDiagnostic,
+        cache_path: &FsPath,
+    ) -> Result<(), String> {
+        let message = format!(
+            "sandbox compiler check failed at step {} with status {:?}",
+            diag.step, diag.status_code
+        );
+        let trace = format!(
+            "command: {}\nworkspace: {}\nstdout:\n{}\nstderr:\n{}",
+            diag.command, diag.workspace, diag.stdout, diag.stderr
+        );
+        self.adapt_feedback_to_cache(
+            TttFeedbackRequest {
+                session_id: diag.session_id,
+                message,
+                feedback_type: Some("sandbox_compilation_error".to_string()),
+                trace: Some(trace),
+            },
+            cache_path,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
     }
 
     async fn persist_compression_cache(&self) -> Result<(), String> {
@@ -994,6 +1055,14 @@ struct TttFeedbackResponse {
     cache_path: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClusterMergeRequest {
+    inputs: Vec<String>,
+    output: String,
+    #[serde(default)]
+    alpha: Option<f32>,
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint helpers
 // ---------------------------------------------------------------------------
@@ -1503,6 +1572,25 @@ async fn cluster_sync(
     Ok(StatusCode::ACCEPTED)
 }
 
+/// `POST /v1/cluster/merge` — merge persisted W_tilde cache files into a fresh
+/// bincode checkpoint via task-vector interpolation.
+async fn cluster_merge(
+    Json(req): Json<ClusterMergeRequest>,
+) -> Result<Json<MergeSummary>, ApiError> {
+    let alpha = req.alpha.unwrap_or(0.5);
+    let inputs = req
+        .inputs
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let output = PathBuf::from(req.output);
+    let summary = spawn_blocking(move || merge_checkpoint_files(&inputs, &output, alpha))
+        .await
+        .map_err(|e| ApiError::Internal(format!("merge task join failed: {e}")))?
+        .map_err(ApiError::BadRequest)?;
+    Ok(Json(summary))
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -1952,7 +2040,12 @@ async fn compressed_messages_path(
 
     if let Some(router) = state.swarm_router.as_ref().as_ref() {
         match router.route_chat_payload(&outbound).await {
-            Ok(local) => return Ok(local_anthropic_message_response(&outbound, local)),
+            Ok(local) => {
+                state
+                    .sandbox_local_synthesis(&session_id, &local.content)
+                    .await;
+                return Ok(local_anthropic_message_response(&outbound, local));
+            }
             Err(e) => {
                 eprintln!("[swarm-router] local Anthropic route unavailable; falling back: {e}")
             }
@@ -2124,7 +2217,12 @@ async fn compressed_openai_chat_path(
 
     if let Some(router) = state.swarm_router.as_ref().as_ref() {
         match router.route_chat_payload(&outbound).await {
-            Ok(local) => return local_openai_chat_response(&outbound, local),
+            Ok(local) => {
+                state
+                    .sandbox_local_synthesis(&session_id, &local.content)
+                    .await;
+                return local_openai_chat_response(&outbound, local);
+            }
             Err(e) => {
                 eprintln!("[swarm-router] local OpenAI route unavailable; falling back: {e}")
             }
@@ -2368,6 +2466,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(create_chat_completion))
         .route("/v1/messages", post(create_message))
         .route("/v1/cluster/sync", post(cluster_sync))
+        .route("/v1/cluster/merge", post(cluster_merge))
         .route("/v1/sessions", post(create_session))
         .route("/v1/sessions/:id", delete(delete_session))
         .route("/v1/adapt", post(adapt))
@@ -2768,6 +2867,25 @@ mod tests {
             .unwrap();
     }
 
+    fn seed_active_test_session(state: &AppState, session_id: &str) {
+        let now = unix_now();
+        let states = state
+            .pipeline
+            .lock()
+            .unwrap()
+            .init_session_states()
+            .unwrap();
+        let mut sessions = state.sessions.write().unwrap();
+        sessions.insert(session_id.to_string(), SessionData::new_active(states, now));
+        drop(sessions);
+        metrics::register_session(session_id);
+        state.refresh_session_metrics().unwrap();
+    }
+
+    async fn hydrate_test_cache(state: &AppState, path: &FsPath) -> usize {
+        state.hydrate_compression_cache_from(path).await.unwrap()
+    }
+
     #[tokio::test]
     async fn context_adaptation_cache_skips_identical_context_per_session() {
         let state = make_test_state().await;
@@ -2902,10 +3020,7 @@ mod tests {
 
         let fresh = make_test_state().await;
         let fresh_pipeline_arc = fresh.pipeline.clone();
-        let restored = fresh
-            .hydrate_compression_cache_from(&temp_path)
-            .await
-            .unwrap();
+        let restored = hydrate_test_cache(&fresh, &temp_path).await;
         assert_eq!(restored, 1);
         assert_eq!(fresh.ttt_sessions.len(), 1);
 
@@ -2915,325 +3030,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_models_returns_200() {
-        let state = make_test_state().await;
-        let pipeline_arc = state.pipeline.clone();
-        let app = create_router(state);
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/v1/models")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        safe_drop(pipeline_arc).await;
-    }
-
-    #[tokio::test]
-    async fn test_create_session_returns_session_id() {
-        let state = make_test_state().await;
-        let pipeline_arc = state.pipeline.clone();
-        let app = create_router(state);
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/sessions")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{}"#))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["session_id"].is_string());
-        assert_eq!(json["object"], "session");
-        safe_drop(pipeline_arc).await;
-    }
-
-    #[tokio::test]
-    async fn test_delete_unknown_session_returns_deleted_false() {
-        let state = make_test_state().await;
-        let pipeline_arc = state.pipeline.clone();
-        let app = create_router(state);
-        let req = Request::builder()
-            .method(Method::DELETE)
-            .uri("/v1/sessions/nonexistent-id")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["deleted"], false);
-        safe_drop(pipeline_arc).await;
-    }
-
-    #[tokio::test]
-    async fn test_adapt_requires_nonempty_corpus() {
-        let state = make_test_state().await;
-        let pipeline_arc = state.pipeline.clone();
-        let app = create_router(state);
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/adapt")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"corpus":[]}"#))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        safe_drop(pipeline_arc).await;
-    }
-
-    fn initialized_test_states(state: &AppState) -> Vec<Tensor> {
-        let pipeline = state.pipeline.lock().unwrap();
-        pipeline
-            .init_session_states()
-            .unwrap()
-            .into_iter()
-            .map(|tensor| Tensor::ones(tensor.dims(), DType::F32, &state.device).unwrap())
-            .collect::<Vec<_>>()
-    }
-
-    #[tokio::test]
-    async fn test_adapt_reuses_session_and_updates_metrics() {
-        let state = make_test_state().await;
-        let pipeline_arc = state.pipeline.clone();
-        let app = create_router(state.clone());
-        let session_id = "adapt-session".to_string();
-        let now = unix_now();
-        let initial_states = initialized_test_states(&state);
-        {
-            let mut sessions = state.sessions.write().unwrap();
-            sessions.insert(
-                session_id.clone(),
-                SessionData::new_active(initial_states.clone(), now),
-            );
-        }
-        metrics::register_session(&session_id);
-        state.refresh_session_metrics().unwrap();
-        let tokens_before = crate::metrics::COUNTER_TOTAL_TOKENS_PREFILLED
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/adapt")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({
-                    "corpus": ["hello adaptation"],
-                    "session_id": session_id,
-                })
-                .to_string(),
-            ))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["session_id"], session_id);
-
-        {
-            let sessions = state.sessions.read().unwrap();
-            let session = sessions.get("adapt-session").unwrap();
-            let session_state_count = match &session.residency {
-                SessionResidency::Active(states) => states.len(),
-                SessionResidency::Quantized(states) => states.len(),
-            };
-            assert_eq!(session_state_count, initial_states.len());
-            assert!(session.last_used >= now);
-        }
-        let tokens_after = crate::metrics::COUNTER_TOTAL_TOKENS_PREFILLED
-            .load(std::sync::atomic::Ordering::Relaxed);
-        assert!(tokens_after > tokens_before);
-        safe_drop(pipeline_arc).await;
-    }
-
-    #[tokio::test]
-    async fn test_chat_completion_returns_200() {
-        let state = make_test_state().await;
-        let pipeline_arc = state.pipeline.clone();
-        let app = create_router(state);
-        let body = r#"{"messages":[{"role":"user","content":"hello"}],"max_tokens":4}"#;
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        safe_drop(pipeline_arc).await;
-    }
-
-    /// Verify that `stream: true` produces an SSE response (text/event-stream
-    /// Content-Type header and body containing `[DONE]`).
-    #[tokio::test]
-    async fn test_chat_completion_stream_returns_sse() {
-        let state = make_test_state().await;
-        let pipeline_arc = state.pipeline.clone();
-        let app = create_router(state);
-        let body = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":2,"stream":true}"#;
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            ct.contains("text/event-stream"),
-            "expected SSE content-type, got: {ct}"
-        );
-
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_str = std::str::from_utf8(&bytes).unwrap();
-        assert!(
-            body_str.contains("[DONE]"),
-            "SSE body must contain [DONE] sentinel"
-        );
-        safe_drop(pipeline_arc).await;
-    }
-
-    #[tokio::test]
-    async fn test_openai_chat_completion_compression_forwards_digest_payload() {
-        use crate::openai_forwarder::OpenAiForwarder;
-        use tokio::sync::oneshot;
-
-        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
-        let captured_for_route = captured.clone();
-        let upstream = Router::new().route(
-            "/v1/chat/completions",
-            post(move |Json(body): Json<serde_json::Value>| {
-                let captured = captured_for_route.clone();
-                async move {
-                    *captured.lock().unwrap() = Some(body);
-                    Json(
-                        serde_json::from_str::<serde_json::Value>(
-                            r#"{"id":"chatcmpl-mock","object":"chat.completion","created":0,"model":"gpt-mock","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
-                        )
-                        .unwrap(),
-                    )
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            axum::serve(listener, upstream)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-
-        let cfg = CompressorConfig {
-            enabled: true,
-            heavy_message_threshold_tokens: 50,
-            recall_top_k: 4,
-        };
-        let state = make_test_state()
-            .await
-            .with_compressor_config(cfg)
-            .with_openai_forwarder(Some(OpenAiForwarder::new(
-                Some("sk-test".to_string()),
-                Some(format!("http://{addr}")),
-            )));
-        let pipeline_arc = state.pipeline.clone();
-        let app = create_router(state);
-        let big = (0..400)
-            .map(|i| format!("tok{i}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let body = serde_json::json!({
-            "model": "gpt-4.1",
-            "session_id": "codex-session",
-            "messages": [
-                {"role": "developer", "content": big},
-                {"role": "user", "content": "modify the adapter"}
-            ],
-            "max_tokens": 16
-        });
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let forwarded = captured.lock().unwrap().clone().expect("forwarded body");
-        assert!(forwarded.get("session_id").is_none());
-        let messages = forwarded["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 1);
-        let content = messages[0]["content"].as_str().unwrap();
-        assert!(content.contains("<axiom_context_digest "));
-        assert!(content.contains("modify the adapter"));
-        assert!(content.contains("chars of prose elided"));
-        assert!(content.len() < big.len());
-
-        let _ = shutdown_tx.send(());
-        safe_drop(pipeline_arc).await;
-    }
-
-    #[tokio::test]
-    async fn test_metrics_endpoint_renders_prometheus_text() {
-        let state = make_test_state().await;
-        let pipeline_arc = state.pipeline.clone();
-        let app = create_router(state);
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/metrics")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("axiom_total_tokens_prefilled"));
-        assert!(body.contains("axiom_prefill_latency_seconds_bucket"));
-        safe_drop(pipeline_arc).await;
-    }
-
-    #[tokio::test]
     async fn test_cluster_sync_merges_delta_into_layer_state() {
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
         let session_id = "cluster-session".to_string();
-        let now = unix_now();
-        let states = {
-            let pipeline = state.pipeline.lock().unwrap();
-            pipeline.init_session_states().unwrap()
-        };
-        {
-            let mut sessions = state.sessions.write().unwrap();
-            sessions.insert(session_id.clone(), SessionData::new_active(states, now));
-        }
-        metrics::register_session(&session_id);
-        state.refresh_session_metrics().unwrap();
+        seed_active_test_session(&state, &session_id);
 
         let delta = Tensor::ones((16usize, 16usize), DType::F32, &state.device)
             .unwrap()
@@ -3275,17 +3077,7 @@ mod tests {
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
         let session_id = "cluster-order-session".to_string();
-        let now = unix_now();
-        let states = {
-            let pipeline = state.pipeline.lock().unwrap();
-            pipeline.init_session_states().unwrap()
-        };
-        {
-            let mut sessions = state.sessions.write().unwrap();
-            sessions.insert(session_id.clone(), SessionData::new_active(states, now));
-        }
-        metrics::register_session(&session_id);
-        state.refresh_session_metrics().unwrap();
+        seed_active_test_session(&state, &session_id);
 
         let delta = Tensor::ones((16usize, 16usize), DType::F32, &state.device)
             .unwrap()

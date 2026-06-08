@@ -337,6 +337,7 @@ pub fn build_digest(
 original_tokens=\"{original_tokens}\" recall_norm=\"{recall_norm:.3}\" state=\"{state_hash}\">\n\
 # Lossy digest of elided heavy context. For code: signatures kept, bodies dropped.\n\
 # Ask Axiom to expand a named symbol if you need its body.\n\
+state_hash={state_hash}\n\
 {body}\n\
 </axiom_context_digest>"
         );
@@ -383,6 +384,7 @@ original_tokens=\"{original_tokens}\" recall_norm=\"{recall_norm:.3}\" state=\"{
 original_tokens=\"{original_tokens}\" recall_norm=\"{recall_norm:.3}\" state=\"{state_hash}\">\n\
 # Lossy digest of elided heavy context. For code: signatures kept, bodies dropped.\n\
 # Ask Axiom to expand a named symbol if you need its body.\n\
+state_hash={state_hash}\n\
 {body}\n\
 </axiom_context_digest>"
     )
