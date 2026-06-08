@@ -25,6 +25,7 @@ mod pairs;
 mod quantization;
 mod server;
 mod skeleton;
+mod swarm_router;
 mod train;
 mod ttt_block;
 mod vibe_memory;

@@ -52,6 +52,7 @@ use crate::inference::InferencePipeline;
 use crate::metrics;
 use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarderError};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
+use crate::swarm_router::{SwarmChatResult, SwarmRouter};
 use crate::vibe_memory::MasterVibe;
 
 const MAX_ACTIVE_VRAM_SESSIONS: usize = 32;
@@ -227,6 +228,9 @@ pub struct AppState {
     /// Outbound bridge to OpenAI-compatible chat completions used by the Codex
     /// compression path. `None` when OpenAI forwarding is disabled.
     pub openai_forwarder: Arc<Option<OpenAiForwarder>>,
+    /// Optional local SLM router. When present, compressed outbound payloads are
+    /// attempted against Ollama before falling back to cloud forwarders.
+    pub swarm_router: Arc<Option<SwarmRouter>>,
     /// Static compression configuration (threshold, top-k, enabled flag).
     pub compressor_config: Arc<CompressorConfig>,
     /// Optional persistent "vibe memory". When `Some`, adapted session W̃
@@ -259,6 +263,7 @@ impl AppState {
             ttt_sessions: Arc::new(TttSessionStore::new()),
             anthropic_forwarder: Arc::new(None),
             openai_forwarder: Arc::new(None),
+            swarm_router: Arc::new(None),
             compressor_config: Arc::new(CompressorConfig::default()),
             master_vibe: Arc::new(Mutex::new(None)),
             source_store: Arc::new(RwLock::new(HashMap::new())),
@@ -455,6 +460,12 @@ impl AppState {
     /// Install an OpenAI-compatible forwarder for the Codex compression path.
     pub fn with_openai_forwarder(mut self, forwarder: Option<OpenAiForwarder>) -> Self {
         self.openai_forwarder = Arc::new(forwarder);
+        self
+    }
+
+    /// Install an optional local SLM/Ollama router.
+    pub fn with_swarm_router(mut self, router: Option<SwarmRouter>) -> Self {
+        self.swarm_router = Arc::new(router);
         self
     }
 
@@ -1138,29 +1149,23 @@ fn chat_completion_sse(
             let mut events: Vec<Result<Event, Infallible>> = Vec::with_capacity(pieces.len() + 2);
 
             for piece in pieces {
-                let chunk = serde_json::json!({
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": piece},
-                        "finish_reason": null
-                    }]
-                });
-                events.push(Ok(Event::default().data(chunk.to_string())));
+                match openai_stream_delta(&completion_id, created, &model, piece) {
+                    Ok(chunk) => events.push(Ok(Event::default().data(chunk))),
+                    Err(e) => {
+                        events.push(Ok(Event::default().data(format!("error: {e:?}"))));
+                        return Sse::new(stream::iter(events)).keep_alive(KeepAlive::default());
+                    }
+                }
             }
 
             // Final chunk: stop signal with empty delta.
-            let stop_chunk = serde_json::json!({
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-            });
-            events.push(Ok(Event::default().data(stop_chunk.to_string())));
+            match openai_stream_stop(&completion_id, created, &model) {
+                Ok(stop_chunk) => events.push(Ok(Event::default().data(stop_chunk))),
+                Err(e) => {
+                    events.push(Ok(Event::default().data(format!("error: {e:?}"))));
+                    return Sse::new(stream::iter(events)).keep_alive(KeepAlive::default());
+                }
+            }
             // OpenAI termination sentinel.
             events.push(Ok(Event::default().data("[DONE]")));
             events
@@ -1726,12 +1731,12 @@ async fn compressed_messages_path(
     session_override: Option<&str>,
     client_auth: &ClientAuth,
 ) -> Result<Value, ApiError> {
-    let forwarder = state
-        .anthropic_forwarder
-        .as_ref()
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("compression active but no forwarder".into()))?
-        .clone();
+    let forwarder = state.anthropic_forwarder.as_ref().as_ref().cloned();
+    if forwarder.is_none() && state.swarm_router.as_ref().is_none() {
+        return Err(ApiError::Internal(
+            "compression active but no Anthropic forwarder or local swarm router".into(),
+        ));
+    }
 
     let messages = body
         .get("messages")
@@ -1877,6 +1882,19 @@ async fn compressed_messages_path(
         .controls
         .record(log_heavy_count as u64, bytes_in, bytes_out);
 
+    if let Some(router) = state.swarm_router.as_ref().as_ref() {
+        match router.route_chat_payload(&outbound).await {
+            Ok(local) => return Ok(local_anthropic_message_response(&outbound, local)),
+            Err(e) => {
+                eprintln!("[swarm-router] local Anthropic route unavailable; falling back: {e}")
+            }
+        }
+    }
+
+    let forwarder = forwarder.ok_or_else(|| ApiError::Upstream {
+        status: StatusCode::BAD_GATEWAY.as_u16(),
+        message: "local swarm route failed and no Anthropic cloud forwarder is configured".into(),
+    })?;
     forwarder
         .forward_messages_json(&outbound, client_auth)
         .await
@@ -1908,12 +1926,12 @@ async fn compressed_openai_chat_path(
     session_override: Option<&str>,
     client_auth: &OpenAiClientAuth,
 ) -> Result<Response, ApiError> {
-    let forwarder = state
-        .openai_forwarder
-        .as_ref()
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("OpenAI compression active but no forwarder".into()))?
-        .clone();
+    let forwarder = state.openai_forwarder.as_ref().as_ref().cloned();
+    if forwarder.is_none() && state.swarm_router.as_ref().is_none() {
+        return Err(ApiError::Internal(
+            "OpenAI compression active but no OpenAI forwarder or local swarm router".into(),
+        ));
+    }
 
     let messages = body
         .get("messages")
@@ -2036,6 +2054,19 @@ async fn compressed_openai_chat_path(
         .controls
         .record(log_heavy_count as u64, bytes_in, bytes_out);
 
+    if let Some(router) = state.swarm_router.as_ref().as_ref() {
+        match router.route_chat_payload(&outbound).await {
+            Ok(local) => return local_openai_chat_response(&outbound, local),
+            Err(e) => {
+                eprintln!("[swarm-router] local OpenAI route unavailable; falling back: {e}")
+            }
+        }
+    }
+
+    let forwarder = forwarder.ok_or_else(|| ApiError::Upstream {
+        status: StatusCode::BAD_GATEWAY.as_u16(),
+        message: "local swarm route failed and no OpenAI cloud forwarder is configured".into(),
+    })?;
     let upstream = forwarder
         .forward_chat_completions_text(&outbound, client_auth)
         .await
@@ -2060,6 +2091,112 @@ async fn compressed_openai_chat_path(
     builder
         .body(axum::body::Body::from(upstream.body))
         .map_err(|e| ApiError::Internal(format!("response build failed: {e}")))
+}
+
+fn local_openai_chat_response(
+    outbound: &Value,
+    local: SwarmChatResult,
+) -> Result<Response, ApiError> {
+    let completion_id = format!("chatcmpl-local-{}", Uuid::new_v4());
+    let created = unix_now();
+    let model = local.model;
+    let content = local.content;
+    let stream = outbound
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if stream {
+        let mut body = String::new();
+        for piece in content.split_inclusive(' ') {
+            body.push_str("data: ");
+            body.push_str(&openai_stream_delta(
+                &completion_id,
+                created,
+                &model,
+                piece,
+            )?);
+            body.push_str("\n\n");
+        }
+        body.push_str("data: ");
+        body.push_str(&openai_stream_stop(&completion_id, created, &model)?);
+        body.push_str("\n\n");
+        body.push_str("data: [DONE]\n\n");
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from(body))
+            .map_err(|e| ApiError::Internal(format!("local stream response build failed: {e}")));
+    }
+
+    let body = openai_completion_body(&completion_id, created, &model, &content)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body))
+        .map_err(|e| ApiError::Internal(format!("local response build failed: {e}")))
+}
+
+fn openai_stream_delta(
+    completion_id: &str,
+    created: u64,
+    model: &str,
+    piece: &str,
+) -> Result<String, ApiError> {
+    let id = json_string(completion_id)?;
+    let model = json_string(model)?;
+    let piece = json_string(piece)?;
+    Ok(format!(
+        r#"{{"id":{id},"object":"chat.completion.chunk","created":{created},"model":{model},"choices":[{{"index":0,"delta":{{"role":"assistant","content":{piece}}},"finish_reason":null}}]}}"#
+    ))
+}
+
+fn openai_stream_stop(completion_id: &str, created: u64, model: &str) -> Result<String, ApiError> {
+    let id = json_string(completion_id)?;
+    let model = json_string(model)?;
+    Ok(format!(
+        r#"{{"id":{id},"object":"chat.completion.chunk","created":{created},"model":{model},"choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}]}}"#
+    ))
+}
+
+fn openai_completion_body(
+    completion_id: &str,
+    created: u64,
+    model: &str,
+    content: &str,
+) -> Result<String, ApiError> {
+    let id = json_string(completion_id)?;
+    let model = json_string(model)?;
+    let content = json_string(content)?;
+    Ok(format!(
+        r#"{{"id":{id},"object":"chat.completion","created":{created},"model":{model},"choices":[{{"index":0,"message":{{"role":"assistant","content":{content}}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}}}"#
+    ))
+}
+
+fn json_string(value: &str) -> Result<String, ApiError> {
+    serde_json::to_string(value).map_err(|e| ApiError::Internal(format!("json encode failed: {e}")))
+}
+
+fn local_anthropic_message_response(outbound: &Value, local: SwarmChatResult) -> Value {
+    let input_tokens = outbound
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .map(|m| m.get("content").map(content_to_text).unwrap_or_default())
+                .map(|text| text.split_whitespace().count())
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let id = json_string(&format!("msg_local_{}", Uuid::new_v4().simple()))
+        .unwrap_or_else(|_| "\"msg_local\"".to_string());
+    let model = json_string(&local.model).unwrap_or_else(|_| "\"local\"".to_string());
+    let content = json_string(&local.content).unwrap_or_else(|_| "\"\"".to_string());
+    let body = format!(
+        r#"{{"id":{id},"type":"message","role":"assistant","content":[{{"type":"text","text":{content}}}],"model":{model},"stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":{input_tokens},"output_tokens":0}}}}"#
+    );
+    serde_json::from_str(&body).unwrap_or(Value::Null)
 }
 
 fn empty_fingerprint(
@@ -2359,6 +2496,11 @@ pub async fn run_server(
     } else {
         None
     };
+    let swarm_router = if compressor_config.enabled {
+        SwarmRouter::from_env()
+    } else {
+        None
+    };
     if compressor_config.enabled {
         match anthropic_forwarder.as_ref() {
             Some(fwd) => {
@@ -2411,6 +2553,19 @@ pub async fn run_server(
                  /v1/chat/completions will fall back to the local pipeline"
             ),
         }
+        if let Some(router) = swarm_router.as_ref() {
+            println!(
+                "[+] Local swarm router ON — Ollama base={} candidates={:?} num_ctx={} timeout_ms={}",
+                router.config().base_url,
+                router.config().model_candidates,
+                router.config().num_ctx,
+                router.config().timeout_ms
+            );
+        } else {
+            println!(
+                "[+] Local swarm router OFF — set AXIOM_SWARM_LOCAL=1 to route compressed payloads to Ollama before cloud fallback."
+            );
+        }
     }
     // Persistent vibe memory (automatic EMA merge on session drop/clear/
     // shutdown). Enabled by default; set AXIOM_VIBE=0 to disable all
@@ -2436,6 +2591,7 @@ pub async fn run_server(
         .with_claude_backend(claude_backend)
         .with_anthropic_forwarder(anthropic_forwarder)
         .with_openai_forwarder(openai_forwarder)
+        .with_swarm_router(swarm_router)
         .with_compressor_config(compressor_config)
         .with_master_vibe(master_vibe);
     if state.compression_active() {
@@ -2710,6 +2866,16 @@ mod tests {
         safe_drop(pipeline_arc).await;
     }
 
+    fn initialized_test_states(state: &AppState) -> Vec<Tensor> {
+        let pipeline = state.pipeline.lock().unwrap();
+        pipeline
+            .init_session_states()
+            .unwrap()
+            .into_iter()
+            .map(|tensor| Tensor::ones(tensor.dims(), DType::F32, &state.device).unwrap())
+            .collect::<Vec<_>>()
+    }
+
     #[tokio::test]
     async fn test_adapt_reuses_session_and_updates_metrics() {
         let state = make_test_state().await;
@@ -2717,15 +2883,7 @@ mod tests {
         let app = create_router(state.clone());
         let session_id = "adapt-session".to_string();
         let now = unix_now();
-        let initial_states = {
-            let pipeline = state.pipeline.lock().unwrap();
-            pipeline
-                .init_session_states()
-                .unwrap()
-                .into_iter()
-                .map(|tensor| Tensor::ones(tensor.dims(), DType::F32, &state.device).unwrap())
-                .collect::<Vec<_>>()
-        };
+        let initial_states = initialized_test_states(&state);
         {
             let mut sessions = state.sessions.write().unwrap();
             sessions.insert(
@@ -2842,17 +3000,12 @@ mod tests {
                 let captured = captured_for_route.clone();
                 async move {
                     *captured.lock().unwrap() = Some(body);
-                    Json(serde_json::json!({
-                        "id": "chatcmpl-mock",
-                        "object": "chat.completion",
-                        "created": 0,
-                        "model": "gpt-mock",
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": "ok"},
-                            "finish_reason": "stop"
-                        }]
-                    }))
+                    Json(
+                        serde_json::from_str::<serde_json::Value>(
+                            r#"{"id":"chatcmpl-mock","object":"chat.completion","created":0,"model":"gpt-mock","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                        )
+                        .unwrap(),
+                    )
                 }
             }),
         );

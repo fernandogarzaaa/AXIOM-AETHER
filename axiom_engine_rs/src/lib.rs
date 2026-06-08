@@ -27,6 +27,7 @@ pub mod search_ingest;
 pub mod search_scrape;
 pub mod server;
 pub mod skeleton;
+pub mod swarm_router;
 pub mod train;
 pub mod ttt_block;
 pub mod vibe_memory;
