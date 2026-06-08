@@ -31,6 +31,7 @@ use candle_core::{DType, Device, Tensor};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::task::spawn_blocking;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
@@ -63,6 +64,11 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn context_hash(source: &str) -> String {
+    let digest = Sha256::digest(source.as_bytes());
+    format!("{digest:x}")
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +230,10 @@ pub struct AppState {
     /// round-trip can expand a dropped symbol body on demand (`POST /v1/expand`).
     /// Soft-bounded (cleared past a cap) since sessions are transient.
     pub source_store: Arc<RwLock<HashMap<String, String>>>,
+    /// Last heavy-context digest successfully adapted per compression session.
+    /// Repeated full-context prompts from Claude/Codex can then reuse the
+    /// already-mutated fast-weights instead of redoing the same TTT prefill.
+    adapted_context_hashes: Arc<RwLock<HashMap<String, String>>>,
     /// Runtime-mutable compression controls + live counters. Lets a dashboard
     /// retune the threshold / on-off without a restart (`/v1/config`).
     pub controls: Arc<CompressionControls>,
@@ -245,6 +255,7 @@ impl AppState {
             compressor_config: Arc::new(CompressorConfig::default()),
             master_vibe: Arc::new(Mutex::new(None)),
             source_store: Arc::new(RwLock::new(HashMap::new())),
+            adapted_context_hashes: Arc::new(RwLock::new(HashMap::new())),
             controls: Arc::new(CompressionControls::from_config(
                 &CompressorConfig::default(),
             )),
@@ -260,6 +271,23 @@ impl AppState {
                 map.clear();
             }
             map.insert(session_id.to_string(), source);
+        }
+    }
+
+    fn should_adapt_heavy_context(&self, session_id: &str, source: &str) -> bool {
+        let hash = context_hash(source);
+        self.adapted_context_hashes
+            .read()
+            .map(|map| map.get(session_id) != Some(&hash))
+            .unwrap_or(true)
+    }
+
+    fn mark_heavy_context_adapted(&self, session_id: &str, source: &str) {
+        if let Ok(mut map) = self.adapted_context_hashes.write() {
+            if map.len() >= 256 {
+                map.clear();
+            }
+            map.insert(session_id.to_string(), context_hash(source));
         }
     }
 
@@ -1637,6 +1665,7 @@ async fn compressed_messages_path(
         let session_id_clone = session_id.clone();
         let heavy_clone = heavy_combined.clone();
         let query_clone = user_query_text.clone();
+        let should_adapt = state.should_adapt_heavy_context(&session_id, &heavy_combined);
 
         // Spawn the compute-heavy loop on a blocking thread so the Tokio
         // runtime keeps serving other requests during the gradient steps.
@@ -1651,9 +1680,14 @@ async fn compressed_messages_path(
                 // tokio::sync::Mutex::blocking_lock is safe in spawn_blocking.
                 let mut session_states = session.blocking_lock();
 
-                let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
-                adapt_session_blocking(&pipeline, &mut session_states, &context_tokens)
-                    .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
+                let context_tokens_processed = if should_adapt {
+                    let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
+                    adapt_session_blocking(&pipeline, &mut session_states, &context_tokens)
+                        .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
+                    context_tokens.len()
+                } else {
+                    whitespace_token_count(&heavy_clone)
+                };
 
                 let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
                 let fingerprint = extract_memory_vector_blocking(
@@ -1661,7 +1695,7 @@ async fn compressed_messages_path(
                     &mut session_states,
                     &query_tokens,
                     &session_id_clone,
-                    context_tokens.len(),
+                    context_tokens_processed,
                     started,
                     top_k,
                 )
@@ -1670,7 +1704,11 @@ async fn compressed_messages_path(
             })
             .await
             .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
-        fp_result?
+        let fingerprint = fp_result?;
+        if should_adapt {
+            state.mark_heavy_context_adapted(&session_id, &heavy_combined);
+        }
+        fingerprint
     };
 
     eprintln!(
@@ -1794,6 +1832,7 @@ async fn compressed_openai_chat_path(
         let session_id_clone = session_id.clone();
         let heavy_clone = heavy_combined.clone();
         let query_clone = user_query_text.clone();
+        let should_adapt = state.should_adapt_heavy_context(&session_id, &heavy_combined);
 
         let fp_result: Result<MemoryFingerprint, ApiError> = spawn_blocking(move || {
             let pipeline = pipeline_arc
@@ -1804,9 +1843,14 @@ async fn compressed_openai_chat_path(
                 .map_err(|e| ApiError::Internal(format!("session allocation failed: {e}")))?;
             let mut session_states = session.blocking_lock();
 
-            let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
-            adapt_session_blocking(&pipeline, &mut session_states, &context_tokens)
-                .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
+            let context_tokens_processed = if should_adapt {
+                let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
+                adapt_session_blocking(&pipeline, &mut session_states, &context_tokens)
+                    .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
+                context_tokens.len()
+            } else {
+                whitespace_token_count(&heavy_clone)
+            };
 
             let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
             extract_memory_vector_blocking(
@@ -1814,7 +1858,7 @@ async fn compressed_openai_chat_path(
                 &mut session_states,
                 &query_tokens,
                 &session_id_clone,
-                context_tokens.len(),
+                context_tokens_processed,
                 started,
                 top_k,
             )
@@ -1822,7 +1866,11 @@ async fn compressed_openai_chat_path(
         })
         .await
         .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
-        fp_result?
+        let fingerprint = fp_result?;
+        if should_adapt {
+            state.mark_heavy_context_adapted(&session_id, &heavy_combined);
+        }
+        fingerprint
     };
 
     eprintln!(
@@ -2333,6 +2381,20 @@ mod tests {
         tokio::task::spawn_blocking(move || drop(arc))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_adaptation_cache_skips_identical_context_per_session() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+
+        assert!(state.should_adapt_heavy_context("s1", "fn a() {}"));
+        state.mark_heavy_context_adapted("s1", "fn a() {}");
+        assert!(!state.should_adapt_heavy_context("s1", "fn a() {}"));
+        assert!(state.should_adapt_heavy_context("s1", "fn b() {}"));
+        assert!(state.should_adapt_heavy_context("s2", "fn a() {}"));
+
+        safe_drop(pipeline_arc).await;
     }
 
     #[tokio::test]
