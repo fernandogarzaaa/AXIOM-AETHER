@@ -106,7 +106,9 @@ impl AnthropicForwarder {
             .header("content-type", "application/json")
             .header(
                 "anthropic-version",
-                auth.anthropic_version.as_deref().unwrap_or(ANTHROPIC_VERSION),
+                auth.anthropic_version
+                    .as_deref()
+                    .unwrap_or(ANTHROPIC_VERSION),
             );
 
         // Relay beta feature flags. The Claude Code subscription/OAuth path
@@ -137,7 +139,10 @@ impl AnthropicForwarder {
             .await
             .map_err(|e| ForwarderError::Network(format!("body read failed: {e}")))?;
         if !status.is_success() {
-            return Err(ForwarderError::Upstream { status: status.as_u16(), body });
+            return Err(ForwarderError::Upstream {
+                status: status.as_u16(),
+                body,
+            });
         }
         serde_json::from_str(&body).map_err(|e| ForwarderError::Decode(e.to_string()))
     }
@@ -147,7 +152,10 @@ impl AnthropicForwarder {
 pub enum ForwarderError {
     Network(String),
     Decode(String),
-    Upstream { status: u16, body: String },
+    Upstream {
+        status: u16,
+        body: String,
+    },
     /// Neither the client nor the proxy supplied any usable credential.
     MissingAuth,
 }
@@ -269,7 +277,10 @@ fn split_content(
             let mut extracted: Vec<ExtractedContent> = Vec::new();
             for block in blocks {
                 let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                let text_opt = block.get("text").and_then(|v| v.as_str()).map(str::to_string);
+                let text_opt = block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 if block_type == "text" {
                     if let Some(text) = text_opt {
                         let count = token_counter(&text);
@@ -322,7 +333,11 @@ pub fn build_compressed_payload(
         .map(|c| c.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let original_tokens: usize = partitioned.heavy_context.iter().map(|c| c.token_count).sum();
+    let original_tokens: usize = partitioned
+        .heavy_context
+        .iter()
+        .map(|c| c.token_count)
+        .sum();
     let fingerprint_block = if heavy_text.trim().is_empty() {
         fingerprint.to_prompt_block()
     } else {
@@ -408,7 +423,10 @@ mod tests {
 
     #[test]
     fn partition_handles_block_content() {
-        let big_text = (0..300).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let big_text = (0..300)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let messages = vec![json!({
             "role": "user",
             "content": [
@@ -463,7 +481,10 @@ mod tests {
     #[test]
     fn build_compressed_payload_appends_user_turn_when_only_heavy_messages() {
         // All messages are heavy → stripped → no surviving messages.
-        let big = (0..400).map(|i| format!("tok{i}")).collect::<Vec<_>>().join(" ");
+        let big = (0..400)
+            .map(|i| format!("tok{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let original = json!({
             "model": "claude-opus-4-7",
             "max_tokens": 64,

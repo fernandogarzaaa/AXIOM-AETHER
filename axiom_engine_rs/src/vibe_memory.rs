@@ -257,7 +257,9 @@ mod tests {
     use candle_core::Device;
 
     fn eye_states(n: usize, d: usize, dev: &Device) -> Vec<Tensor> {
-        (0..n).map(|_| Tensor::eye(d, DType::F32, dev).unwrap()).collect()
+        (0..n)
+            .map(|_| Tensor::eye(d, DType::F32, dev).unwrap())
+            .collect()
     }
 
     #[test]
@@ -296,7 +298,10 @@ mod tests {
         // Seed master = identity.
         vibe.commit_session(&eye_states(1, 2, &dev)).unwrap();
         // New session = 2*identity. Expect 0.9*I + 0.1*(2I) = 1.1*I on the diagonal.
-        let twice = vec![Tensor::eye(2, DType::F32, &dev).unwrap().affine(2.0, 0.0).unwrap()];
+        let twice = vec![Tensor::eye(2, DType::F32, &dev)
+            .unwrap()
+            .affine(2.0, 0.0)
+            .unwrap()];
         vibe.commit_session(&twice).unwrap();
         let m = vibe.prime_states().unwrap();
         let diag = m[0].flatten_all().unwrap().to_vec1::<f32>().unwrap();

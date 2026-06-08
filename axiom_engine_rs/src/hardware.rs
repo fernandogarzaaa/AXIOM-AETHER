@@ -158,7 +158,9 @@ pub fn recommend(p: &HardwareProfile) -> Recommendation {
 
 /// Detect the live hardware profile. Best-effort and non-panicking.
 pub fn detect() -> HardwareProfile {
-    let cpu_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let (ram_total_mb, ram_free_mb) = detect_ram_mb();
     let gpu = detect_gpu();
 
@@ -213,7 +215,12 @@ fn detect_gpu() -> Option<GpuInfo> {
     let total_mb: u64 = parts.next()?.parse().ok()?;
     let free_mb: u64 = parts.next()?.parse().ok()?;
     let busy = gpu_has_compute_apps();
-    Some(GpuInfo { name, total_mb, free_mb, busy })
+    Some(GpuInfo {
+        name,
+        total_mb,
+        free_mb,
+        busy,
+    })
 }
 
 /// True if any process is currently resident as a CUDA compute app on the GPU.
@@ -222,9 +229,9 @@ fn gpu_has_compute_apps() -> bool {
         .args(["--query-compute-apps=pid", "--format=csv,noheader"])
         .output();
     match out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).lines().any(|l| !l.trim().is_empty())
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .any(|l| !l.trim().is_empty()),
         _ => false,
     }
 }
@@ -253,7 +260,12 @@ fn detect_ram_mb() -> (u64, u64) {
         // wmic is deprecated but present on virtually all Windows hosts; parse
         // FreePhysicalMemory (KB) and TotalVisibleMemorySize (KB) from OS info.
         if let Ok(o) = std::process::Command::new("wmic")
-            .args(["OS", "get", "FreePhysicalMemory,TotalVisibleMemorySize", "/value"])
+            .args([
+                "OS",
+                "get",
+                "FreePhysicalMemory,TotalVisibleMemorySize",
+                "/value",
+            ])
             .output()
         {
             let s = String::from_utf8_lossy(&o.stdout);
@@ -288,10 +300,16 @@ pub fn report(p: &HardwareProfile, r: &Recommendation) -> String {
     if p.has_cuda {
         s.push_str(&format!(
             "GPU                  : {} ({} MB free / {} MB total){}\n",
-            p.gpu_name.clone().unwrap_or_else(|| "CUDA device".to_string()),
+            p.gpu_name
+                .clone()
+                .unwrap_or_else(|| "CUDA device".to_string()),
             p.vram_free_mb,
             p.vram_total_mb,
-            if p.gpu_busy { ", BUSY (compute tenant resident)" } else { "" }
+            if p.gpu_busy {
+                ", BUSY (compute tenant resident)"
+            } else {
+                ""
+            }
         ));
     } else {
         s.push_str("GPU                  : none detected (CPU-only host)\n");
@@ -300,7 +318,10 @@ pub fn report(p: &HardwareProfile, r: &Recommendation) -> String {
     s.push_str(&format!("Proxy device         : {}\n", r.proxy_device));
     s.push_str(&format!("Training device      : {}\n", r.training_device));
     if r.vram_budget_mb > 0 {
-        s.push_str(&format!("Training VRAM budget : {} MB (30% headroom)\n", r.vram_budget_mb));
+        s.push_str(&format!(
+            "Training VRAM budget : {} MB (30% headroom)\n",
+            r.vram_budget_mb
+        ));
     }
     s.push_str(&format!("Training threads     : {}\n", r.training_threads));
     s.push_str(&format!("Why                  : {}\n", r.reason));
@@ -347,7 +368,11 @@ mod tests {
         let mut p = base();
         p.gpu_busy = true;
         let r = recommend(&p);
-        assert_eq!(r.proxy_device, DeviceChoice::Cpu, "proxy must yield to training");
+        assert_eq!(
+            r.proxy_device,
+            DeviceChoice::Cpu,
+            "proxy must yield to training"
+        );
         // Training still targets CUDA (it is the resident tenant).
         assert_eq!(r.training_device, DeviceChoice::Cuda);
     }

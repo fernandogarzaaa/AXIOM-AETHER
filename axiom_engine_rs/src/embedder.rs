@@ -98,13 +98,21 @@ impl EmbeddingModel {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let encoder = BiEncoder::new(vb, cfg).ok()?;
         varmap.load(checkpoint).ok()?;
-        Some(Self { encoder, tokenizer, device, _varmap: varmap })
+        Some(Self {
+            encoder,
+            tokenizer,
+            device,
+            _varmap: varmap,
+        })
     }
 
     /// Embed `text` into an L2-normalized `[d_model]` vector via the encoder.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let ids =
-            self.tokenizer.encode(text, false).map(|e| e.get_ids().to_vec()).unwrap_or_default();
+        let ids = self
+            .tokenizer
+            .encode(text, false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_default();
         let t = self.encoder.ids_tensor(&ids, &self.device)?;
         self.encoder.encode(&t)?.to_vec1::<f32>()
     }
@@ -139,12 +147,7 @@ mod tests {
     fn pool_and_normalize_produces_unit_vector() {
         // hidden [1, 2, 3]: tokens (3,4,0) and (0,0,0) → mean (1.5,2,0)
         // → norm 2.5 → normalized (0.6, 0.8, 0.0).
-        let h = Tensor::from_vec(
-            vec![3f32, 4., 0., 0., 0., 0.],
-            (1, 2, 3),
-            &Device::Cpu,
-        )
-        .unwrap();
+        let h = Tensor::from_vec(vec![3f32, 4., 0., 0., 0., 0.], (1, 2, 3), &Device::Cpu).unwrap();
         let v = pool_and_normalize(&h).unwrap();
         assert_eq!(v.len(), 3);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();

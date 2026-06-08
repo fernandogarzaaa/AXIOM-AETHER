@@ -45,10 +45,8 @@ use crate::model::AxiomTTTLM;
 
 const DEFAULT_INCLUDED_EXTENSIONS: &[&str] = &[
     // Systems / backend
-    "rs", "py", "go",
-    // TypeScript / JavaScript family
-    "ts", "tsx", "js", "jsx", "mjs", "cjs",
-    // Docs / config (structural priors)
+    "rs", "py", "go", // TypeScript / JavaScript family
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", // Docs / config (structural priors)
     "md", "toml", "yaml", "yml", "json", "txt",
 ];
 
@@ -210,16 +208,14 @@ impl RepoFileDataset {
 
     /// Sample a batch: returns `(inputs [B, T], targets [B, T])` where
     /// targets are inputs shifted by one position.
-    pub fn next_batch(
-        &mut self,
-        batch_size: usize,
-        device: &Device,
-    ) -> Result<(Tensor, Tensor)> {
+    pub fn next_batch(&mut self, batch_size: usize, device: &Device) -> Result<(Tensor, Tensor)> {
         if self.sequences.is_empty() {
             candle_core::bail!("meta-train dataset is empty; widen --max-files or --max-sequences");
         }
-        let mut inputs_flat: Vec<u32> = Vec::with_capacity(batch_size * (self.sequences[0].len() - 1));
-        let mut targets_flat: Vec<u32> = Vec::with_capacity(batch_size * (self.sequences[0].len() - 1));
+        let mut inputs_flat: Vec<u32> =
+            Vec::with_capacity(batch_size * (self.sequences[0].len() - 1));
+        let mut targets_flat: Vec<u32> =
+            Vec::with_capacity(batch_size * (self.sequences[0].len() - 1));
         let seq_len = self.sequences[0].len() - 1;
         let vocab = self.vocab_size;
         for _ in 0..batch_size {
@@ -563,11 +559,17 @@ mod tests {
         let temp = tempdir_path("meta_train_dataset");
         write(
             &temp.join("a.rs"),
-            &(0..200).map(|i| format!("tok{i}")).collect::<Vec<_>>().join(" "),
+            &(0..200)
+                .map(|i| format!("tok{i}"))
+                .collect::<Vec<_>>()
+                .join(" "),
         );
         write(
             &temp.join("nested/b.md"),
-            &(0..200).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" "),
+            &(0..200)
+                .map(|i| format!("word{i}"))
+                .collect::<Vec<_>>()
+                .join(" "),
         );
         write(&temp.join("ignored.exe"), "binary contents");
         write(&temp.join("target/junk.rs"), "should not be read");
@@ -586,7 +588,10 @@ mod tests {
         let temp = tempdir_path("meta_train_batch");
         write(
             &temp.join("z.txt"),
-            &(0..400).map(|i| format!("t{i}")).collect::<Vec<_>>().join(" "),
+            &(0..400)
+                .map(|i| format!("t{i}"))
+                .collect::<Vec<_>>()
+                .join(" "),
         );
         let mut ds = RepoFileDataset::build(&temp, 64, 8, 5, 50, 11).unwrap();
         let (inputs, targets) = ds.next_batch(4, &Device::Cpu).unwrap();
@@ -596,7 +601,8 @@ mod tests {
     }
 
     fn tempdir_path(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("axiom-meta-train-{label}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("axiom-meta-train-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

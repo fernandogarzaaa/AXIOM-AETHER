@@ -62,7 +62,11 @@ pub fn mine_doc_body(text: &str, min_comment_chars: usize) -> Vec<Pair> {
             let c = c.trim().to_string();
             let body = body.trim().to_string();
             if c.len() >= min_comment_chars && !body.is_empty() {
-                out.push(Pair { anchor: c, positive: body, source: "doc".into() });
+                out.push(Pair {
+                    anchor: c,
+                    positive: body,
+                    source: "doc".into(),
+                });
             }
         } else {
             i += 1;
@@ -81,7 +85,11 @@ pub fn mine_markdown(text: &str, min_body_chars: usize) -> Vec<Pair> {
         if let Some(h) = heading {
             let b = body.trim();
             if b.len() >= min_body_chars {
-                out.push(Pair { anchor: h.clone(), positive: b.to_string(), source: "md".into() });
+                out.push(Pair {
+                    anchor: h.clone(),
+                    positive: b.to_string(),
+                    source: "md".into(),
+                });
             }
         }
     };
@@ -102,7 +110,10 @@ pub fn mine_markdown(text: &str, min_body_chars: usize) -> Vec<Pair> {
 
 /// Append pairs to a JSONL file.
 pub fn write_pairs_jsonl(path: impl AsRef<Path>, pairs: &[Pair]) -> std::io::Result<()> {
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     for p in pairs {
         let line = serde_json::to_string(p)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -155,8 +166,13 @@ mod tests {
 
     #[test]
     fn pairs_jsonl_roundtrip() {
-        let path = std::env::temp_dir().join(format!("axiom_pairs_test_{}.jsonl", std::process::id()));
-        let p = vec![Pair { anchor: "q".into(), positive: "a".into(), source: "doc".into() }];
+        let path =
+            std::env::temp_dir().join(format!("axiom_pairs_test_{}.jsonl", std::process::id()));
+        let p = vec![Pair {
+            anchor: "q".into(),
+            positive: "a".into(),
+            source: "doc".into(),
+        }];
         write_pairs_jsonl(&path, &p).unwrap();
         let back = read_pairs_jsonl(&path);
         assert_eq!(back, p);

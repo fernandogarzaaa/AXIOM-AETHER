@@ -43,7 +43,13 @@ pub struct MemoryStore {
 fn scope_file_stem(scope: &str) -> String {
     scope
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -171,7 +177,11 @@ mod tests {
 
     fn temp_root(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("axiom_mem_test_{tag}_{}_{}", now_secs(), std::process::id()));
+        p.push(format!(
+            "axiom_mem_test_{tag}_{}_{}",
+            now_secs(),
+            std::process::id()
+        ));
         p
     }
 
@@ -179,7 +189,9 @@ mod tests {
     fn append_then_load_roundtrip() {
         let root = temp_root("roundtrip");
         let store = MemoryStore::open(&root).unwrap();
-        store.append(&rec("a", "personal", "use 4-space indent", vec![1.0, 0.0])).unwrap();
+        store
+            .append(&rec("a", "personal", "use 4-space indent", vec![1.0, 0.0]))
+            .unwrap();
         let loaded = store.load_scope("personal");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "use 4-space indent");
@@ -190,8 +202,12 @@ mod tests {
     fn latest_write_wins_per_id() {
         let root = temp_root("latest");
         let store = MemoryStore::open(&root).unwrap();
-        store.append(&rec("x", "personal", "old", vec![1.0])).unwrap();
-        store.append(&rec("x", "personal", "new", vec![1.0])).unwrap();
+        store
+            .append(&rec("x", "personal", "old", vec![1.0]))
+            .unwrap();
+        store
+            .append(&rec("x", "personal", "new", vec![1.0]))
+            .unwrap();
         let loaded = store.load_scope("personal");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "new");
@@ -202,7 +218,9 @@ mod tests {
     fn tombstone_excludes_record() {
         let root = temp_root("tomb");
         let store = MemoryStore::open(&root).unwrap();
-        store.append(&rec("k", "personal", "secret-ish", vec![1.0])).unwrap();
+        store
+            .append(&rec("k", "personal", "secret-ish", vec![1.0]))
+            .unwrap();
         store.tombstone("personal", "k").unwrap();
         let loaded = store.load_scope("personal");
         assert!(loaded.is_empty());
@@ -213,8 +231,12 @@ mod tests {
     fn scopes_are_isolated() {
         let root = temp_root("iso");
         let store = MemoryStore::open(&root).unwrap();
-        store.append(&rec("p", "project:aaa", "repo A secret", vec![1.0])).unwrap();
-        store.append(&rec("q", "project:bbb", "repo B secret", vec![1.0])).unwrap();
+        store
+            .append(&rec("p", "project:aaa", "repo A secret", vec![1.0]))
+            .unwrap();
+        store
+            .append(&rec("q", "project:bbb", "repo B secret", vec![1.0]))
+            .unwrap();
         let a = store.load_scope("project:aaa");
         let b = store.load_scope("project:bbb");
         assert_eq!(a.len(), 1);
@@ -228,7 +250,9 @@ mod tests {
     fn corrupt_line_is_skipped() {
         let root = temp_root("corrupt");
         let store = MemoryStore::open(&root).unwrap();
-        store.append(&rec("good", "personal", "ok", vec![1.0])).unwrap();
+        store
+            .append(&rec("good", "personal", "ok", vec![1.0]))
+            .unwrap();
         let path = store.scope_path("personal");
         let mut f = OpenOptions::new().append(true).open(path).unwrap();
         f.write_all(b"{ this is not json\n").unwrap();

@@ -1,0 +1,90 @@
+//! surgical_target.rs — clean, idiomatic Rust matching the Axiom repo's design
+//! patterns: Result-based error handling, small focused functions, immutable
+//! data flow, doc comments, and a thin typed wrapper over a candle tensor.
+
+use std::collections::HashMap;
+
+use candle_core::{DType, Device, Result, Tensor};
+
+/// A per-layer fast-weight matrix paired with its layer index.
+#[derive(Clone)]
+pub struct LayerState {
+    pub index: usize,
+    pub weight: Tensor,
+}
+
+impl LayerState {
+    /// Build an identity-initialised state of shape `[d_model, d_model]`.
+    pub fn identity(index: usize, d_model: usize, device: &Device) -> Result<Self> {
+        let weight = Tensor::eye(d_model, DType::F32, device)?;
+        Ok(Self { index, weight })
+    }
+
+    /// Frobenius norm of the underlying weight matrix.
+    pub fn frobenius_norm(&self) -> Result<f32> {
+        let squared = self.weight.sqr()?.sum_all()?;
+        Ok(squared.to_scalar::<f32>()?.sqrt())
+    }
+}
+
+/// Exponential moving average of two states: `keep * a + (1 - keep) * b`.
+pub fn ema_merge(a: &Tensor, b: &Tensor, keep: f64) -> Result<Tensor> {
+    let left = a.affine(keep, 0.0)?;
+    let right = b.affine(1.0 - keep, 0.0)?;
+    left.add(&right)
+}
+
+/// Summarise a stack of layer states into a name->norm map.
+pub fn summarise(states: &[LayerState]) -> Result<HashMap<String, f32>> {
+    let mut out = HashMap::with_capacity(states.len());
+    for state in states {
+        out.insert(format!("layer_{}", state.index), state.frobenius_norm()?);
+    }
+    Ok(out)
+}
+
+/// Count the states whose norm exceeds a threshold, using an iterator chain.
+pub fn count_active(states: &[LayerState], threshold: f32) -> Result<usize> {
+    let mut active = 0;
+    for state in states {
+        if state.frobenius_norm()? > threshold {
+            active += 1;
+        }
+    }
+    Ok(active)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device() -> Device {
+        Device::Cpu
+    }
+
+    #[test]
+    fn identity_has_expected_shape() {
+        let state = LayerState::identity(0, 8, &device()).unwrap();
+        assert_eq!(state.weight.dims(), &[8, 8]);
+    }
+
+    #[test]
+    fn ema_blends_toward_second() {
+        let dev = device();
+        let a = Tensor::eye(4, DType::F32, &dev).unwrap();
+        let b = a.affine(2.0, 0.0).unwrap();
+        let merged = ema_merge(&a, &b, 0.9).unwrap();
+        let diag = merged.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!((diag[0] - 1.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn summary_contains_every_layer() {
+        let dev = device();
+        let states: Vec<LayerState> = (0..3)
+            .map(|i| LayerState::identity(i, 4, &dev).unwrap())
+            .collect();
+        let summary = summarise(&states).unwrap();
+        assert_eq!(summary.len(), 3);
+    }
+}

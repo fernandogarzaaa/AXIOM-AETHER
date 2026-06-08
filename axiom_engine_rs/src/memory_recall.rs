@@ -24,7 +24,10 @@ pub struct RecallParams {
 
 impl Default for RecallParams {
     fn default() -> Self {
-        Self { min_score: 0.2, k: 5 }
+        Self {
+            min_score: 0.2,
+            k: 5,
+        }
     }
 }
 
@@ -63,7 +66,10 @@ pub fn recall(
     let mut hits: Vec<RecallHit> = ranked
         .into_iter()
         .filter(|(score, _)| *score >= params.min_score)
-        .map(|(score, r)| RecallHit { score, record: r.clone() })
+        .map(|(score, r)| RecallHit {
+            score,
+            record: r.clone(),
+        })
         .collect();
 
     // Score order, recency tie-break.
@@ -103,7 +109,11 @@ mod tests {
 
     fn temp_store(tag: &str) -> (MemoryStore, PathBuf) {
         let mut p = std::env::temp_dir();
-        p.push(format!("axiom_recall_test_{tag}_{}_{}", now(), std::process::id()));
+        p.push(format!(
+            "axiom_recall_test_{tag}_{}_{}",
+            now(),
+            std::process::id()
+        ));
         (MemoryStore::open(&p).unwrap(), p)
     }
 
@@ -116,13 +126,20 @@ mod tests {
     #[test]
     fn recall_returns_real_bodies_ranked() {
         let (store, root) = temp_store("ranked");
-        store.append(&rec("near", "personal", "BODY-NEAR", vec![1.0, 0.0], now())).unwrap();
-        store.append(&rec("far", "personal", "BODY-FAR", vec![0.0, 1.0], now())).unwrap();
+        store
+            .append(&rec("near", "personal", "BODY-NEAR", vec![1.0, 0.0], now()))
+            .unwrap();
+        store
+            .append(&rec("far", "personal", "BODY-FAR", vec![0.0, 1.0], now()))
+            .unwrap();
         let hits = recall(
             &store,
             &["personal".to_string()],
             &[1.0, 0.0],
-            &RecallParams { min_score: 0.1, k: 5 },
+            &RecallParams {
+                min_score: 0.1,
+                k: 5,
+            },
         );
         assert_eq!(hits[0].record.body, "BODY-NEAR");
         let _ = std::fs::remove_dir_all(&root);
@@ -131,13 +148,20 @@ mod tests {
     #[test]
     fn recall_searches_union_of_scopes() {
         let (store, root) = temp_store("union");
-        store.append(&rec("a", "personal", "P", vec![1.0, 0.0], now())).unwrap();
-        store.append(&rec("b", "project:zzz", "Q", vec![0.9, 0.1], now())).unwrap();
+        store
+            .append(&rec("a", "personal", "P", vec![1.0, 0.0], now()))
+            .unwrap();
+        store
+            .append(&rec("b", "project:zzz", "Q", vec![0.9, 0.1], now()))
+            .unwrap();
         let hits = recall(
             &store,
             &["personal".to_string(), "project:zzz".to_string()],
             &[1.0, 0.0],
-            &RecallParams { min_score: 0.1, k: 5 },
+            &RecallParams {
+                min_score: 0.1,
+                k: 5,
+            },
         );
         assert_eq!(hits.len(), 2);
         let _ = std::fs::remove_dir_all(&root);
@@ -146,12 +170,17 @@ mod tests {
     #[test]
     fn recall_respects_min_score() {
         let (store, root) = temp_store("minscore");
-        store.append(&rec("orth", "personal", "ORTH", vec![0.0, 1.0], now())).unwrap();
+        store
+            .append(&rec("orth", "personal", "ORTH", vec![0.0, 1.0], now()))
+            .unwrap();
         let hits = recall(
             &store,
             &["personal".to_string()],
             &[1.0, 0.0],
-            &RecallParams { min_score: 0.5, k: 5 },
+            &RecallParams {
+                min_score: 0.5,
+                k: 5,
+            },
         );
         assert!(hits.is_empty());
         let _ = std::fs::remove_dir_all(&root);
@@ -169,7 +198,10 @@ mod tests {
             &store,
             &["personal".to_string()],
             &[1.0, 0.0],
-            &RecallParams { min_score: 0.1, k: 5 },
+            &RecallParams {
+                min_score: 0.1,
+                k: 5,
+            },
         );
         let bodies: Vec<&str> = hits.iter().map(|h| h.record.body.as_str()).collect();
         assert!(bodies.contains(&"NEW-DECISION"));

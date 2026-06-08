@@ -34,7 +34,9 @@ pub struct Deduper {
 
 impl Deduper {
     pub fn new() -> Self {
-        Self { seen: HashSet::new() }
+        Self {
+            seen: HashSet::new(),
+        }
     }
     /// Returns true if this content is new (and records it); false if duplicate.
     pub fn accept(&mut self, bytes: &[u8]) -> bool {

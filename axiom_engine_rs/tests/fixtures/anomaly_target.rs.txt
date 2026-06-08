@@ -1,0 +1,86 @@
+// anomaly_target.rs — DELIBERATELY foreign to this codebase. High-entropy,
+// un-idiomatic, anti-pattern soup used purely as a drift-detection target.
+// (Never compiled: lives outside any crate. Do not use as a reference.)
+
+static mut GLOBAL_COUNTER_XQZ: i64 = 0;
+static mut RAW_BUFFER_PTR_7: *mut u8 = 0 as *mut u8;
+static mut FLAG_SOUP_ΩΩ: [bool; 17] = [false; 17];
+
+#[no_mangle]
+unsafe extern "C" fn frobnicate_the_void(p1: i32, p2: i32, p3: i32, p4: i32) -> i64 {
+    GLOBAL_COUNTER_XQZ += 1;
+    let mut acc: i64 = 0xDEAD_BEEF;
+    for aaa in 0..p1 {
+        for bbb in 0..p2 {
+            for ccc in 0..p3 {
+                for ddd in 0..p4 {
+                    for eee in 0..(aaa ^ bbb ^ ccc ^ ddd) {
+                        acc = acc.wrapping_mul(31).wrapping_add(eee as i64);
+                        GLOBAL_COUNTER_XQZ ^= acc >> 3;
+                        if acc % 7 == 0 {
+                            acc = !acc;
+                            continue;
+                        } else if acc % 11 == 3 {
+                            acc <<= 1;
+                            break;
+                        } else {
+                            acc = acc.rotate_left((eee % 13) as u32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let ptr = &mut GLOBAL_COUNTER_XQZ as *mut i64 as *mut u8;
+    *ptr.offset(0) = (acc & 0xFF) as u8;
+    *ptr.offset(1) = ((acc >> 8) & 0xFF) as u8;
+    RAW_BUFFER_PTR_7 = ptr;
+    acc
+}
+
+macro_rules! spaghetti_zZ {
+    ($x:expr, $y:expr, $($rest:tt)*) => {{
+        let mut q = $x;
+        q = q.wrapping_add($y);
+        q ^= 0xA5A5_A5A5u32 as i32;
+        q = q.wrapping_mul(2654435761u32 as i32);
+        $( q ^= stringify!($rest).len() as i32; )*
+        q
+    }};
+}
+
+fn goto_emulator_3000(seed: i32) -> i32 {
+    let mut state = 0;
+    let mut value = seed;
+    'dispatch: loop {
+        match state {
+            0 => { value = spaghetti_zZ!(value, 99, alpha beta gamma); state = 1; }
+            1 => { if value > 1000 { state = 4; } else { value += value; state = 2; } }
+            2 => { value ^= value << 3; state = 3; }
+            3 => { value = value.wrapping_sub(7); if value < 0 { state = 4; } else { state = 1; } }
+            4 => { break 'dispatch; }
+            _ => unreachable!("impossible state {}", state),
+        }
+    }
+    value
+}
+
+unsafe fn manual_memcpy_horror(dst: *mut u8, src: *const u8, n: usize) {
+    let mut i = 0usize;
+    while i < n {
+        *dst.add(i) = *src.add(i);
+        FLAG_SOUP_ΩΩ[i % 17] = !FLAG_SOUP_ΩΩ[i % 17];
+        i += 1;
+    }
+}
+
+fn main() {
+    unsafe {
+        let r = frobnicate_the_void(3, 4, 5, 6);
+        let g = goto_emulator_3000(r as i32);
+        let mut scratch_ʌ: [u8; 8] = [0; 8];
+        manual_memcpy_horror(scratch_ʌ.as_mut_ptr(), &g as *const i32 as *const u8, 4);
+        GLOBAL_COUNTER_XQZ += scratch_ʌ.iter().map(|&b| b as i64).sum::<i64>();
+        println!("{} {} {:?}", GLOBAL_COUNTER_XQZ, g, RAW_BUFFER_PTR_7);
+    }
+}

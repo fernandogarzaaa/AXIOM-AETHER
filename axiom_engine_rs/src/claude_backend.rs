@@ -63,8 +63,8 @@ impl ClaudeBackend {
             return None;
         }
         let api_key = std::env::var("ANTHROPIC_API_KEY").ok()?;
-        let model =
-            std::env::var("AXIOM_CLAUDE_MODEL").unwrap_or_else(|_| DEFAULT_CLAUDE_MODEL.to_string());
+        let model = std::env::var("AXIOM_CLAUDE_MODEL")
+            .unwrap_or_else(|_| DEFAULT_CLAUDE_MODEL.to_string());
         let default_system = std::env::var("AXIOM_CLAUDE_SYSTEM").ok();
         let mut backend = Self::new(model, api_key, default_system);
         if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL") {
@@ -122,9 +122,7 @@ impl ClaudeBackend {
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response
-                .text()
-                .unwrap_or_else(|_| "<no body>".to_string());
+            let text = response.text().unwrap_or_else(|_| "<no body>".to_string());
             return Err(format!("anthropic API error {status}: {text}"));
         }
 

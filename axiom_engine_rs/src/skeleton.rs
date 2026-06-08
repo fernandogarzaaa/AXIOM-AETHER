@@ -13,6 +13,8 @@
 
 use std::collections::HashSet;
 
+use tree_sitter::{Node, Parser, Query};
+
 /// Visibility / async prefixes stripped before testing for a declaration.
 const VIS_PREFIXES: [&str; 9] = [
     "pub ",
@@ -122,6 +124,170 @@ fn is_doc(t: &str) -> bool {
         || t.starts_with("/**")
 }
 
+fn rust_ast_body(heavy: &str, max_doc_lines: usize) -> Option<(String, usize)> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(heavy, None)?;
+    let language = tree_sitter_rust::LANGUAGE.into();
+    let query = Query::new(
+        &language,
+        r#"
+        (use_declaration) @import
+        (function_item) @decl
+        (struct_item) @decl
+        (enum_item) @decl
+        (trait_item) @decl
+        (impl_item) @decl
+        (type_item) @decl
+        (const_item) @decl
+        (static_item) @decl
+        (mod_item) @decl
+        (macro_definition) @decl
+        (line_comment) @doc
+        (block_comment) @doc
+        "#,
+    )
+    .ok()?;
+
+    let _capture_names = query.capture_names();
+    let mut captured: Vec<(usize, &'static str, Node)> = Vec::new();
+    collect_rust_captures(tree.root_node(), &mut captured);
+    captured.sort_by_key(|(start, _, _)| *start);
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut doc_budget = max_doc_lines;
+    let mut elided = 0usize;
+    let mut decl_count = 0usize;
+
+    for (_, capture_name, node) in captured {
+        if capture_name == "decl" {
+            decl_count += 1;
+        }
+        let rendered = match capture_name {
+            "import" => node_text(node, heavy)
+                .map(str::trim_end)
+                .map(str::to_string),
+            "doc" => {
+                let text = node_text(node, heavy)?.trim();
+                if !is_doc(text) || doc_budget == 0 {
+                    elided += 1;
+                    None
+                } else {
+                    doc_budget -= 1;
+                    Some(text.to_string())
+                }
+            }
+            "decl" => render_rust_decl(node, heavy),
+            _ => None,
+        };
+        if let Some(line) = rendered {
+            push_unique_structural(&line, &mut out, &mut seen, &mut elided);
+        } else {
+            elided += 1;
+        }
+    }
+
+    if out.is_empty() {
+        return None;
+    }
+    if decl_count > 0 || elided > 0 || tree.root_node().has_error() {
+        out.push(format!(
+            "// … {} implementation lines elided …",
+            elided.max(1)
+        ));
+    }
+    Some((out.join("\n"), elided))
+}
+
+fn collect_rust_captures<'tree>(
+    node: Node<'tree>,
+    captured: &mut Vec<(usize, &'static str, Node<'tree>)>,
+) {
+    let capture = match node.kind() {
+        "use_declaration" => Some("import"),
+        "line_comment" | "block_comment" => Some("doc"),
+        "function_item" | "struct_item" | "enum_item" | "trait_item" | "impl_item"
+        | "type_item" | "const_item" | "static_item" | "mod_item" | "macro_definition" => {
+            Some("decl")
+        }
+        _ => None,
+    };
+    if let Some(name) = capture {
+        captured.push((node.start_byte(), name, node));
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            collect_rust_captures(child, captured);
+        }
+    }
+}
+
+fn node_text<'a>(node: Node, source: &'a str) -> Option<&'a str> {
+    node.utf8_text(source.as_bytes()).ok()
+}
+
+fn render_rust_decl(node: Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "function_item" => render_until_child(node, source, &["block"], " { … }"),
+        "impl_item" | "trait_item" | "mod_item" => {
+            render_until_child(node, source, &["declaration_list", "block"], " { … }")
+        }
+        "struct_item" | "enum_item" | "macro_definition" => render_until_child(
+            node,
+            source,
+            &[
+                "field_declaration_list",
+                "ordered_field_declaration_list",
+                "enum_variant_list",
+                "token_tree",
+            ],
+            " { … }",
+        ),
+        "const_item" | "static_item" => render_until_equals(node, source),
+        _ => node_text(node, source).map(|s| s.trim_end().to_string()),
+    }
+}
+
+fn render_until_child(
+    node: Node,
+    source: &str,
+    child_kinds: &[&str],
+    suffix: &str,
+) -> Option<String> {
+    let child = first_named_child_kind(node, child_kinds);
+    let end = child
+        .map(|n| n.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    let start = node.start_byte();
+    let prefix = source.get(start..end)?.trim_end();
+    Some(format!(
+        "{}{}",
+        prefix.trim_end_matches('{').trim_end(),
+        suffix
+    ))
+}
+
+fn first_named_child_kind<'tree>(node: Node<'tree>, child_kinds: &[&str]) -> Option<Node<'tree>> {
+    for i in 0..node.named_child_count() {
+        let child = node.named_child(i as u32)?;
+        if child_kinds.iter().any(|kind| child.kind() == *kind) {
+            return Some(child);
+        }
+    }
+    None
+}
+
+fn render_until_equals(node: Node, source: &str) -> Option<String> {
+    let text = node_text(node, source)?.trim_end();
+    if let Some(eq) = text.find('=') {
+        return Some(format!("{} = …;", text[..eq].trim_end()));
+    }
+    Some(text.to_string())
+}
+
 fn is_decl(t: &str) -> bool {
     let mut s = t;
     // Strip stacked visibility/async prefixes (e.g. "pub async fn").
@@ -164,6 +330,17 @@ pub fn build_digest(
     let mut doc_budget = max_doc_lines as i32;
     let mut elided = 0usize;
     let mut code_lines = 0usize; // imports + declarations + brace-method signatures
+
+    if let Some((body, _)) = rust_ast_body(heavy, max_doc_lines) {
+        return format!(
+            "<axiom_context_digest session=\"{session_id}\" kind=\"structural-skeleton\" \
+original_tokens=\"{original_tokens}\" recall_norm=\"{recall_norm:.3}\" state=\"{state_hash}\">\n\
+# Lossy digest of elided heavy context. For code: signatures kept, bodies dropped.\n\
+# Ask Axiom to expand a named symbol if you need its body.\n\
+{body}\n\
+</axiom_context_digest>"
+        );
+    }
 
     for line in heavy.lines() {
         let t = line.trim_start();
@@ -376,6 +553,15 @@ impl Point {
         let txt = "pub async fn handler() -> Result<()> {\n  ok()\n}";
         let d = build_digest(txt, "s", 10, 0.0, "h", 0);
         assert!(d.contains("pub async fn handler() -> Result<()> { … }"));
+    }
+
+    #[test]
+    fn rust_ast_keeps_static_mut_declarations() {
+        let txt = "static mut GLOBAL_COUNTER_XQZ: i64 = 0;\nfn run() { unsafe { GLOBAL_COUNTER_XQZ += 1; } }";
+        let d = build_digest(txt, "s", 10, 0.0, "h", 0);
+        assert!(d.contains("static mut GLOBAL_COUNTER_XQZ: i64 = …;"), "{d}");
+        assert!(d.contains("fn run() { … }"));
+        assert!(!d.contains("GLOBAL_COUNTER_XQZ += 1"));
     }
 
     #[test]

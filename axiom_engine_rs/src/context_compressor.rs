@@ -44,6 +44,28 @@ use crate::inference::InferencePipeline;
 /// matches the stable d512 CUDA diagnostics on the 6GB RTX 2060 target.
 pub const MAX_ADAPT_CHUNK_TOKENS: usize = 128;
 
+/// Serialize downstream execution feedback into a stable adaptation block.
+/// The text is intentionally plain and tokenizer-friendly; adaptation still
+/// flows through [`MAX_ADAPT_CHUNK_TOKENS`] windows in `adapt_session_blocking`.
+pub fn feedback_adaptation_text(kind: &str, message: &str, trace: Option<&str>) -> String {
+    let kind = kind.trim();
+    let kind = if kind.is_empty() {
+        "execution_feedback"
+    } else {
+        kind
+    };
+    let message = message.trim();
+    let trace = trace.map(str::trim).filter(|t| !t.is_empty());
+    match trace {
+        Some(trace) => format!(
+            "<axiom_execution_feedback kind=\"{kind}\">\nmessage:\n{message}\ntrace:\n{trace}\n</axiom_execution_feedback>"
+        ),
+        None => format!(
+            "<axiom_execution_feedback kind=\"{kind}\">\nmessage:\n{message}\n</axiom_execution_feedback>"
+        ),
+    }
+}
+
 /// One session's per-layer fast-weight state, behind an async mutex so
 /// the same session can be queued for sequential updates without
 /// blocking the whole server.

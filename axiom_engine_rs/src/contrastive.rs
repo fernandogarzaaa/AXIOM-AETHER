@@ -12,7 +12,7 @@ pub fn info_nce(anchors: &Tensor, positives: &Tensor, tau: f64) -> Result<Tensor
     let logits = anchors.matmul(&pt)?.affine(1.0 / tau, 0.0)?;
     let device = anchors.device();
     let targets = Tensor::arange(0u32, b as u32, device)?; // diagonal
-    // a→p direction
+                                                           // a→p direction
     let loss_a = candle_nn::loss::cross_entropy(&logits, &targets)?;
     // p→a direction (transpose logits)
     let logits_t = logits.t()?.contiguous()?;
@@ -28,7 +28,11 @@ pub fn batch_recall_at_1(anchors: &Tensor, positives: &Tensor) -> Result<f32> {
     let sims = anchors.matmul(&pt)?; // [B,B]
     let pred = sims.argmax(D::Minus1)?; // [B]
     let pred: Vec<u32> = pred.to_vec1()?;
-    let correct = pred.iter().enumerate().filter(|(i, p)| **p as usize == *i).count();
+    let correct = pred
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| **p as usize == *i)
+        .count();
     Ok(correct as f32 / b.max(1) as f32)
 }
 
@@ -53,7 +57,11 @@ mod tests {
 
     #[test]
     fn perfect_alignment_has_low_loss() {
-        let a = norm_rows(vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]]);
+        let a = norm_rows(vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ]);
         let loss = info_nce(&a, &a, 0.05).unwrap().to_scalar::<f32>().unwrap();
         assert!(loss < 0.1, "loss {loss}");
         assert_eq!(batch_recall_at_1(&a, &a).unwrap(), 1.0);

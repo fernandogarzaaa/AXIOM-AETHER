@@ -45,8 +45,8 @@ use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
 use crate::context_compressor::{
-    adapt_session_blocking, extract_memory_vector_blocking, CompressionControls, CompressorConfig,
-    MemoryFingerprint, SessionStates, TttSessionStore,
+    adapt_session_blocking, extract_memory_vector_blocking, feedback_adaptation_text,
+    CompressionControls, CompressorConfig, MemoryFingerprint, SessionStates, TttSessionStore,
 };
 use crate::inference::InferencePipeline;
 use crate::metrics;
@@ -301,6 +301,56 @@ impl AppState {
             }
             map.insert(session_id.to_string(), context_hash(source));
         }
+    }
+
+    async fn adapt_feedback_to_cache(
+        &self,
+        req: TttFeedbackRequest,
+        cache_path: &FsPath,
+    ) -> Result<TttFeedbackResponse, ApiError> {
+        let session_id = req.session_id.trim().to_string();
+        let message = req.message.trim().to_string();
+        if session_id.is_empty() || message.is_empty() {
+            return Err(ApiError::BadRequest(
+                "session_id and message are required".into(),
+            ));
+        }
+
+        let kind = req.feedback_type.as_deref().unwrap_or("execution_feedback");
+        let feedback_text = feedback_adaptation_text(kind, &message, req.trace.as_deref());
+        let pipeline_arc = self.pipeline.clone();
+        let store = self.ttt_sessions.clone();
+        let session_id_for_task = session_id.clone();
+        let feedback_for_task = feedback_text.clone();
+
+        let token_count: Result<usize, ApiError> = spawn_blocking(move || {
+            let pipeline = pipeline_arc
+                .lock()
+                .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+            let handle = store
+                .get_or_create(&session_id_for_task, &pipeline)
+                .map_err(|e| ApiError::Internal(format!("session allocation failed: {e}")))?;
+            let mut states = handle.blocking_lock();
+            let tokens = pipeline.encode_text(&feedback_for_task);
+            adapt_session_blocking(&pipeline, &mut states, &tokens)
+                .map_err(|e| ApiError::Internal(format!("feedback TTT adapt failed: {e}")))?;
+            Ok(tokens.len())
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
+        let token_count = token_count?;
+
+        self.mark_heavy_context_adapted(&session_id, &feedback_text);
+        self.persist_compression_cache_to(cache_path)
+            .await
+            .map_err(ApiError::Internal)?;
+
+        Ok(TttFeedbackResponse {
+            session_id,
+            feedback_tokens: token_count,
+            persisted: true,
+            cache_path: cache_path.display().to_string(),
+        })
     }
 
     async fn persist_compression_cache(&self) -> Result<(), String> {
@@ -924,6 +974,24 @@ struct PersistedCompressionEntry {
     session_id: String,
     context_hash: String,
     checkpoint: SessionCheckpoint,
+}
+
+#[derive(Debug, Deserialize)]
+struct TttFeedbackRequest {
+    session_id: String,
+    message: String,
+    #[serde(default)]
+    feedback_type: Option<String>,
+    #[serde(default)]
+    trace: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TttFeedbackResponse {
+    session_id: String,
+    feedback_tokens: usize,
+    persisted: bool,
+    cache_path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2275,6 +2343,18 @@ async fn ttt_sessions_clear(State(state): State<AppState>) -> impl IntoResponse 
     Json(serde_json::json!({ "cleared": true }))
 }
 
+/// `POST /v1/ttt/feedback` — adapt an execution/compiler failure into a
+/// session's W_tilde state and persist the updated compression cache.
+async fn ttt_feedback(
+    State(state): State<AppState>,
+    Json(req): Json<TttFeedbackRequest>,
+) -> Result<Json<TttFeedbackResponse>, ApiError> {
+    let response = state
+        .adapt_feedback_to_cache(req, &compression_cache_path())
+        .await?;
+    Ok(Json(response))
+}
+
 // ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
@@ -2296,6 +2376,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/ttt/sessions", get(ttt_sessions_stats))
         .route("/v1/ttt/sessions", delete(ttt_sessions_clear))
         .route("/v1/ttt/sessions/:id", delete(ttt_session_drop))
+        .route("/v1/ttt/feedback", post(ttt_feedback))
         .route("/v1/expand", post(expand_symbol_handler))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
@@ -2784,6 +2865,48 @@ mod tests {
             .unwrap();
 
         assert!(!fresh.should_adapt_heavy_context("persist-s1", "fn persisted() { cache(); }"));
+        assert_eq!(fresh.ttt_sessions.len(), 1);
+
+        let _ = std::fs::remove_file(&temp_path);
+        safe_drop(pipeline_arc).await;
+        safe_drop(fresh_pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn feedback_loop_adapts_and_persists_session_checkpoint() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let temp_path = std::env::temp_dir().join(format!(
+            "axiom_feedback_cache_test_{}_{}.bin",
+            unix_now(),
+            std::process::id()
+        ));
+
+        let response = state
+            .adapt_feedback_to_cache(
+                TttFeedbackRequest {
+                    session_id: "feedback-s1".to_string(),
+                    message: "compile error: expected struct LayerState field weight".to_string(),
+                    feedback_type: Some("compilation_error".to_string()),
+                    trace: Some("error[E0609]: no field `weights` on type LayerState".to_string()),
+                },
+                &temp_path,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.session_id, "feedback-s1");
+        assert!(response.feedback_tokens > 0);
+        assert!(temp_path.exists());
+        assert_eq!(state.ttt_sessions.len(), 1);
+
+        let fresh = make_test_state().await;
+        let fresh_pipeline_arc = fresh.pipeline.clone();
+        let restored = fresh
+            .hydrate_compression_cache_from(&temp_path)
+            .await
+            .unwrap();
+        assert_eq!(restored, 1);
         assert_eq!(fresh.ttt_sessions.len(), 1);
 
         let _ = std::fs::remove_file(&temp_path);
