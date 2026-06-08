@@ -193,6 +193,29 @@ impl AxiomTTTLM {
         self.ln_f.forward(&last)
     }
 
+    /// Adapt session fast-weights over a token sequence without materializing
+    /// hidden states, logits, or vocabulary projections.
+    ///
+    /// This is the hot path for context compression: it performs the same
+    /// per-token TTT state mutation as [`Self::forward_hidden`] / [`Self::forward_lm`],
+    /// but intentionally discards every intermediate activation once the layer
+    /// states have been updated.
+    pub fn adapt_tokens(&self, input_ids: &Tensor, session_states: &mut [Tensor]) -> Result<()> {
+        let (_, seq_len) = input_ids.dims2()?;
+        let embeddings = self.embeddings.forward(input_ids)?;
+
+        for t in 0..seq_len {
+            let token_emb = embeddings.narrow(1, t, 1)?.squeeze(1)?;
+            let mut hidden = token_emb;
+            for (i, block) in self.layers.iter().enumerate() {
+                hidden = block.forward_native(&hidden, &mut session_states[i])?;
+            }
+            drop(hidden);
+        }
+
+        Ok(())
+    }
+
     /// Autoregressive forward pass over a token sequence to logits
     /// `[1, T, vocab_size]`. Equivalent to `lm_head(forward_hidden(..))`; the
     /// hidden-state computation lives in [`Self::forward_hidden`].
@@ -350,5 +373,32 @@ mod tests {
             .max_all()
             .unwrap();
         assert!(diff.to_scalar::<f32>().unwrap() < 1e-5);
+    }
+
+    #[test]
+    fn adapt_tokens_matches_forward_lm_state_without_materializing_logits() {
+        let (model, device) = make_model(2);
+        let mut logits_states = model.init_states(&device).unwrap();
+        let mut adapt_states = model.init_states(&device).unwrap();
+        let input_ids =
+            Tensor::from_vec(vec![0u32, 1, 2, 3, 4], (1usize, 5usize), &device).unwrap();
+
+        let _ = model
+            .forward_lm(&input_ids, &mut logits_states[..])
+            .unwrap();
+        model
+            .adapt_tokens(&input_ids, &mut adapt_states[..])
+            .unwrap();
+
+        for (logits_state, adapt_state) in logits_states.iter().zip(adapt_states.iter()) {
+            let diff = logits_state
+                .sub(adapt_state)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap();
+            assert!(diff.to_scalar::<f32>().unwrap() < 1e-5);
+        }
     }
 }

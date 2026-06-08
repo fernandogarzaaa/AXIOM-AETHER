@@ -258,7 +258,7 @@ fn adapt_session_window_blocking(
 ) -> CResult<()> {
     let device = pipeline.device();
     let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), device)?;
-    let _logits = pipeline.model().forward_lm(&input, states)?;
+    pipeline.model().adapt_tokens(&input, states)?;
 
     // Autograd truncation: detach each updated W̃ from its op-graph so history
     // does not accumulate across windows/calls. Without this, streaming a large

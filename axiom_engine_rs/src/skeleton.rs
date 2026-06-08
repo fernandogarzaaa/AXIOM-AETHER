@@ -11,24 +11,48 @@
 //! heavy context into its fast-weights (adapt_session), and the drift signal
 //! (recall_norm + state_hash) rides along as tiny attributes on the digest.
 
+use std::collections::HashSet;
+
 /// Visibility / async prefixes stripped before testing for a declaration.
 const VIS_PREFIXES: [&str; 9] = [
-    "pub ", "public ", "private ", "protected ", "export ", "default ", "async ",
-    "static ", "final ",
+    "pub ",
+    "public ",
+    "private ",
+    "protected ",
+    "export ",
+    "default ",
+    "async ",
+    "static ",
+    "final ",
 ];
 
 /// Keywords that begin a declaration whose signature we keep. Covers Rust, Go,
 /// Python, JS/TS, Java/C#, C/C++.
 const DECL_KEYWORDS: [&str; 18] = [
-    "fn ", "func ", "def ", "function ", "struct ", "enum ", "trait ", "impl ",
-    "impl<", "interface ", "class ", "type ", "const ", "static ", "mod ",
-    "namespace ", "package ", "module ",
+    "fn ",
+    "func ",
+    "def ",
+    "function ",
+    "struct ",
+    "enum ",
+    "trait ",
+    "impl ",
+    "impl<",
+    "interface ",
+    "class ",
+    "type ",
+    "const ",
+    "static ",
+    "mod ",
+    "namespace ",
+    "package ",
+    "module ",
 ];
 
 /// Control-flow keywords that can also end a line with `{` — never signatures.
 const CONTROL_KEYWORDS: [&str; 13] = [
-    "if ", "if(", "for ", "for(", "while ", "while(", "switch ", "switch(",
-    "match ", "else", "do ", "try ", "catch",
+    "if ", "if(", "for ", "for(", "while ", "while(", "switch ", "switch(", "match ", "else",
+    "do ", "try ", "catch",
 ];
 
 /// Heuristic: a method/function signature with no leading keyword (JS/TS class
@@ -136,6 +160,7 @@ pub fn build_digest(
     max_doc_lines: usize,
 ) -> String {
     let mut out: Vec<String> = Vec::new();
+    let mut seen_structural: HashSet<String> = HashSet::new();
     let mut doc_budget = max_doc_lines as i32;
     let mut elided = 0usize;
     let mut code_lines = 0usize; // imports + declarations + brace-method signatures
@@ -146,16 +171,20 @@ pub fn build_digest(
             continue;
         }
         if is_import(t) {
-            out.push(line.trim_end().to_string());
+            push_unique_structural(line.trim_end(), &mut out, &mut seen_structural, &mut elided);
             code_lines += 1;
         } else if is_decl(t) || looks_like_signature(t) {
             let sig = line.split('{').next().unwrap_or(line).trim_end();
             let suffix = if line.contains('{') { " { … }" } else { "" };
-            out.push(format!("{sig}{suffix}"));
+            let structural = format!("{sig}{suffix}");
+            push_unique_structural(&structural, &mut out, &mut seen_structural, &mut elided);
             code_lines += 1;
         } else if is_doc(t) && doc_budget > 0 {
-            out.push(line.trim_end().to_string());
-            doc_budget -= 1;
+            let before = seen_structural.len();
+            push_unique_structural(line.trim_end(), &mut out, &mut seen_structural, &mut elided);
+            if seen_structural.len() > before {
+                doc_budget -= 1;
+            }
         } else {
             elided += 1;
         }
@@ -180,6 +209,23 @@ original_tokens=\"{original_tokens}\" recall_norm=\"{recall_norm:.3}\" state=\"{
 {body}\n\
 </axiom_context_digest>"
     )
+}
+
+fn push_unique_structural(
+    line: &str,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    elided: &mut usize,
+) {
+    let normalized = line.trim();
+    if normalized.is_empty() {
+        return;
+    }
+    if seen.insert(normalized.to_string()) {
+        out.push(line.to_string());
+    } else {
+        *elided += 1;
+    }
 }
 
 /// Leading-whitespace width of a line (tabs count as 4) — for indent matching.
@@ -367,6 +413,14 @@ impl Point {
         // control headers must be elided, not kept as signatures
         assert!(!d.contains("if (x > 0) { … }"));
         assert!(!d.contains("for (i in xs) { … }"));
+    }
+
+    #[test]
+    fn repeated_declarations_are_deduplicated_in_digest() {
+        let repeated = "fn calculate_invoice_total(customer_id: &str) -> Result<Money> {\n    lookup_contract_discount(customer_id)?;\n}\n\n".repeat(3);
+        let d = build_digest(&repeated, "s", 100, 0.0, "h", 0);
+        assert_eq!(d.matches("fn calculate_invoice_total").count(), 1);
+        assert!(d.contains("implementation lines elided"));
     }
 
     #[test]
