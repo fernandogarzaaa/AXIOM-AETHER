@@ -41,6 +41,15 @@ pub struct SandboxDiagnostic {
     pub stderr: String,
 }
 
+impl SandboxDiagnostic {
+    pub fn feedback_trace(&self) -> String {
+        format!(
+            "command: {}\nworkspace: {}\nstdout:\n{}\nstderr:\n{}",
+            self.command, self.workspace, self.stdout, self.stderr
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxRunReport {
     pub session_id: String,

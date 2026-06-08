@@ -51,9 +51,11 @@ use crate::context_compressor::{
 use crate::inference::InferencePipeline;
 use crate::metrics;
 use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarderError};
+use crate::poly_jit::{PolyJitEngine, PolyJitStatus};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
 use crate::sandbox::{SandboxController, SandboxDiagnostic};
 use crate::swarm_router::{SwarmChatResult, SwarmRouter};
+use crate::vfs::{NeuralVfs, VfsMountReport, VfsReadReport, VfsStats};
 use crate::vibe_memory::MasterVibe;
 use crate::weight_merge::{merge_checkpoint_files, MergeSummary};
 
@@ -250,6 +252,10 @@ pub struct AppState {
     /// Runtime-mutable compression controls + live counters. Lets a dashboard
     /// retune the threshold / on-off without a restart (`/v1/config`).
     pub controls: Arc<CompressionControls>,
+    /// Safe user-mode VFS loopback that feeds file reads into TTT prefill.
+    pub neural_vfs: Arc<NeuralVfs>,
+    /// User-mode polymorphic runtime status and execution wrapper.
+    pub poly_jit: Arc<PolyJitEngine>,
 }
 
 impl AppState {
@@ -273,6 +279,8 @@ impl AppState {
             controls: Arc::new(CompressionControls::from_config(
                 &CompressorConfig::default(),
             )),
+            neural_vfs: Arc::new(NeuralVfs::new()),
+            poly_jit: Arc::new(PolyJitEngine::default()),
         }
     }
 
@@ -396,10 +404,7 @@ impl AppState {
             "sandbox compiler check failed at step {} with status {:?}",
             diag.step, diag.status_code
         );
-        let trace = format!(
-            "command: {}\nworkspace: {}\nstdout:\n{}\nstderr:\n{}",
-            diag.command, diag.workspace, diag.stdout, diag.stderr
-        );
+        let trace = diag.feedback_trace();
         self.adapt_feedback_to_cache(
             TttFeedbackRequest {
                 session_id: diag.session_id,
@@ -1061,6 +1066,28 @@ struct ClusterMergeRequest {
     output: String,
     #[serde(default)]
     alpha: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HypervisorMountRequest {
+    root: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    warm_paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HypervisorMountResponse {
+    mount: VfsMountReport,
+    warmed: Vec<VfsReadReport>,
+    vfs: VfsStats,
+}
+
+#[derive(Debug, Serialize)]
+struct HypervisorJitStatusResponse {
+    jit: PolyJitStatus,
+    vfs: VfsStats,
 }
 
 // ---------------------------------------------------------------------------
@@ -2453,6 +2480,55 @@ async fn ttt_feedback(
     Ok(Json(response))
 }
 
+/// `POST /v1/hypervisor/mount` — install a safe user-mode VFS loopback mount.
+/// Optional `warm_paths` are immediately read through the VFS and prefetched
+/// into the session fast-weights.
+async fn hypervisor_mount(
+    State(state): State<AppState>,
+    Json(req): Json<HypervisorMountRequest>,
+) -> Result<Json<HypervisorMountResponse>, ApiError> {
+    if req.root.trim().is_empty() {
+        return Err(ApiError::BadRequest("root is required".into()));
+    }
+    let mount = state
+        .neural_vfs
+        .mount(req.root.trim())
+        .map_err(ApiError::BadRequest)?;
+    let session_id = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("hypervisor-vfs");
+    let mut warmed = Vec::new();
+    for path in req.warm_paths {
+        let report = state
+            .neural_vfs
+            .read_file_and_prefill(
+                path,
+                session_id,
+                state.pipeline.clone(),
+                state.ttt_sessions.clone(),
+            )
+            .await
+            .map_err(ApiError::BadRequest)?;
+        warmed.push(report);
+    }
+    Ok(Json(HypervisorMountResponse {
+        mount,
+        warmed,
+        vfs: state.neural_vfs.status(),
+    }))
+}
+
+/// `GET /v1/hypervisor/jit_status` — report current user-mode JIT/VFS state.
+async fn hypervisor_jit_status(State(state): State<AppState>) -> Json<HypervisorJitStatusResponse> {
+    Json(HypervisorJitStatusResponse {
+        jit: state.poly_jit.status(),
+        vfs: state.neural_vfs.status(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
@@ -2476,6 +2552,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/ttt/sessions", delete(ttt_sessions_clear))
         .route("/v1/ttt/sessions/:id", delete(ttt_session_drop))
         .route("/v1/ttt/feedback", post(ttt_feedback))
+        .route("/v1/hypervisor/mount", post(hypervisor_mount))
+        .route("/v1/hypervisor/jit_status", get(hypervisor_jit_status))
         .route("/v1/expand", post(expand_symbol_handler))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())

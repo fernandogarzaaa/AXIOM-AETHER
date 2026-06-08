@@ -23,6 +23,7 @@ mod model;
 mod model_meta;
 mod openai_forwarder;
 mod pairs;
+mod poly_jit;
 mod quantization;
 mod sandbox;
 mod server;
@@ -30,6 +31,7 @@ mod skeleton;
 mod swarm_router;
 mod train;
 mod ttt_block;
+mod vfs;
 mod vibe_memory;
 mod weight_merge;
 
