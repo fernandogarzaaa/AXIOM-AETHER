@@ -245,7 +245,9 @@ impl AppState {
             compressor_config: Arc::new(CompressorConfig::default()),
             master_vibe: Arc::new(Mutex::new(None)),
             source_store: Arc::new(RwLock::new(HashMap::new())),
-            controls: Arc::new(CompressionControls::from_config(&CompressorConfig::default())),
+            controls: Arc::new(CompressionControls::from_config(
+                &CompressorConfig::default(),
+            )),
         }
     }
 
@@ -299,7 +301,10 @@ impl AppState {
         if handles.is_empty() {
             return;
         }
-        eprintln!("[vibe] flushing {} live session(s) into master vibe", handles.len());
+        eprintln!(
+            "[vibe] flushing {} live session(s) into master vibe",
+            handles.len()
+        );
         for (_, handle) in handles {
             self.flush_session_to_vibe(&handle).await;
         }
@@ -515,7 +520,10 @@ enum ApiError {
     /// Upstream (Anthropic) failure. Carries the upstream status code so the
     /// client can distinguish auth/rate-limit/server errors and the message
     /// body for diagnostics.
-    Upstream { status: u16, message: String },
+    Upstream {
+        status: u16,
+        message: String,
+    },
 }
 
 impl IntoResponse for ApiError {
@@ -528,8 +536,7 @@ impl IntoResponse for ApiError {
             ApiError::Upstream { status, message } => {
                 // Pass the upstream status through when it's a valid client/
                 // server code; otherwise surface a 502 Bad Gateway.
-                let code = StatusCode::from_u16(status)
-                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
                 (code, message).into_response()
             }
         }
@@ -1489,12 +1496,11 @@ async fn create_message(
 
     let req: AnthropicMessagesRequest = match serde_json::from_value(body) {
         Ok(r) => r,
-        Err(e) => return ApiError::BadRequest(format!("invalid /v1/messages body: {e}")).into_response(),
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid /v1/messages body: {e}")).into_response()
+        }
     };
-    local_messages_path(state, req).map_or_else(
-        |e| e.into_response(),
-        |json| json.into_response(),
-    )
+    local_messages_path(state, req).map_or_else(|e| e.into_response(), |json| json.into_response())
 }
 
 fn local_messages_path(
@@ -1634,36 +1640,36 @@ async fn compressed_messages_path(
 
         // Spawn the compute-heavy loop on a blocking thread so the Tokio
         // runtime keeps serving other requests during the gradient steps.
-        let fp_result: Result<MemoryFingerprint, ApiError> = tokio::task::spawn_blocking(move || {
-            let pipeline = pipeline_arc
-                .lock()
-                .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
-            let session = store.get_or_create(&session_id_clone, &pipeline).map_err(|e| {
-                ApiError::Internal(format!("session allocation failed: {e}"))
-            })?;
-            // tokio::sync::Mutex::blocking_lock is safe in spawn_blocking.
-            let mut session_states = session.blocking_lock();
+        let fp_result: Result<MemoryFingerprint, ApiError> =
+            tokio::task::spawn_blocking(move || {
+                let pipeline = pipeline_arc
+                    .lock()
+                    .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+                let session = store
+                    .get_or_create(&session_id_clone, &pipeline)
+                    .map_err(|e| ApiError::Internal(format!("session allocation failed: {e}")))?;
+                // tokio::sync::Mutex::blocking_lock is safe in spawn_blocking.
+                let mut session_states = session.blocking_lock();
 
-            let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
-            adapt_session_blocking(&pipeline, &mut session_states, &context_tokens).map_err(
-                |e| ApiError::Internal(format!("TTT adapt failed: {e}")),
-            )?;
+                let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
+                adapt_session_blocking(&pipeline, &mut session_states, &context_tokens)
+                    .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
 
-            let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
-            let fingerprint = extract_memory_vector_blocking(
-                &pipeline,
-                &mut session_states,
-                &query_tokens,
-                &session_id_clone,
-                context_tokens.len(),
-                started,
-                top_k,
-            )
-            .map_err(|e| ApiError::Internal(format!("memory extraction failed: {e}")))?;
-            Ok(fingerprint)
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
+                let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
+                let fingerprint = extract_memory_vector_blocking(
+                    &pipeline,
+                    &mut session_states,
+                    &query_tokens,
+                    &session_id_clone,
+                    context_tokens.len(),
+                    started,
+                    top_k,
+                )
+                .map_err(|e| ApiError::Internal(format!("memory extraction failed: {e}")))?;
+                Ok(fingerprint)
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
         fp_result?
     };
 
@@ -1691,9 +1697,15 @@ async fn compressed_messages_path(
 
     // Record live compression stats for the dashboard: original vs forwarded
     // payload size and how many heavy messages were absorbed this request.
-    let bytes_in = serde_json::to_string(body).map(|s| s.len() as u64).unwrap_or(0);
-    let bytes_out = serde_json::to_string(&outbound).map(|s| s.len() as u64).unwrap_or(0);
-    state.controls.record(log_heavy_count as u64, bytes_in, bytes_out);
+    let bytes_in = serde_json::to_string(body)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    let bytes_out = serde_json::to_string(&outbound)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    state
+        .controls
+        .record(log_heavy_count as u64, bytes_in, bytes_out);
 
     forwarder
         .forward_messages_json(&outbound, client_auth)
@@ -1787,15 +1799,14 @@ async fn compressed_openai_chat_path(
             let pipeline = pipeline_arc
                 .lock()
                 .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
-            let session = store.get_or_create(&session_id_clone, &pipeline).map_err(|e| {
-                ApiError::Internal(format!("session allocation failed: {e}"))
-            })?;
+            let session = store
+                .get_or_create(&session_id_clone, &pipeline)
+                .map_err(|e| ApiError::Internal(format!("session allocation failed: {e}")))?;
             let mut session_states = session.blocking_lock();
 
             let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
-            adapt_session_blocking(&pipeline, &mut session_states, &context_tokens).map_err(
-                |e| ApiError::Internal(format!("TTT adapt failed: {e}")),
-            )?;
+            adapt_session_blocking(&pipeline, &mut session_states, &context_tokens)
+                .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
 
             let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
             extract_memory_vector_blocking(
@@ -1832,9 +1843,15 @@ async fn compressed_openai_chat_path(
         obj.remove("session_id");
     }
 
-    let bytes_in = serde_json::to_string(body).map(|s| s.len() as u64).unwrap_or(0);
-    let bytes_out = serde_json::to_string(&outbound).map(|s| s.len() as u64).unwrap_or(0);
-    state.controls.record(log_heavy_count as u64, bytes_in, bytes_out);
+    let bytes_in = serde_json::to_string(body)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    let bytes_out = serde_json::to_string(&outbound)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    state
+        .controls
+        .record(log_heavy_count as u64, bytes_in, bytes_out);
 
     let upstream = forwarder
         .forward_chat_completions_text(&outbound, client_auth)
@@ -1895,11 +1912,7 @@ fn content_to_text(content: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => blocks
             .iter()
-            .filter_map(|b: &Value| {
-                b.get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
+            .filter_map(|b: &Value| b.get("text").and_then(Value::as_str).map(str::to_string))
             .collect::<Vec<_>>()
             .join(""),
         _ => String::new(),
@@ -1972,10 +1985,7 @@ pub fn create_router(state: AppState) -> Router {
 /// `POST /v1/expand` — the retrieval half of the skeleton round-trip. Given a
 /// `session_id` and a `symbol` name, return the full declaration + body that the
 /// digest dropped. Body: `{"session_id": "...", "symbol": "..."}`.
-async fn expand_symbol_handler(
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> Response {
+async fn expand_symbol_handler(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
     let session_id = body.get("session_id").and_then(Value::as_str).unwrap_or("");
     let symbol = body.get("symbol").and_then(Value::as_str).unwrap_or("");
     if session_id.is_empty() || symbol.is_empty() {
@@ -2028,9 +2038,9 @@ async fn expand_symbol_handler(
 /// words). Higher compression = lower threshold (more messages qualify).
 fn level_to_threshold(level: &str) -> Option<usize> {
     match level.to_ascii_lowercase().as_str() {
-        "high" => Some(80),     // aggressive — even medium pastes compress
-        "medium" => Some(200),  // conservative default — large pastes
-        "low" => Some(400),     // only very large pastes
+        "high" => Some(80),    // aggressive — even medium pastes compress
+        "medium" => Some(200), // conservative default — large pastes
+        "low" => Some(400),    // only very large pastes
         _ => None,
     }
 }
@@ -2121,15 +2131,24 @@ pub async fn run_server(
     // checkpoint (warns + random init), so the DEFAULT_CHECKPOINT_PATH special
     // case is no longer needed.
     let runtime = crate::inference::InferenceRuntimeOptions {
-        tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok().filter(|p| !p.trim().is_empty()),
+        tokenizer_path: std::env::var("AXIOM_TOKENIZER")
+            .ok()
+            .filter(|p| !p.trim().is_empty()),
         ..Default::default()
     };
-    let pipeline = InferencePipeline::with_checkpoint_and_options(
-        config.clone(),
-        device.clone(),
-        checkpoint_path,
-        runtime,
-    )
+    let pipeline_config = config.clone();
+    let pipeline_device = device.clone();
+    let pipeline_checkpoint = checkpoint_path.to_string();
+    let pipeline = spawn_blocking(move || {
+        InferencePipeline::with_checkpoint_and_options(
+            pipeline_config,
+            pipeline_device,
+            &pipeline_checkpoint,
+            runtime,
+        )
+    })
+    .await
+    .map_err(|e| format!("pipeline assembly task failed: {e}"))?
     .map_err(|e| format!("failed to assemble inference pipeline: {e}"))?;
 
     println!(
@@ -2213,7 +2232,9 @@ pub async fn run_server(
     // Persistent vibe memory (automatic EMA merge on session drop/clear/
     // shutdown). Enabled by default; set AXIOM_VIBE=0 to disable all
     // master-vibe persistence in the proxy.
-    let vibe_enabled = std::env::var("AXIOM_VIBE").map(|v| v != "0").unwrap_or(true);
+    let vibe_enabled = std::env::var("AXIOM_VIBE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let master_vibe = if vibe_enabled {
         let v = MasterVibe::from_env(config.n_layers, config.d_model, &device);
         println!(
