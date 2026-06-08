@@ -1344,6 +1344,20 @@ fn count_corpus_tokens(state: &AppState, corpus: &[String]) -> Result<usize, Api
     Ok(corpus.iter().map(|text| pipeline.token_count(text)).sum())
 }
 
+fn partition_messages_for_state(
+    state: &AppState,
+    messages: &[Value],
+    threshold: usize,
+) -> Result<crate::anthropic_forwarder::PartitionedMessages, ApiError> {
+    let pipeline = state
+        .pipeline
+        .lock()
+        .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+    Ok(partition_messages(messages, threshold, |text| {
+        pipeline.token_count(text)
+    }))
+}
+
 /// Run generation, optionally using and updating a named session.
 ///
 /// When a Claude backend is installed on [`AppState`], generation is
@@ -1616,7 +1630,7 @@ async fn compressed_messages_path(
     let threshold = state.controls.threshold();
     let top_k = cfg.recall_top_k;
 
-    let partitioned = partition_messages(&messages, threshold, whitespace_token_count);
+    let partitioned = partition_messages_for_state(state, &messages, threshold)?;
 
     // Resolve / create the TTT session. Precedence: the X-Axiom-Session-Id
     // header (passed in as session_override), then a body `session_id`, then
@@ -1686,7 +1700,7 @@ async fn compressed_messages_path(
                         .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
                     context_tokens.len()
                 } else {
-                    whitespace_token_count(&heavy_clone)
+                    pipeline.token_count(&heavy_clone)
                 };
 
                 let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
@@ -1792,7 +1806,7 @@ async fn compressed_openai_chat_path(
     let cfg = state.compressor_config.clone();
     let threshold = state.controls.threshold();
     let top_k = cfg.recall_top_k;
-    let partitioned = partition_messages(&messages, threshold, whitespace_token_count);
+    let partitioned = partition_messages_for_state(state, &messages, threshold)?;
 
     let session_id = session_override
         .map(str::to_string)
@@ -1849,7 +1863,7 @@ async fn compressed_openai_chat_path(
                     .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
                 context_tokens.len()
             } else {
-                whitespace_token_count(&heavy_clone)
+                pipeline.token_count(&heavy_clone)
             };
 
             let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
@@ -2394,6 +2408,55 @@ mod tests {
         assert!(state.should_adapt_heavy_context("s1", "fn b() {}"));
         assert!(state.should_adapt_heavy_context("s2", "fn a() {}"));
 
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn compression_partition_uses_active_bpe_token_count() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let tokenizer = root.join("checkpoints/axiom_bpe.json");
+        if !tokenizer.exists() {
+            return;
+        }
+
+        let state = tokio::task::spawn_blocking(move || {
+            use crate::config::AxiomConfig;
+            use crate::inference::{InferencePipeline, InferenceRuntimeOptions};
+
+            let config = AxiomConfig {
+                d_model: 16,
+                n_layers: 1,
+                vocab_size: 16000,
+                lr_inner: 1e-3,
+                norm_eps: 1e-6,
+            };
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            let pipeline =
+                InferencePipeline::with_checkpoint_and_options(config, Device::Cpu, "", runtime)
+                    .expect("pipeline init");
+            AppState::new(pipeline, "axiom-ttt-test".to_string())
+        })
+        .await
+        .unwrap();
+        let pipeline_arc = state.pipeline.clone();
+
+        let compact_code = "fn calculate_invoice_total(customer_id:&str)->Result<Money>{lookup_contract_discount(customer_id)?;Ok(Money::zero(\"USD\"))}";
+        assert!(whitespace_token_count(compact_code) < 20);
+
+        let messages = vec![serde_json::json!({
+            "role": "developer",
+            "content": compact_code
+        })];
+        let partitioned = partition_messages_for_state(&state, &messages, 20).unwrap();
+
+        assert_eq!(partitioned.heavy_context.len(), 1);
+        assert!(partitioned.heavy_context[0].token_count >= 20);
         safe_drop(pipeline_arc).await;
     }
 
