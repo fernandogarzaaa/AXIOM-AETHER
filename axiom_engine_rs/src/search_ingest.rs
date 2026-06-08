@@ -1,7 +1,7 @@
 //! search_ingest.rs — Just-In-Time (JIT) search-reasoning ingestion.
 //!
 //! Transitions Axiom from a static code compressor into a live search node.
-//! Scraped web text (from scripts/lib/axiom-scrape.js) is streamed into the
+//! Scraped web text (from the native Rust search scraper) is streamed into the
 //! local BPE tokenizer, absorbed by an online Test-Time Training pass over
 //! detached 128-token chunks (protecting the RTX 2060's VRAM), and distilled
 //! into an `<axiom_search_fingerprint>` — a dense, zero-token-waste semantic

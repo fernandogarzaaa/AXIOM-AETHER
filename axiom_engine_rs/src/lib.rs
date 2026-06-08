@@ -24,6 +24,7 @@ pub mod openai_forwarder;
 pub mod pairs;
 pub mod quantization;
 pub mod search_ingest;
+pub mod search_scrape;
 pub mod server;
 pub mod skeleton;
 pub mod train;
