@@ -83,6 +83,14 @@ impl TttSessionStore {
         Ok(entry.value().clone())
     }
 
+    /// Insert a fully materialized session state, replacing any existing handle.
+    /// Used when hydrating persisted compression cache snapshots on startup.
+    pub fn insert_states(&self, session_id: String, states: Vec<Tensor>) -> SessionStates {
+        let handle = Arc::new(AsyncMutex::new(states));
+        self.sessions.insert(session_id, handle.clone());
+        handle
+    }
+
     /// Number of live sessions; used by the metrics + stats endpoints.
     pub fn len(&self) -> usize {
         self.sessions.len()

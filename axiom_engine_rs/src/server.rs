@@ -18,6 +18,8 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fs;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,8 +39,7 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::anthropic_forwarder::{
-    build_compressed_payload, partition_messages, whitespace_token_count, AnthropicForwarder,
-    ClientAuth, ForwarderError,
+    build_compressed_payload, partition_messages, AnthropicForwarder, ClientAuth, ForwarderError,
 };
 use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
@@ -69,6 +70,12 @@ fn unix_now() -> u64 {
 fn context_hash(source: &str) -> String {
     let digest = Sha256::digest(source.as_bytes());
     format!("{digest:x}")
+}
+
+fn compression_cache_path() -> PathBuf {
+    std::env::var("AXIOM_COMPRESSION_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("checkpoints/memory/axiom_compression_cache.bin"))
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +296,101 @@ impl AppState {
             }
             map.insert(session_id.to_string(), context_hash(source));
         }
+    }
+
+    async fn persist_compression_cache(&self) -> Result<(), String> {
+        self.persist_compression_cache_to(&compression_cache_path())
+            .await
+    }
+
+    async fn hydrate_compression_cache(&self) -> Result<usize, String> {
+        self.hydrate_compression_cache_from(&compression_cache_path())
+            .await
+    }
+
+    async fn persist_compression_cache_to(&self, path: &FsPath) -> Result<(), String> {
+        let hashes = self
+            .adapted_context_hashes
+            .read()
+            .map_err(|_| "adapted context hash lock poisoned".to_string())?
+            .clone();
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
+        let mut entries = Vec::new();
+        for (session_id, handle) in self.ttt_sessions.snapshot_handles() {
+            let Some(context_hash) = hashes.get(&session_id).cloned() else {
+                continue;
+            };
+            let states = handle.lock().await;
+            let layers = states
+                .iter()
+                .map(tensor_to_layer_checkpoint)
+                .collect::<candle_core::Result<Vec<_>>>()
+                .map_err(|e| format!("checkpoint encode failed: {e}"))?;
+            entries.push(PersistedCompressionEntry {
+                session_id: session_id.clone(),
+                context_hash,
+                checkpoint: SessionCheckpoint {
+                    session_id,
+                    version: 1,
+                    created_at: unix_now(),
+                    layers,
+                },
+            });
+        }
+
+        let payload = PersistedCompressionCache {
+            version: 1,
+            entries,
+        };
+        let bytes = bincode::serialize(&payload)
+            .map_err(|e| format!("compression cache serialize failed: {e}"))?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("compression cache mkdir failed: {e}"))?;
+        }
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, bytes).map_err(|e| format!("compression cache write failed: {e}"))?;
+        fs::rename(&tmp, path).map_err(|e| format!("compression cache rename failed: {e}"))?;
+        Ok(())
+    }
+
+    async fn hydrate_compression_cache_from(&self, path: &FsPath) -> Result<usize, String> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let bytes = fs::read(path).map_err(|e| format!("compression cache read failed: {e}"))?;
+        let payload: PersistedCompressionCache = bincode::deserialize(&bytes)
+            .map_err(|e| format!("compression cache decode failed: {e}"))?;
+        if payload.version != 1 {
+            return Err(format!(
+                "unsupported compression cache version {}",
+                payload.version
+            ));
+        }
+
+        let mut restored = 0usize;
+        for entry in payload.entries {
+            if entry.checkpoint.version != 1 {
+                continue;
+            }
+            let states = entry
+                .checkpoint
+                .layers
+                .iter()
+                .map(|lc| layer_checkpoint_to_tensor(lc, &self.device))
+                .collect::<candle_core::Result<Vec<_>>>()
+                .map_err(|e| format!("compression cache tensor restore failed: {e}"))?;
+            self.ttt_sessions
+                .insert_states(entry.session_id.clone(), states);
+            if let Ok(mut hashes) = self.adapted_context_hashes.write() {
+                hashes.insert(entry.session_id, entry.context_hash);
+            }
+            restored += 1;
+        }
+        Ok(restored)
     }
 
     /// Install (or clear) the persistent vibe-memory master.
@@ -798,6 +900,19 @@ pub struct SessionCheckpoint {
     pub version: u32,
     pub created_at: u64,
     pub layers: Vec<LayerCheckpoint>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedCompressionCache {
+    version: u32,
+    entries: Vec<PersistedCompressionEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedCompressionEntry {
+    session_id: String,
+    context_hash: String,
+    checkpoint: SessionCheckpoint,
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,6 +1836,9 @@ async fn compressed_messages_path(
         let fingerprint = fp_result?;
         if should_adapt {
             state.mark_heavy_context_adapted(&session_id, &heavy_combined);
+            if let Err(e) = state.persist_compression_cache().await {
+                eprintln!("[axiom-ttt] compression cache persist skipped: {e}");
+            }
         }
         fingerprint
     };
@@ -1883,6 +2001,9 @@ async fn compressed_openai_chat_path(
         let fingerprint = fp_result?;
         if should_adapt {
             state.mark_heavy_context_adapted(&session_id, &heavy_combined);
+            if let Err(e) = state.persist_compression_cache().await {
+                eprintln!("[axiom-ttt] compression cache persist skipped: {e}");
+            }
         }
         fingerprint
     };
@@ -2317,6 +2438,19 @@ pub async fn run_server(
         .with_openai_forwarder(openai_forwarder)
         .with_compressor_config(compressor_config)
         .with_master_vibe(master_vibe);
+    if state.compression_active() {
+        match state.hydrate_compression_cache().await {
+            Ok(0) => println!(
+                "[+] Compression cache: no persisted adapted sessions found at {}",
+                compression_cache_path().display()
+            ),
+            Ok(n) => println!(
+                "[+] Compression cache: hydrated {n} adapted session(s) from {}",
+                compression_cache_path().display()
+            ),
+            Err(e) => eprintln!("[!] Compression cache hydration skipped: {e}"),
+        }
+    }
     // Keep a handle for the graceful-shutdown flush (AppState is cheaply Clone).
     let shutdown_state = state.clone();
     let app = create_router(state);
@@ -2447,7 +2581,7 @@ mod tests {
         let pipeline_arc = state.pipeline.clone();
 
         let compact_code = "fn calculate_invoice_total(customer_id:&str)->Result<Money>{lookup_contract_discount(customer_id)?;Ok(Money::zero(\"USD\"))}";
-        assert!(whitespace_token_count(compact_code) < 20);
+        assert!(crate::anthropic_forwarder::whitespace_token_count(compact_code) < 20);
 
         let messages = vec![serde_json::json!({
             "role": "developer",
@@ -2458,6 +2592,47 @@ mod tests {
         assert_eq!(partitioned.heavy_context.len(), 1);
         assert!(partitioned.heavy_context[0].token_count >= 20);
         safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn compression_cache_persists_hash_and_session_checkpoint() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let temp_path = std::env::temp_dir().join(format!(
+            "axiom_compression_cache_test_{}_{}.bin",
+            unix_now(),
+            std::process::id()
+        ));
+
+        {
+            let pipeline = state.pipeline.lock().unwrap();
+            let handle = state
+                .ttt_sessions
+                .get_or_create("persist-s1", &pipeline)
+                .unwrap();
+            let mut states = handle.lock().await;
+            let tokens = pipeline.encode_text("fn persisted() { cache(); }");
+            adapt_session_blocking(&pipeline, &mut states, &tokens).unwrap();
+        }
+        state.mark_heavy_context_adapted("persist-s1", "fn persisted() { cache(); }");
+        state
+            .persist_compression_cache_to(&temp_path)
+            .await
+            .unwrap();
+
+        let fresh = make_test_state().await;
+        let fresh_pipeline_arc = fresh.pipeline.clone();
+        fresh
+            .hydrate_compression_cache_from(&temp_path)
+            .await
+            .unwrap();
+
+        assert!(!fresh.should_adapt_heavy_context("persist-s1", "fn persisted() { cache(); }"));
+        assert_eq!(fresh.ttt_sessions.len(), 1);
+
+        let _ = std::fs::remove_file(&temp_path);
+        safe_drop(pipeline_arc).await;
+        safe_drop(fresh_pipeline_arc).await;
     }
 
     #[tokio::test]
