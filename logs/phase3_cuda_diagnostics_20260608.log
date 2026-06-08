@@ -1,0 +1,147 @@
+=== AXIOM PHASE 3 CUDA DIAGNOSTICS ===
+timestamp=2026-06-08T08:30:15.1863969+08:00
+
+=== git ===
+## main...origin/main [ahead 19]
+ M scripts/compress_dashboard.py
+?? logs/
+?? scripts/author_synth_pairs.py
+?? tests/anomaly_target.rs
+?? tests/surgical_target.rs
+
+=== Cargo.toml ===
+[package]
+name = "axiom_engine"
+version = "0.1.0"
+edition = "2021"
+description = "Axiom-TTT Inference Engine – Rust implementation using candle"
+
+[features]
+default = []
+# Enable NVIDIA CUDA GPU backend (requires CUDA toolkit).
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# Enable Apple Metal GPU backend (macOS / Apple Silicon only).
+metal = ["candle-core/metal", "candle-nn/metal"]
+
+[dependencies]
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
+tokio = { version = "1.35", features = ["full"] }
+sha2 = "0.10.8"
+rand = "0.8.5"
+indicatif = "0.17.7"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+tokenizers = "0.15"
+urlencoding = "2.1"
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+safetensors = "0.7.0"
+dashmap = "5.5"
+walkdir = "2.5"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+
+=== candle-core cargo info ===
+    Updating crates.io index
+candle-core #blas #tensor #machine-learning
+Minimalist ML framework.
+version: 0.10.2
+license: MIT OR Apache-2.0
+rust-version: unknown
+documentation: https://docs.rs/candle-core/0.10.2
+repository: https://github.com/huggingface/candle
+crates.io: https://crates.io/crates/candle-core/0.10.2
+features:
+ +default    = []
+  accelerate = [dep:libc, dep:accelerate-src]
+  cuda       = [cudarc, dep:candle-kernels, candle-ug?/cuda]
+  cudarc     = [dep:cudarc]
+  cudnn      = [cuda, cudarc/cudnn]
+  metal      = [dep:objc2-metal, dep:objc2-foundation, dep:candle-metal-kernels, candle-ug?/metal]
+  mkl        = [dep:libc, dep:intel-mkl-src]
+  nccl       = [cuda, cudarc/nccl]
+  ug         = [dep:candle-ug]
+
+=== nvcc --version ===
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2025 NVIDIA Corporation
+Built on Tue_Dec_16_19:27:18_Pacific_Standard_Time_2025
+Cuda compilation tools, release 13.1, V13.1.115
+Build cuda_13.1.r13.1/compiler.37061995_0
+
+=== nvidia-smi ===
+Mon Jun  8 08:30:15 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 610.47                 KMD Version: 610.47        CUDA UMD Version: 13.3     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                  Driver-Model | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 2060      WDDM  |   00000000:01:00.0 Off |                  N/A |
+| N/A   77C    P0             33W /   80W |       0MiB /   6144MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A            3312    C+G   ...__2p2nqsd0c76g0\app\Codex.exe      N/A      |
++-----------------------------------------------------------------------------------------+
+
+=== CUDA env ===
+
+Name            Value                                                   
+----            -----                                                   
+CUDA_PATH_V13_1 C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
+CUDA_PATH       C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
+
+
+
+
+=== cl plain shell ===
+INFO: Could not find files for the given pattern(s).
+
+=== cl via vcvars64 ===
+C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64\cl.exe
+Microsoft (R) C/C++ Optimizing Compiler Version 19.50.35727 for x64
+
+=== 2026-06-08 Phase 3 CUDA addendum ===
+Milestone: OpenAI/Codex compression bridge committed as 567b4c1 Add OpenAI chat compression bridge.
+
+CUDA build checks:
+- cargo check --manifest-path axiom_engine_rs\Cargo.toml --features cuda --bin train_semantic: PASS under Visual Studio vcvars64 with NVCC_PREPEND_FLAGS=-allow-unsupported-compiler.
+- cargo test --lib --manifest-path axiom_engine_rs\Cargo.toml --features cuda: PASS, 116 passed / 0 failed.
+
+CUDA training diagnostics:
+- Tiny CUDA smoke: d_model=64, n_layers=1, win=16, step_cap=1, device=CUDA:0, finite loss 9.6803, PASS.
+- Scaled CUDA smoke: d_model=512, n_layers=4, win=64, step_cap=2, device=CUDA:0, finite loss 9.6803, two steps in 11s, PASS.
+- Baked scaled checkpoint run: d_model=512, n_layers=2, vocab=16000, win=64, corpus tokens=1600, 24 training steps, validation CE=9.4396, checkpoint written to target\phase3_cuda_baked_d512.bin, PASS.
+
+Baked checkpoint metadata:
+{
+  "d_model": 512,
+  "n_layers": 2,
+  "vocab_size": 16000,
+  "lr_inner": 0.001,
+  "norm_eps": 0.000001,
+  "val_ce": 9.439558,
+  "tokenizer": "C:\\Users\\garza\\AXIOM-AETHER\\checkpoints/axiom_bpe.json",
+  "stabilize": true
+}
+
+Current GPU snapshot after run:
+NVIDIA GeForce RTX 2060, driver 610.47, total 6144 MiB, used 0 MiB, free 5955 MiB, util 0%.
+
+Notes:
+- Candle dependency is candle-core/candle-nn 0.10.2 with cuda feature enabled in Cargo.toml.
+- CUDA 13.1 toolchain requires NVCC_PREPEND_FLAGS=-allow-unsupported-compiler with the installed Visual Studio 2026 compiler.
+- Search ingestion hard-caps online TTT windows at SEARCH_CHUNK=512 and recursively halves chunks down to MIN_CHUNK=32 on memory pressure.
