@@ -48,6 +48,7 @@ use crate::context_compressor::{
     adapt_session_blocking, extract_memory_vector_blocking, feedback_adaptation_text,
     CompressionControls, CompressorConfig, MemoryFingerprint, SessionStates, TttSessionStore,
 };
+use crate::dwe::{extract_delta_fragment, DweBus, DweTelemetry};
 use crate::hamiltonian::QuantumRuntimeStatus;
 use crate::inference::InferencePipeline;
 use crate::metrics;
@@ -55,6 +56,8 @@ use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarder
 use crate::poly_jit::{PolyJitEngine, PolyJitStatus};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
 use crate::sandbox::{SandboxController, SandboxDiagnostic};
+use crate::surprisal::{ExactAttentionResidualCache, ExactResidualTelemetry};
+use crate::swarm_route::{LocalSwarmRouteMatrix, SwarmMatrixState};
 use crate::swarm_router::{SwarmChatResult, SwarmRouter};
 use crate::vfs::{NeuralVfs, VfsMountReport, VfsReadReport, VfsStats};
 use crate::vibe_memory::MasterVibe;
@@ -257,6 +260,12 @@ pub struct AppState {
     pub neural_vfs: Arc<NeuralVfs>,
     /// User-mode polymorphic runtime status and execution wrapper.
     pub poly_jit: Arc<PolyJitEngine>,
+    /// SR-TTT exact residual path for high-surprisal identifiers.
+    pub exact_residual_cache: Arc<ExactAttentionResidualCache>,
+    /// DWE binary tensor-delta broadcast bus.
+    pub dwe_bus: Arc<DweBus>,
+    /// Localized high-plasticity model allocation tracker.
+    pub swarm_matrix: Arc<LocalSwarmRouteMatrix>,
 }
 
 impl AppState {
@@ -282,6 +291,9 @@ impl AppState {
             )),
             neural_vfs: Arc::new(NeuralVfs::new()),
             poly_jit: Arc::new(PolyJitEngine::default()),
+            exact_residual_cache: Arc::new(ExactAttentionResidualCache::default()),
+            dwe_bus: Arc::new(DweBus::from_env()),
+            swarm_matrix: Arc::new(LocalSwarmRouteMatrix::new()),
         }
     }
 
@@ -333,8 +345,9 @@ impl AppState {
         let store = self.ttt_sessions.clone();
         let session_id_for_task = session_id.clone();
         let feedback_for_task = feedback_text.clone();
+        let dwe_sequence = unix_now();
 
-        let token_count: Result<usize, ApiError> = spawn_blocking(move || {
+        let adapt_result = spawn_blocking(move || {
             let pipeline = pipeline_arc
                 .lock()
                 .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
@@ -342,14 +355,20 @@ impl AppState {
                 .get_or_create(&session_id_for_task, &pipeline)
                 .map_err(|e| ApiError::Internal(format!("session allocation failed: {e}")))?;
             let mut states = handle.blocking_lock();
+            let baseline = states.clone();
             let tokens = pipeline.encode_text(&feedback_for_task);
             adapt_session_blocking(&pipeline, &mut states, &tokens)
                 .map_err(|e| ApiError::Internal(format!("feedback TTT adapt failed: {e}")))?;
-            Ok(tokens.len())
+            let fragment =
+                extract_delta_fragment(&session_id_for_task, dwe_sequence, &states, &baseline).ok();
+            Ok::<_, ApiError>((tokens.len(), fragment))
         })
         .await
-        .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
-        let token_count = token_count?;
+        .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))??;
+        let (token_count, fragment) = adapt_result;
+        if let Some(fragment) = fragment {
+            self.dwe_bus.broadcast(fragment);
+        }
 
         self.mark_heavy_context_adapted(&session_id, &feedback_text);
         self.persist_compression_cache_to(cache_path)
@@ -1094,6 +1113,13 @@ struct HypervisorJitStatusResponse {
 #[derive(Debug, Serialize)]
 struct HypervisorQuantumStateResponse {
     quantum: QuantumRuntimeStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct SwarmMatrixStateResponse {
+    matrix: SwarmMatrixState,
+    dwe: DweTelemetry,
+    exact_residual: ExactResidualTelemetry,
 }
 
 // ---------------------------------------------------------------------------
@@ -1989,46 +2015,67 @@ async fn compressed_messages_path(
         let heavy_clone = heavy_combined.clone();
         let query_clone = user_query_text.clone();
         let should_adapt = state.should_adapt_heavy_context(&session_id, &heavy_combined);
+        let exact_cache = state.exact_residual_cache.clone();
+        let dwe_sequence = unix_now();
 
         // Spawn the compute-heavy loop on a blocking thread so the Tokio
         // runtime keeps serving other requests during the gradient steps.
-        let fp_result: Result<MemoryFingerprint, ApiError> =
-            tokio::task::spawn_blocking(move || {
-                let pipeline = pipeline_arc
-                    .lock()
-                    .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
-                let session = store
-                    .get_or_create(&session_id_clone, &pipeline)
-                    .map_err(|e| ApiError::Internal(format!("session allocation failed: {e}")))?;
-                // tokio::sync::Mutex::blocking_lock is safe in spawn_blocking.
-                let mut session_states = session.blocking_lock();
+        let fp_result: Result<_, ApiError> = tokio::task::spawn_blocking(move || {
+            let pipeline = pipeline_arc
+                .lock()
+                .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+            let session = store
+                .get_or_create(&session_id_clone, &pipeline)
+                .map_err(|e| ApiError::Internal(format!("session allocation failed: {e}")))?;
+            // tokio::sync::Mutex::blocking_lock is safe in spawn_blocking.
+            let mut session_states = session.blocking_lock();
 
-                let context_tokens_processed = if should_adapt {
-                    let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
-                    adapt_session_blocking(&pipeline, &mut session_states, &context_tokens)
-                        .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
-                    context_tokens.len()
-                } else {
-                    pipeline.token_count(&heavy_clone)
-                };
-
-                let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
-                let fingerprint = extract_memory_vector_blocking(
-                    &pipeline,
-                    &mut session_states,
-                    &query_tokens,
+            let mut dwe_fragment = None;
+            let context_tokens_processed = if should_adapt {
+                let baseline = session_states.clone();
+                let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
+                let (fast_tokens, _sr_report) =
+                    exact_cache.route_tokens(&session_id_clone, &context_tokens, &heavy_clone);
+                adapt_session_blocking(&pipeline, &mut session_states, &fast_tokens)
+                    .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
+                dwe_fragment = extract_delta_fragment(
                     &session_id_clone,
-                    context_tokens_processed,
-                    started,
-                    top_k,
+                    dwe_sequence,
+                    &session_states,
+                    &baseline,
                 )
-                .map_err(|e| ApiError::Internal(format!("memory extraction failed: {e}")))?;
-                Ok(fingerprint)
-            })
-            .await
-            .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
-        let fingerprint = fp_result?;
+                .ok();
+                context_tokens.len()
+            } else {
+                pipeline.token_count(&heavy_clone)
+            };
+
+            let residual_prompt = exact_cache.residual_prompt(&session_id_clone, 96);
+            let recall_query = if residual_prompt.is_empty() {
+                query_clone
+            } else {
+                format!("{query_clone}\n\n{residual_prompt}")
+            };
+            let query_tokens: Vec<u32> = pipeline.encode_text(&recall_query);
+            let fingerprint = extract_memory_vector_blocking(
+                &pipeline,
+                &mut session_states,
+                &query_tokens,
+                &session_id_clone,
+                context_tokens_processed,
+                started,
+                top_k,
+            )
+            .map_err(|e| ApiError::Internal(format!("memory extraction failed: {e}")))?;
+            Ok((fingerprint, dwe_fragment))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
+        let (fingerprint, dwe_fragment) = fp_result?;
         if should_adapt {
+            if let Some(fragment) = dwe_fragment {
+                state.dwe_bus.broadcast(fragment);
+            }
             state.mark_heavy_context_adapted(&session_id, &heavy_combined);
             if let Err(e) = state.persist_compression_cache().await {
                 eprintln!("[axiom-ttt] compression cache persist skipped: {e}");
@@ -2177,8 +2224,10 @@ async fn compressed_openai_chat_path(
         let heavy_clone = heavy_combined.clone();
         let query_clone = user_query_text.clone();
         let should_adapt = state.should_adapt_heavy_context(&session_id, &heavy_combined);
+        let exact_cache = state.exact_residual_cache.clone();
+        let dwe_sequence = unix_now();
 
-        let fp_result: Result<MemoryFingerprint, ApiError> = spawn_blocking(move || {
+        let fp_result: Result<_, ApiError> = spawn_blocking(move || {
             let pipeline = pipeline_arc
                 .lock()
                 .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
@@ -2187,17 +2236,34 @@ async fn compressed_openai_chat_path(
                 .map_err(|e| ApiError::Internal(format!("session allocation failed: {e}")))?;
             let mut session_states = session.blocking_lock();
 
+            let mut dwe_fragment = None;
             let context_tokens_processed = if should_adapt {
+                let baseline = session_states.clone();
                 let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
-                adapt_session_blocking(&pipeline, &mut session_states, &context_tokens)
+                let (fast_tokens, _sr_report) =
+                    exact_cache.route_tokens(&session_id_clone, &context_tokens, &heavy_clone);
+                adapt_session_blocking(&pipeline, &mut session_states, &fast_tokens)
                     .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
+                dwe_fragment = extract_delta_fragment(
+                    &session_id_clone,
+                    dwe_sequence,
+                    &session_states,
+                    &baseline,
+                )
+                .ok();
                 context_tokens.len()
             } else {
                 pipeline.token_count(&heavy_clone)
             };
 
-            let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
-            extract_memory_vector_blocking(
+            let residual_prompt = exact_cache.residual_prompt(&session_id_clone, 96);
+            let recall_query = if residual_prompt.is_empty() {
+                query_clone
+            } else {
+                format!("{query_clone}\n\n{residual_prompt}")
+            };
+            let query_tokens: Vec<u32> = pipeline.encode_text(&recall_query);
+            let fingerprint = extract_memory_vector_blocking(
                 &pipeline,
                 &mut session_states,
                 &query_tokens,
@@ -2206,12 +2272,16 @@ async fn compressed_openai_chat_path(
                 started,
                 top_k,
             )
-            .map_err(|e| ApiError::Internal(format!("memory extraction failed: {e}")))
+            .map_err(|e| ApiError::Internal(format!("memory extraction failed: {e}")))?;
+            Ok((fingerprint, dwe_fragment))
         })
         .await
         .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
-        let fingerprint = fp_result?;
+        let (fingerprint, dwe_fragment) = fp_result?;
         if should_adapt {
+            if let Some(fragment) = dwe_fragment {
+                state.dwe_bus.broadcast(fragment);
+            }
             state.mark_heavy_context_adapted(&session_id, &heavy_combined);
             if let Err(e) = state.persist_compression_cache().await {
                 eprintln!("[axiom-ttt] compression cache persist skipped: {e}");
@@ -2500,6 +2570,10 @@ async fn hypervisor_mount(
         .neural_vfs
         .mount(req.root.trim())
         .map_err(ApiError::BadRequest)?;
+    state
+        .swarm_matrix
+        .observe_vfs_target(&mount.mounted_root)
+        .await;
     let session_id = req
         .session_id
         .as_deref()
@@ -2544,6 +2618,20 @@ async fn hypervisor_quantum_coherent_state(
     })
 }
 
+/// `GET /v1/swarm/matrix_state` — report localized model/DWE/SR-TTT state.
+async fn swarm_matrix_state(State(state): State<AppState>) -> Json<SwarmMatrixStateResponse> {
+    let dwe = state.dwe_bus.telemetry();
+    let exact_residual = state.exact_residual_cache.telemetry();
+    let matrix = state
+        .swarm_matrix
+        .state(dwe.clone(), exact_residual.clone());
+    Json(SwarmMatrixStateResponse {
+        matrix,
+        dwe,
+        exact_residual,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
@@ -2573,6 +2661,7 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/hypervisor/quantum_coherent_state",
             get(hypervisor_quantum_coherent_state),
         )
+        .route("/v1/swarm/matrix_state", get(swarm_matrix_state))
         .route("/v1/expand", post(expand_symbol_handler))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())

@@ -1,0 +1,331 @@
+//! Differential Weight Exchange (DWE).
+//!
+//! DWE serializes fast-weight deltas as compact bincode fragments and ships
+//! them over isolated Tokio TCP tasks. Consumers inflate the fragment and apply
+//! tensor additions directly, avoiding text prefill replay.
+
+use std::sync::{Arc, Mutex};
+
+use candle_core::{DType, Device, Result as CandleResult, Tensor};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+
+pub const MAX_DWE_FRAGMENT_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_DWE_QUEUE: usize = 128;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DweLayerDelta {
+    pub layer_index: usize,
+    pub shape: Vec<usize>,
+    pub values: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DweFragment {
+    pub schema: String,
+    pub session_id: String,
+    pub sequence: u64,
+    pub layers: Vec<DweLayerDelta>,
+    pub state_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DweTelemetry {
+    pub queued_fragments: usize,
+    pub sent_fragments: u64,
+    pub received_fragments: u64,
+    pub applied_fragments: u64,
+    pub last_session_id: Option<String>,
+    pub last_fragment_bytes: usize,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct DweBus {
+    tx: mpsc::Sender<DweFragment>,
+    telemetry: Arc<Mutex<DweTelemetry>>,
+}
+
+impl DweBus {
+    pub fn new(peers: Vec<String>) -> Self {
+        let (tx, rx) = mpsc::channel::<DweFragment>(DEFAULT_DWE_QUEUE);
+        let telemetry = Arc::new(Mutex::new(DweTelemetry::default()));
+        attach_broadcast_task(peers, rx, telemetry.clone());
+        Self { tx, telemetry }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(Vec::new())
+    }
+
+    pub fn from_env() -> Self {
+        let peers = std::env::var("AXIOM_DWE_PEERS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|peer| !peer.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self::new(peers)
+    }
+
+    pub fn telemetry(&self) -> DweTelemetry {
+        let mut telemetry = self.telemetry.lock().map(|t| t.clone()).unwrap_or_default();
+        telemetry.queued_fragments = self.tx.max_capacity().saturating_sub(self.tx.capacity());
+        telemetry
+    }
+
+    pub fn broadcast(&self, fragment: DweFragment) {
+        if let Err(err) = self.tx.try_send(fragment) {
+            update_telemetry(&self.telemetry, |t| {
+                t.last_error = Some(format!("dwe queue full: {err}"));
+            });
+        }
+    }
+}
+
+fn attach_broadcast_task(
+    peers: Vec<String>,
+    rx: mpsc::Receiver<DweFragment>,
+    telemetry: Arc<Mutex<DweTelemetry>>,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        if peers.is_empty() {
+            std::mem::forget(rx);
+        } else {
+            update_telemetry(&telemetry, |t| {
+                t.last_error = Some("dwe peers configured but no tokio runtime active".into());
+            });
+        }
+        return;
+    };
+    handle.spawn(broadcast_loop(peers, rx, telemetry));
+}
+
+async fn broadcast_loop(
+    peers: Vec<String>,
+    mut rx: mpsc::Receiver<DweFragment>,
+    telemetry: Arc<Mutex<DweTelemetry>>,
+) {
+    while let Some(fragment) = rx.recv().await {
+        if peers.is_empty() {
+            continue;
+        }
+        let Ok(encoded) = serialize_fragment_for_telemetry(&fragment, &telemetry) else {
+            continue;
+        };
+        broadcast_fragment_to_peers(&peers, &fragment, &encoded, &telemetry).await;
+    }
+}
+
+fn serialize_fragment_for_telemetry(
+    fragment: &DweFragment,
+    telemetry: &Arc<Mutex<DweTelemetry>>,
+) -> Result<Vec<u8>, String> {
+    serialize_fragment(fragment).map_err(|err| {
+        update_telemetry(telemetry, |t| {
+            t.last_error = Some(err.clone());
+        });
+        err
+    })
+}
+
+async fn broadcast_fragment_to_peers(
+    peers: &[String],
+    fragment: &DweFragment,
+    encoded: &[u8],
+    telemetry: &Arc<Mutex<DweTelemetry>>,
+) {
+    for peer in peers {
+        match send_encoded_fragment(peer, encoded).await {
+            Ok(()) => record_send_success(telemetry, fragment, encoded.len()),
+            Err(err) => update_telemetry(telemetry, |t| {
+                t.last_error = Some(format!("dwe send {peer}: {err}"));
+            }),
+        }
+    }
+}
+
+fn record_send_success(
+    telemetry: &Arc<Mutex<DweTelemetry>>,
+    fragment: &DweFragment,
+    fragment_bytes: usize,
+) {
+    update_telemetry(telemetry, |t| {
+        t.sent_fragments += 1;
+        t.last_session_id = Some(fragment.session_id.clone());
+        t.last_fragment_bytes = fragment_bytes;
+        t.last_error = None;
+    });
+}
+
+pub fn extract_delta_fragment(
+    session_id: &str,
+    sequence: u64,
+    optimized: &[Tensor],
+    baseline: &[Tensor],
+) -> CandleResult<DweFragment> {
+    let mut layers = Vec::new();
+    for (layer_index, (optimized, baseline)) in optimized.iter().zip(baseline).enumerate() {
+        let delta = optimized.sub(baseline)?.to_dtype(DType::F32)?;
+        let shape = delta.dims().to_vec();
+        let values = delta.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+        layers.push(DweLayerDelta {
+            layer_index,
+            shape,
+            values,
+        });
+    }
+    let state_hash = hash_layers(&layers);
+    Ok(DweFragment {
+        schema: "axiom.dwe.v1".into(),
+        session_id: session_id.to_string(),
+        sequence,
+        layers,
+        state_hash,
+    })
+}
+
+pub fn serialize_fragment(fragment: &DweFragment) -> Result<Vec<u8>, String> {
+    let encoded = bincode::serialize(fragment).map_err(|e| e.to_string())?;
+    if encoded.len() > MAX_DWE_FRAGMENT_BYTES {
+        return Err(format!(
+            "fragment too large: {} > {}",
+            encoded.len(),
+            MAX_DWE_FRAGMENT_BYTES
+        ));
+    }
+    Ok(encoded)
+}
+
+pub fn deserialize_fragment(bytes: &[u8]) -> Result<DweFragment, String> {
+    if bytes.len() > MAX_DWE_FRAGMENT_BYTES {
+        return Err(format!(
+            "fragment too large: {} > {}",
+            bytes.len(),
+            MAX_DWE_FRAGMENT_BYTES
+        ));
+    }
+    bincode::deserialize(bytes).map_err(|e| e.to_string())
+}
+
+pub fn apply_fragment(
+    states: &mut [Tensor],
+    fragment: &DweFragment,
+    device: &Device,
+) -> CandleResult<()> {
+    for layer in &fragment.layers {
+        if layer.layer_index >= states.len() {
+            candle_core::bail!("dwe layer {} out of range", layer.layer_index);
+        }
+        let total: usize = layer.shape.iter().product();
+        if total != layer.values.len() {
+            candle_core::bail!("dwe layer shape/value mismatch");
+        }
+        let delta = Tensor::from_vec(layer.values.clone(), (total,), device)?
+            .reshape(layer.shape.as_slice())?;
+        states[layer.layer_index] = states[layer.layer_index].add(&delta)?;
+    }
+    Ok(())
+}
+
+pub async fn start_dwe_listener(
+    addr: &str,
+    tx: mpsc::Sender<DweFragment>,
+    telemetry: Arc<Mutex<DweTelemetry>>,
+) -> Result<(), String> {
+    let listener = TcpListener::bind(addr).await.map_err(|e| e.to_string())?;
+    loop {
+        let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let tx = tx.clone();
+        let telemetry = telemetry.clone();
+        tokio::spawn(async move {
+            let mut len_buf = [0_u8; 4];
+            if let Err(err) = socket.read_exact(&mut len_buf).await {
+                update_telemetry(&telemetry, |t| t.last_error = Some(err.to_string()));
+                return;
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len > MAX_DWE_FRAGMENT_BYTES {
+                update_telemetry(&telemetry, |t| {
+                    t.last_error = Some(format!("incoming fragment too large: {len}"));
+                });
+                return;
+            }
+            let mut bytes = vec![0_u8; len];
+            if let Err(err) = socket.read_exact(&mut bytes).await {
+                update_telemetry(&telemetry, |t| t.last_error = Some(err.to_string()));
+                return;
+            }
+            match deserialize_fragment(&bytes) {
+                Ok(fragment) => {
+                    update_telemetry(&telemetry, |t| {
+                        t.received_fragments += 1;
+                        t.last_session_id = Some(fragment.session_id.clone());
+                        t.last_fragment_bytes = bytes.len();
+                        t.last_error = None;
+                    });
+                    let _ = tx.send(fragment).await;
+                }
+                Err(err) => update_telemetry(&telemetry, |t| t.last_error = Some(err)),
+            }
+        });
+    }
+}
+
+async fn send_encoded_fragment(peer: &str, encoded: &[u8]) -> Result<(), String> {
+    let mut stream = TcpStream::connect(peer).await.map_err(|e| e.to_string())?;
+    stream
+        .write_all(&(encoded.len() as u32).to_le_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    stream.write_all(encoded).await.map_err(|e| e.to_string())
+}
+
+fn hash_layers(layers: &[DweLayerDelta]) -> String {
+    let mut hasher = Sha256::new();
+    for layer in layers {
+        hasher.update(layer.layer_index.to_le_bytes());
+        for dim in &layer.shape {
+            hasher.update(dim.to_le_bytes());
+        }
+        for value in &layer.values {
+            hasher.update(value.to_le_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn update_telemetry(telemetry: &Arc<Mutex<DweTelemetry>>, update: impl FnOnce(&mut DweTelemetry)) {
+    if let Ok(mut telemetry) = telemetry.lock() {
+        update(&mut telemetry);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fragment_roundtrips_and_applies_delta() {
+        let device = Device::Cpu;
+        let base = vec![Tensor::zeros((2, 2), DType::F32, &device).unwrap()];
+        let optimized = vec![Tensor::ones((2, 2), DType::F32, &device).unwrap()];
+        let fragment = extract_delta_fragment("dwe", 1, &optimized, &base).unwrap();
+        let bytes = serialize_fragment(&fragment).unwrap();
+        let decoded = deserialize_fragment(&bytes).unwrap();
+        let mut local = base;
+        apply_fragment(&mut local, &decoded, &device).unwrap();
+        assert_eq!(
+            local[0].to_vec2::<f32>().unwrap(),
+            vec![vec![1.0, 1.0], vec![1.0, 1.0]]
+        );
+    }
+}
