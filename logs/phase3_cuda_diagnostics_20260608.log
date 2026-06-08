@@ -196,3 +196,26 @@ Verification:
 - context_compressor::tests::adapt_chunk_cap_stays_below_phase3_ceiling asserts MAX_ADAPT_CHUNK_TOKENS < 512.
 - cargo test --lib --manifest-path axiom_engine_rs\Cargo.toml: PASS, 118 passed / 0 failed.
 - cargo test --lib --manifest-path axiom_engine_rs\Cargo.toml --features cuda: PASS, 118 passed / 0 failed.
+
+=== 2026-06-08 Phase 3 d512/4-layer bake addendum ===
+Milestone: scaled architecture checkpoint baked at the requested d_model=512 / 4-layer tier.
+
+CUDA run:
+- AXIOM_DMODEL=512, AXIOM_NLAYERS=4, AXIOM_TRAIN_WIN=128, AXIOM_TRAIN_LAST_TOKEN_ONLY=1, AXIOM_TTT_STABILIZE=1.
+- device=CUDA:0, vocab=16000, corpus tokens=1600.
+- 12 training steps, finite train loss around 9.6805, validation CE=9.6776.
+- step_ms samples: 824.1 at step 6, 457.4 at step 12; avg_step_ms=622.8.
+- Checkpoint written to target\phase3_cuda_fast_baked_d512_l4.bin with sidecar target\phase3_cuda_fast_baked_d512_l4.meta.json.
+
+Sidecar:
+{
+  "d_model": 512,
+  "n_layers": 4,
+  "vocab_size": 16000,
+  "lr_inner": 0.001,
+  "norm_eps": 0.000001,
+  "val_ce": 9.677617,
+  "tokenizer": "C:\\Users\\garza\\AXIOM-AETHER\\checkpoints/axiom_bpe.json",
+  "stabilize": true,
+  "last_token_only": true
+}
