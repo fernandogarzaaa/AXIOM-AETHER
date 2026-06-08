@@ -31,7 +31,9 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::config::AxiomConfig;
-use crate::context_compressor::{adapt_session_blocking, extract_memory_vector_blocking};
+use crate::context_compressor::{
+    adapt_session_blocking, extract_memory_vector_blocking, MAX_ADAPT_CHUNK_TOKENS,
+};
 use crate::embedder::{embed_text, EmbeddingModel};
 use crate::inference::InferencePipeline;
 use crate::memory_recall::{recall, RecallParams};
@@ -43,9 +45,9 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "axiom-ttt";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Token window fed through `forward_lm` at a time. Bounds per-call memory:
-/// `forward_lm` buffers one hidden vector per token in the window.
-const ADAPT_WINDOW_TOKENS: usize = 256;
+/// Token window fed through online TTT adaptation at a time. Bounds per-call
+/// memory and remains strictly below the Phase 3 512-token ceiling.
+const ADAPT_WINDOW_TOKENS: usize = MAX_ADAPT_CHUNK_TOKENS;
 /// Cap on tokens scored by `axiom_evaluate_drift` (bounds compute per call).
 const DRIFT_MAX_TOKENS: usize = 512;
 
@@ -87,8 +89,9 @@ pub async fn run_stdio_server(
         let dev = device.clone();
         let ckpt = checkpoint_path.clone();
         // BPE tokenizer via AXIOM_TOKENIZER (falls back to hash tokenizer when unset).
-        let tokenizer_path =
-            std::env::var("AXIOM_TOKENIZER").ok().filter(|p| !p.trim().is_empty());
+        let tokenizer_path = std::env::var("AXIOM_TOKENIZER")
+            .ok()
+            .filter(|p| !p.trim().is_empty());
         tokio::task::spawn_blocking(move || {
             let runtime = crate::inference::InferenceRuntimeOptions {
                 tokenizer_path,
@@ -102,7 +105,9 @@ pub async fn run_stdio_server(
     };
 
     let vibe = MasterVibe::from_env(config.n_layers, config.d_model, &device);
-    let prime = std::env::var("AXIOM_VIBE_PRIME").map(|v| v == "1").unwrap_or(false);
+    let prime = std::env::var("AXIOM_VIBE_PRIME")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     if prime && !vibe.is_initialized() {
         eprintln!("[mcp] AXIOM_VIBE_PRIME=1 set but no master vibe yet; sessions start from identity until first commit");
     }
@@ -132,12 +137,16 @@ pub async fn run_stdio_server(
     eprintln!("[mcp] memory store at {memory_dir}");
 
     // Phase 2.0.1 trained embedder (CPU for the MCP path). Absent → TTT fallback.
-    let embedder_ckpt =
-        std::env::var("AXIOM_EMB_CKPT").unwrap_or_else(|_| "checkpoints/axiom_embedder.bin".to_string());
+    let embedder_ckpt = std::env::var("AXIOM_EMB_CKPT")
+        .unwrap_or_else(|_| "checkpoints/axiom_embedder.bin".to_string());
     let embedder = EmbeddingModel::load(&embedder_ckpt, Device::Cpu).map(Arc::new);
     eprintln!(
         "[mcp] contrastive embedder: {}",
-        if embedder.is_some() { "loaded" } else { "absent (pipeline fallback)" }
+        if embedder.is_some() {
+            "loaded"
+        } else {
+            "absent (pipeline fallback)"
+        }
     );
 
     let ctx = McpContext {
@@ -191,7 +200,11 @@ async fn handle_message(line: &str, ctx: &McpContext) -> Option<Value> {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[mcp] parse error: {e}");
-            return Some(error_response(Value::Null, -32700, &format!("parse error: {e}")));
+            return Some(error_response(
+                Value::Null,
+                -32700,
+                &format!("parse error: {e}"),
+            ));
         }
     };
 
@@ -336,7 +349,10 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
         return error_response(id, -32602, "missing params");
     };
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     match name {
         "axiom_compress_path" => {
@@ -352,13 +368,20 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 Ok(block) => success_response(id, tool_text_result(&block, false)),
                 Err(e) => {
                     eprintln!("[mcp] axiom_compress_path failed: {e}");
-                    success_response(id, tool_text_result(&format!("compression failed: {e}"), true))
+                    success_response(
+                        id,
+                        tool_text_result(&format!("compression failed: {e}"), true),
+                    )
                 }
             }
         }
         "axiom_evaluate_drift" => {
             let Some(code) = args.get("code_content").and_then(Value::as_str) else {
-                return error_response(id, -32602, "axiom_evaluate_drift requires string 'code_content'");
+                return error_response(
+                    id,
+                    -32602,
+                    "axiom_evaluate_drift requires string 'code_content'",
+                );
             };
             let code = code.to_string();
             let ctx = ctx.clone();
@@ -369,7 +392,10 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 Ok((report, is_drift)) => success_response(id, tool_text_result(&report, is_drift)),
                 Err(e) => {
                     eprintln!("[mcp] axiom_evaluate_drift failed: {e}");
-                    success_response(id, tool_text_result(&format!("evaluation failed: {e}"), true))
+                    success_response(
+                        id,
+                        tool_text_result(&format!("evaluation failed: {e}"), true),
+                    )
                 }
             }
         }
@@ -400,8 +426,16 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 return error_response(id, -32602, "axiom_remember requires string 'text'");
             };
             let text = text.to_string();
-            let kind = args.get("kind").and_then(Value::as_str).unwrap_or("conversation").to_string();
-            let scope = args.get("scope").and_then(Value::as_str).unwrap_or("personal").to_string();
+            let kind = args
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("conversation")
+                .to_string();
+            let scope = args
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("personal")
+                .to_string();
             let ctx = ctx.clone();
             let outcome =
                 tokio::task::spawn_blocking(move || remember_blocking(&text, &kind, &scope, &ctx))
@@ -409,7 +443,9 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
                 Ok(msg) => success_response(id, tool_text_result(&msg, false)),
-                Err(e) => success_response(id, tool_text_result(&format!("remember failed: {e}"), true)),
+                Err(e) => {
+                    success_response(id, tool_text_result(&format!("remember failed: {e}"), true))
+                }
             }
         }
         "axiom_recall" => {
@@ -417,15 +453,21 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 return error_response(id, -32602, "axiom_recall requires string 'query'");
             };
             let query = query.to_string();
-            let scope = args.get("scope").and_then(Value::as_str).map(|s| s.to_string());
+            let scope = args
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
             let ctx = ctx.clone();
-            let outcome =
-                tokio::task::spawn_blocking(move || recall_blocking(&query, scope.as_deref(), &ctx))
-                    .await
-                    .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            let outcome = tokio::task::spawn_blocking(move || {
+                recall_blocking(&query, scope.as_deref(), &ctx)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
                 Ok(report) => success_response(id, tool_text_result(&report, false)),
-                Err(e) => success_response(id, tool_text_result(&format!("recall failed: {e}"), true)),
+                Err(e) => {
+                    success_response(id, tool_text_result(&format!("recall failed: {e}"), true))
+                }
             }
         }
         "axiom_forget" => {
@@ -433,7 +475,11 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 return error_response(id, -32602, "axiom_forget requires string 'id'");
             };
             let mem_id = mem_id.to_string();
-            let scope = args.get("scope").and_then(Value::as_str).unwrap_or("personal").to_string();
+            let scope = args
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("personal")
+                .to_string();
             let ctx = ctx.clone();
             let outcome =
                 tokio::task::spawn_blocking(move || forget_blocking(&mem_id, &scope, &ctx))
@@ -441,7 +487,9 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
                 Ok(msg) => success_response(id, tool_text_result(&msg, false)),
-                Err(e) => success_response(id, tool_text_result(&format!("forget failed: {e}"), true)),
+                Err(e) => {
+                    success_response(id, tool_text_result(&format!("forget failed: {e}"), true))
+                }
             }
         }
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
@@ -454,8 +502,8 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
 /// with `AXIOM_PROXY_URL` (default `http://127.0.0.1:3000`).
 /// Returns `(text, is_error)`.
 fn expand_symbol_blocking(session_id: &str, symbol: &str) -> Result<(String, bool), String> {
-    let base = std::env::var("AXIOM_PROXY_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+    let base =
+        std::env::var("AXIOM_PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
     let url = format!("{}/v1/expand", base.trim_end_matches('/'));
     let client = reqwest::blocking::Client::new();
     let resp = client
@@ -468,7 +516,11 @@ fn expand_symbol_blocking(session_id: &str, symbol: &str) -> Result<(String, boo
         .json()
         .map_err(|e| format!("bad response from proxy ({status}): {e}"))?;
     if body.get("found").and_then(Value::as_bool).unwrap_or(false) {
-        let code = body.get("body").and_then(Value::as_str).unwrap_or("").to_string();
+        let code = body
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         Ok((code, false))
     } else {
         let err = body
@@ -476,7 +528,10 @@ fn expand_symbol_blocking(session_id: &str, symbol: &str) -> Result<(String, boo
             .and_then(Value::as_str)
             .unwrap_or("symbol not found")
             .to_string();
-        Ok((format!("could not expand '{symbol}' (HTTP {status}): {err}"), true))
+        Ok((
+            format!("could not expand '{symbol}' (HTTP {status}): {err}"),
+            true,
+        ))
     }
 }
 
@@ -522,7 +577,11 @@ fn compress_path_blocking(path: &str, ctx: &McpContext) -> Result<String, String
             }
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
                 let remaining = ctx.max_bytes.saturating_sub(total_bytes);
-                let slice = if text.len() > remaining { &text[..remaining] } else { &text[..] };
+                let slice = if text.len() > remaining {
+                    &text[..remaining]
+                } else {
+                    &text[..]
+                };
                 corpus.push_str(slice);
                 corpus.push('\n');
                 total_bytes += slice.len();
@@ -534,7 +593,10 @@ fn compress_path_blocking(path: &str, ctx: &McpContext) -> Result<String, String
         return Err(format!("no readable text content under {path}"));
     }
 
-    let pipeline = ctx.pipeline.lock().map_err(|_| "pipeline lock poisoned".to_string())?;
+    let pipeline = ctx
+        .pipeline
+        .lock()
+        .map_err(|_| "pipeline lock poisoned".to_string())?;
     let token_ids = pipeline.encode_text(&corpus);
     let tokens_processed = token_ids.len();
 
@@ -546,13 +608,7 @@ fn compress_path_blocking(path: &str, ctx: &McpContext) -> Result<String, String
     }
 
     // Recall pass + fingerprint. Use the tail of the corpus as the query.
-    let query: Vec<u32> = token_ids
-        .iter()
-        .rev()
-        .take(32)
-        .rev()
-        .copied()
-        .collect();
+    let query: Vec<u32> = token_ids.iter().rev().take(32).rev().copied().collect();
     let session_id = format!("mcp-compress-{}", short_hash(path));
     let fingerprint = extract_memory_vector_blocking(
         &pipeline,
@@ -585,7 +641,10 @@ fn compress_path_blocking(path: &str, ctx: &McpContext) -> Result<String, String
 
 /// `axiom_evaluate_drift` worker. Returns `(report_text, is_drift)`.
 fn evaluate_drift_blocking(code: &str, ctx: &McpContext) -> Result<(String, bool), String> {
-    let pipeline = ctx.pipeline.lock().map_err(|_| "pipeline lock poisoned".to_string())?;
+    let pipeline = ctx
+        .pipeline
+        .lock()
+        .map_err(|_| "pipeline lock poisoned".to_string())?;
     let mut ids = pipeline.encode_text(code);
     if ids.len() < 2 {
         return Ok((
@@ -600,8 +659,8 @@ fn evaluate_drift_blocking(code: &str, ctx: &McpContext) -> Result<(String, bool
     let mut states = start_states(ctx, &pipeline)?;
 
     // Next-token prediction: predict ids[1..] from ids[..n-1].
-    let input = Tensor::from_vec(ids[..n - 1].to_vec(), (1, n - 1), device)
-        .map_err(|e| e.to_string())?;
+    let input =
+        Tensor::from_vec(ids[..n - 1].to_vec(), (1, n - 1), device).map_err(|e| e.to_string())?;
     let logits = pipeline
         .model()
         .forward_lm(&input, &mut states)
@@ -611,7 +670,8 @@ fn evaluate_drift_blocking(code: &str, ctx: &McpContext) -> Result<(String, bool
         .squeeze(0)
         .and_then(|t| t.reshape((n - 1, vocab)))
         .map_err(|e| e.to_string())?;
-    let targets = Tensor::from_vec(ids[1..].to_vec(), (n - 1,), device).map_err(|e| e.to_string())?;
+    let targets =
+        Tensor::from_vec(ids[1..].to_vec(), (n - 1,), device).map_err(|e| e.to_string())?;
     let loss = candle_nn::loss::cross_entropy(&logits_2d, &targets).map_err(|e| e.to_string())?;
     let loss_val = loss.to_scalar::<f32>().map_err(|e| e.to_string())?;
 
@@ -632,17 +692,28 @@ fn embed_query(text: &str, ctx: &McpContext) -> Result<Vec<f32>, String> {
     if let Some(e) = &ctx.embedder {
         return e.embed(text).map_err(|err| err.to_string());
     }
-    let pipeline = ctx.pipeline.lock().map_err(|_| "pipeline lock poisoned".to_string())?;
+    let pipeline = ctx
+        .pipeline
+        .lock()
+        .map_err(|_| "pipeline lock poisoned".to_string())?;
     embed_text(&pipeline, text).map_err(|err| err.to_string())
 }
 
 /// `axiom_remember` worker. Embeds the text, scores its drift (salience), and
 /// appends a record to the chosen scope. Returns the new memory id.
-fn remember_blocking(text: &str, kind: &str, scope: &str, ctx: &McpContext) -> Result<String, String> {
+fn remember_blocking(
+    text: &str,
+    kind: &str,
+    scope: &str,
+    ctx: &McpContext,
+) -> Result<String, String> {
     let embedding = embed_query(text, ctx)?;
     // Salience = drift cross-entropy (reuses the evaluate path's signal cheaply).
     let drift = {
-        let pipeline = ctx.pipeline.lock().map_err(|_| "pipeline lock poisoned".to_string())?;
+        let pipeline = ctx
+            .pipeline
+            .lock()
+            .map_err(|_| "pipeline lock poisoned".to_string())?;
         drift_score(&pipeline, text).unwrap_or(0.0)
     };
 
@@ -664,9 +735,14 @@ fn remember_blocking(text: &str, kind: &str, scope: &str, ctx: &McpContext) -> R
         supersedes: None,
         tombstone: false,
     };
-    let store = ctx.memory.lock().map_err(|_| "memory lock poisoned".to_string())?;
+    let store = ctx
+        .memory
+        .lock()
+        .map_err(|_| "memory lock poisoned".to_string())?;
     store.append(&rec).map_err(|e| e.to_string())?;
-    Ok(format!("remembered id={id} scope={scope} (salience drift={drift:.2})"))
+    Ok(format!(
+        "remembered id={id} scope={scope} (salience drift={drift:.2})"
+    ))
 }
 
 /// `axiom_recall` worker. Embeds the query and searches `personal` ∪ optional
@@ -680,7 +756,10 @@ fn recall_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result
             scopes.push(s.to_string());
         }
     }
-    let store = ctx.memory.lock().map_err(|_| "memory lock poisoned".to_string())?;
+    let store = ctx
+        .memory
+        .lock()
+        .map_err(|_| "memory lock poisoned".to_string())?;
     let hits = recall(&store, &scopes, &q_emb, &RecallParams::default());
     if hits.is_empty() {
         return Ok("no relevant memories found".to_string());
@@ -698,7 +777,10 @@ fn recall_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result
 
 /// `axiom_forget` worker. Tombstones an id in its scope.
 fn forget_blocking(mem_id: &str, scope: &str, ctx: &McpContext) -> Result<String, String> {
-    let store = ctx.memory.lock().map_err(|_| "memory lock poisoned".to_string())?;
+    let store = ctx
+        .memory
+        .lock()
+        .map_err(|_| "memory lock poisoned".to_string())?;
     store.tombstone(scope, mem_id).map_err(|e| e.to_string())?;
     Ok(format!("forgot id={mem_id} scope={scope}"))
 }
@@ -716,7 +798,10 @@ fn drift_score(pipeline: &InferencePipeline, text: &str) -> Result<f32, String> 
     let mut states = pipeline.init_session_states().map_err(|e| e.to_string())?;
     let input =
         Tensor::from_vec(ids[..n - 1].to_vec(), (1, n - 1), device).map_err(|e| e.to_string())?;
-    let logits = pipeline.model().forward_lm(&input, &mut states).map_err(|e| e.to_string())?;
+    let logits = pipeline
+        .model()
+        .forward_lm(&input, &mut states)
+        .map_err(|e| e.to_string())?;
     let vocab = pipeline.model().config.vocab_size;
     let logits_2d = logits
         .squeeze(0)
@@ -752,7 +837,10 @@ fn tool_text_result(text: &str, is_error: bool) -> Value {
 fn short_hash(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(s.as_bytes());
-    format!("{:x}{:x}{:x}{:x}", digest[0], digest[1], digest[2], digest[3])
+    format!(
+        "{:x}{:x}{:x}{:x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 //! Transitions Axiom from a static code compressor into a live search node.
 //! Scraped web text (from scripts/lib/axiom-scrape.js) is streamed into the
 //! local BPE tokenizer, absorbed by an online Test-Time Training pass over
-//! detached <=512-token chunks (protecting the RTX 2060's VRAM), and distilled
+//! detached 128-token chunks (protecting the RTX 2060's VRAM), and distilled
 //! into an `<axiom_search_fingerprint>` — a dense, zero-token-waste semantic
 //! pointer a lightweight local router can use WITHOUT calling a large external
 //! LLM.
@@ -12,11 +12,13 @@ use std::time::Instant;
 
 use candle_core::Result;
 
-use crate::context_compressor::{adapt_session_blocking, extract_memory_vector_blocking};
+use crate::context_compressor::{
+    adapt_session_blocking, extract_memory_vector_blocking, MAX_ADAPT_CHUNK_TOKENS,
+};
 use crate::inference::InferencePipeline;
 
 /// Hard cap on tokens per TTT adaptation window (VRAM safety on a 6 GB 2060).
-pub const SEARCH_CHUNK: usize = 512;
+pub const SEARCH_CHUNK: usize = MAX_ADAPT_CHUNK_TOKENS;
 /// Floor below which we stop halving the chunk on memory pressure.
 const MIN_CHUNK: usize = 32;
 

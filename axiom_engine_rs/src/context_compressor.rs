@@ -39,6 +39,11 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::inference::InferencePipeline;
 
+/// Global hard cap for online TTT adaptation windows. This keeps every
+/// compression path strictly below the 512-token Phase 3 VRAM ceiling and
+/// matches the stable d512 CUDA diagnostics on the 6GB RTX 2060 target.
+pub const MAX_ADAPT_CHUNK_TOKENS: usize = 128;
+
 /// One session's per-layer fast-weight state, behind an async mutex so
 /// the same session can be queued for sequential updates without
 /// blocking the whole server.
@@ -74,10 +79,7 @@ impl TttSessionStore {
         // for the same session can't both insert and clobber each other's W̃.
         let states = pipeline.init_session_states()?;
         let arc = Arc::new(AsyncMutex::new(states));
-        let entry = self
-            .sessions
-            .entry(session_id.to_string())
-            .or_insert(arc);
+        let entry = self.sessions.entry(session_id.to_string()).or_insert(arc);
         Ok(entry.value().clone())
     }
 
@@ -243,6 +245,17 @@ pub fn adapt_session_blocking(
     if token_ids.is_empty() {
         return Ok(());
     }
+    for window in token_ids.chunks(MAX_ADAPT_CHUNK_TOKENS) {
+        adapt_session_window_blocking(pipeline, states, window)?;
+    }
+    Ok(())
+}
+
+fn adapt_session_window_blocking(
+    pipeline: &InferencePipeline,
+    states: &mut [Tensor],
+    token_ids: &[u32],
+) -> CResult<()> {
     let device = pipeline.device();
     let input = Tensor::from_vec(token_ids.to_vec(), (1, token_ids.len()), device)?;
     let _logits = pipeline.model().forward_lm(&input, states)?;
@@ -292,9 +305,10 @@ pub fn extract_memory_vector_blocking(
     };
     let q_len = recall_query.len();
     let q_input = Tensor::from_vec(recall_query.clone(), (1, q_len), device)?;
-    let logits = pipeline.model().forward_lm(&q_input, states)?; // [1, T, vocab]
-    // Take the final-token logit vector.
-    let final_logits = logits.narrow(1, q_len - 1, 1)?.squeeze(1)?.squeeze(0)?;
+    let final_logits = pipeline
+        .model()
+        .forward_last_logits(&q_input, states)?
+        .squeeze(0)?;
     let final_vec: Vec<f32> = final_logits.to_vec1::<f32>()?;
 
     // Deterministic state hash + Frobenius norms over the post-recall W̃.
@@ -320,11 +334,8 @@ pub fn extract_memory_vector_blocking(
         .map(|(i, v)| (i, v.abs()))
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let recall_top_k_indices: Vec<u32> = ranked
-        .iter()
-        .take(top_k)
-        .map(|(i, _)| *i as u32)
-        .collect();
+    let recall_top_k_indices: Vec<u32> =
+        ranked.iter().take(top_k).map(|(i, _)| *i as u32).collect();
 
     let recall_top_k_decoded = if pipeline.has_real_tokenizer() {
         pipeline.decode_tokens(&recall_top_k_indices)
@@ -373,12 +384,7 @@ pub struct CompressorConfig {
 impl CompressorConfig {
     pub fn from_env() -> Self {
         let enabled = std::env::var("AXIOM_TTT_COMPRESS")
-            .map(|v| {
-                matches!(
-                    v.to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
         let threshold = std::env::var("AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS")
             .ok()
@@ -439,10 +445,12 @@ impl CompressionControls {
         self.enabled.store(v, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn threshold(&self) -> usize {
-        self.threshold_tokens.load(std::sync::atomic::Ordering::Relaxed)
+        self.threshold_tokens
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn set_threshold(&self, v: usize) {
-        self.threshold_tokens.store(v.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.threshold_tokens
+            .store(v.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record one compression request: a count of heavy messages absorbed, and
@@ -515,6 +523,11 @@ mod tests {
             .map(|t| t.flatten_all().unwrap().to_vec1::<f32>().unwrap())
             .collect();
         assert_ne!(snapshot, after, "W_tilde must move after adapt_session");
+    }
+
+    #[test]
+    fn adapt_chunk_cap_stays_below_phase3_ceiling() {
+        assert!(MAX_ADAPT_CHUNK_TOKENS < 512);
     }
 
     #[test]

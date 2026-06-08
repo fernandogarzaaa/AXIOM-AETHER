@@ -181,3 +181,18 @@ Verification:
 - cargo test --lib --manifest-path axiom_engine_rs\Cargo.toml --features cuda: PASS, 117 passed / 0 failed.
 - cargo build --release --manifest-path axiom_engine_rs\Cargo.toml --features cuda --bin train_semantic: PASS.
 - Current GPU snapshot after run: NVIDIA GeForce RTX 2060, used 0 MiB, free 5955 MiB, util 0%.
+
+=== 2026-06-08 Phase 3 global chunking addendum ===
+Milestone: online TTT adaptation is now globally capped inside adapt_session_blocking.
+
+Changes:
+- Added MAX_ADAPT_CHUNK_TOKENS=128 in context_compressor.rs.
+- adapt_session_blocking now internally slices every token stream into 128-token windows before calling forward_lm, so direct server compression calls, Codex/OpenAI compression, Anthropic compression, MCP compression, and search ingestion all inherit the same <512-token autograd/memory defense.
+- search_ingest.rs now defines SEARCH_CHUNK from MAX_ADAPT_CHUNK_TOKENS.
+- mcp_stdio.rs now defines ADAPT_WINDOW_TOKENS from MAX_ADAPT_CHUNK_TOKENS.
+- extract_memory_vector_blocking now uses forward_last_logits for recall, avoiding a full [T, vocab] allocation when only the final token is needed.
+
+Verification:
+- context_compressor::tests::adapt_chunk_cap_stays_below_phase3_ceiling asserts MAX_ADAPT_CHUNK_TOKENS < 512.
+- cargo test --lib --manifest-path axiom_engine_rs\Cargo.toml: PASS, 118 passed / 0 failed.
+- cargo test --lib --manifest-path axiom_engine_rs\Cargo.toml --features cuda: PASS, 118 passed / 0 failed.
