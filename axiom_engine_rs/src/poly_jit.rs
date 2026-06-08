@@ -14,12 +14,16 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::hamiltonian::{HamiltonianFault, QuantumRuntimeStatus, VariationalHamiltonian};
+
 pub const MAX_POLY_JIT_STEPS: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct PolyJitEngine {
     timeout: Duration,
     status: Arc<Mutex<PolyJitStatus>>,
+    quantum_status: Arc<Mutex<QuantumRuntimeStatus>>,
+    optimizer: VariationalHamiltonian,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +66,7 @@ pub struct PolyJitStatus {
     pub last_session_id: Option<String>,
     pub last_status: Option<String>,
     pub last_error: Option<String>,
+    pub quantum: QuantumRuntimeStatus,
 }
 
 #[derive(Debug)]
@@ -96,11 +101,22 @@ impl PolyJitEngine {
         Self {
             timeout,
             status: Arc::new(Mutex::new(PolyJitStatus::default())),
+            quantum_status: Arc::new(Mutex::new(QuantumRuntimeStatus::default())),
+            optimizer: VariationalHamiltonian::default(),
         }
     }
 
     pub fn status(&self) -> PolyJitStatus {
-        self.status.lock().map(|s| s.clone()).unwrap_or_default()
+        let mut status = self.status.lock().map(|s| s.clone()).unwrap_or_default();
+        status.quantum = self.quantum_status();
+        status
+    }
+
+    pub fn quantum_status(&self) -> QuantumRuntimeStatus {
+        self.quantum_status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
     }
 
     pub async fn run_with_feedback<F, Fut>(
@@ -163,7 +179,10 @@ impl PolyJitEngine {
                 break;
             }
             if let Some(source_path) = request.source_path.as_deref() {
-                let patched = synthesize_patch(source_excerpt.as_deref().unwrap_or(""));
+                let patched = source_excerpt
+                    .as_deref()
+                    .and_then(|source| self.quantum_patch(&diagnostic, source))
+                    .or_else(|| synthesize_patch(source_excerpt.as_deref().unwrap_or("")));
                 if let Some(patched) = patched {
                     tokio::fs::write(source_path, patched)
                         .await
@@ -212,6 +231,27 @@ impl PolyJitEngine {
         if let Ok(mut status) = self.status.lock() {
             update(&mut status);
         }
+    }
+
+    fn quantum_patch(&self, diagnostic: &PolyJitDiagnostic, source: &str) -> Option<String> {
+        if source.trim().is_empty() {
+            return None;
+        }
+        let fault = HamiltonianFault {
+            stdout: diagnostic.stdout.clone(),
+            stderr: diagnostic.stderr.clone(),
+            status_code: diagnostic.status_code,
+            source: source.to_string(),
+        };
+        let optimization = self.optimizer.optimize_fault(&fault).ok()?;
+        if let Ok(mut status) = self.quantum_status.lock() {
+            status.total_optimizations += 1;
+            if optimization.collapsed_patch.is_some() {
+                status.total_collapses += 1;
+            }
+            status.last_state = optimization.telemetry;
+        }
+        optimization.collapsed_patch
     }
 }
 

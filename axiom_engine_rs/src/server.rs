@@ -48,6 +48,7 @@ use crate::context_compressor::{
     adapt_session_blocking, extract_memory_vector_blocking, feedback_adaptation_text,
     CompressionControls, CompressorConfig, MemoryFingerprint, SessionStates, TttSessionStore,
 };
+use crate::hamiltonian::QuantumRuntimeStatus;
 use crate::inference::InferencePipeline;
 use crate::metrics;
 use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarderError};
@@ -1088,6 +1089,11 @@ struct HypervisorMountResponse {
 struct HypervisorJitStatusResponse {
     jit: PolyJitStatus,
     vfs: VfsStats,
+}
+
+#[derive(Debug, Serialize)]
+struct HypervisorQuantumStateResponse {
+    quantum: QuantumRuntimeStatus,
 }
 
 // ---------------------------------------------------------------------------
@@ -2529,6 +2535,15 @@ async fn hypervisor_jit_status(State(state): State<AppState>) -> Json<Hypervisor
     })
 }
 
+/// `GET /v1/hypervisor/quantum_coherent_state` — report Q-TTT manifold state.
+async fn hypervisor_quantum_coherent_state(
+    State(state): State<AppState>,
+) -> Json<HypervisorQuantumStateResponse> {
+    Json(HypervisorQuantumStateResponse {
+        quantum: state.poly_jit.quantum_status(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
@@ -2554,6 +2569,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/ttt/feedback", post(ttt_feedback))
         .route("/v1/hypervisor/mount", post(hypervisor_mount))
         .route("/v1/hypervisor/jit_status", get(hypervisor_jit_status))
+        .route(
+            "/v1/hypervisor/quantum_coherent_state",
+            get(hypervisor_quantum_coherent_state),
+        )
         .route("/v1/expand", post(expand_symbol_handler))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
