@@ -5,17 +5,52 @@ token updates the model's per-layer dynamic weight matrices (W̃) in real time,
 so the engine _learns from context_ during generation without a fine-tuning
 pipeline.
 
-It runs three ways, all from one Rust binary + a few bundled scripts:
+It runs as a local-first Rust runtime with several compatible surfaces:
 
-1. **Local context-compression proxy** for Claude Code — strips heavy context,
-   absorbs it into fast-weight tensors, forwards a lean fingerprinted payload.
+1. **OpenAI/Codex + Anthropic/Claude context-compression proxy** - strips heavy
+   context, absorbs it into fast-weight tensors, and forwards a lean
+   fingerprinted payload.
 2. **Native MCP server** (`--mode mcp`) exposing `axiom_compress_path`,
    `axiom_evaluate_drift`, and `axiom_expand` tools over JSON-RPC stdio.
-3. **JIT search-reasoning node** — scrapes the live web, absorbs results via
-   online TTT, and emits a dense `<axiom_search_fingerprint>` semantic pointer.
+3. **JIT search-reasoning node** - scrapes the live web with Rust-native
+   ingestion, absorbs results via online TTT, and emits a dense
+   `<axiom_search_fingerprint>` semantic pointer.
+4. **Closed-loop hypervisor runtime** - user-mode Neural VFS, Poly JIT repair,
+   Q-TTT simulated tensor optimization, SR-TTT exact residual memory, DWE binary
+   tensor deltas, and localized swarm telemetry.
 
 [![Release Binaries](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/release.yml/badge.svg)](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/release.yml)
 [![Docker](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/docker.yml/badge.svg)](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/docker.yml)
+
+---
+
+## Current Runtime Snapshot
+
+Current `main` includes the Phase 7/8 runtime surfaces:
+
+| Layer | Status |
+|---|---|
+| Active model | BPE production stack, `d_model=256`, `n_layers=4`, `vocab_size=16000` |
+| Context proxy | Native Anthropic `/v1/messages` and OpenAI/Codex `/v1/chat/completions` compression paths |
+| Persistence | On-disk `bincode` fast-weight cache under `checkpoints/memory/` |
+| Local routing | Ollama-first swarm router with cloud fallback when configured |
+| Hypervisor | Safe user-mode VFS loopback, Poly JIT fault capture/repair, sandbox feedback |
+| Q-TTT | Bounded simulated MPS manifold with paired real/imag tensor layout `[2, branches, bond_dim]` |
+| SR-TTT | Surprisal-aware dual track: normal fast-weight updates plus exact residual cache for hashes/API keys/schema tokens |
+| DWE | Binary differential weight exchange using compact `bincode` tensor delta fragments |
+| Swarm matrix | VFS-driven local model-domain telemetry with RTX 2060-safe VRAM accounting |
+| Tests | Full Rust unit/integration matrix passes locally |
+
+Important telemetry endpoints:
+
+```text
+GET  /v1/hypervisor/jit_status
+GET  /v1/hypervisor/quantum_coherent_state
+GET  /v1/swarm/matrix_state
+POST /v1/hypervisor/mount
+POST /v1/ttt/feedback
+POST /v1/cluster/merge
+```
 
 ---
 
@@ -293,10 +328,11 @@ cargo build --release --bin search_node
 ./target/release/search_node "test-time training fast weights"
 ```
 
-Pipeline: `scripts/lib/axiom-scrape.js` (headless DuckDuckGo fetch + HTML strip)
-→ BPE tokenize → online TTT over detached ≤512-token chunks (OOM-resilient
-chunk-halving) → `<axiom_search_fingerprint>` with `recall_top_k_topics` and a
-`recall_norm` confidence signal. Logic lives in `src/search_ingest.rs`.
+Pipeline: Rust-native `reqwest` + `scraper` search fetch and HTML cleanup
+-> BPE tokenize -> online TTT over detached <=512-token chunks
+-> `<axiom_search_fingerprint>` with `recall_top_k_topics` and a
+`recall_norm` confidence signal. Logic lives in `src/search_ingest.rs` and
+`src/search_scrape.rs`.
 
 ---
 
@@ -309,11 +345,18 @@ endpoints.
 GET  /v1/models
 POST /v1/completions
 POST /v1/chat/completions
-POST /v1/messages                 (Anthropic Messages API — compression path)
+POST /v1/messages                 (Anthropic Messages API - compression path)
 POST /v1/expand                   (expand a dropped symbol body: {session_id, symbol})
-POST /v1/sessions                 (create persistent W̃ session)
+POST /v1/sessions                 (create persistent fast-weight session)
 POST /v1/adapt                    (in-place TTT adaptation over a corpus)
-GET  /v1/sessions/{id}/checkpoint  PUT …/checkpoint   DELETE /v1/sessions/{id}
+POST /v1/ttt/feedback             (compiler/runtime feedback -> persistent TTT cache)
+POST /v1/cluster/sync             (cluster state synchronization)
+POST /v1/cluster/merge            (merge persisted fast-weight checkpoints)
+POST /v1/hypervisor/mount         (safe user-mode Neural VFS mount + warm paths)
+GET  /v1/hypervisor/jit_status
+GET  /v1/hypervisor/quantum_coherent_state
+GET  /v1/swarm/matrix_state
+GET  /v1/sessions/{id}/checkpoint  PUT .../checkpoint   DELETE /v1/sessions/{id}
 GET  /v1/ttt/sessions   DELETE /v1/ttt/sessions        GET /metrics
 ```
 
@@ -344,7 +387,7 @@ context — **without retrieval at inference time**.
 ```
 axiom_engine --mode <MODE> [OPTIONS]
 
-Modes:  train | generate | server | mcp | meta-train
+Modes:  train | generate | server | mcp | lsp | meta-train | doctor
 
 Options:
   --device auto|cpu|cuda|metal   Compute device (default: cpu; 'auto' = CUDA-if-available)
@@ -378,6 +421,17 @@ Key env: `AXIOM_PRODUCTION_BPE`, `AXIOM_TOKENIZER`, `AXIOM_BPE_CKPT`,
 | Native MCP server | `mcp_stdio.rs` |
 | Persistent vibe memory (EMA) | `vibe_memory.rs` |
 | JIT search ingestion | `search_ingest.rs` |
+| Rust-native search scraping | `search_scrape.rs` |
+| Local Ollama router | `swarm_router.rs` |
+| Localized swarm telemetry | `swarm_route.rs` |
+| User-mode Neural VFS | `vfs.rs` |
+| Poly JIT fault recovery | `poly_jit.rs` |
+| Sandbox feedback runner | `sandbox.rs` |
+| Q-TTT manifold + Hamiltonian optimizer | `q_manifold.rs`, `hamiltonian.rs` |
+| Surprisal residual cache | `surprisal.rs` |
+| Differential weight exchange | `dwe.rs` |
+| LSP daemon | `lsp.rs` |
+| Weight checkpoint merge | `weight_merge.rs` |
 | HTTP API server | `server.rs` |
 | Meta-training | `meta_train.rs` |
 | CLI entry-point | `main.rs` |
