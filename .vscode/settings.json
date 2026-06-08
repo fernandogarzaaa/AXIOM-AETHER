@@ -1,0 +1,17 @@
+{
+  "multi-lsp.servers": {
+    "axiom": {
+      "command": [
+        "C:/Users/garza/AXIOM-AETHER/target/rt_serve_release/release/axiom_engine.exe",
+        "--lsp"
+      ],
+      "fileTypes": [
+        "rust",
+        "javascript",
+        "typescript",
+        "python"
+      ],
+      "initializationOptions": {}
+    }
+  }
+}
