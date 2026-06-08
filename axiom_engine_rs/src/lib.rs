@@ -20,6 +20,7 @@ pub mod meta_train;
 pub mod metrics;
 pub mod model;
 pub mod model_meta;
+pub mod openai_forwarder;
 pub mod pairs;
 pub mod quantization;
 pub mod search_ingest;

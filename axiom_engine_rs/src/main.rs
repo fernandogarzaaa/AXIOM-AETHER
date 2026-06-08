@@ -20,6 +20,7 @@ mod meta_train;
 mod metrics;
 mod model;
 mod model_meta;
+mod openai_forwarder;
 mod pairs;
 mod quantization;
 mod server;

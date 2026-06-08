@@ -48,6 +48,7 @@ use crate::context_compressor::{
 };
 use crate::inference::InferencePipeline;
 use crate::metrics;
+use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarderError};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
 use crate::vibe_memory::MasterVibe;
 
@@ -207,9 +208,12 @@ pub struct AppState {
     /// above (which serves the legacy `/v1/sessions` API); this store
     /// is used exclusively by the `/v1/messages` compression path.
     pub ttt_sessions: Arc<TttSessionStore>,
-    /// Outbound bridge to the real Anthropic API used by the compression
-    /// path. `None` when no `ANTHROPIC_API_KEY` is configured.
+    /// Outbound bridge to the real Anthropic API used by the Claude compression
+    /// path. `None` when Anthropic forwarding is disabled.
     pub anthropic_forwarder: Arc<Option<AnthropicForwarder>>,
+    /// Outbound bridge to OpenAI-compatible chat completions used by the Codex
+    /// compression path. `None` when OpenAI forwarding is disabled.
+    pub openai_forwarder: Arc<Option<OpenAiForwarder>>,
     /// Static compression configuration (threshold, top-k, enabled flag).
     pub compressor_config: Arc<CompressorConfig>,
     /// Optional persistent "vibe memory". When `Some`, adapted session W̃
@@ -237,6 +241,7 @@ impl AppState {
             claude_backend: Arc::new(None),
             ttt_sessions: Arc::new(TttSessionStore::new()),
             anthropic_forwarder: Arc::new(None),
+            openai_forwarder: Arc::new(None),
             compressor_config: Arc::new(CompressorConfig::default()),
             master_vibe: Arc::new(Mutex::new(None)),
             source_store: Arc::new(RwLock::new(HashMap::new())),
@@ -312,6 +317,12 @@ impl AppState {
         self
     }
 
+    /// Install an OpenAI-compatible forwarder for the Codex compression path.
+    pub fn with_openai_forwarder(mut self, forwarder: Option<OpenAiForwarder>) -> Self {
+        self.openai_forwarder = Arc::new(forwarder);
+        self
+    }
+
     /// Override the compressor configuration. Also seeds the runtime controls so
     /// the live threshold / on-off state starts from the configured values.
     pub fn with_compressor_config(mut self, config: CompressorConfig) -> Self {
@@ -325,6 +336,12 @@ impl AppState {
     /// from the live controls so a dashboard can toggle it without a restart.
     pub fn compression_active(&self) -> bool {
         self.controls.enabled() && self.anthropic_forwarder.is_some()
+    }
+
+    /// True iff OpenAI-compatible chat compression has both the runtime feature
+    /// flag and an upstream forwarder.
+    pub fn openai_compression_active(&self) -> bool {
+        self.controls.enabled() && self.openai_forwarder.is_some()
     }
 
     fn refresh_session_metrics(&self) -> Result<(), ApiError> {
@@ -851,8 +868,37 @@ async fn create_completion(
 /// When `stream: false` (or absent), a single JSON object is returned.
 async fn create_chat_completion(
     State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
 ) -> Response {
+    let session_override = headers
+        .get("x-axiom-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    if state.openai_compression_active() {
+        let client_auth = OpenAiClientAuth {
+            authorization: headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        };
+        match compressed_openai_chat_path(&state, &body, session_override.as_deref(), &client_auth)
+            .await
+        {
+            Ok(resp) => return resp,
+            Err(err) => return err.into_response(),
+        }
+    }
+
+    let req: ChatCompletionRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid /v1/chat/completions body: {e}"))
+                .into_response()
+        }
+    };
+
     if req.stream.unwrap_or(false) {
         let sse = chat_completion_sse(state.clone(), req);
         state.trigger_lru_vram_budget();
@@ -1672,6 +1718,150 @@ async fn compressed_messages_path(
         })
 }
 
+/// OpenAI-compatible active-compression path: partition -> adapt -> recall ->
+/// forward to `/v1/chat/completions`.
+async fn compressed_openai_chat_path(
+    state: &AppState,
+    body: &Value,
+    session_override: Option<&str>,
+    client_auth: &OpenAiClientAuth,
+) -> Result<Response, ApiError> {
+    let forwarder = state
+        .openai_forwarder
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("OpenAI compression active but no forwarder".into()))?
+        .clone();
+
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| ApiError::BadRequest("messages[] required".into()))?;
+
+    let cfg = state.compressor_config.clone();
+    let threshold = state.controls.threshold();
+    let top_k = cfg.recall_top_k;
+    let partitioned = partition_messages(&messages, threshold, whitespace_token_count);
+
+    let session_id = session_override
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("transient-{}", Uuid::new_v4()));
+
+    let started = Instant::now();
+    let log_heavy_count = partitioned.heavy_context.len();
+    let log_heavy_tokens: usize = partitioned
+        .heavy_context
+        .iter()
+        .map(|c| c.token_count)
+        .sum();
+
+    let user_query_text = partitioned
+        .target_user_index
+        .and_then(|idx| partitioned.surviving.get(idx))
+        .and_then(|m| m.get("content"))
+        .map(content_to_text)
+        .unwrap_or_default();
+    let heavy_combined = partitioned
+        .heavy_context
+        .iter()
+        .map(|c| c.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let fingerprint = if partitioned.heavy_context.is_empty() {
+        empty_fingerprint(state, &session_id, started)?
+    } else {
+        let pipeline_arc = state.pipeline.clone();
+        let store = state.ttt_sessions.clone();
+        let session_id_clone = session_id.clone();
+        let heavy_clone = heavy_combined.clone();
+        let query_clone = user_query_text.clone();
+
+        let fp_result: Result<MemoryFingerprint, ApiError> = spawn_blocking(move || {
+            let pipeline = pipeline_arc
+                .lock()
+                .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+            let session = store.get_or_create(&session_id_clone, &pipeline).map_err(|e| {
+                ApiError::Internal(format!("session allocation failed: {e}"))
+            })?;
+            let mut session_states = session.blocking_lock();
+
+            let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
+            adapt_session_blocking(&pipeline, &mut session_states, &context_tokens).map_err(
+                |e| ApiError::Internal(format!("TTT adapt failed: {e}")),
+            )?;
+
+            let query_tokens: Vec<u32> = pipeline.encode_text(&query_clone);
+            extract_memory_vector_blocking(
+                &pipeline,
+                &mut session_states,
+                &query_tokens,
+                &session_id_clone,
+                context_tokens.len(),
+                started,
+                top_k,
+            )
+            .map_err(|e| ApiError::Internal(format!("memory extraction failed: {e}")))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
+        fp_result?
+    };
+
+    eprintln!(
+        "[axiom-ttt] openai compressed session={} heavy_msgs={} heavy_tokens~{} recall_norm={:.3} elapsed_ms={}",
+        fingerprint.session_id,
+        log_heavy_count,
+        log_heavy_tokens,
+        fingerprint.recall_norm,
+        fingerprint.elapsed_ms,
+    );
+
+    if !heavy_combined.trim().is_empty() {
+        state.store_source(&session_id, heavy_combined.clone());
+    }
+
+    let mut outbound = build_compressed_payload(body, &fingerprint, &partitioned);
+    if let Some(obj) = outbound.as_object_mut() {
+        obj.remove("session_id");
+    }
+
+    let bytes_in = serde_json::to_string(body).map(|s| s.len() as u64).unwrap_or(0);
+    let bytes_out = serde_json::to_string(&outbound).map(|s| s.len() as u64).unwrap_or(0);
+    state.controls.record(log_heavy_count as u64, bytes_in, bytes_out);
+
+    let upstream = forwarder
+        .forward_chat_completions_text(&outbound, client_auth)
+        .await
+        .map_err(|e| match e {
+            OpenAiForwarderError::MissingAuth => ApiError::Upstream {
+                status: StatusCode::UNAUTHORIZED.as_u16(),
+                message: format!("{e}"),
+            },
+            other => ApiError::Upstream {
+                status: StatusCode::BAD_GATEWAY.as_u16(),
+                message: format!("OpenAI upstream call failed: {other}"),
+            },
+        })?;
+
+    let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = upstream.content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    } else {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    builder
+        .body(axum::body::Body::from(upstream.body))
+        .map_err(|e| ApiError::Internal(format!("response build failed: {e}")))
+}
+
 fn empty_fingerprint(
     state: &AppState,
     session_id: &str,
@@ -1721,6 +1911,7 @@ async fn ttt_sessions_stats(State(state): State<AppState>) -> impl IntoResponse 
     Json(serde_json::json!({
         "active_sessions": state.ttt_sessions.len(),
         "compression_active": state.compression_active(),
+        "openai_compression_active": state.openai_compression_active(),
         "threshold_tokens": state.compressor_config.heavy_message_threshold_tokens,
         "recall_top_k": state.compressor_config.recall_top_k,
     }))
@@ -1871,7 +2062,9 @@ async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
         "threshold_tokens": threshold,
         "recall_top_k": state.compressor_config.recall_top_k,
         "forwarder_ready": state.anthropic_forwarder.is_some(),
+        "openai_forwarder_ready": state.openai_forwarder.is_some(),
         "compression_active": state.compression_active(),
+        "openai_compression_active": state.openai_compression_active(),
         "counters": {
             "requests": requests,
             "messages_compressed": msgs,
@@ -1907,6 +2100,8 @@ async fn post_config(State(state): State<AppState>, Json(body): Json<Value>) -> 
         "enabled": enabled,
         "level": if enabled { threshold_to_level(threshold) } else { "off" },
         "threshold_tokens": threshold,
+        "compression_active": state.compression_active(),
+        "openai_compression_active": state.openai_compression_active(),
     }))
 }
 
@@ -1957,6 +2152,11 @@ pub async fn run_server(
     } else {
         None
     };
+    let openai_forwarder = if compressor_config.enabled {
+        OpenAiForwarder::from_env()
+    } else {
+        None
+    };
     if compressor_config.enabled {
         match anthropic_forwarder.as_ref() {
             Some(fwd) => {
@@ -1986,6 +2186,29 @@ pub async fn run_server(
                  to the local pipeline"
             ),
         }
+        match openai_forwarder.as_ref() {
+            Some(fwd) => {
+                println!(
+                    "[+] OpenAI/Codex compression bridge ON — /v1/chat/completions \
+                     can absorb heavy messages locally, then forward a lean payload upstream."
+                );
+                if fwd.has_own_key() {
+                    println!(
+                        "[+] OpenAI upstream auth: proxy-owned OPENAI_API_KEY injected as \
+                         bearer auth when the client sends none."
+                    );
+                } else {
+                    println!(
+                        "[+] OpenAI upstream auth: PASSTHROUGH — no proxy key set; the client's \
+                         own Authorization header is relayed upstream."
+                    );
+                }
+            }
+            None => println!(
+                "[!] Active-compression enabled but the OpenAI forwarder failed to construct — \
+                 /v1/chat/completions will fall back to the local pipeline"
+            ),
+        }
     }
     // Persistent vibe memory (automatic EMA merge on session drop/clear/
     // shutdown). Enabled by default; set AXIOM_VIBE=0 to disable all
@@ -2008,6 +2231,7 @@ pub async fn run_server(
     let state = AppState::new(pipeline, model_id)
         .with_claude_backend(claude_backend)
         .with_anthropic_forwarder(anthropic_forwarder)
+        .with_openai_forwarder(openai_forwarder)
         .with_compressor_config(compressor_config)
         .with_master_vibe(master_vibe);
     // Keep a handle for the graceful-shutdown flush (AppState is cheaply Clone).
@@ -2281,6 +2505,97 @@ mod tests {
             body_str.contains("[DONE]"),
             "SSE body must contain [DONE] sentinel"
         );
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_openai_chat_completion_compression_forwards_digest_payload() {
+        use crate::openai_forwarder::OpenAiForwarder;
+        use tokio::sync::oneshot;
+
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().unwrap() = Some(body);
+                    Json(serde_json::json!({
+                        "id": "chatcmpl-mock",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "gpt-mock",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, upstream)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let cfg = CompressorConfig {
+            enabled: true,
+            heavy_message_threshold_tokens: 50,
+            recall_top_k: 4,
+        };
+        let state = make_test_state()
+            .await
+            .with_compressor_config(cfg)
+            .with_openai_forwarder(Some(OpenAiForwarder::new(
+                Some("sk-test".to_string()),
+                Some(format!("http://{addr}")),
+            )));
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let big = (0..400)
+            .map(|i| format!("tok{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = serde_json::json!({
+            "model": "gpt-4.1",
+            "session_id": "codex-session",
+            "messages": [
+                {"role": "developer", "content": big},
+                {"role": "user", "content": "modify the adapter"}
+            ],
+            "max_tokens": 16
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let forwarded = captured.lock().unwrap().clone().expect("forwarded body");
+        assert!(forwarded.get("session_id").is_none());
+        let messages = forwarded["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.contains("<axiom_context_digest "));
+        assert!(content.contains("modify the adapter"));
+        assert!(content.contains("chars of prose elided"));
+        assert!(content.len() < big.len());
+
+        let _ = shutdown_tx.send(());
         safe_drop(pipeline_arc).await;
     }
 
