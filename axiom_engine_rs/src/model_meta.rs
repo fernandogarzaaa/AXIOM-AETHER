@@ -26,6 +26,10 @@ pub struct ModelMeta {
     /// `#[serde(default)]` → old sidecars (no field) load as `false`.
     #[serde(default)]
     pub stabilize: bool,
+    /// Whether training used the detached-chunk final-token loss fast path.
+    /// This is training provenance only; inference remains unchanged.
+    #[serde(default)]
+    pub last_token_only: bool,
 }
 
 impl ModelMeta {
@@ -62,22 +66,29 @@ pub struct SizeRung {
 /// Default ladder, smallest → largest. Ceiling tuned for ~3.7 GB usable VRAM.
 pub fn default_ladder() -> Vec<SizeRung> {
     vec![
-        SizeRung { d_model: 256, n_layers: 4 },
-        SizeRung { d_model: 384, n_layers: 6 },
-        SizeRung { d_model: 512, n_layers: 8 },
-        SizeRung { d_model: 640, n_layers: 8 },
+        SizeRung {
+            d_model: 256,
+            n_layers: 4,
+        },
+        SizeRung {
+            d_model: 384,
+            n_layers: 6,
+        },
+        SizeRung {
+            d_model: 512,
+            n_layers: 8,
+        },
+        SizeRung {
+            d_model: 640,
+            n_layers: 8,
+        },
     ]
 }
 
 /// Estimate the training footprint (bytes) of a config: embedding + lm_head +
 /// per-layer projections, times 4 (params + grad + AdamW m + v, all fp32),
 /// plus a flat activation budget for one `win`-token forward.
-pub fn estimate_footprint_bytes(
-    d_model: usize,
-    n_layers: usize,
-    vocab: usize,
-    win: usize,
-) -> u64 {
+pub fn estimate_footprint_bytes(d_model: usize, n_layers: usize, vocab: usize, win: usize) -> u64 {
     let params = 2 * vocab * d_model // embedding + lm_head
         + n_layers * 3 * d_model * d_model // w_q, w_k, w_v per layer
         + n_layers * d_model // layer norms (approx)
@@ -124,6 +135,7 @@ mod tests {
             val_ce: 3.21,
             tokenizer: "t.json".into(),
             stabilize: true,
+            last_token_only: true,
         };
         let ckpt = std::env::temp_dir().join("axiom_meta_test.bin");
         let ckpt = ckpt.to_string_lossy().to_string();

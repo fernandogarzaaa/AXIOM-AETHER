@@ -159,11 +159,56 @@ impl AxiomTTTLM {
         self.ln_f.forward(&sequence_output)
     }
 
-    /// Autoregressive forward pass over a token sequence → logits
+    /// Autoregressive forward pass that returns only the final hidden state
+    /// `[1, d_model]`. Session states are updated exactly as in
+    /// [`Self::forward_hidden`], but intermediate token outputs are not stored.
+    /// This is the fast path for detached online training where each chunk
+    /// contributes a single next-token loss.
+    pub fn forward_last_hidden(
+        &self,
+        input_ids: &Tensor,
+        session_states: &mut [Tensor],
+    ) -> Result<Tensor> {
+        let (_, seq_len) = input_ids.dims2()?;
+        let embeddings = self.embeddings.forward(input_ids)?;
+
+        let mut last_hidden: Option<Tensor> = None;
+        for t in 0..seq_len {
+            let token_emb = embeddings.narrow(1, t, 1)?.squeeze(1)?;
+            let mut hidden = token_emb;
+            for (i, block) in self.layers.iter().enumerate() {
+                hidden = block.forward_native(&hidden, &mut session_states[i])?;
+            }
+            last_hidden = Some(hidden);
+        }
+
+        let last = last_hidden.unwrap_or_else(|| {
+            Tensor::zeros(
+                (1usize, self.config.d_model),
+                DType::F32,
+                input_ids.device(),
+            )
+            .expect("zero last hidden")
+        });
+        self.ln_f.forward(&last)
+    }
+
+    /// Autoregressive forward pass over a token sequence to logits
     /// `[1, T, vocab_size]`. Equivalent to `lm_head(forward_hidden(..))`; the
     /// hidden-state computation lives in [`Self::forward_hidden`].
     pub fn forward_lm(&self, input_ids: &Tensor, session_states: &mut [Tensor]) -> Result<Tensor> {
         let normed = self.forward_hidden(input_ids, session_states)?;
+        self.lm_head.forward(&normed)
+    }
+
+    /// Autoregressive forward pass returning only final-token logits
+    /// `[1, vocab_size]`.
+    pub fn forward_last_logits(
+        &self,
+        input_ids: &Tensor,
+        session_states: &mut [Tensor],
+    ) -> Result<Tensor> {
+        let normed = self.forward_last_hidden(input_ids, session_states)?;
         self.lm_head.forward(&normed)
     }
 }
@@ -278,9 +323,32 @@ mod tests {
         let mut s2 = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 3usize), DType::U32, &device).unwrap();
         let logits = model.forward_lm(&input_ids, &mut s1[..]).unwrap();
-        assert_eq!(logits.dims(), &[1, 3, 32]); // vocab_size = 32
+        // vocab_size = 32
+        assert_eq!(logits.dims(), &[1, 3, 32]);
         // hidden path produces values of the right shape
         let hidden = model.forward_hidden(&input_ids, &mut s2[..]).unwrap();
         assert_eq!(hidden.dims(), &[1, 3, 16]);
+    }
+
+    #[test]
+    fn test_forward_last_logits_matches_full_final_token() {
+        let (model, device) = make_model(2);
+        let mut s1 = model.init_states(&device).unwrap();
+        let mut s2 = model.init_states(&device).unwrap();
+        let input_ids = Tensor::from_vec(vec![0u32, 1, 2, 3], (1usize, 4usize), &device).unwrap();
+
+        let full = model.forward_lm(&input_ids, &mut s1[..]).unwrap();
+        let last = model.forward_last_logits(&input_ids, &mut s2[..]).unwrap();
+
+        assert_eq!(last.dims(), &[1, 32]);
+        let full_last = full.narrow(1, 3, 1).unwrap().squeeze(1).unwrap();
+        let diff = full_last
+            .sub(&last)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap();
+        assert!(diff.to_scalar::<f32>().unwrap() < 1e-5);
     }
 }

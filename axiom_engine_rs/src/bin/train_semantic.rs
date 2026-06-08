@@ -13,7 +13,8 @@
 //! Env: AXIOM_DMODEL / AXIOM_NLAYERS (override auto-size)
 //!      AXIOM_VRAM_BUDGET_MB (override VRAM probe)
 //!      AXIOM_LR(3e-3) AXIOM_INNER_LR(1e-3) AXIOM_EPOCHS(8) AXIOM_STEP_CAP(4000)
-//!      AXIOM_TRAIN_WIN(128) AXIOM_MAX_TOKENS(2000000) AXIOM_PATIENCE(3)
+//!      AXIOM_TRAIN_WIN(128, capped at 128 for 6GB VRAM) AXIOM_MAX_TOKENS(2000000) AXIOM_PATIENCE(3)
+//!      AXIOM_TRAIN_LAST_TOKEN_ONLY(0) enables a faster detached-chunk loss
 //!      AXIOM_CORPUS_OUT(checkpoints/corpus)
 //!      AXIOM_BPE(checkpoints/axiom_bpe.json)
 //!      AXIOM_BPE_CKPT(checkpoints/axiom_production_bpe.bin)
@@ -29,14 +30,23 @@ use candle_nn::{Optimizer, VarBuilder, VarMap};
 use tokenizers::Tokenizer;
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 fn env_f64(k: &str, d: f64) -> f64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 /// Free VRAM in bytes via nvidia-smi; None if unavailable (→ CPU budget).
@@ -80,7 +90,10 @@ fn val_ce(model: &AxiomTTTLM, dev: &Device, ids: &[u32], vocab: usize, win: usiz
         let logits = model.forward_lm(&input, &mut states).unwrap();
         let l2d = logits.squeeze(0).unwrap().reshape((m - 1, vocab)).unwrap();
         let tgt = Tensor::from_vec(w[1..].to_vec(), (m - 1,), dev).unwrap();
-        total += candle_nn::loss::cross_entropy(&l2d, &tgt).unwrap().to_scalar::<f32>().unwrap()
+        total += candle_nn::loss::cross_entropy(&l2d, &tgt)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
             * (m - 1) as f32;
         n += m - 1;
     }
@@ -102,10 +115,15 @@ fn main() {
 
 fn run() {
     let repo = repo_root();
-    let bpe = std::env::var("AXIOM_BPE")
-        .unwrap_or_else(|_| repo.join("checkpoints/axiom_bpe.json").to_string_lossy().into());
+    let bpe = std::env::var("AXIOM_BPE").unwrap_or_else(|_| {
+        repo.join("checkpoints/axiom_bpe.json")
+            .to_string_lossy()
+            .into()
+    });
     let ckpt = std::env::var("AXIOM_BPE_CKPT").unwrap_or_else(|_| {
-        repo.join("checkpoints/axiom_production_bpe.bin").to_string_lossy().into()
+        repo.join("checkpoints/axiom_production_bpe.bin")
+            .to_string_lossy()
+            .into()
     });
     let tok = Tokenizer::from_file(&bpe).expect("load BPE tokenizer");
     let vocab = tok.get_vocab_size(true);
@@ -114,7 +132,13 @@ fn run() {
     let inner_lr = env_f64("AXIOM_INNER_LR", 1e-3) as f32;
     let epochs = env_usize("AXIOM_EPOCHS", 8);
     let step_cap = env_usize("AXIOM_STEP_CAP", 4000);
-    let win = env_usize("AXIOM_TRAIN_WIN", 128);
+    let requested_win = env_usize("AXIOM_TRAIN_WIN", 128);
+    let win = requested_win.clamp(2, 128);
+    if requested_win != win {
+        eprintln!(
+            "[train] AXIOM_TRAIN_WIN={requested_win} adjusted to {win} for strict 2..128 detached windows on 6GB VRAM"
+        );
+    }
     let max_tokens = env_usize("AXIOM_MAX_TOKENS", 2_000_000);
     let patience = env_usize("AXIOM_PATIENCE", 3);
     // Stability controls (matter for deep/wide models like d512/8L that otherwise
@@ -122,6 +146,9 @@ fn run() {
     let grad_clip = env_f64("AXIOM_GRAD_CLIP", 1.0);
     let warmup = env_usize("AXIOM_WARMUP_STEPS", 100);
     let log_every = env_usize("AXIOM_LOG_EVERY", 0);
+    let last_token_only = std::env::var("AXIOM_TRAIN_LAST_TOKEN_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     // Inner-loop stabilization (normalized keys + state clamp): required for
     // deep/wide models (d384, d512+) to stay finite. Recorded in the sidecar so
     // the proxy runs the checkpoint the same way it was trained.
@@ -168,6 +195,7 @@ fn run() {
     let model = AxiomTTTLM::new(vb, config.clone()).expect("build model");
     model.set_stabilize(stabilize);
     eprintln!("[train] inner-loop stabilization: {stabilize}");
+    eprintln!("[train] last-token-only fast loss: {last_token_only}");
 
     // RESUME: continue from an existing checkpoint when dims match.
     if Path::new(&ckpt).exists() {
@@ -185,9 +213,17 @@ fn run() {
     let mut toks: Vec<u32> = Vec::new();
     let shards = corpus_shards(&corpus_dir);
     if shards.is_empty() {
-        for p in std::fs::read_dir(repo.join("axiom_engine_rs/src")).into_iter().flatten().flatten() {
+        for p in std::fs::read_dir(repo.join("axiom_engine_rs/src"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let t = std::fs::read_to_string(p.path()).unwrap_or_default();
-            toks.extend(tok.encode(t, false).map(|e| e.get_ids().to_vec()).unwrap_or_default());
+            toks.extend(
+                tok.encode(t, false)
+                    .map(|e| e.get_ids().to_vec())
+                    .unwrap_or_default(),
+            );
             if toks.len() >= max_tokens {
                 break;
             }
@@ -195,7 +231,11 @@ fn run() {
     } else {
         for s in &shards {
             let t = std::fs::read_to_string(s).unwrap_or_default();
-            toks.extend(tok.encode(t, false).map(|e| e.get_ids().to_vec()).unwrap_or_default());
+            toks.extend(
+                tok.encode(t, false)
+                    .map(|e| e.get_ids().to_vec())
+                    .unwrap_or_default(),
+            );
             if toks.len() >= max_tokens {
                 toks.truncate(max_tokens);
                 break;
@@ -209,11 +249,20 @@ fn run() {
 
     // --- Train: AdamW + early-stop on val CE; OOM-safe steps; bake best -------
     let windows: Vec<&[u32]> = train_toks.chunks(win).filter(|c| c.len() >= 2).collect();
-    let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW { lr, ..Default::default() }).unwrap();
+    let mut opt = AdamW::new(
+        varmap.all_vars(),
+        ParamsAdamW {
+            lr,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let t0 = std::time::Instant::now();
     let mut best_val = f32::INFINITY;
     let mut since_improve = 0usize;
     let mut step = 0usize;
+    let mut step_ms_sum = 0.0f64;
+    let mut step_ms_count = 0usize;
     'train: for ep in 0..epochs {
         let mut sum = 0.0f32;
         let mut cnt = 0usize;
@@ -221,6 +270,7 @@ fn run() {
             let n = w.len();
             let mut states = model.init_states(&device).unwrap();
             let input = Tensor::from_vec(w[..n - 1].to_vec(), (1, n - 1), &device).unwrap();
+            let step_started = std::time::Instant::now();
             // OOM-resilient step: on a memory failure, skip this window gracefully.
             // Also NaN-guarded + grad-clipped + LR-warmed to keep deep models stable.
             let stepped = (|| -> candle_core::Result<f32> {
@@ -230,9 +280,16 @@ fn run() {
                 } else if step == warmup {
                     opt.set_learning_rate(lr);
                 }
-                let logits = model.forward_lm(&input, &mut states)?;
-                let l2d = logits.squeeze(0)?.reshape((n - 1, vocab))?;
-                let tgt = Tensor::from_vec(w[1..].to_vec(), (n - 1,), &device)?;
+                let (l2d, tgt) = if last_token_only {
+                    let logits = model.forward_last_logits(&input, &mut states)?;
+                    let tgt = Tensor::from_vec(vec![w[n - 1]], (1usize,), &device)?;
+                    (logits.reshape((1usize, vocab))?, tgt)
+                } else {
+                    let logits = model.forward_lm(&input, &mut states)?;
+                    let l2d = logits.squeeze(0)?.reshape((n - 1, vocab))?;
+                    let tgt = Tensor::from_vec(w[1..].to_vec(), (n - 1,), &device)?;
+                    (l2d, tgt)
+                };
                 let loss = candle_nn::loss::cross_entropy(&l2d, &tgt)?;
                 let lval = loss.to_scalar::<f32>()?;
                 // Skip poisoned steps: never let a NaN/inf gradient touch the weights.
@@ -263,6 +320,9 @@ fn run() {
                 opt.step(&grads)?;
                 Ok(lval)
             })();
+            let step_ms = step_started.elapsed().as_secs_f64() * 1000.0;
+            step_ms_sum += step_ms;
+            step_ms_count += 1;
             match stepped {
                 Ok(l) if l.is_finite() => {
                     sum += l;
@@ -276,9 +336,11 @@ fn run() {
             // first per-epoch eval (set AXIOM_LOG_EVERY>0 to enable).
             if log_every > 0 && step % log_every == 0 {
                 eprintln!(
-                    "[train]   step {} loss~{:.4} ({:.0}s)",
+                    "[train]   step {} loss~{:.4} step_ms={:.1} avg_step_ms={:.1} ({:.0}s)",
                     step,
                     sum / cnt.max(1) as f32,
+                    step_ms,
+                    step_ms_sum / step_ms_count.max(1) as f64,
                     t0.elapsed().as_secs_f32()
                 );
             }
@@ -310,6 +372,7 @@ fn run() {
                 val_ce: best_val,
                 tokenizer: bpe.clone(),
                 stabilize,
+                last_token_only,
             }
             .save(&ckpt);
         } else {
@@ -320,6 +383,11 @@ fn run() {
             }
         }
     }
-    eprintln!("[train] BEST val_ce={:.4} → {ckpt} (+ sidecar), {:.0}s", best_val, t0.elapsed().as_secs_f32());
+    eprintln!(
+        "[train] BEST val_ce={:.4} → {ckpt} (+ sidecar), {:.0}s, avg_step_ms={:.1}",
+        best_val,
+        t0.elapsed().as_secs_f32(),
+        step_ms_sum / step_ms_count.max(1) as f64
+    );
     println!("{best_val:.4}");
 }

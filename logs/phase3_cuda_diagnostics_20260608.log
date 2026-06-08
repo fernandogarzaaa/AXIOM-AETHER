@@ -145,3 +145,39 @@ Notes:
 - Candle dependency is candle-core/candle-nn 0.10.2 with cuda feature enabled in Cargo.toml.
 - CUDA 13.1 toolchain requires NVCC_PREPEND_FLAGS=-allow-unsupported-compiler with the installed Visual Studio 2026 compiler.
 - Search ingestion hard-caps online TTT windows at SEARCH_CHUNK=512 and recursively halves chunks down to MIN_CHUNK=32 on memory pressure.
+
+=== 2026-06-08 Phase 3 speed/memory addendum ===
+Milestone: train_semantic now clamps AXIOM_TRAIN_WIN to 2..128 for the 6GB RTX 2060 target and emits per-step millisecond diagnostics. A fast detached-chunk loss mode is available via AXIOM_TRAIN_LAST_TOKEN_ONLY=1.
+
+Why the cap is 128:
+- Diagnostic run with AXIOM_TRAIN_WIN=999 initially clamped to 512 and d_model=512/n_layers=2 produced CUDA_ERROR_OUT_OF_MEMORY on the RTX 2060.
+- The cap was tightened to 128, which is strictly below the requested <512-token detached chunking ceiling and was stable on d512.
+
+Fast-path model invariant:
+- Added AxiomTTTLM::forward_last_hidden and forward_last_logits, which update session states like the full path while avoiding intermediate token-output storage.
+- Unit proof: model::tests::test_forward_last_logits_matches_full_final_token passed, confirming final-token logits match the final slice of forward_lm for identical initial states.
+
+CUDA fast-step diagnostics:
+- Command shape: d_model=512, n_layers=2, vocab=16000, AXIOM_TRAIN_WIN=999, AXIOM_TRAIN_LAST_TOKEN_ONLY=1, AXIOM_TTT_STABILIZE=1.
+- Runtime clamp: AXIOM_TRAIN_WIN=999 adjusted to 128 for strict 2..128 detached windows on 6GB VRAM.
+- Four-step smoke: step_ms=504.3, 393.2, 316.3, 324.8; avg_step_ms=384.6; finite loss around 9.6803; PASS.
+- Complete one-epoch bake after metadata update: 12 steps, avg_step_ms=331.1, val_ce=9.6780, checkpoint written to target\phase3_cuda_fast_baked_d512.bin; PASS.
+
+Baked fast checkpoint metadata:
+{
+  "d_model": 512,
+  "n_layers": 2,
+  "vocab_size": 16000,
+  "lr_inner": 0.001,
+  "norm_eps": 0.000001,
+  "val_ce": 9.678044,
+  "tokenizer": "C:\\Users\\garza\\AXIOM-AETHER\\checkpoints/axiom_bpe.json",
+  "stabilize": true,
+  "last_token_only": true
+}
+
+Verification:
+- cargo test --lib --manifest-path axiom_engine_rs\Cargo.toml: PASS, 117 passed / 0 failed.
+- cargo test --lib --manifest-path axiom_engine_rs\Cargo.toml --features cuda: PASS, 117 passed / 0 failed.
+- cargo build --release --manifest-path axiom_engine_rs\Cargo.toml --features cuda --bin train_semantic: PASS.
+- Current GPU snapshot after run: NVIDIA GeForce RTX 2060, used 0 MiB, free 5955 MiB, util 0%.
