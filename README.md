@@ -122,6 +122,24 @@ verified end-to-end through the proxy:
 
 ## Quick Start
 
+### One-line install
+
+Linux/macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/fernandogarzaaa/AXIOM-AETHER/main/scripts/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+iwr https://raw.githubusercontent.com/fernandogarzaaa/AXIOM-AETHER/main/scripts/install.ps1 -UseB | iex
+```
+
+The installer downloads the latest GitHub Release binary, installs it as
+`axiom`, and runs `axiom init` to scaffold `~/.axiom` or
+`%USERPROFILE%\.axiom`.
+
 ### Zero-install binary (pre-built releases)
 
 ```bash

@@ -1,10 +1,12 @@
 mod anthropic_forwarder;
 mod claude_backend;
+mod cli;
 mod cluster;
 mod config;
 mod context_compressor;
 mod contrastive;
 mod corpus;
+mod daemon;
 mod data_gen;
 mod dwe;
 mod embedder;
@@ -43,6 +45,7 @@ mod weight_merge;
 use std::env;
 
 use candle_core::{bail, Device, Result};
+use cli::{AxiomCommand, DaemonCommand, ParsedCli, SwarmCommand};
 use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use inference::{InferencePipeline, InferenceRuntimeOptions};
 use train::AxiomTrainer;
@@ -369,6 +372,12 @@ fn main() -> Result<()> {
 }
 
 async fn run_main() -> Result<()> {
+    match cli::parse_entry().map_err(|e| candle_core::Error::Msg(e.to_string()))? {
+        ParsedCli::Command(command) => return handle_axiom_command(command).await,
+        ParsedCli::HelpPrinted => return Ok(()),
+        ParsedCli::Legacy => {}
+    }
+
     let args = parse_cli()?;
 
     // `doctor` reports the hardware profile + recommended config and exits. It
@@ -508,4 +517,99 @@ async fn run_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
+    match command {
+        AxiomCommand::Init(args) => {
+            let (paths, mut cfg, created) = config::load_or_init_user_config()
+                .map_err(|e| candle_core::Error::Msg(format!("init failed: {e}")))?;
+            if args.no_fetch {
+                cfg.models.auto_fetch = false;
+                config::write_user_config(&paths, &cfg)
+                    .map_err(|e| candle_core::Error::Msg(format!("config write failed: {e}")))?;
+            } else if let Err(err) = config::ensure_base_model(&paths, &cfg) {
+                eprintln!(
+                    "[axiom] model auto-fetch skipped: {err}. You can place {} manually in {}.",
+                    cfg.models.base_model_file,
+                    paths.models_dir.display()
+                );
+            }
+            println!(
+                "[axiom] initialized {} at {}",
+                if created {
+                    "new environment"
+                } else {
+                    "environment"
+                },
+                paths.home.display()
+            );
+            println!("[axiom] config: {}", paths.config.display());
+            println!("[axiom] logs:   {}", paths.logs_dir.display());
+        }
+        AxiomCommand::Daemon { command } => match command {
+            DaemonCommand::Start => {
+                let (paths, cfg, _) = config::load_or_init_user_config()
+                    .map_err(|e| candle_core::Error::Msg(format!("daemon init failed: {e}")))?;
+                if let Err(err) = config::ensure_base_model(&paths, &cfg) {
+                    eprintln!(
+                        "[axiom] model auto-fetch skipped: {err}. Continuing with local/runtime defaults."
+                    );
+                }
+                let status = daemon::start()
+                    .map_err(|e| candle_core::Error::Msg(format!("daemon start failed: {e}")))?;
+                print_daemon_status("started", &status);
+            }
+            DaemonCommand::Stop => {
+                let status = daemon::stop()
+                    .map_err(|e| candle_core::Error::Msg(format!("daemon stop failed: {e}")))?;
+                print_daemon_status("stopped", &status);
+            }
+            DaemonCommand::Status => {
+                let status = daemon::status()
+                    .map_err(|e| candle_core::Error::Msg(format!("daemon status failed: {e}")))?;
+                print_daemon_status("status", &status);
+            }
+        },
+        AxiomCommand::Mount { path } => match daemon::mount(path.clone()) {
+            Ok(response) => {
+                println!("[axiom] mounted {}", path.display());
+                println!("{response}");
+            }
+            Err(err) => {
+                eprintln!("[axiom] {err}");
+            }
+        },
+        AxiomCommand::Swarm { command } => match command {
+            SwarmCommand::Connect { ip } => {
+                let peer = cli::normalize_peer(&ip);
+                let (paths, _cfg, inserted) = config::add_swarm_peer(&peer)
+                    .map_err(|e| candle_core::Error::Msg(format!("swarm connect failed: {e}")))?;
+                println!(
+                    "[axiom] DWE peer {} {peer}",
+                    if inserted {
+                        "added"
+                    } else {
+                        "already configured"
+                    }
+                );
+                println!("[axiom] config: {}", paths.config.display());
+                println!("[axiom] restart the daemon to apply updated peer routing.");
+            }
+        },
+    }
+    Ok(())
+}
+
+fn print_daemon_status(label: &str, status: &daemon::DaemonStatus) {
+    println!(
+        "[axiom] daemon {label}: {}",
+        if status.running { "running" } else { "stopped" }
+    );
+    if let Some(pid) = status.pid {
+        println!("[axiom] pid: {}", pid);
+    }
+    println!("[axiom] endpoint: {}", status.endpoint);
+    println!("[axiom] pid file: {}", status.pid_file.display());
+    println!("[axiom] log: {}", status.log_path.display());
 }
