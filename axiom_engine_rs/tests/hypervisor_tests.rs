@@ -127,3 +127,127 @@ async fn poly_jit_repairs_faulted_script_and_finishes() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[tokio::test]
+async fn hypervisor_read_endpoint_absorbs_file_incrementally() {
+    let root = std::env::temp_dir().join(format!("axiom-read-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.rs"), "pub fn a() -> i32 { 1 }").unwrap();
+    std::fs::write(root.join("b.rs"), "pub fn b() -> i32 { 2 }").unwrap();
+
+    let app = create_router(test_state().await);
+    // Mount first (no warm paths).
+    let mount = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/hypervisor/mount")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"root": root.to_string_lossy()}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mount.status(), StatusCode::OK);
+
+    // Incrementally read a file → absorbed into the session's W̃.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/hypervisor/read")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path": "b.rs", "session_id": "vfs-incr"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(v["read"]["digest_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(v["vfs"]["read_events"].as_u64().unwrap(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn jit_run_endpoint_repairs_source_and_feeds_ttt() {
+    let root = std::env::temp_dir().join(format!("axiom-jitrun-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let script = root.join("check.sh");
+    // Fails with `exit 1`; Q-TTT collapses to the exit-code-flip candidate.
+    std::fs::write(&script, "#!/bin/sh\necho 'build failed' >&2\nexit 1\n").unwrap();
+
+    let app = create_router(test_state().await);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/hypervisor/jit_run")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "jit-1",
+                        "command": "sh",
+                        "args": [script.to_string_lossy()],
+                        "source_path": script.to_string_lossy(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(v["report"]["passed"], true);
+    assert_eq!(v["report"]["patched"], true);
+    assert_eq!(v["source_restored"], false, "a passing repair keeps the patch");
+    assert!(std::fs::read_to_string(&script).unwrap().contains("exit 0"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn jit_run_restores_source_when_repair_fails() {
+    let root = std::env::temp_dir().join(format!("axiom-jitfail-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let script = root.join("hard.sh");
+    // No patch rule matches (avoids `exit 1`/markers/throw/assert) → repair
+    // cannot pass → the source must be restored byte-for-byte.
+    let original = "#!/bin/sh\necho 'mysterious failure mode' >&2\nexit 3\n";
+    std::fs::write(&script, original).unwrap();
+
+    let app = create_router(test_state().await);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/hypervisor/jit_run")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "command": "sh",
+                        "args": [script.to_string_lossy()],
+                        "source_path": script.to_string_lossy(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(v["report"]["passed"], false);
+    // SAFETY: the original source must be intact byte-for-byte.
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), original);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
