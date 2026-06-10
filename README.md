@@ -242,6 +242,23 @@ missing it logs `pre-flight: predicting failure …` and then immunizes
 proactively, so the predicted failure never happens. This turns the immune
 system from reactive + prophylactic into genuinely *anticipatory*.
 
+### Cross-reactive immunity (generalization by analogy)
+
+Like antibodies that recognize a pathogen similar to one seen before, Axiom
+generalizes a heal across a **program family**: if `cargo build` learned it
+needs `target/`, then a never-seen `cargo test` referenced in the conversation
+gets an analogical **hint** in the proxy's `<axiom_immunity>` block —
+
+```text
+- cross-reactive hint: a sibling `cargo build` previously needed directory
+  target; a different `cargo …` invocation here may need the same (Axiom has
+  not applied it).
+```
+
+These are advisory **only** — never auto-applied — so a wrong analogy costs
+nothing. Fires only for multi-sub-command families, never for a directly-known
+command (that's a direct advisory) or an unrelated program.
+
 ### Adaptive immune confidence (maturation + waning)
 
 Heals carry a confidence that follows an adaptive-immunity lifecycle:

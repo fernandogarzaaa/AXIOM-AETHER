@@ -18,7 +18,7 @@
 //! `~/.axiom/heal_memory.json`). Only directory heals are remembered: transient
 //! retries are situational and never replayed prophylactically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -339,6 +339,59 @@ impl HealMemory {
                     r.command,
                     r.required_env.join(", ")
                 ));
+            }
+        }
+        out
+    }
+
+    /// Cross-reactive immunity: analogical hints from *sibling* commands in the
+    /// same program family (same executable, different sub-command) that carry
+    /// learned heals. Fires when the program name is referenced in `text` but
+    /// the sibling's exact signature is not — generalizing immunity by analogy.
+    /// These are advisory ONLY (never auto-applied), so a wrong analogy costs
+    /// nothing. Capped to keep proxy payloads lean.
+    pub fn cross_reactive_hints(&self, text: &str) -> Vec<String> {
+        let hay = text.to_ascii_lowercase();
+        let mut out = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut records: Vec<&ProgramRecord> = self
+            .data
+            .programs
+            .values()
+            .filter(|r| !r.dirs.is_empty())
+            .collect();
+        records.sort_by(|a, b| a.command.cmp(&b.command));
+        for r in records {
+            let Some(sig) = command_signature(&r.command) else {
+                continue;
+            };
+            // Cross-reactivity is for multi-sub-command families ("cargo build"),
+            // not single-command tools, and the exact command must NOT already be
+            // referenced (that path is a direct advisory, not an analogy).
+            let mut parts = sig.splitn(2, ' ');
+            let prog = parts.next().unwrap_or("");
+            if parts.next().is_none() || prog.len() < 3 || hay.contains(&sig) {
+                continue;
+            }
+            if !hay.contains(prog) || !seen.insert(format!("{prog}:{:?}", r.dirs)) {
+                continue;
+            }
+            let dirs = r
+                .dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!(
+                "cross-reactive hint: a sibling `{}` previously needed director{} {}; \
+                 a different `{prog} …` invocation here may need the same (Axiom has \
+                 not applied it).",
+                r.command,
+                if r.dirs.len() == 1 { "y" } else { "ies" },
+                dirs
+            ));
+            if out.len() >= 3 {
+                break;
             }
         }
         out
@@ -669,6 +722,29 @@ mod tests {
 
         let miss = mem.report_text(Some("rustc"));
         assert!(miss.contains("no acquired immunity matching"));
+    }
+
+    #[test]
+    fn cross_reactive_hints_generalize_within_a_program_family() {
+        let mut mem = HealMemory::load(tmp("xreact"));
+        mem.remember_dirs(
+            &fingerprint("cargo", &["build".into()]),
+            "cargo build",
+            &[PathBuf::from("target")],
+        );
+
+        // A sibling sub-command (`cargo test`) referenced but never learned →
+        // analogical hint from `cargo build`.
+        let hints = mem.cross_reactive_hints("why does cargo test fail in CI?");
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("cargo build") && hints[0].contains("target"));
+
+        // The exact command directly referenced → NOT a cross-reactive hint
+        // (that's a direct advisory's job).
+        assert!(mem.cross_reactive_hints("cargo build broke").is_empty());
+
+        // A different program family → no analogy.
+        assert!(mem.cross_reactive_hints("npm test failing").is_empty());
     }
 
     #[test]
