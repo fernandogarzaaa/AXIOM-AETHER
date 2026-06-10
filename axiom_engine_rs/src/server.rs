@@ -3112,11 +3112,7 @@ pub async fn run_server(
 
     // Swarm immunity: serve/merge the same heal memory `axiom run` learns into
     // (AXIOM_HEAL_MEMORY overrides the path, 0/off disables the endpoints).
-    let heal_memory_path = match std::env::var("AXIOM_HEAL_MEMORY") {
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
-        Ok(v) => Some(std::path::PathBuf::from(v)),
-        Err(_) => dirs::home_dir().map(|h| h.join(".axiom").join("heal_memory.json")),
-    };
+    let heal_memory_path = crate::heal_memory::HealMemory::default_path();
     if let Some(p) = heal_memory_path.as_ref() {
         println!("[+] Swarm immunity ON — /v1/immunity serves and merges {}", p.display());
     }

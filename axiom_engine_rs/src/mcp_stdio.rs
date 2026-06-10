@@ -337,6 +337,16 @@ fn tools_list() -> Value {
                     },
                     "required": ["id"]
                 }
+            },
+            {
+                "name": "axiom_immunity",
+                "description": "Report what Axiom has learned about program failures from supervised `axiom run` executions: the heals it now applies prophylactically (e.g. directories it pre-creates) and each program's failure-tension history. Use when debugging a command that fails in the user's environment — Axiom may already know the fix.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Optional case-insensitive command substring to filter by (e.g. 'cargo build'). Omit to list everything Axiom has learned." }
+                    }
+                }
             }
         ]
     })
@@ -491,6 +501,19 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     success_response(id, tool_text_result(&format!("forget failed: {e}"), true))
                 }
             }
+        }
+        "axiom_immunity" => {
+            let query = args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            let outcome = tokio::task::spawn_blocking(move || match crate::heal_memory::HealMemory::default_path() {
+                Some(path) => crate::heal_memory::HealMemory::load(&path).report_text(query.as_deref()),
+                None => "Axiom heal memory is disabled (AXIOM_HEAL_MEMORY=0).".to_string(),
+            })
+            .await
+            .unwrap_or_else(|e| format!("worker join error: {e}"));
+            success_response(id, tool_text_result(&outcome, false))
         }
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
     }
@@ -851,14 +874,18 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
         assert!(names.contains(&"axiom_expand"));
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object");
-            assert!(t["inputSchema"]["required"].is_array());
+            // `required` is optional in MCP (axiom_immunity has only optional
+            // params); when present it must be an array.
+            if let Some(req) = t["inputSchema"].get("required") {
+                assert!(req.is_array());
+            }
         }
     }
 
@@ -870,6 +897,18 @@ mod tests {
         assert!(names.contains(&"axiom_remember"));
         assert!(names.contains(&"axiom_recall"));
         assert!(names.contains(&"axiom_forget"));
+    }
+
+    #[test]
+    fn tools_list_includes_immunity_tool() {
+        let list = tools_list();
+        let names: Vec<&str> = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"axiom_immunity"));
     }
 
     #[test]

@@ -112,6 +112,66 @@ impl HealMemory {
         self.data.programs.get(fp)
     }
 
+    /// Every program this memory knows about, newest-insertion-order-agnostic.
+    pub fn all_records(&self) -> Vec<&ProgramRecord> {
+        self.data.programs.values().collect()
+    }
+
+    /// Records whose command line contains `query` (case-insensitive). An empty
+    /// query matches everything.
+    pub fn find(&self, query: &str) -> Vec<&ProgramRecord> {
+        let q = query.trim().to_ascii_lowercase();
+        self.data
+            .programs
+            .values()
+            .filter(|r| q.is_empty() || r.command.to_ascii_lowercase().contains(&q))
+            .collect()
+    }
+
+    /// Human- and agent-readable summary of acquired immunity. `query` filters
+    /// by command substring; `None`/empty lists everything.
+    pub fn report_text(&self, query: Option<&str>) -> String {
+        let mut records = self.find(query.unwrap_or(""));
+        if records.is_empty() {
+            return match query {
+                Some(q) if !q.trim().is_empty() => {
+                    format!("Axiom has no acquired immunity matching \"{q}\".")
+                }
+                _ => "Axiom has not learned any program failures yet.".to_string(),
+            };
+        }
+        // Stable output: most-experienced programs first.
+        records.sort_by(|a, b| b.ce_count.cmp(&a.ce_count).then(a.command.cmp(&b.command)));
+        let mut out = format!("Acquired immunity ({} program(s)):\n", records.len());
+        for r in records {
+            out.push_str(&format!("\n• {}\n", r.command));
+            out.push_str(&format!(
+                "    failures observed: {}   mean tension (CE): {:.3}\n",
+                r.ce_count, r.ce_mean
+            ));
+            if r.dirs.is_empty() {
+                out.push_str("    learned heals: none (no directory heals)\n");
+            } else {
+                out.push_str("    learned heals: pre-create directories\n");
+                for d in &r.dirs {
+                    out.push_str(&format!("      - {}\n", d.display()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve the default heal-memory path used across the engine:
+    /// `AXIOM_HEAL_MEMORY` overrides it; `0`/`off` disables it (returns `None`);
+    /// otherwise `~/.axiom/heal_memory.json`.
+    pub fn default_path() -> Option<PathBuf> {
+        match std::env::var("AXIOM_HEAL_MEMORY") {
+            Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
+            Ok(v) => Some(PathBuf::from(v)),
+            Err(_) => dirs::home_dir().map(|h| h.join(".axiom").join("heal_memory.json")),
+        }
+    }
+
     /// Re-create every remembered directory that is missing. Returns the dirs
     /// actually created now (the immunization applied to *this* environment).
     pub fn immunize(&self, fp: &str) -> Vec<PathBuf> {
@@ -320,6 +380,33 @@ mod tests {
         assert!(ours.merge_json("{broken").is_err());
         // Local state untouched.
         assert_eq!(ours.record(&fp).unwrap().dirs, vec![PathBuf::from("/keep")]);
+    }
+
+    #[test]
+    fn report_text_summarizes_and_filters() {
+        let mut mem = HealMemory::load(tmp("report"));
+        let fp_cargo = fingerprint("cargo", &["build".into()]);
+        mem.remember_dirs(&fp_cargo, "cargo build", &[PathBuf::from("/target")]);
+        mem.observe_failure(&fp_cargo, "cargo build", 4.0);
+        let fp_py = fingerprint("python", &["app.py".into()]);
+        mem.observe_failure(&fp_py, "python app.py", 6.0);
+
+        let all = mem.report_text(None);
+        assert!(all.contains("cargo build") && all.contains("python app.py"));
+        assert!(all.contains("/target"), "remembered heals must be listed");
+
+        let filtered = mem.report_text(Some("cargo"));
+        assert!(filtered.contains("cargo build"));
+        assert!(!filtered.contains("python app.py"), "filter must exclude non-matches");
+
+        let miss = mem.report_text(Some("rustc"));
+        assert!(miss.contains("no acquired immunity matching"));
+    }
+
+    #[test]
+    fn report_text_empty_memory_is_friendly() {
+        let mem = HealMemory::load(tmp("empty_report"));
+        assert!(mem.report_text(None).contains("has not learned any program failures"));
     }
 
     #[test]

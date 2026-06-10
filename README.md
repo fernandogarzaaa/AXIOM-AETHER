@@ -212,6 +212,19 @@ What actually happens on a failure:
    `axiom swarm immunity nodeA:3000`; the same program then succeeds
    **first-try on node B, where it had never run before**.
 
+### Inspecting acquired immunity
+
+What Axiom has learned is queryable by both the operator and an AI agent:
+
+```bash
+axiom immunity            # everything learned: heals + per-program tension history
+axiom immunity cargo      # filter by command substring
+```
+
+The same report is exposed to agents as the **`axiom_immunity`** MCP tool — so
+Claude, debugging a command that fails in your environment, can ask Axiom what
+it already knows about that program's failures and the heals it now applies.
+
 Honesty notes: source-artifact patching lives in the Poly JIT hypervisor path,
 not here; restarting a process is not literally resuming a suspended thread
 (v1 targets batch/idempotent programs); and with an unbaked checkpoint the CE
