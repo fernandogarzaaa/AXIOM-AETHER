@@ -457,6 +457,43 @@ fn heals_missing_execute_bit_on_a_script() {
 }
 
 #[test]
+fn diagnoses_and_remembers_missing_env_var() {
+    use axiom_engine::heal_memory::{fingerprint, HealMemory};
+
+    let memory = unique_tmp("envmem").with_extension("json");
+    // Fails citing a missing env var (a name not set in this process).
+    let script = "echo 'error: AXIOM_FAKE_TOKEN_XYZ must be set' >&2; exit 1";
+    let args = vec!["-c".to_string(), script.to_string()];
+    let report = supervise_opts(
+        tiny_pipeline(),
+        "sh".into(),
+        args.clone(),
+        SupervisorOptions {
+            max_restarts: 3,
+            heal_memory_path: Some(memory.clone()),
+            ..SupervisorOptions::default()
+        },
+    );
+
+    // Can't fabricate the value → run fails, but a diagnostic is surfaced…
+    assert!(!report.success);
+    assert!(
+        report.diagnostics.iter().any(|d| d.contains("AXIOM_FAKE_TOKEN_XYZ")),
+        "missing env var must be diagnosed: {:?}",
+        report.diagnostics
+    );
+    // …and the requirement is remembered for advisories / `axiom immunity`.
+    let fp = fingerprint("sh", &args);
+    let mem = HealMemory::load(&memory);
+    assert_eq!(
+        mem.record(&fp).map(|r| r.required_env.clone()),
+        Some(vec!["AXIOM_FAKE_TOKEN_XYZ".to_string()])
+    );
+
+    let _ = std::fs::remove_file(&memory);
+}
+
+#[test]
 fn novel_healed_failure_is_written_to_recall_memory() {
     use axiom_engine::memory_store::{MemoryKind, MemoryStore};
 

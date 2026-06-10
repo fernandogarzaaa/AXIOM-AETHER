@@ -46,6 +46,11 @@ pub struct ProgramRecord {
     pub command: String,
     /// Directories this program needed created in the past.
     pub dirs: Vec<PathBuf>,
+    /// Environment variables this program reported as required-but-unset. A
+    /// value cannot be safely fabricated, so these are surfaced as diagnostics
+    /// (in advisories / `axiom immunity`) rather than auto-applied.
+    #[serde(default)]
+    pub required_env: Vec<String>,
     /// Running mean of failure-trace cross-entropy.
     pub ce_mean: f32,
     /// Number of failures folded into `ce_mean`.
@@ -269,6 +274,12 @@ impl HealMemory {
                     out.push_str(&format!("      - {}\n", d.display()));
                 }
             }
+            if !r.required_env.is_empty() {
+                out.push_str(&format!(
+                    "    requires env vars (set before running): {}\n",
+                    r.required_env.join(", ")
+                ));
+            }
         }
         out
     }
@@ -284,7 +295,7 @@ impl HealMemory {
             .data
             .programs
             .values()
-            .filter(|r| !r.dirs.is_empty())
+            .filter(|r| !r.dirs.is_empty() || !r.required_env.is_empty())
             .collect();
         records.sort_by(|a, b| a.command.cmp(&b.command));
         for r in records {
@@ -294,31 +305,41 @@ impl HealMemory {
             if !haystack.contains(&sig) {
                 continue;
             }
-            let dirs = r
-                .dirs
-                .iter()
-                .map(|d| d.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let c = r.confidence_now(now_secs());
-            // Phrase by matured confidence: an established fix is asserted, a
-            // tentative one is offered as a possibility.
-            let preamble = if c >= 0.6 {
-                format!(
-                    "`{}` reliably fails in this environment (fixed {} time(s)); Axiom's established fix",
-                    r.command, r.immunizations
-                )
-            } else {
-                format!(
-                    "`{}` has failed in this environment before; Axiom's tentative fix",
-                    r.command
-                )
-            };
-            out.push(format!(
-                "{preamble}: create director{} {}. Apply preemptively if it fails again.",
-                if r.dirs.len() == 1 { "y" } else { "ies" },
-                dirs
-            ));
+            if !r.dirs.is_empty() {
+                let dirs = r
+                    .dirs
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let c = r.confidence_now(now_secs());
+                // Phrase by matured confidence: an established fix is asserted, a
+                // tentative one is offered as a possibility.
+                let preamble = if c >= 0.6 {
+                    format!(
+                        "`{}` reliably fails in this environment (fixed {} time(s)); Axiom's established fix",
+                        r.command, r.immunizations
+                    )
+                } else {
+                    format!(
+                        "`{}` has failed in this environment before; Axiom's tentative fix",
+                        r.command
+                    )
+                };
+                out.push(format!(
+                    "{preamble}: create director{} {}. Apply preemptively if it fails again.",
+                    if r.dirs.len() == 1 { "y" } else { "ies" },
+                    dirs
+                ));
+            }
+            if !r.required_env.is_empty() {
+                out.push(format!(
+                    "`{}` requires environment variable(s) {} to be set — Axiom cannot \
+                     fabricate the value(s); ensure they are exported.",
+                    r.command,
+                    r.required_env.join(", ")
+                ));
+            }
         }
         out
     }
@@ -427,6 +448,28 @@ impl HealMemory {
         // A freshly learned heal is tentative until reuse proves it.
         if record.confidence <= 0.0 {
             record.confidence = INITIAL_CONFIDENCE;
+        }
+    }
+
+    /// Record environment variables a program reported as required-but-unset, so
+    /// they can be surfaced as diagnostics. Deduplicates; creates the record if
+    /// this is the program's first observation.
+    pub fn remember_env_requirement(&mut self, fp: &str, command_line: &str, vars: &[String]) {
+        if vars.is_empty() {
+            return;
+        }
+        let record = self
+            .data
+            .programs
+            .entry(fp.to_string())
+            .or_insert_with(|| ProgramRecord {
+                command: command_line.to_string(),
+                ..ProgramRecord::default()
+            });
+        for v in vars {
+            if !record.required_env.contains(v) {
+                record.required_env.push(v.clone());
+            }
         }
     }
 
@@ -626,6 +669,20 @@ mod tests {
 
         let miss = mem.report_text(Some("rustc"));
         assert!(miss.contains("no acquired immunity matching"));
+    }
+
+    #[test]
+    fn env_requirement_surfaces_in_advisory_and_report() {
+        let mut mem = HealMemory::load(tmp("envadv"));
+        let fp = fingerprint("cargo", &["run".into()]);
+        mem.remember_env_requirement(&fp, "cargo run", &["DATABASE_URL".into()]);
+
+        let adv = mem.advisories_for_text("why does cargo run fail?");
+        assert!(
+            adv.iter().any(|a| a.contains("DATABASE_URL") && a.contains("environment variable")),
+            "env requirement must surface as an advisory: {adv:?}"
+        );
+        assert!(mem.report_text(None).contains("requires env vars"));
     }
 
     #[test]

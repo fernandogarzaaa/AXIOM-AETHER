@@ -123,6 +123,10 @@ pub struct RunReport {
     /// Total TTT absorption passes run across all failures. Tension-gated: a
     /// novel/first-seen fault is absorbed harder than a familiar one.
     pub absorption_passes: usize,
+    /// Non-corrective findings surfaced to the operator (e.g. a required
+    /// environment variable Axiom cannot fabricate). Recorded and reported, but
+    /// they do not by themselves justify a restart.
+    pub diagnostics: Vec<String>,
 }
 
 /// Absorption passes for a familiar (KNOWN) failure: light reinforcement, the
@@ -290,6 +294,47 @@ pub fn extract_permission_denied_paths(trace: &str) -> Vec<PathBuf> {
             if looks_path {
                 seen.insert(t.to_string());
                 found.push(PathBuf::from(t));
+            }
+        }
+    }
+    found
+}
+
+/// Extract environment-variable names a trace reports as required-but-unset.
+/// Recognised phrasings (broad but anchored on "environment variable" / "env
+/// var" / "must be set" / "is not set" near an UPPER_SNAKE identifier):
+///   * `FOO environment variable not set`
+///   * `missing required environment variable: API_TOKEN`
+///   * `error: BAR must be set`
+///   * `KeyError: 'DATABASE_URL'` on a line mentioning environ/env
+pub fn extract_required_env_vars(trace: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in trace.lines() {
+        let lower = line.to_ascii_lowercase();
+        let env_context = lower.contains("environment variable")
+            || lower.contains("env var")
+            || lower.contains("environ")
+            || lower.contains("must be set")
+            || lower.contains("is not set")
+            || lower.contains("not set");
+        if !env_context {
+            continue;
+        }
+        // UPPER_SNAKE identifiers, the near-universal convention for env var
+        // names. Requiring an underscore keeps precision high: it admits
+        // API_TOKEN / DATABASE_URL while rejecting all-caps log words like
+        // FATAL / ERROR / WARNING that share a line with "must be set".
+        for raw in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            let t = raw.trim();
+            if t.len() >= 3
+                && t.contains('_')
+                && t.chars().any(|c| c.is_ascii_alphabetic())
+                && t.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && seen.insert(t.to_string())
+            {
+                found.push(t.to_string());
             }
         }
     }
@@ -464,6 +509,7 @@ pub fn run_supervised(
         tension: Vec::new(),
         tokens_absorbed: 0,
         absorption_passes: 0,
+        diagnostics: Vec::new(),
     };
     // One session for the whole supervised lifetime: every failure compounds
     // into the same fast-weights.
@@ -624,6 +670,28 @@ pub fn run_supervised(
                 new_heal_descs.push(heal.to_string());
                 report.heals.push(heal);
                 applied_new_heal = true;
+            }
+        }
+
+        // 3-env. A diagnostic pathogen class: a required environment variable
+        // is unset. Axiom cannot fabricate a value, so it does NOT mark a heal
+        // (no blind restart) — it surfaces an actionable diagnostic once and
+        // remembers the requirement so advisories/`axiom immunity` can tell the
+        // operator (and Claude) to export it.
+        for var in extract_required_env_vars(&trace) {
+            if std::env::var_os(&var).is_some() {
+                continue; // already set in the environment — not the problem
+            }
+            let diag = format!(
+                "requires environment variable {var} (unset) — set it and re-run; \
+                 Axiom cannot safely fabricate its value"
+            );
+            if !report.diagnostics.contains(&diag) {
+                println!("[axiom-run]   diagnosis: {diag}");
+                report.diagnostics.push(diag);
+                if let Some(mem) = memory.as_mut() {
+                    mem.remember_env_requirement(&fp, &command_line, &[var]);
+                }
             }
         }
 
@@ -843,6 +911,24 @@ mod tests {
     fn ignores_lines_without_enoent_phrases() {
         let trace = "error: something else entirely about /tmp/ax/file";
         assert!(extract_missing_paths(trace).is_empty());
+    }
+
+    #[test]
+    fn extracts_required_env_vars_from_varied_phrasings() {
+        assert_eq!(
+            extract_required_env_vars("error: API_TOKEN environment variable not set"),
+            vec!["API_TOKEN"]
+        );
+        assert_eq!(
+            extract_required_env_vars("missing required environment variable: DATABASE_URL"),
+            vec!["DATABASE_URL"]
+        );
+        assert_eq!(
+            extract_required_env_vars("FATAL: SECRET_KEY must be set"),
+            vec!["SECRET_KEY"]
+        );
+        // No env context → nothing, even with an UPPER_SNAKE token present.
+        assert!(extract_required_env_vars("compiled OK with FLAG_X enabled").is_empty());
     }
 
     #[test]
