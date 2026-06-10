@@ -679,23 +679,25 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             });
             // Learned immunity is on by default (~/.axiom/heal_memory.json);
             // AXIOM_HEAL_MEMORY overrides the path, "0"/"off" disables it.
-            let heal_memory_path = match std::env::var("AXIOM_HEAL_MEMORY") {
-                Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
-                Ok(v) => Some(std::path::PathBuf::from(v)),
-                Err(_) => dirs::home_dir().map(|h| h.join(".axiom").join("heal_memory.json")),
+            let heal_memory_path = heal_memory::HealMemory::default_path();
+            // Opt-in: AXIOM_RUN_REMEMBER=1 writes novel healed failures into the
+            // recall memory store (AXIOM_MEMORY_DIR or the default), so the proxy
+            // can surface them into Claude's context later.
+            let remember_into = (std::env::var("AXIOM_RUN_REMEMBER").as_deref() == Ok("1"))
+                .then(|| {
+                    std::env::var("AXIOM_MEMORY_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| std::path::PathBuf::from("checkpoints/memory"))
+                });
+            let opts = self_heal::SupervisorOptions {
+                max_restarts,
+                vibe_path,
+                heal_memory_path,
+                remember_into,
             };
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
-                .spawn(move || {
-                    self_heal::run_supervised(
-                        &pipeline,
-                        &program,
-                        &args,
-                        max_restarts,
-                        vibe_path.as_deref(),
-                        heal_memory_path.as_deref(),
-                    )
-                })
+                .spawn(move || self_heal::run_supervised(&pipeline, &program, &args, &opts))
                 .map_err(|e| candle_core::Error::Msg(format!("supervisor thread failed: {e}")))?
                 .join()
                 .map_err(|_| candle_core::Error::Msg("supervisor thread panicked".into()))??;
@@ -708,6 +710,16 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             );
             if !report.success {
                 std::process::exit(report.exit_code.unwrap_or(1));
+            }
+        }
+        AxiomCommand::Immunity { query } => {
+            match heal_memory::HealMemory::default_path() {
+                Some(path) => {
+                    let memory = heal_memory::HealMemory::load(&path);
+                    println!("{}", memory.report_text(query.as_deref()));
+                    println!("\n[axiom] heal memory: {}", path.display());
+                }
+                None => println!("[axiom] heal memory disabled (AXIOM_HEAL_MEMORY=0)."),
             }
         }
         AxiomCommand::Swarm { command } => match command {
@@ -728,11 +740,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             }
             SwarmCommand::Immunity { peer } => {
                 // Resolve the same local memory the supervisor learns into.
-                let local = match std::env::var("AXIOM_HEAL_MEMORY") {
-                    Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
-                    Ok(v) => Some(std::path::PathBuf::from(v)),
-                    Err(_) => dirs::home_dir().map(|h| h.join(".axiom").join("heal_memory.json")),
-                };
+                let local = heal_memory::HealMemory::default_path();
                 let Some(local) = local else {
                     return Err(candle_core::Error::Msg(
                         "heal memory disabled (AXIOM_HEAL_MEMORY=0) — nothing to merge into".into(),

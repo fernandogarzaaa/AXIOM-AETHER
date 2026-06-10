@@ -429,6 +429,22 @@ kept, bodies elided. Request any dropped body with POST /v1/expand \
     )
 }
 
+/// Prepend `block` to the last `user`-role message of a built payload, in
+/// place. Used to inject the immunity advisory after the compressed payload is
+/// assembled. No-op if there is no user message (the advisory is best-effort).
+pub fn prepend_block_to_last_user_turn(payload: &mut Value, block: &str) {
+    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if let Some(msg) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+    {
+        prepend_to_user_content(msg, block);
+    }
+}
+
 fn prepend_to_user_content(msg: &mut Value, prepend_text: &str) {
     let content = msg.get("content").cloned().unwrap_or(Value::Null);
     let new_content = match content {

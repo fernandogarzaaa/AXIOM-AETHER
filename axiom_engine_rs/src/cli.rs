@@ -56,6 +56,12 @@ pub enum AxiomCommand {
         #[command(subcommand)]
         command: SwarmCommand,
     },
+    /// Report what Axiom has learned about program failures (acquired immunity):
+    /// remembered heals and per-program failure-tension history.
+    Immunity {
+        /// Optional case-insensitive command substring to filter by.
+        query: Option<String>,
+    },
 }
 
 #[derive(Debug, Args, Default)]

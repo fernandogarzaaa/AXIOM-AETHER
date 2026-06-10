@@ -172,10 +172,13 @@ What actually happens on a failure:
 1. **Tension** — the failure trace is scored through the model (cross-entropy,
    the same signal as the drift gate). An anomaly is a loss spike in the
    network, and the number is printed.
-2. **Absorption** — the trace is wrapped in the execution-feedback schema and
-   streamed through the TTT stack: real gradient steps move the session's W̃
-   toward the failure. One session spans all restarts, so the program's failure
-   history compounds.
+2. **Absorption (tension-gated)** — the trace is wrapped in the
+   execution-feedback schema and streamed through the TTT stack: real gradient
+   steps move the session's W̃ toward the failure. The *depth* of absorption is
+   gated by the failure's novelty — a **FIRST/NOVEL** fault is absorbed deeply
+   (the engine concentrates gradient effort on the surprising tension), a
+   **KNOWN** fault is reinforced lightly. One session spans all restarts, so the
+   program's failure history compounds.
 3. **Environmental heal** — deterministic, safe policies repair what the
    process cannot survive: missing directories (`ENOENT` / `Directory
    nonexistent` → `mkdir -p`), and recognised **transient faults**
@@ -208,6 +211,57 @@ What actually happens on a failure:
    weakened. Demonstrated: a program crashes once on node A; node B runs
    `axiom swarm immunity nodeA:3000`; the same program then succeeds
    **first-try on node B, where it had never run before**.
+
+### Inspecting acquired immunity
+
+What Axiom has learned is queryable by both the operator and an AI agent:
+
+```bash
+axiom immunity            # everything learned: heals + per-program tension history
+axiom immunity cargo      # filter by command substring
+```
+
+The same report is exposed to agents as the **`axiom_immunity`** MCP tool — so
+Claude, debugging a command that fails in your environment, can ask Axiom what
+it already knows about that program's failures and the heals it now applies.
+
+### Closing the loop: runtime experience → reasoning context
+
+With `AXIOM_RUN_REMEMBER=1`, a **novel** failure that the supervisor heals is
+written into the recall memory store (`AXIOM_MEMORY_DIR`, default
+`checkpoints/memory`) as a `Fix` memory — using the measured **tension (CE) as
+its salience**. That is the same store `axiom_recall` / the proxy's recall
+layer reads from, so a fault the *runtime* lived through becomes knowledge the
+*reasoning layer* surfaces later:
+
+```text
+[axiom-run]   heal: created directory /build/dist
+[axiom-run]   remembered fix for the reasoning layer (recall id=…)
+# → "Program `…` failed (exit 2) and Axiom self-healed it: created directory
+#    /build/dist. If this command fails again in this environment, apply that fix."
+```
+
+This is the bridge the project is named for: the self-healing runtime and the
+cognitive layer share one memory.
+
+### Active immunity in the proxy
+
+The loop also runs *without anyone asking*. When a compressed `/v1/messages`
+request references a command Axiom has already learned to heal, the proxy
+injects a short `<axiom_immunity>` advisory into the outbound payload:
+
+```text
+<axiom_immunity>
+Axiom has prior self-healing experience with commands referenced here:
+- `cargo build` has failed in this environment before; Axiom's learned fix:
+  create directory ./target. Apply preemptively if it fails again.
+</axiom_immunity>
+```
+
+Matching is deliberately precise — a program-name + sub-command signature must
+appear in the conversation **and** Axiom must hold a concrete learned heal for
+it — so it never fires on prose or bare shell snippets. Disable with
+`AXIOM_IMMUNITY_INJECT=0`.
 
 Honesty notes: source-artifact patching lives in the Poly JIT hypervisor path,
 not here; restarting a process is not literally resuming a suspended thread
