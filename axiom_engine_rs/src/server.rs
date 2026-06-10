@@ -267,6 +267,9 @@ pub struct AppState {
     pub dwe_bus: Arc<DweBus>,
     /// Localized high-plasticity model allocation tracker.
     pub swarm_matrix: Arc<LocalSwarmRouteMatrix>,
+    /// Path to the persistent heal memory served/merged by the swarm-immunity
+    /// endpoints (`/v1/immunity`). `None` disables those routes.
+    pub heal_memory_path: Arc<Option<std::path::PathBuf>>,
 }
 
 impl AppState {
@@ -295,7 +298,14 @@ impl AppState {
             exact_residual_cache: Arc::new(ExactAttentionResidualCache::default()),
             dwe_bus: Arc::new(DweBus::from_env()),
             swarm_matrix: Arc::new(LocalSwarmRouteMatrix::new()),
+            heal_memory_path: Arc::new(None),
         }
+    }
+
+    /// Enable the swarm-immunity endpoints against this heal-memory file.
+    pub fn with_heal_memory_path(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.heal_memory_path = Arc::new(path);
+        self
     }
 
     /// Store the original heavy source for a session so `/v1/expand` can later
@@ -2751,6 +2761,8 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/v1/swarm/matrix_state", get(swarm_matrix_state))
         .route("/v1/expand", post(expand_symbol_handler))
+        .route("/v1/immunity", get(get_immunity))
+        .route("/v1/immunity/merge", post(post_immunity_merge))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -2803,6 +2815,62 @@ async fn expand_symbol_handler(State(state): State<AppState>, Json(body): Json<V
                 "found": false,
                 "error": "symbol not found in stored source",
             })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/immunity` — export this node's heal memory for swarm peers.
+async fn get_immunity(State(state): State<AppState>) -> Response {
+    let Some(path) = state.heal_memory_path.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "heal memory not configured on this node"})),
+        )
+            .into_response();
+    };
+    let memory = crate::heal_memory::HealMemory::load(path);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        memory.to_json(),
+    )
+        .into_response()
+}
+
+/// `POST /v1/immunity/merge` — fold a peer's exported heal memory into this
+/// node's (swarm immunity). Body: the peer's `GET /v1/immunity` payload.
+/// Returns the merge report. Local learning is never weakened: dirs are
+/// unioned and tension histories are count-weighted.
+async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Response {
+    let Some(path) = state.heal_memory_path.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "heal memory not configured on this node"})),
+        )
+            .into_response();
+    };
+    let mut memory = crate::heal_memory::HealMemory::load(path);
+    match memory.merge_json(&body) {
+        Ok(report) => {
+            if let Err(e) = memory.save() {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("merge succeeded but save failed: {e}")})),
+                )
+                    .into_response();
+            }
+            Json(serde_json::json!({
+                "merged": true,
+                "programs_added": report.programs_added,
+                "programs_merged": report.programs_merged,
+                "dirs_added": report.dirs_added,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
         )
             .into_response(),
     }
@@ -3042,13 +3110,25 @@ pub async fn run_server(
         None
     };
 
+    // Swarm immunity: serve/merge the same heal memory `axiom run` learns into
+    // (AXIOM_HEAL_MEMORY overrides the path, 0/off disables the endpoints).
+    let heal_memory_path = match std::env::var("AXIOM_HEAL_MEMORY") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
+        Ok(v) => Some(std::path::PathBuf::from(v)),
+        Err(_) => dirs::home_dir().map(|h| h.join(".axiom").join("heal_memory.json")),
+    };
+    if let Some(p) = heal_memory_path.as_ref() {
+        println!("[+] Swarm immunity ON — /v1/immunity serves and merges {}", p.display());
+    }
+
     let state = AppState::new(pipeline, model_id)
         .with_claude_backend(claude_backend)
         .with_anthropic_forwarder(anthropic_forwarder)
         .with_openai_forwarder(openai_forwarder)
         .with_swarm_router(swarm_router)
         .with_compressor_config(compressor_config)
-        .with_master_vibe(master_vibe);
+        .with_master_vibe(master_vibe)
+        .with_heal_memory_path(heal_memory_path);
     if state.compression_active() {
         match state.hydrate_compression_cache().await {
             Ok(0) => println!(

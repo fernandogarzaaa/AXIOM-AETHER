@@ -67,6 +67,17 @@ struct MemoryFile {
     programs: HashMap<String, ProgramRecord>,
 }
 
+/// What a swarm-immunity merge changed locally.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MergeReport {
+    /// Programs we had never seen, adopted from the peer.
+    pub programs_added: usize,
+    /// Programs both sides knew, whose records were combined.
+    pub programs_merged: usize,
+    /// New remembered directories gained from the peer.
+    pub dirs_added: usize,
+}
+
 /// Persistent heal memory, loaded eagerly and saved explicitly.
 #[derive(Debug)]
 pub struct HealMemory {
@@ -164,6 +175,50 @@ impl HealMemory {
         }
     }
 
+    /// Serialize the whole memory for transfer to a swarm peer.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(&self.data).unwrap_or_else(|_| "{}".into())
+    }
+
+    /// Merge a peer's exported memory into this one (swarm immunity).
+    ///
+    /// Semantics per program fingerprint: directory lists are unioned, and the
+    /// failure-tension history is combined as a count-weighted mean — so a peer
+    /// with 100 observed failures outweighs one with 2. Unknown programs are
+    /// adopted wholesale. A malformed peer payload is rejected without touching
+    /// local state.
+    pub fn merge_json(&mut self, peer_json: &str) -> Result<MergeReport, String> {
+        let peer: MemoryFile =
+            serde_json::from_str(peer_json).map_err(|e| format!("invalid peer memory: {e}"))?;
+        let mut report = MergeReport::default();
+        for (fp, theirs) in peer.programs {
+            match self.data.programs.get_mut(&fp) {
+                None => {
+                    report.programs_added += 1;
+                    report.dirs_added += theirs.dirs.len();
+                    self.data.programs.insert(fp, theirs);
+                }
+                Some(ours) => {
+                    report.programs_merged += 1;
+                    for d in theirs.dirs {
+                        if !ours.dirs.contains(&d) {
+                            ours.dirs.push(d);
+                            report.dirs_added += 1;
+                        }
+                    }
+                    let total = ours.ce_count + theirs.ce_count;
+                    if total > 0 {
+                        ours.ce_mean = (ours.ce_mean * ours.ce_count as f32
+                            + theirs.ce_mean * theirs.ce_count as f32)
+                            / total as f32;
+                        ours.ce_count = total;
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// Persist to disk (pretty JSON so the memory stays human-auditable).
     pub fn save(&self) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
@@ -226,6 +281,45 @@ mod tests {
         assert_eq!(mem.observe_failure(&fp, "prog", 5.0), Novelty::First);
         assert_eq!(mem.observe_failure(&fp, "prog", 5.01), Novelty::Known);
         assert_eq!(mem.observe_failure(&fp, "prog", 9.0), Novelty::Novel);
+    }
+
+    #[test]
+    fn merge_adopts_unknown_and_unions_known_programs() {
+        let fp_shared = fingerprint("shared", &[]);
+        let fp_peer_only = fingerprint("peer-only", &[]);
+
+        let mut ours = HealMemory::load(tmp("merge_ours"));
+        ours.remember_dirs(&fp_shared, "shared", &[PathBuf::from("/a")]);
+        ours.observe_failure(&fp_shared, "shared", 4.0); // count=1, mean=4.0
+
+        let mut theirs = HealMemory::load(tmp("merge_theirs"));
+        theirs.remember_dirs(&fp_shared, "shared", &[PathBuf::from("/a"), PathBuf::from("/b")]);
+        // Three failures at 6.0 → their history outweighs ours 3:1.
+        for _ in 0..3 {
+            theirs.observe_failure(&fp_shared, "shared", 6.0);
+        }
+        theirs.remember_dirs(&fp_peer_only, "peer-only", &[PathBuf::from("/c")]);
+
+        let report = ours.merge_json(&theirs.to_json()).unwrap();
+        assert_eq!(report.programs_added, 1);
+        assert_eq!(report.programs_merged, 1);
+        assert_eq!(report.dirs_added, 2, "/b from shared + /c from peer-only");
+
+        let shared = ours.record(&fp_shared).unwrap();
+        assert_eq!(shared.dirs, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(shared.ce_count, 4);
+        assert!((shared.ce_mean - 5.5).abs() < 1e-5, "count-weighted: (4+18)/4");
+        assert!(ours.record(&fp_peer_only).is_some());
+    }
+
+    #[test]
+    fn merge_rejects_malformed_peer_payload() {
+        let fp = fingerprint("prog", &[]);
+        let mut ours = HealMemory::load(tmp("merge_bad"));
+        ours.remember_dirs(&fp, "prog", &[PathBuf::from("/keep")]);
+        assert!(ours.merge_json("{broken").is_err());
+        // Local state untouched.
+        assert_eq!(ours.record(&fp).unwrap().dirs, vec![PathBuf::from("/keep")]);
     }
 
     #[test]
