@@ -219,6 +219,23 @@ What actually happens on a failure:
    `axiom swarm immunity nodeA:3000`; the same program then succeeds
    **first-try on node B, where it had never run before**.
 
+### Anticipatory immunity (pre-failure prediction)
+
+Acquired immunity also lets Axiom predict a failure *before the command runs* —
+no model, no execution, just learned prerequisites checked against the current
+environment:
+
+```bash
+axiom run --dry-run -- cargo build   # predict only, don't execute
+# [axiom-run] dry-run prediction: LIKELY TO FAIL — 1 missing learned
+#             prerequisite(s): /repo/target
+```
+
+Every real run does this as a silent pre-flight: if a learned prerequisite is
+missing it logs `pre-flight: predicting failure …` and then immunizes
+proactively, so the predicted failure never happens. This turns the immune
+system from reactive + prophylactic into genuinely *anticipatory*.
+
 ### Adaptive immune confidence (maturation + waning)
 
 Heals carry a confidence that follows an adaptive-immunity lifecycle:

@@ -191,6 +191,17 @@ pub fn relativize_dir(dir: &Path, anchor: &Path) -> PathBuf {
     }
 }
 
+/// Inverse of [`relativize_dir`]: resolve a stored heal against `anchor`. A
+/// relative heal is anchored here (portable immunity); an absolute heal is used
+/// verbatim.
+pub fn resolve_dir(dir: &Path, anchor: &Path) -> PathBuf {
+    if dir.is_relative() {
+        anchor.join(dir)
+    } else {
+        dir.to_path_buf()
+    }
+}
+
 impl HealMemory {
     /// Load the memory at `path`, or start empty when missing/corrupt (a bad
     /// memory file must never break a run).
@@ -341,16 +352,30 @@ impl HealMemory {
         };
         let mut applied = Vec::new();
         for dir in &record.dirs {
-            let resolved = if dir.is_relative() {
-                anchor.join(dir)
-            } else {
-                dir.clone()
-            };
+            let resolved = resolve_dir(dir, anchor);
             if !resolved.exists() && std::fs::create_dir_all(&resolved).is_ok() {
                 applied.push(resolved);
             }
         }
         applied
+    }
+
+    /// Anticipatory immunity: the program's learned prerequisite directories
+    /// that are *currently missing* (re-anchored). A non-empty result predicts
+    /// the program would fail right now for want of those directories — before
+    /// it is ever run. Returns `(resolved_missing_dirs, confidence)`; an unknown
+    /// program yields an empty list.
+    pub fn missing_prerequisites(&self, fp: &str, anchor: &Path) -> (Vec<PathBuf>, f32) {
+        let Some(record) = self.data.programs.get(fp) else {
+            return (Vec::new(), 0.0);
+        };
+        let missing = record
+            .dirs
+            .iter()
+            .map(|d| resolve_dir(d, anchor))
+            .filter(|d| !d.exists())
+            .collect();
+        (missing, record.confidence_now(now_secs()))
     }
 
     /// Fold one failure's tension into the program's CE history and classify it

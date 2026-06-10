@@ -305,6 +305,73 @@ impl SupervisorOptions {
     }
 }
 
+/// An anticipatory failure prediction made *before* a command runs, from
+/// accumulated immunity (missing learned prerequisites).
+#[derive(Debug, Clone)]
+pub struct FailurePrediction {
+    /// True when the command is predicted to fail as the environment stands.
+    pub likely: bool,
+    /// Learned prerequisite directories that are currently missing (resolved).
+    pub missing_prerequisites: Vec<PathBuf>,
+    /// Matured confidence of the underlying immunity (0 when unknown).
+    pub confidence: f32,
+    /// Human-readable explanation.
+    pub rationale: String,
+}
+
+/// Predict, before running, whether `command args...` is likely to fail in the
+/// current environment — purely from learned immunity (no execution, no model).
+/// This is the anticipatory counterpart to the reactive supervisor.
+pub fn predict_failure(command: &str, args: &[String], opts: &SupervisorOptions) -> FailurePrediction {
+    let anchor = opts
+        .anchor
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let Some(path) = opts.heal_memory_path.as_deref() else {
+        return FailurePrediction {
+            likely: false,
+            missing_prerequisites: Vec::new(),
+            confidence: 0.0,
+            rationale: "heal memory disabled — no basis to predict".into(),
+        };
+    };
+    let fp = crate::heal_memory::fingerprint(command, args);
+    let mem = crate::heal_memory::HealMemory::load(path);
+    if mem.record(&fp).is_none() {
+        return FailurePrediction {
+            likely: false,
+            missing_prerequisites: Vec::new(),
+            confidence: 0.0,
+            rationale: "no prior experience with this command".into(),
+        };
+    }
+    let (missing, confidence) = mem.missing_prerequisites(&fp, &anchor);
+    if missing.is_empty() {
+        FailurePrediction {
+            likely: false,
+            missing_prerequisites: missing,
+            confidence,
+            rationale: "all learned prerequisites already satisfied".into(),
+        }
+    } else {
+        let list = missing
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        FailurePrediction {
+            likely: true,
+            rationale: format!(
+                "predicting failure (confidence {confidence:.2}): {} missing learned prerequisite(s): {list}",
+                missing.len()
+            ),
+            missing_prerequisites: missing,
+            confidence,
+        }
+    }
+}
+
 /// Run `command args...` under self-healing supervision.
 ///
 /// Persistence is opt-in via [`SupervisorOptions`]: the run's adapted W̃ can
@@ -341,6 +408,13 @@ pub fn run_supervised(
     let mut states = pipeline.init_session_states()?;
     let mut healed_paths: HashSet<PathBuf> = HashSet::new();
     let mut transient_retries = 0usize;
+
+    // Anticipatory pre-flight: predict failure from learned immunity before the
+    // command runs, so the proactive immunization below has a stated rationale.
+    let prediction = predict_failure(command, args, opts);
+    if prediction.likely {
+        println!("[axiom-run] pre-flight: {}", prediction.rationale);
+    }
 
     // Learned immunity: re-create what this program needed in past runs BEFORE
     // the first attempt, so remembered failure modes never recur.

@@ -649,25 +649,12 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
         }
         AxiomCommand::Run {
             max_restarts,
+            dry_run,
             command,
         } => {
-            let device = device_from_str(
-                &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
-            )?;
-            let (cfg, ckpt) =
-                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
-            let runtime = InferenceRuntimeOptions {
-                tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
-                context_api_url: None,
-                context_api_key: None,
-                max_context_tokens: 0,
-            };
-            let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
             let (program, args) = command
                 .split_first()
                 .ok_or_else(|| candle_core::Error::Msg("axiom run needs a command".into()))?;
-            // TTT adaptation recurses through candle's backward graph; give it a
-            // large stack like every other adapt path in the engine.
             let program = program.clone();
             let args = args.to_vec();
             // Opt-in persistence: AXIOM_RUN_VIBE=1 folds the run's failure
@@ -696,6 +683,36 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 remember_into,
                 anchor: None, // default: the current working directory
             };
+
+            // Anticipatory pre-flight: predict from learned immunity, no model
+            // or execution needed. `--dry-run` reports the prediction and stops.
+            if dry_run {
+                let p = self_heal::predict_failure(&program, &args, &opts);
+                println!(
+                    "[axiom-run] dry-run prediction: {} — {}",
+                    if p.likely { "LIKELY TO FAIL" } else { "no failure predicted" },
+                    p.rationale
+                );
+                for d in &p.missing_prerequisites {
+                    println!("[axiom-run]   missing prerequisite: {}", d.display());
+                }
+                return Ok(());
+            }
+
+            let device = device_from_str(
+                &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            )?;
+            let (cfg, ckpt) =
+                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
+                context_api_url: None,
+                context_api_key: None,
+                max_context_tokens: 0,
+            };
+            // TTT adaptation recurses through candle's backward graph; give it a
+            // large stack like every other adapt path in the engine.
+            let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
                 .spawn(move || self_heal::run_supervised(&pipeline, &program, &args, &opts))

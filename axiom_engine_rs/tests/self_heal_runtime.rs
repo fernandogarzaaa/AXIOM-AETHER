@@ -380,6 +380,52 @@ fn immunity_is_location_invariant_across_working_directories() {
 }
 
 #[test]
+fn predicts_failure_from_missing_prerequisites_before_running() {
+    use axiom_engine::heal_memory::{fingerprint, HealMemory};
+    use axiom_engine::self_heal::predict_failure;
+
+    let anchor = unique_tmp("predict_anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let memory = unique_tmp("predict_mem").with_extension("json");
+
+    // Teach Axiom that this command needs ./build/out (relative).
+    let mut mem = HealMemory::load(&memory);
+    mem.remember_dirs(
+        &fingerprint("sh", &["-c".into(), "echo x > build/out/r".into()]),
+        "sh -c echo x > build/out/r",
+        &[PathBuf::from("build/out")],
+    );
+    mem.save().unwrap();
+
+    let opts = |anchor: PathBuf| SupervisorOptions {
+        heal_memory_path: Some(memory.clone()),
+        anchor: Some(anchor),
+        ..SupervisorOptions::default()
+    };
+    let cmd = "sh".to_string();
+    let args = vec!["-c".to_string(), "echo x > build/out/r".to_string()];
+
+    // Prerequisite missing under the anchor → failure predicted before running.
+    let p = predict_failure(&cmd, &args, &opts(anchor.clone()));
+    assert!(p.likely, "missing prerequisite must predict failure");
+    assert_eq!(p.missing_prerequisites, vec![anchor.join("build").join("out")]);
+
+    // Create it → prediction flips to no-failure (prerequisites satisfied).
+    std::fs::create_dir_all(anchor.join("build").join("out")).unwrap();
+    let p2 = predict_failure(&cmd, &args, &opts(anchor.clone()));
+    assert!(!p2.likely);
+    assert!(p2.missing_prerequisites.is_empty());
+
+    // An unknown command yields no prediction.
+    let p3 = predict_failure("totally", &["unknown".into()], &opts(anchor.clone()));
+    assert!(!p3.likely);
+    assert!(p3.rationale.contains("no prior experience"));
+
+    let _ = std::fs::remove_dir_all(&anchor);
+    let _ = std::fs::remove_file(&memory);
+}
+
+#[test]
 fn novel_healed_failure_is_written_to_recall_memory() {
     use axiom_engine::memory_store::{MemoryKind, MemoryStore};
 
