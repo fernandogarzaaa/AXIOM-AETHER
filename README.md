@@ -186,7 +186,10 @@ What actually happens on a failure:
    and recognised **transient faults** (`Connection refused/reset/timed out`,
    DNS, EAGAIN) where waiting *is* the heal — a bounded backoff-retry (max 2).
    Heals only ever create directories, add an execute bit, or wait — never
-   delete, overwrite, or fabricate file content. A **missing required
+   delete, overwrite, or fabricate file content. Non-correctable conditions are
+   **diagnosed** instead of faked: a **missing executable** (`command not
+   found`) and a **full disk** (`ENOSPC`) are surfaced as actionable messages.
+   A **missing required
    environment variable** is *diagnosed* (not fixed — a value can't be safely
    fabricated): Axiom surfaces an actionable message, remembers the requirement,
    and feeds it to `axiom immunity` and the proxy advisory so the operator (and
