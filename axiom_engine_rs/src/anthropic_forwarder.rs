@@ -339,7 +339,12 @@ pub fn build_compressed_payload(
         .map(|c| c.token_count)
         .sum();
     let fingerprint_block = if heavy_text.trim().is_empty() {
-        fingerprint.to_prompt_block()
+        // No heavy text to skeletonize → a compact "absorbed locally" marker.
+        // We deliberately do NOT forward the verbose neural fingerprint
+        // (recall_top_k_indices / layer norms): those vocab ids are noise to a
+        // different model and only waste tokens. The drift signal lives
+        // server-side; only a short provenance header rides the wire.
+        opaque_fingerprint_block(fingerprint)
     } else {
         let digest = crate::skeleton::build_digest(
             &heavy_text,
@@ -375,46 +380,52 @@ pub fn build_compressed_payload(
     payload
 }
 
+/// Compact marker for heavy context that was absorbed locally but has no
+/// extractable code structure (prose / minified / binary-ish).
+///
+/// The verbose neural fingerprint (`recall_top_k_indices`, layer Frobenius
+/// norms, vocab-id decode instructions) is intentionally NOT forwarded: those
+/// fields are meaningless to a *different* upstream model and only burn tokens
+/// while degrading answers (see the honesty footnote in `context_compressor`).
+/// We keep only a short, readable provenance header; the TTT drift signal stays
+/// server-side where the session and metrics consume it.
 fn opaque_fingerprint_block(fingerprint: &MemoryFingerprint) -> String {
     format!(
         "<axiom_context_fingerprint session_id=\"{session}\" tokens_compressed=\"{tokens}\" \
-schema=\"{schema}\" mode=\"opaque-ttt\">\n\
+schema=\"{schema}\" mode=\"absorbed\">\n\
 state_hash={hash}\n\
-associative_recall_norm={norm:.6}\n\
-associative_recall_l1={l1:.6}\n\
-recall_top_k_indices={top:?}\n\
-layers={layers} d_model={d}\n\
-compression_ms={ms}\n\
 raw_context=elided\n\
+note=Heavy context was absorbed locally via online TTT; it had no extractable \
+code structure, so no lossy neural pointer is forwarded (it would be noise to \
+this model). Answer from the surrounding turns; the original text is retained \
+server-side for this session.\n\
 </axiom_context_fingerprint>",
         session = fingerprint.session_id,
         tokens = fingerprint.context_tokens_processed,
         schema = fingerprint.schema,
         hash = fingerprint.state_hash,
-        norm = fingerprint.recall_norm,
-        l1 = fingerprint.recall_l1,
-        top = fingerprint.recall_top_k_indices,
-        layers = fingerprint.n_layers,
-        d = fingerprint.d_model,
-        ms = fingerprint.elapsed_ms,
     )
 }
 
+/// Readable compression block for code: the structural skeleton (signatures
+/// kept, bodies elided) plus a short provenance header. As with the marker
+/// above, the opaque neural fields are dropped from the wire — the skeleton is
+/// the thing Claude can actually read, and dropped bodies are recoverable via
+/// `POST /v1/expand`.
 fn structural_fingerprint_block(fingerprint: &MemoryFingerprint, digest: &str) -> String {
     format!(
         "<axiom_context_fingerprint session_id=\"{session}\" tokens_compressed=\"{tokens}\" \
 schema=\"{schema}\" mode=\"structural-digest\">\n\
 state_hash={hash}\n\
-associative_recall_norm={norm:.6}\n\
-recall_top_k_indices={top:?}\n\
 {digest}\n\
+note=Structural skeleton of locally-absorbed context: declaration signatures \
+kept, bodies elided. Request any dropped body with POST /v1/expand \
+{{\"session_id\",\"symbol\"}}.\n\
 </axiom_context_fingerprint>",
         session = fingerprint.session_id,
         tokens = fingerprint.context_tokens_processed,
         schema = fingerprint.schema,
         hash = fingerprint.state_hash,
-        norm = fingerprint.recall_norm,
-        top = fingerprint.recall_top_k_indices,
     )
 }
 
@@ -564,6 +575,10 @@ mod tests {
         assert!(content.contains("raw_context=elided"));
         assert!(!content.contains("tok399"));
         assert!(content.len() < big.len()); // raw heavy text was compressed
+        // #2: the opaque neural noise must NOT reach the wire.
+        assert!(!content.contains("recall_top_k_indices"));
+        assert!(!content.contains("layer_frobenius_norms"));
+        assert!(!content.contains("associative_recall_l1"));
     }
 
     #[test]
@@ -605,5 +620,8 @@ pub fn run() -> usize {
         assert!(content.contains("fn run"));
         assert!(content.contains("usize"));
         assert!(!content.contains("secret_body"));
+        // #2: even with top-k indices present on the fingerprint, the structural
+        // block must not forward them — only the readable skeleton goes upstream.
+        assert!(!content.contains("recall_top_k_indices"));
     }
 }
