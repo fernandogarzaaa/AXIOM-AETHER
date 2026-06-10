@@ -177,12 +177,17 @@ What actually happens on a failure:
    toward the failure. One session spans all restarts, so the program's failure
    history compounds.
 3. **Environmental heal** — deterministic, safe policies repair what the
-   process cannot survive: v1 ships the canonical one, missing directories
-   (`ENOENT` / `Directory nonexistent` → `mkdir -p`). Heals only ever *create
-   directories* — never delete, overwrite, or fabricate file content.
+   process cannot survive: missing directories (`ENOENT` / `Directory
+   nonexistent` → `mkdir -p`), and recognised **transient faults**
+   (`Connection refused/reset/timed out`, DNS, EAGAIN) where waiting *is* the
+   heal — a bounded backoff-retry (max 2). Heals only ever create directories
+   or wait — never delete, overwrite, or fabricate file content.
 4. **Continue** — restart up to `--max-restarts` (default 3), but **only when a
    new heal was applied**: an unhealed environment is never blindly replayed,
    and the child's exit code is preserved on give-up.
+5. **Persist (opt-in)** — with `AXIOM_RUN_VIBE=1`, the run's adapted W̃ is
+   EMA-merged into the master vibe on completion: the program's failure history
+   becomes memory that outlives the process.
 
 Honesty notes: source-artifact patching lives in the Poly JIT hypervisor path,
 not here; restarting a process is not literally resuming a suspended thread

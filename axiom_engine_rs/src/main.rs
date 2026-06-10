@@ -669,9 +669,24 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             // large stack like every other adapt path in the engine.
             let program = program.clone();
             let args = args.to_vec();
+            // Opt-in persistence: AXIOM_RUN_VIBE=1 folds the run's failure
+            // history into the master vibe (AXIOM_VIBE_PATH or the default).
+            let vibe_path = (std::env::var("AXIOM_RUN_VIBE").as_deref() == Ok("1")).then(|| {
+                std::env::var("AXIOM_VIBE_PATH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH))
+            });
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
-                .spawn(move || self_heal::run_supervised(&pipeline, &program, &args, max_restarts))
+                .spawn(move || {
+                    self_heal::run_supervised(
+                        &pipeline,
+                        &program,
+                        &args,
+                        max_restarts,
+                        vibe_path.as_deref(),
+                    )
+                })
                 .map_err(|e| candle_core::Error::Msg(format!("supervisor thread failed: {e}")))?
                 .join()
                 .map_err(|_| candle_core::Error::Msg("supervisor thread panicked".into()))??;

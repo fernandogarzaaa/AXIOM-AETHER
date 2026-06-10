@@ -48,19 +48,48 @@ const TRACE_TAIL_BYTES: usize = 8 * 1024;
 /// CE scoring window (mirrors eval_model's chunking).
 const CE_CHUNK: usize = 512;
 
+/// Cap on transient-fault retries per supervised run (waiting is the heal, but
+/// only for recognised transient phrases and only this many times).
+const MAX_TRANSIENT_RETRIES: usize = 2;
+
+/// Transient-fault phrases where the correct heal is simply waiting and
+/// retrying: the environment repairs itself with time.
+const TRANSIENT_PHRASES: &[&str] = &[
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "temporary failure in name resolution",
+    "resource temporarily unavailable",
+    "operation timed out",
+];
+
 /// One applied environmental repair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Heal {
     /// `mkdir -p <path>` equivalent.
     CreatedDirectory(PathBuf),
+    /// A recognised transient fault: backed off and retried.
+    TransientRetry(&'static str),
 }
 
 impl std::fmt::Display for Heal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Heal::CreatedDirectory(p) => write!(f, "created directory {}", p.display()),
+            Heal::TransientRetry(phrase) => {
+                write!(f, "transient fault (\"{phrase}\") — backing off and retrying")
+            }
         }
     }
+}
+
+/// Detect a recognised transient-fault phrase in a failure trace.
+pub fn detect_transient(trace: &str) -> Option<&'static str> {
+    let lower = trace.to_ascii_lowercase();
+    TRANSIENT_PHRASES
+        .iter()
+        .find(|p| lower.contains(*p))
+        .copied()
 }
 
 /// One failed attempt: the tension measured on its trace, before and after the
@@ -202,11 +231,17 @@ fn tail(s: &str, max: usize) -> &str {
 }
 
 /// Run `command args...` under self-healing supervision.
+///
+/// When `vibe_path` is `Some` and any failure tokens were absorbed, the
+/// supervised session's W̃ is EMA-merged into the master vibe at that path on
+/// completion — the program's failure history becomes persistent memory that
+/// outlives the run.
 pub fn run_supervised(
     pipeline: &InferencePipeline,
     command: &str,
     args: &[String],
     max_restarts: usize,
+    vibe_path: Option<&Path>,
 ) -> CResult<RunReport> {
     let mut report = RunReport {
         success: false,
@@ -220,6 +255,7 @@ pub fn run_supervised(
     // into the same fast-weights.
     let mut states = pipeline.init_session_states()?;
     let mut healed_paths: HashSet<PathBuf> = HashSet::new();
+    let mut transient_retries = 0usize;
 
     for attempt in 1..=max_restarts + 1 {
         report.attempts = attempt;
@@ -240,6 +276,7 @@ pub fn run_supervised(
                 "[axiom-run] attempt {attempt}: exited cleanly in {:.1}s",
                 started.elapsed().as_secs_f32()
             );
+            commit_to_vibe(pipeline, &states, &report, vibe_path);
             return Ok(report);
         }
 
@@ -293,19 +330,67 @@ pub fn run_supervised(
             }
         }
 
+        // 3b. Transient faults: when nothing in the filesystem could be fixed
+        //     but the trace shows a recognised transient phrase, waiting IS the
+        //     heal — back off briefly and retry (bounded, never blind).
+        if !applied_new_heal && transient_retries < MAX_TRANSIENT_RETRIES {
+            if let Some(phrase) = detect_transient(&trace) {
+                transient_retries += 1;
+                let heal = Heal::TransientRetry(phrase);
+                println!("[axiom-run]   heal: {heal}");
+                report.heals.push(heal);
+                std::thread::sleep(std::time::Duration::from_millis(500 * attempt as u64));
+                applied_new_heal = true;
+            }
+        }
+
         // 4. Continue only when something actually changed; a blind restart of
         //    an unhealed environment would just replay the same failure.
         if !applied_new_heal {
             println!("[axiom-run] no applicable heal for this failure — stopping");
+            commit_to_vibe(pipeline, &states, &report, vibe_path);
             return Ok(report);
         }
         if attempt == max_restarts + 1 {
             println!("[axiom-run] restart budget exhausted");
+            commit_to_vibe(pipeline, &states, &report, vibe_path);
             return Ok(report);
         }
         println!("[axiom-run] environment healed — restarting");
     }
     Ok(report)
+}
+
+/// Persist the supervised session's adapted W̃ into the master vibe, when a
+/// vibe path was requested and there is anything to persist.
+fn commit_to_vibe(
+    pipeline: &InferencePipeline,
+    states: &[Tensor],
+    report: &RunReport,
+    vibe_path: Option<&Path>,
+) {
+    let Some(path) = vibe_path else { return };
+    if report.tokens_absorbed == 0 || states.is_empty() {
+        return;
+    }
+    let d_model = match states[0].dim(0) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let mut vibe = crate::vibe_memory::MasterVibe::load_or_init(
+        path,
+        states.len(),
+        d_model,
+        pipeline.device(),
+        crate::vibe_memory::DEFAULT_VIBE_DECAY,
+    );
+    match vibe.commit_and_save(states) {
+        Ok(()) => println!(
+            "[axiom-run] failure history persisted to master vibe: {}",
+            path.display()
+        ),
+        Err(e) => eprintln!("[axiom-run] vibe persist skipped: {e}"),
+    }
 }
 
 #[cfg(test)]

@@ -34,9 +34,21 @@ fn supervise(
     args: Vec<String>,
     max_restarts: usize,
 ) -> axiom_engine::self_heal::RunReport {
+    supervise_with_vibe(pipeline, cmd, args, max_restarts, None)
+}
+
+fn supervise_with_vibe(
+    pipeline: InferencePipeline,
+    cmd: String,
+    args: Vec<String>,
+    max_restarts: usize,
+    vibe_path: Option<PathBuf>,
+) -> axiom_engine::self_heal::RunReport {
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || run_supervised(&pipeline, &cmd, &args, max_restarts).unwrap())
+        .spawn(move || {
+            run_supervised(&pipeline, &cmd, &args, max_restarts, vibe_path.as_deref()).unwrap()
+        })
         .unwrap()
         .join()
         .unwrap()
@@ -123,4 +135,59 @@ fn clean_run_is_untouched() {
     assert_eq!(report.attempts, 1);
     assert!(report.heals.is_empty());
     assert_eq!(report.tokens_absorbed, 0, "no failure → nothing absorbed");
+}
+
+#[test]
+fn transient_fault_retries_then_succeeds() {
+    // First run prints a recognised transient phrase and fails; the marker file
+    // makes the second run succeed — modelling a service that came back up.
+    let marker = unique_tmp("transient_marker");
+    let script = format!(
+        "if [ -f {m} ]; then echo recovered; else touch {m}; echo 'connect: Connection refused' >&2; exit 1; fi",
+        m = marker.display()
+    );
+    let report = supervise(tiny_pipeline(), "sh".into(), vec!["-c".into(), script], 3);
+
+    assert!(report.success, "must recover after the transient retry");
+    assert_eq!(report.attempts, 2);
+    assert_eq!(report.heals, vec![Heal::TransientRetry("connection refused")]);
+
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn transient_retries_are_bounded() {
+    // Always fails with a transient phrase: 1 attempt + 2 transient retries,
+    // then the supervisor must stop rather than loop.
+    let report = supervise(
+        tiny_pipeline(),
+        "sh".into(),
+        vec![
+            "-c".into(),
+            "echo 'connect: Connection timed out' >&2; exit 1".into(),
+        ],
+        5,
+    );
+    assert!(!report.success);
+    assert_eq!(report.attempts, 3, "1 attempt + MAX_TRANSIENT_RETRIES");
+    assert_eq!(report.heals.len(), 2);
+}
+
+#[test]
+fn failure_history_persists_to_vibe_when_requested() {
+    let vibe = unique_tmp("vibe").with_extension("bin");
+    let report = supervise_with_vibe(
+        tiny_pipeline(),
+        "sh".into(),
+        vec!["-c".into(), "exit 3".into()],
+        1,
+        Some(vibe.clone()),
+    );
+    assert!(!report.success);
+    assert!(report.tokens_absorbed > 0);
+    assert!(
+        vibe.exists(),
+        "absorbed failure history must be committed to the master vibe"
+    );
+    let _ = std::fs::remove_file(&vibe);
 }
