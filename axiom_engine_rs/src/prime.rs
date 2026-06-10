@@ -66,8 +66,8 @@ pub struct PrimeReport {
 }
 
 /// Walk `target` and return source files worth priming, deepest-first stable by
-/// path, bounded by `max_files`.
-fn collect_source_files(target: &Path, max_files: usize) -> Vec<PathBuf> {
+/// path, bounded by `max_files`. Shared with `bench`.
+pub(crate) fn collect_source_files(target: &Path, max_files: usize) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     for entry in WalkDir::new(target)
         .follow_links(false)

@@ -1,4 +1,5 @@
 mod anthropic_forwarder;
+mod bench;
 mod bootstrap;
 mod claude_backend;
 mod cli;
@@ -640,6 +641,29 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH)
                 });
             prime::run_prime(&path, &pipeline, &vibe_path)?;
+        }
+        AxiomCommand::Bench { path } => {
+            // Same model resolution as prime/server; bench only reads the
+            // tokenizer for token counts, so a missing checkpoint is harmless.
+            let device = device_from_str(
+                &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            )?;
+            let legacy = AxiomConfig {
+                d_model: 64,
+                n_layers: 2,
+                vocab_size: 256,
+                lr_inner: 1e-3,
+                norm_eps: 1e-6,
+            };
+            let (cfg, ckpt) = resolve_production_model(legacy, DEFAULT_CHECKPOINT_PATH);
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
+                context_api_url: None,
+                context_api_key: None,
+                max_context_tokens: 0,
+            };
+            let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            bench::run_bench(&path, &pipeline)?;
         }
         AxiomCommand::Swarm { command } => match command {
             SwarmCommand::Connect { ip } => {

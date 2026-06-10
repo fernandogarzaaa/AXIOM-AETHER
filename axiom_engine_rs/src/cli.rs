@@ -34,6 +34,12 @@ pub enum AxiomCommand {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Measure compression: token savings + structural round-trip fidelity.
+    Bench {
+        /// Directory to crawl and measure (defaults to the current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Manage DWE swarm peers.
     Swarm {
         #[command(subcommand)]
