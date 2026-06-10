@@ -420,3 +420,204 @@ async fn ttt_session_admin_endpoints_reflect_live_state() {
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["removed"], true);
 }
+
+// --- Graceful degradation -------------------------------------------------
+
+/// State shared with the flaky mock: it returns 500 for the first `fail_n`
+/// upstream calls, then 200, capturing every received payload in order.
+#[derive(Clone)]
+struct FlakyState {
+    captured: Captured,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    fail_n: usize,
+}
+
+async fn flaky_messages_handler(
+    State(st): State<FlakyState>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    st.captured.lock().await.push(body);
+    let n = st.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if n < st.fail_n {
+        // Upstream 500 — exactly the recoverable class the proxy should retry.
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"type": "error", "error": {"type": "overloaded_error"}})),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "id": "msg_mock_recovered",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "recovered reply"}],
+        "model": "claude-mock",
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {"input_tokens": 1, "output_tokens": 2}
+    }))
+    .into_response()
+}
+
+async fn start_flaky_mock(fail_n: usize) -> (SocketAddr, Captured) {
+    let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+    let st = FlakyState {
+        captured: captured.clone(),
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        fail_n,
+    };
+    let app = Router::new()
+        .route("/v1/messages", post(flaky_messages_handler))
+        .with_state(st);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, captured)
+}
+
+#[tokio::test]
+async fn upstream_5xx_retries_once_with_uncompressed_payload() {
+    // When the compressed forward draws an upstream 500, the proxy must retry
+    // ONCE with the original uncompressed body so the client keeps their turn.
+    let (mock_addr, captured) = start_flaky_mock(1).await;
+
+    let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
+    let forwarder = AnthropicForwarder::new(
+        Some("test-key".to_string()),
+        Some(format!("http://{mock_addr}")),
+    );
+    let cfg = CompressorConfig {
+        enabled: true,
+        heavy_message_threshold_tokens: 50,
+        recall_top_k: 8,
+    };
+    let state = AppState::new(pipeline, "axiom-degrade".to_string())
+        .with_anthropic_forwarder(Some(forwarder))
+        .with_compressor_config(cfg);
+    let app = create_router(state);
+
+    let heavy_text: String = (0..200)
+        .map(|i| format!("code{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let req_body = json!({
+        "model": "claude-opus-4-7",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": heavy_text.clone()},
+            {"role": "user", "content": "summarise that codebase in one sentence"}
+        ],
+        "session_id": "degrade-session-1"
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    // The fallback succeeded, so the client sees a normal 200 — not the 500.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let resp_json: Value = serde_json::from_slice(&resp_bytes).unwrap();
+    assert_eq!(resp_json["id"], "msg_mock_recovered");
+
+    let received = captured.lock().await.clone();
+    assert_eq!(received.len(), 2, "must attempt compressed then fall back once");
+
+    let content_of = |payload: &Value| -> String {
+        payload["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>()
+            .concat()
+    };
+
+    // Attempt 1: compressed — fingerprint present, raw heavy text stripped.
+    let first = content_of(&received[0]);
+    assert!(first.contains("<axiom_context_fingerprint "), "attempt 1 must be compressed");
+    assert!(!first.contains("code199"), "attempt 1 must strip raw heavy text");
+
+    // Attempt 2: the uncompressed fallback — raw heavy text restored, no fingerprint,
+    // and the Axiom-only session_id extension still scrubbed from the wire.
+    let second = content_of(&received[1]);
+    assert!(second.contains("code199"), "fallback must carry the original heavy text");
+    assert!(!second.contains("<axiom_context_fingerprint "), "fallback must not be compressed");
+    assert!(received[1].get("session_id").is_none(), "session_id must not leak upstream");
+}
+
+#[tokio::test]
+async fn upstream_401_does_not_retry() {
+    // Auth failures are NOT recoverable by resending the original payload, so the
+    // proxy must surface the 401 immediately without a second upstream call. A
+    // handler that always 401s, reusing FlakyState only to capture payloads.
+    let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+    let st = FlakyState {
+        captured: captured.clone(),
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        fail_n: usize::MAX, // never "recovers"
+    };
+    let app401 = Router::new()
+        .route(
+            "/v1/messages",
+            post(|State(st): State<FlakyState>, Json(body): Json<Value>| async move {
+                use axum::response::IntoResponse;
+                st.captured.lock().await.push(body);
+                st.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"type": "error", "error": {"type": "authentication_error"}})),
+                )
+                    .into_response()
+            }),
+        )
+        .with_state(st);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app401).await;
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
+    let forwarder =
+        AnthropicForwarder::new(Some("test-key".to_string()), Some(format!("http://{addr}")));
+    let cfg = CompressorConfig {
+        enabled: true,
+        heavy_message_threshold_tokens: 50,
+        recall_top_k: 8,
+    };
+    let state = AppState::new(pipeline, "axiom-noauth".to_string())
+        .with_anthropic_forwarder(Some(forwarder))
+        .with_compressor_config(cfg);
+    let app = create_router(state);
+
+    let heavy_text: String = (0..200).map(|i| format!("code{i}")).collect::<Vec<_>>().join(" ");
+    let req_body = json!({
+        "model": "claude-opus-4-7",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": heavy_text},
+            {"role": "user", "content": "summarise"}
+        ],
+        "session_id": "noauth-session"
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body.to_string()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "401 must surface to client");
+    let received = captured.lock().await.clone();
+    assert_eq!(received.len(), 1, "401 must NOT trigger an uncompressed retry");
+}

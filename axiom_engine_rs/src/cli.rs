@@ -28,6 +28,18 @@ pub enum AxiomCommand {
         /// Directory to mount into the hypervisor.
         path: PathBuf,
     },
+    /// Warm-start the persistent vibe memory by absorbing a codebase through TTT.
+    Prime {
+        /// Directory to crawl and absorb (defaults to the current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Measure compression: token savings + structural round-trip fidelity.
+    Bench {
+        /// Directory to crawl and measure (defaults to the current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Manage DWE swarm peers.
     Swarm {
         #[command(subcommand)]
@@ -40,6 +52,11 @@ pub struct InitArgs {
     /// Skip automatic base-model download during initialization.
     #[arg(long)]
     pub no_fetch: bool,
+    /// Skip bootstrapping a local checkpoint. By default `init` trains a small
+    /// model locally (no network) when none exists, so the proxy never boots on
+    /// random weights.
+    #[arg(long)]
+    pub no_train: bool,
 }
 
 #[derive(Debug, Subcommand)]

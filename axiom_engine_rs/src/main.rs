@@ -1,4 +1,6 @@
 mod anthropic_forwarder;
+mod bench;
+mod bootstrap;
 mod claude_backend;
 mod cli;
 mod cluster;
@@ -28,6 +30,7 @@ mod model_meta;
 mod openai_forwarder;
 mod pairs;
 mod poly_jit;
+mod prime;
 mod q_manifold;
 mod quantization;
 mod sandbox;
@@ -546,6 +549,30 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             );
             println!("[axiom] config: {}", paths.config.display());
             println!("[axiom] logs:   {}", paths.logs_dir.display());
+
+            // Bootstrap a real local checkpoint so the proxy never boots on
+            // random weights. Offline (procedural dataset), bounded, best-effort
+            // — a training error here must not fail `init`.
+            if !args.no_train {
+                let device = device_from_str(
+                    &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+                )
+                .unwrap_or(Device::Cpu);
+                match bootstrap::ensure_checkpoint(DEFAULT_CHECKPOINT_PATH, device) {
+                    Ok(true) => println!(
+                        "[axiom] bootstrapped a local checkpoint at {DEFAULT_CHECKPOINT_PATH} \
+                         (small offline model — run train_tokenizer + train_semantic for the \
+                         full scaled model)"
+                    ),
+                    Ok(false) => println!(
+                        "[axiom] checkpoint already present at {DEFAULT_CHECKPOINT_PATH} — skipping bootstrap"
+                    ),
+                    Err(err) => eprintln!(
+                        "[axiom] checkpoint bootstrap skipped: {err}. The proxy will boot on \
+                         random weights until you train one (or re-run `axiom init`)."
+                    ),
+                }
+            }
         }
         AxiomCommand::Daemon { command } => match command {
             DaemonCommand::Start => {
@@ -580,6 +607,64 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 eprintln!("[axiom] {err}");
             }
         },
+        AxiomCommand::Prime { path } => {
+            // Build the production model exactly as the server/LSP do (BPE +
+            // checkpoint when present, legacy fresh-init otherwise), then absorb
+            // the target codebase into the persistent vibe memory.
+            let device = device_from_str(
+                &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            )?;
+            // Same small CPU-friendly legacy base the other runtime modes use;
+            // resolve_production_model upgrades it to the scaled BPE model when
+            // the checkpoint artifacts are present. (AxiomConfig::default() is the
+            // 7B-scale blueprint — far too large to init/adapt on CPU here.)
+            let legacy = AxiomConfig {
+                d_model: 64,
+                n_layers: 2,
+                vocab_size: 256,
+                lr_inner: 1e-3,
+                norm_eps: 1e-6,
+            };
+            let (cfg, ckpt) = resolve_production_model(legacy, DEFAULT_CHECKPOINT_PATH);
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
+                context_api_url: None,
+                context_api_key: None,
+                max_context_tokens: 0,
+            };
+            let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            // Persist the vibe next to the repo by default (matches the proxy's
+            // default), overridable with AXIOM_VIBE_PATH.
+            let vibe_path = std::env::var("AXIOM_VIBE_PATH")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH)
+                });
+            prime::run_prime(&path, &pipeline, &vibe_path)?;
+        }
+        AxiomCommand::Bench { path } => {
+            // Same model resolution as prime/server; bench only reads the
+            // tokenizer for token counts, so a missing checkpoint is harmless.
+            let device = device_from_str(
+                &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            )?;
+            let legacy = AxiomConfig {
+                d_model: 64,
+                n_layers: 2,
+                vocab_size: 256,
+                lr_inner: 1e-3,
+                norm_eps: 1e-6,
+            };
+            let (cfg, ckpt) = resolve_production_model(legacy, DEFAULT_CHECKPOINT_PATH);
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
+                context_api_url: None,
+                context_api_key: None,
+                max_context_tokens: 0,
+            };
+            let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            bench::run_bench(&path, &pipeline)?;
+        }
         AxiomCommand::Swarm { command } => match command {
             SwarmCommand::Connect { ip } => {
                 let peer = cli::normalize_peer(&ip);

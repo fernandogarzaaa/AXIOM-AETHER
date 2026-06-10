@@ -46,7 +46,8 @@ use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
 use crate::context_compressor::{
     adapt_session_blocking, extract_memory_vector_blocking, feedback_adaptation_text,
-    CompressionControls, CompressorConfig, MemoryFingerprint, SessionStates, TttSessionStore,
+    should_retry_uncompressed, CompressionControls, CompressorConfig, MemoryFingerprint,
+    SessionStates, TttSessionStore,
 };
 use crate::dwe::{extract_delta_fragment, DweBus, DweTelemetry};
 use crate::hamiltonian::QuantumRuntimeStatus;
@@ -2136,27 +2137,76 @@ async fn compressed_messages_path(
         status: StatusCode::BAD_GATEWAY.as_u16(),
         message: "local swarm route failed and no Anthropic cloud forwarder is configured".into(),
     })?;
-    forwarder
+
+    // First attempt: forward the lean, compressed payload.
+    match forwarder
         .forward_messages_json(&outbound, client_auth)
         .await
-        .map_err(|e| match e {
-            // Surface the real upstream status (401/429/5xx) to the client.
-            ForwarderError::Upstream { status, body } => ApiError::Upstream {
-                status,
-                message: format!("anthropic upstream {status}: {body}"),
-            },
-            // No credential at all → 401 so the client knows to authenticate.
-            ForwarderError::MissingAuth => ApiError::Upstream {
-                status: StatusCode::UNAUTHORIZED.as_u16(),
-                message: format!("{e}"),
-            },
-            // Network/decode failures mean we never got a usable response →
-            // 502 Bad Gateway rather than a misleading 500.
-            other => ApiError::Upstream {
-                status: StatusCode::BAD_GATEWAY.as_u16(),
-                message: format!("anthropic upstream call failed: {other}"),
-            },
-        })
+    {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            // Graceful degradation: a compression-side fault (or a transient
+            // upstream/network hiccup) must never cost the client their turn. If
+            // we actually altered the payload and the failure is one the original
+            // payload could fix, retry ONCE with the uncompressed body. The TTT
+            // session already absorbed the heavy context above, so this only
+            // forgoes the token *savings* for this one request — never the answer.
+            let did_compress = log_heavy_count > 0;
+            if did_compress && should_retry_uncompressed(&err) {
+                eprintln!(
+                    "[axiom-ttt] compressed forward failed ({err}); retrying once with original \
+                     uncompressed payload (session={session_id})"
+                );
+                state.controls.record_degraded_fallback();
+                // The untouched client body, minus Axiom-only extensions.
+                let mut fallback = body.clone();
+                if let Some(obj) = fallback.as_object_mut() {
+                    obj.remove("session_id");
+                }
+                return forwarder
+                    .forward_messages_json(&fallback, client_auth)
+                    .await
+                    .map_err(map_anthropic_forwarder_error);
+            }
+            Err(map_anthropic_forwarder_error(err))
+        }
+    }
+}
+
+/// Map an Anthropic [`ForwarderError`] onto the client-facing [`ApiError`].
+fn map_anthropic_forwarder_error(err: ForwarderError) -> ApiError {
+    match err {
+        // Surface the real upstream status (401/429/5xx) to the client.
+        ForwarderError::Upstream { status, body } => ApiError::Upstream {
+            status,
+            message: format!("anthropic upstream {status}: {body}"),
+        },
+        // No credential at all → 401 so the client knows to authenticate.
+        ForwarderError::MissingAuth => ApiError::Upstream {
+            status: StatusCode::UNAUTHORIZED.as_u16(),
+            message: format!("{err}"),
+        },
+        // Network/decode failures mean we never got a usable response →
+        // 502 Bad Gateway rather than a misleading 500.
+        other => ApiError::Upstream {
+            status: StatusCode::BAD_GATEWAY.as_u16(),
+            message: format!("anthropic upstream call failed: {other}"),
+        },
+    }
+}
+
+/// Map an OpenAI [`OpenAiForwarderError`] onto the client-facing [`ApiError`].
+fn map_openai_forwarder_error(err: OpenAiForwarderError) -> ApiError {
+    match err {
+        OpenAiForwarderError::MissingAuth => ApiError::Upstream {
+            status: StatusCode::UNAUTHORIZED.as_u16(),
+            message: format!("{err}"),
+        },
+        other => ApiError::Upstream {
+            status: StatusCode::BAD_GATEWAY.as_u16(),
+            message: format!("OpenAI upstream call failed: {other}"),
+        },
+    }
 }
 
 /// OpenAI-compatible active-compression path: partition -> adapt -> recall ->
@@ -2336,19 +2386,57 @@ async fn compressed_openai_chat_path(
         status: StatusCode::BAD_GATEWAY.as_u16(),
         message: "local swarm route failed and no OpenAI cloud forwarder is configured".into(),
     })?;
-    let upstream = forwarder
+
+    // Graceful degradation (mirrors the Anthropic path): a compression-side fault
+    // must never cost the client their turn. We retry ONCE with the original
+    // uncompressed body — for a transient network fault, or for a recoverable
+    // non-2xx status (5xx / 400) that our injected fingerprint may have caused.
+    // Unlike the Anthropic forwarder, this one returns Ok even for non-2xx (the
+    // status rides in the response), so we inspect both the Err and the status.
+    let did_compress = log_heavy_count > 0;
+    let fallback_body = || {
+        let mut fallback = body.clone();
+        if let Some(obj) = fallback.as_object_mut() {
+            obj.remove("session_id");
+        }
+        fallback
+    };
+
+    let mut fell_back = false;
+    let mut upstream = match forwarder
         .forward_chat_completions_text(&outbound, client_auth)
         .await
-        .map_err(|e| match e {
-            OpenAiForwarderError::MissingAuth => ApiError::Upstream {
-                status: StatusCode::UNAUTHORIZED.as_u16(),
-                message: format!("{e}"),
-            },
-            other => ApiError::Upstream {
-                status: StatusCode::BAD_GATEWAY.as_u16(),
-                message: format!("OpenAI upstream call failed: {other}"),
-            },
-        })?;
+    {
+        Ok(resp) => resp,
+        Err(OpenAiForwarderError::Network(msg)) if did_compress => {
+            eprintln!(
+                "[axiom-ttt] compressed OpenAI forward failed (network error: {msg}); retrying \
+                 once with original uncompressed payload (session={session_id})"
+            );
+            state.controls.record_degraded_fallback();
+            fell_back = true;
+            forwarder
+                .forward_chat_completions_text(&fallback_body(), client_auth)
+                .await
+                .map_err(map_openai_forwarder_error)?
+        }
+        Err(other) => return Err(map_openai_forwarder_error(other)),
+    };
+
+    if !fell_back && did_compress && (upstream.status >= 500 || upstream.status == 400) {
+        eprintln!(
+            "[axiom-ttt] compressed OpenAI forward returned {}; retrying once with original \
+             uncompressed payload (session={session_id})",
+            upstream.status
+        );
+        state.controls.record_degraded_fallback();
+        if let Ok(retry) = forwarder
+            .forward_chat_completions_text(&fallback_body(), client_auth)
+            .await
+        {
+            upstream = retry;
+        }
+    }
 
     let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
@@ -2767,6 +2855,7 @@ async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
             "bytes_in": bytes_in,
             "bytes_out": bytes_out,
             "savings_pct": (savings_pct * 10.0).round() / 10.0,
+            "degraded_fallbacks": state.controls.degraded_fallbacks(),
         }
     }))
 }
