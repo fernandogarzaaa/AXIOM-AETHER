@@ -40,6 +40,17 @@ pub enum AxiomCommand {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Run a program under self-healing supervision: failures are absorbed into
+    /// the TTT fast-weights, the environment is repaired (e.g. missing
+    /// directories created), and the program is restarted until it succeeds.
+    Run {
+        /// Restart budget after the first attempt.
+        #[arg(long, default_value_t = 3)]
+        max_restarts: usize,
+        /// The command to supervise, followed by its arguments.
+        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
     /// Manage DWE swarm peers.
     Swarm {
         #[command(subcommand)]

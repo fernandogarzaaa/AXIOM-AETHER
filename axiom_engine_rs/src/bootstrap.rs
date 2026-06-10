@@ -20,13 +20,7 @@ use crate::train::AxiomTrainer;
 
 /// CPU-friendly runtime dims — must match the legacy base the server/prime use.
 pub fn bootstrap_config() -> AxiomConfig {
-    AxiomConfig {
-        d_model: 64,
-        n_layers: 2,
-        vocab_size: 256,
-        lr_inner: 1e-3,
-        norm_eps: 1e-6,
-    }
+    AxiomConfig::runtime_small()
 }
 
 fn env_usize(key: &str, default: usize) -> usize {

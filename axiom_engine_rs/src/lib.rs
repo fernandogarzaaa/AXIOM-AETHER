@@ -34,6 +34,7 @@ pub mod quantization;
 pub mod sandbox;
 pub mod search_ingest;
 pub mod search_scrape;
+pub mod self_heal;
 pub mod server;
 pub mod skeleton;
 pub mod surprisal;

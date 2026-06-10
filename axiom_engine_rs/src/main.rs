@@ -34,6 +34,7 @@ mod prime;
 mod q_manifold;
 mod quantization;
 mod sandbox;
+mod self_heal;
 mod server;
 mod skeleton;
 mod surprisal;
@@ -397,13 +398,7 @@ async fn run_main() -> Result<()> {
     let device = device_from_str(&args.device)?;
 
     // Keep local defaults small enough for CPU experimentation.
-    let config = AxiomConfig {
-        d_model: 64,
-        n_layers: 2,
-        vocab_size: 256,
-        lr_inner: 1e-3,
-        norm_eps: 1e-6,
-    };
+    let config = AxiomConfig::runtime_small();
 
     match args.mode.as_str() {
         "train" => {
@@ -614,18 +609,10 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             let device = device_from_str(
                 &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
             )?;
-            // Same small CPU-friendly legacy base the other runtime modes use;
-            // resolve_production_model upgrades it to the scaled BPE model when
-            // the checkpoint artifacts are present. (AxiomConfig::default() is the
-            // 7B-scale blueprint — far too large to init/adapt on CPU here.)
-            let legacy = AxiomConfig {
-                d_model: 64,
-                n_layers: 2,
-                vocab_size: 256,
-                lr_inner: 1e-3,
-                norm_eps: 1e-6,
-            };
-            let (cfg, ckpt) = resolve_production_model(legacy, DEFAULT_CHECKPOINT_PATH);
+            // Small CPU-friendly base; resolve_production_model upgrades it to
+            // the scaled BPE model when the checkpoint artifacts are present.
+            let (cfg, ckpt) =
+                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
             let runtime = InferenceRuntimeOptions {
                 tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
                 context_api_url: None,
@@ -648,14 +635,8 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             let device = device_from_str(
                 &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
             )?;
-            let legacy = AxiomConfig {
-                d_model: 64,
-                n_layers: 2,
-                vocab_size: 256,
-                lr_inner: 1e-3,
-                norm_eps: 1e-6,
-            };
-            let (cfg, ckpt) = resolve_production_model(legacy, DEFAULT_CHECKPOINT_PATH);
+            let (cfg, ckpt) =
+                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
             let runtime = InferenceRuntimeOptions {
                 tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
                 context_api_url: None,
@@ -664,6 +645,61 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             };
             let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
             bench::run_bench(&path, &pipeline)?;
+        }
+        AxiomCommand::Run {
+            max_restarts,
+            command,
+        } => {
+            let device = device_from_str(
+                &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            )?;
+            let (cfg, ckpt) =
+                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
+                context_api_url: None,
+                context_api_key: None,
+                max_context_tokens: 0,
+            };
+            let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            let (program, args) = command
+                .split_first()
+                .ok_or_else(|| candle_core::Error::Msg("axiom run needs a command".into()))?;
+            // TTT adaptation recurses through candle's backward graph; give it a
+            // large stack like every other adapt path in the engine.
+            let program = program.clone();
+            let args = args.to_vec();
+            // Opt-in persistence: AXIOM_RUN_VIBE=1 folds the run's failure
+            // history into the master vibe (AXIOM_VIBE_PATH or the default).
+            let vibe_path = (std::env::var("AXIOM_RUN_VIBE").as_deref() == Ok("1")).then(|| {
+                std::env::var("AXIOM_VIBE_PATH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH))
+            });
+            let report = std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn(move || {
+                    self_heal::run_supervised(
+                        &pipeline,
+                        &program,
+                        &args,
+                        max_restarts,
+                        vibe_path.as_deref(),
+                    )
+                })
+                .map_err(|e| candle_core::Error::Msg(format!("supervisor thread failed: {e}")))?
+                .join()
+                .map_err(|_| candle_core::Error::Msg("supervisor thread panicked".into()))??;
+            println!(
+                "[axiom-run] result: {} after {} attempt(s); {} heal(s); {} failure token(s) absorbed",
+                if report.success { "SUCCESS" } else { "FAILED" },
+                report.attempts,
+                report.heals.len(),
+                report.tokens_absorbed
+            );
+            if !report.success {
+                std::process::exit(report.exit_code.unwrap_or(1));
+            }
         }
         AxiomCommand::Swarm { command } => match command {
             SwarmCommand::Connect { ip } => {

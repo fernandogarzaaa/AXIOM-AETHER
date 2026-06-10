@@ -147,6 +147,56 @@ expand round-trip rate (every kept signature must recover its body). It does
 
 ---
 
+## Self-healing runtime — `axiom run`
+
+The core Axiom thesis: software running *inside* Axiom is not static text that
+crashes — its failures become state the engine can feel and react to. `axiom
+run` is that thesis as a working primitive:
+
+```bash
+axiom run -- sh -c 'echo 42 > /data/out/result.txt'   # /data/out does not exist
+```
+
+```text
+sh: 1: cannot create /data/out/result.txt: Directory nonexistent
+[axiom-run] attempt 1: exit=Some(2) — absorbing failure into W̃
+[axiom-run]   tension: CE 5.545 -> 5.545 after absorption (29 tokens)
+[axiom-run]   heal: created directory /data/out
+[axiom-run] environment healed — restarting
+[axiom-run] attempt 2: exited cleanly in 0.0s
+[axiom-run] result: SUCCESS after 2 attempt(s); 1 heal(s); 29 failure token(s) absorbed
+```
+
+What actually happens on a failure:
+
+1. **Tension** — the failure trace is scored through the model (cross-entropy,
+   the same signal as the drift gate). An anomaly is a loss spike in the
+   network, and the number is printed.
+2. **Absorption** — the trace is wrapped in the execution-feedback schema and
+   streamed through the TTT stack: real gradient steps move the session's W̃
+   toward the failure. One session spans all restarts, so the program's failure
+   history compounds.
+3. **Environmental heal** — deterministic, safe policies repair what the
+   process cannot survive: missing directories (`ENOENT` / `Directory
+   nonexistent` → `mkdir -p`), and recognised **transient faults**
+   (`Connection refused/reset/timed out`, DNS, EAGAIN) where waiting *is* the
+   heal — a bounded backoff-retry (max 2). Heals only ever create directories
+   or wait — never delete, overwrite, or fabricate file content.
+4. **Continue** — restart up to `--max-restarts` (default 3), but **only when a
+   new heal was applied**: an unhealed environment is never blindly replayed,
+   and the child's exit code is preserved on give-up.
+5. **Persist (opt-in)** — with `AXIOM_RUN_VIBE=1`, the run's adapted W̃ is
+   EMA-merged into the master vibe on completion: the program's failure history
+   becomes memory that outlives the process.
+
+Honesty notes: source-artifact patching lives in the Poly JIT hypervisor path,
+not here; restarting a process is not literally resuming a suspended thread
+(v1 targets batch/idempotent programs); and with an unbaked checkpoint the CE
+sits near `ln(vocab)` (uniform) — the tension *plumbing* is always real, the
+sharpness of the signal comes from the trained semantic model.
+
+---
+
 ## Quick Start
 
 ### One-line install
