@@ -276,6 +276,59 @@ fn immunity_is_per_command_fingerprint() {
 }
 
 #[test]
+fn novel_faults_are_absorbed_harder_than_familiar_ones() {
+    // A non-healable, deterministic failure (`exit 7`): no heal applies, so the
+    // run absorbs once and stops. With a shared memory, the FIRST run sees a
+    // novel fault (deep absorption); the SECOND run recognises it (light).
+    let memory = unique_tmp("gate_mem").with_extension("json");
+    let args = vec!["-c".to_string(), "exit 7".to_string()];
+
+    let first = supervise_full(
+        tiny_pipeline(),
+        "sh".into(),
+        args.clone(),
+        3,
+        None,
+        Some(memory.clone()),
+    );
+    assert!(!first.success);
+    assert_eq!(first.attempts, 1, "no heal → single attempt");
+    assert_eq!(
+        first.absorption_passes, 3,
+        "a first-seen fault must be absorbed deeply"
+    );
+
+    let second = supervise_full(
+        tiny_pipeline(),
+        "sh".into(),
+        args,
+        3,
+        None,
+        Some(memory.clone()),
+    );
+    assert!(!second.success);
+    assert_eq!(
+        second.absorption_passes, 1,
+        "a recognised (KNOWN) fault must be reinforced lightly"
+    );
+
+    let _ = std::fs::remove_file(&memory);
+}
+
+#[test]
+fn absorption_is_deep_without_memory_history() {
+    // No heal memory → no classification → treat the fault as unfamiliar.
+    let report = supervise(
+        tiny_pipeline(),
+        "sh".into(),
+        vec!["-c".into(), "exit 1".into()],
+        3,
+    );
+    assert!(!report.success);
+    assert_eq!(report.absorption_passes, 3);
+}
+
+#[test]
 fn failure_history_persists_to_vibe_when_requested() {
     let vibe = unique_tmp("vibe").with_extension("bin");
     let report = supervise_with_vibe(

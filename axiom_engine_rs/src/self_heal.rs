@@ -116,6 +116,27 @@ pub struct RunReport {
     pub heals: Vec<Heal>,
     pub tension: Vec<TensionSample>,
     pub tokens_absorbed: usize,
+    /// Total TTT absorption passes run across all failures. Tension-gated: a
+    /// novel/first-seen fault is absorbed harder than a familiar one.
+    pub absorption_passes: usize,
+}
+
+/// Absorption passes for a familiar (KNOWN) failure: light reinforcement, the
+/// engine has already moved its weights toward this fault before.
+const LIGHT_ABSORPTION_PASSES: usize = 1;
+
+/// Absorption passes for a FIRST/NOVEL fault (or when there is no history to
+/// classify against): concentrate gradient effort on the surprising tension.
+const DEEP_ABSORPTION_PASSES: usize = 3;
+
+/// Tension-gated absorption depth. Without a classification (no heal memory) we
+/// treat the fault as unfamiliar and absorb deeply.
+fn absorption_passes(novelty: Option<crate::heal_memory::Novelty>) -> usize {
+    use crate::heal_memory::Novelty;
+    match novelty {
+        Some(Novelty::Known) => LIGHT_ABSORPTION_PASSES,
+        _ => DEEP_ABSORPTION_PASSES,
+    }
 }
 
 /// Mean next-token cross-entropy of `ids` through the model with the given
@@ -257,6 +278,7 @@ pub fn run_supervised(
         heals: Vec::new(),
         tension: Vec::new(),
         tokens_absorbed: 0,
+        absorption_passes: 0,
     };
     // One session for the whole supervised lifetime: every failure compounds
     // into the same fast-weights.
@@ -321,18 +343,28 @@ pub fn run_supervised(
         let ids = pipeline.encode_text(&feedback);
         let ce_before = sequence_ce(pipeline, &states, &ids)?;
 
-        // 2. Absorb: real TTT gradient steps on the failure trace.
-        adapt_session_blocking(pipeline, &mut states, &ids)?;
+        // 2a. Classify the fault against this program's tension history BEFORE
+        //     deciding how hard to absorb it.
+        let novelty = memory
+            .as_mut()
+            .map(|mem| mem.observe_failure(&fp, &command_line, ce_before));
+        if let Some(n) = novelty {
+            println!("[axiom-run]   failure mode: {n} (vs this program's tension history)");
+        }
+
+        // 2b. Tension-gated absorption: concentrate gradient effort on
+        //     new/surprising faults; lightly reinforce familiar ones.
+        let passes = absorption_passes(novelty);
+        for _ in 0..passes {
+            adapt_session_blocking(pipeline, &mut states, &ids)?;
+        }
         report.tokens_absorbed += ids.len();
+        report.absorption_passes += passes;
         let ce_after = sequence_ce(pipeline, &states, &ids)?;
         println!(
-            "[axiom-run]   tension: CE {ce_before:.3} -> {ce_after:.3} after absorption ({} tokens)",
+            "[axiom-run]   tension: CE {ce_before:.3} -> {ce_after:.3} after {passes} absorption pass(es) ({} tokens)",
             ids.len()
         );
-        if let Some(mem) = memory.as_mut() {
-            let novelty = mem.observe_failure(&fp, &command_line, ce_before);
-            println!("[axiom-run]   failure mode: {novelty} (vs this program's tension history)");
-        }
         report.tension.push(TensionSample {
             attempt,
             ce_before,

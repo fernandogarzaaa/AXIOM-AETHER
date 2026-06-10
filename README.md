@@ -172,10 +172,13 @@ What actually happens on a failure:
 1. **Tension** — the failure trace is scored through the model (cross-entropy,
    the same signal as the drift gate). An anomaly is a loss spike in the
    network, and the number is printed.
-2. **Absorption** — the trace is wrapped in the execution-feedback schema and
-   streamed through the TTT stack: real gradient steps move the session's W̃
-   toward the failure. One session spans all restarts, so the program's failure
-   history compounds.
+2. **Absorption (tension-gated)** — the trace is wrapped in the
+   execution-feedback schema and streamed through the TTT stack: real gradient
+   steps move the session's W̃ toward the failure. The *depth* of absorption is
+   gated by the failure's novelty — a **FIRST/NOVEL** fault is absorbed deeply
+   (the engine concentrates gradient effort on the surprising tension), a
+   **KNOWN** fault is reinforced lightly. One session spans all restarts, so the
+   program's failure history compounds.
 3. **Environmental heal** — deterministic, safe policies repair what the
    process cannot survive: missing directories (`ENOENT` / `Directory
    nonexistent` → `mkdir -p`), and recognised **transient faults**
