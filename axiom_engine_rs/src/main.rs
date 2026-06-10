@@ -694,6 +694,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 vibe_path,
                 heal_memory_path,
                 remember_into,
+                anchor: None, // default: the current working directory
             };
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)

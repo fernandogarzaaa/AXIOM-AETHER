@@ -122,6 +122,17 @@ pub fn fingerprint(command: &str, args: &[String]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Express `dir` relative to `anchor` when it lives under it (making the heal
+/// portable across checkouts/machines); otherwise return `dir` unchanged so
+/// out-of-tree absolute heals are preserved verbatim.
+pub fn relativize_dir(dir: &Path, anchor: &Path) -> PathBuf {
+    match dir.strip_prefix(anchor) {
+        Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => dir.to_path_buf(),
+    }
+}
+
 impl HealMemory {
     /// Load the memory at `path`, or start empty when missing/corrupt (a bad
     /// memory file must never break a run).
@@ -239,13 +250,28 @@ impl HealMemory {
     /// Re-create every remembered directory that is missing. Returns the dirs
     /// actually created now (the immunization applied to *this* environment).
     pub fn immunize(&self, fp: &str) -> Vec<PathBuf> {
+        let anchor = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.immunize_anchored(fp, &anchor)
+    }
+
+    /// Re-create remembered-but-missing directories, re-anchoring *relative*
+    /// heals to `anchor` (the supervised process's working directory). This is
+    /// what makes immunity location-invariant: a heal learned as `target` in
+    /// one checkout is applied as `<anchor>/target` here. Absolute heals are
+    /// used verbatim. Returns the resolved absolute paths actually created.
+    pub fn immunize_anchored(&self, fp: &str, anchor: &Path) -> Vec<PathBuf> {
         let Some(record) = self.data.programs.get(fp) else {
             return Vec::new();
         };
         let mut applied = Vec::new();
         for dir in &record.dirs {
-            if !dir.exists() && std::fs::create_dir_all(dir).is_ok() {
-                applied.push(dir.clone());
+            let resolved = if dir.is_relative() {
+                anchor.join(dir)
+            } else {
+                dir.clone()
+            };
+            if !resolved.exists() && std::fs::create_dir_all(&resolved).is_ok() {
+                applied.push(resolved);
             }
         }
         applied

@@ -202,7 +202,14 @@ What actually happens on a failure:
    own life history. Run a program once: crash → heal → success. Wipe the
    environment and run it again: `immunity: pre-created remembered directory …`
    → success on attempt 1 with **zero failure tokens absorbed**.
-7. **Swarm immunity** — heals learned anywhere immunize the whole fleet. The
+7. **Portable (location-invariant) immunity** — a heal under the working
+   directory is remembered *relative* to it and re-anchored on immunize, so a
+   fix learned in one checkout applies in another — and, via swarm immunity,
+   on another machine. Learn `dist/` in `/home/alice/projA`; the same command
+   in `/home/bob/projB` is immunized to `/home/bob/projB/dist` and succeeds on
+   the first attempt, a location it never ran in. Heals outside the working
+   directory stay absolute.
+8. **Swarm immunity** — heals learned anywhere immunize the whole fleet. The
    server exports its heal memory at `GET /v1/immunity` and accepts a peer's at
    `POST /v1/immunity/merge`; `axiom swarm immunity <host:port>` pulls a peer
    and merges in one command. Merges are conservative: directory lists are

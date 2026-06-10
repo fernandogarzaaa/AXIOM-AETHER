@@ -208,13 +208,23 @@ pub fn extract_missing_paths(trace: &str) -> Vec<PathBuf> {
             }
         }
         // Unquoted candidates: any whitespace- or colon-delimited word that
-        // looks like a path. Covers `cat: /a/b: No such file or directory` and
-        // `sh: 1: cannot create /a/b/out.txt: Directory nonexistent`, where the
-        // path sits mid-token rather than at a colon boundary.
+        // looks like a path. Covers `cat: /a/b: No such file or directory`,
+        // `sh: 1: cannot create /a/b/out.txt: Directory nonexistent`, and bare
+        // *relative* paths like `build/out/app.bin` (which is what a shell
+        // prints when the program used a cwd-relative path — the portable case).
         for word in line.split(|c: char| c.is_whitespace() || c == ':') {
             let t = word.trim().trim_end_matches([',', ';']);
-            if (t.starts_with('/') || t.starts_with("./")) && t.len() > 1 && seen.insert(t.into())
-            {
+            if t.len() <= 1 || t.contains("://") || seen.contains(t) {
+                continue; // too short, a URL, or already captured
+            }
+            let absolute = t.starts_with('/') || t.starts_with("./");
+            let relative_path = t.contains('/')
+                && t
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_');
+            if absolute || relative_path {
+                seen.insert(t.to_string());
                 found.push(PathBuf::from(t));
             }
         }
@@ -225,18 +235,25 @@ pub fn extract_missing_paths(trace: &str) -> Vec<PathBuf> {
 /// Apply the missing-directory heal for one implicated path.
 ///
 /// A component with an extension is treated as a file → its parent directory is
-/// created; otherwise the path itself is created. Only `create_dir_all` is ever
-/// performed — nothing is deleted or written.
-fn heal_missing_path(path: &Path) -> Option<Heal> {
-    let dir = if path
+/// created; otherwise the path itself is created. Relative paths (as they often
+/// appear in error traces) resolve against `anchor` — the supervised process's
+/// working directory — so the heal lands where the program actually looked.
+/// Only `create_dir_all` is ever performed — nothing is deleted or written.
+fn heal_missing_path(path: &Path, anchor: &Path) -> Option<Heal> {
+    let resolved = if path.is_relative() {
+        anchor.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let dir = if resolved
         .file_name()
         .and_then(|n| n.to_str())
         .map(|n| n.contains('.'))
         .unwrap_or(false)
     {
-        path.parent()?.to_path_buf()
+        resolved.parent()?.to_path_buf()
     } else {
-        path.to_path_buf()
+        resolved
     };
     if dir.as_os_str().is_empty() || dir.exists() {
         return None;
@@ -270,6 +287,12 @@ pub struct SupervisorOptions {
     /// MemoryStore root: novel healed failures are written here as `Fix`
     /// memories the proxy's recall layer can surface into Claude's context.
     pub remember_into: Option<PathBuf>,
+    /// Working directory for the supervised process and the anchor for
+    /// location-invariant immunity: heals under this dir are remembered
+    /// *relative* to it and re-anchored here on immunize, so a fix learned in
+    /// one checkout (or on another machine, via swarm immunity) applies in
+    /// another. `None` → the current process working directory.
+    pub anchor: Option<PathBuf>,
 }
 
 impl SupervisorOptions {
@@ -297,6 +320,13 @@ pub fn run_supervised(
     let max_restarts = opts.max_restarts;
     let vibe_path = opts.vibe_path.as_deref();
     let heal_memory_path = opts.heal_memory_path.as_deref();
+    // Anchor = supervised process working directory = the frame heals are made
+    // portable against. Defaults to the current process cwd.
+    let anchor = opts
+        .anchor
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
     let mut report = RunReport {
         success: false,
         attempts: 0,
@@ -318,7 +348,7 @@ pub fn run_supervised(
     let fp = crate::heal_memory::fingerprint(command, args);
     let mut memory = heal_memory_path.map(crate::heal_memory::HealMemory::load);
     if let Some(mem) = memory.as_ref() {
-        for dir in mem.immunize(&fp) {
+        for dir in mem.immunize_anchored(&fp, &anchor) {
             let heal = Heal::Immunized(dir.clone());
             println!("[axiom-run] {heal}");
             healed_paths.insert(dir);
@@ -329,9 +359,11 @@ pub fn run_supervised(
     for attempt in 1..=max_restarts + 1 {
         report.attempts = attempt;
         let started = Instant::now();
-        let output = Command::new(command).args(args).output().map_err(|e| {
-            candle_core::Error::Msg(format!("failed to spawn '{command}': {e}"))
-        })?;
+        let output = Command::new(command)
+            .args(args)
+            .current_dir(&anchor)
+            .output()
+            .map_err(|e| candle_core::Error::Msg(format!("failed to spawn '{command}': {e}")))?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         // The supervised program's output still belongs to the user.
@@ -346,7 +378,7 @@ pub fn run_supervised(
                 started.elapsed().as_secs_f32()
             );
             commit_to_vibe(pipeline, &states, &report, vibe_path);
-            finalize_memory(memory.as_mut(), &fp, &command_line, &report);
+            finalize_memory(memory.as_mut(), &fp, &command_line, &report, &anchor);
             return Ok(report);
         }
 
@@ -407,7 +439,7 @@ pub fn run_supervised(
             if healed_paths.contains(&path) {
                 continue;
             }
-            if let Some(heal) = heal_missing_path(&path) {
+            if let Some(heal) = heal_missing_path(&path, &anchor) {
                 println!("[axiom-run]   heal: {heal}");
                 healed_paths.insert(path);
                 new_heal_descs.push(heal.to_string());
@@ -454,13 +486,13 @@ pub fn run_supervised(
         if !applied_new_heal {
             println!("[axiom-run] no applicable heal for this failure — stopping");
             commit_to_vibe(pipeline, &states, &report, vibe_path);
-            finalize_memory(memory.as_mut(), &fp, &command_line, &report);
+            finalize_memory(memory.as_mut(), &fp, &command_line, &report, &anchor);
             return Ok(report);
         }
         if attempt == max_restarts + 1 {
             println!("[axiom-run] restart budget exhausted");
             commit_to_vibe(pipeline, &states, &report, vibe_path);
-            finalize_memory(memory.as_mut(), &fp, &command_line, &report);
+            finalize_memory(memory.as_mut(), &fp, &command_line, &report, &anchor);
             return Ok(report);
         }
         println!("[axiom-run] environment healed — restarting");
@@ -476,14 +508,21 @@ fn finalize_memory(
     fp: &str,
     command_line: &str,
     report: &RunReport,
+    anchor: &Path,
 ) {
     let Some(mem) = memory else { return };
     if report.success {
+        // Remember directory heals *relative to the anchor* when they live
+        // under it, so immunity is portable to other checkouts/machines; heals
+        // outside the anchor stay absolute. Immunized dirs are included (the
+        // run proved them) — remember_dirs dedups against what's already stored.
         let dirs: Vec<PathBuf> = report
             .heals
             .iter()
             .filter_map(|h| match h {
-                Heal::CreatedDirectory(p) => Some(p.clone()),
+                Heal::CreatedDirectory(p) | Heal::Immunized(p) => {
+                    Some(crate::heal_memory::relativize_dir(p, anchor))
+                }
                 _ => None,
             })
             .collect();
@@ -624,10 +663,28 @@ mod tests {
                 .as_nanos()
         ));
         let file_path = base.join("deep").join("out.txt");
-        let heal = heal_missing_path(&file_path).expect("heal must apply");
+        // Absolute path → anchor is ignored.
+        let heal = heal_missing_path(&file_path, Path::new("/unused")).expect("heal must apply");
         assert_eq!(heal, Heal::CreatedDirectory(base.join("deep")));
         assert!(base.join("deep").exists());
         assert!(!file_path.exists(), "heal must never create the file itself");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn relative_trace_path_heals_under_anchor() {
+        let anchor = std::env::temp_dir().join(format!(
+            "axiom_anchor_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&anchor).unwrap();
+        // A relative path from a trace resolves against the anchor (child cwd).
+        let heal = heal_missing_path(Path::new("build/out.bin"), &anchor).expect("heal applies");
+        assert_eq!(heal, Heal::CreatedDirectory(anchor.join("build")));
+        assert!(anchor.join("build").exists());
+        let _ = std::fs::remove_dir_all(&anchor);
     }
 }

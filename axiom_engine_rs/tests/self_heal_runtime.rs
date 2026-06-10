@@ -64,6 +64,7 @@ fn supervise_full(
             vibe_path,
             heal_memory_path: heal_memory,
             remember_into: None,
+            anchor: None,
         },
     )
 }
@@ -335,6 +336,47 @@ fn absorption_is_deep_without_memory_history() {
     );
     assert!(!report.success);
     assert_eq!(report.absorption_passes, 3);
+}
+
+#[test]
+fn immunity_is_location_invariant_across_working_directories() {
+    use axiom_engine::self_heal::Heal::{CreatedDirectory, Immunized};
+
+    // Same command, run in two different working directories. A relative-path
+    // heal learned in dir A must transfer to dir B — a location the program has
+    // never run in — because the heal is remembered relative to the anchor.
+    let dir_a = unique_tmp("loc_a");
+    let dir_b = unique_tmp("loc_b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let memory = unique_tmp("loc_mem").with_extension("json");
+    // cwd-relative output path — identical command string → identical fingerprint.
+    let args = vec!["-c".to_string(), "echo built > build/out/app.bin".to_string()];
+
+    let mk = |anchor: PathBuf| SupervisorOptions {
+        max_restarts: 3,
+        heal_memory_path: Some(memory.clone()),
+        anchor: Some(anchor),
+        ..SupervisorOptions::default()
+    };
+
+    // Run 1 in dir A: fails on missing build/out, heals it, succeeds, learns.
+    let a = supervise_opts(tiny_pipeline(), "sh".into(), args.clone(), mk(dir_a.clone()));
+    assert!(a.success);
+    assert_eq!(a.heals, vec![CreatedDirectory(dir_a.join("build").join("out"))]);
+
+    // Run 2 in dir B: never ran here, yet immunity pre-creates build/out under B
+    // and the program succeeds on the first attempt.
+    assert!(!dir_b.join("build").join("out").exists());
+    let b = supervise_opts(tiny_pipeline(), "sh".into(), args, mk(dir_b.clone()));
+    assert!(b.success);
+    assert_eq!(b.attempts, 1, "portable immunity → first-try success in a new location");
+    assert_eq!(b.heals, vec![Immunized(dir_b.join("build").join("out"))]);
+    assert!(dir_b.join("build").join("out").join("app.bin").exists());
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_file(&memory);
 }
 
 #[test]
