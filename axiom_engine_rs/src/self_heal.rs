@@ -257,20 +257,46 @@ fn tail(s: &str, max: usize) -> &str {
     &s[start..]
 }
 
+/// Optional persistence wiring for a supervised run. All paths default to
+/// `None` (purely in-memory supervision).
+#[derive(Debug, Clone, Default)]
+pub struct SupervisorOptions {
+    /// Restart budget after the first attempt.
+    pub max_restarts: usize,
+    /// EMA-merge the run's adapted W̃ into this master vibe on completion.
+    pub vibe_path: Option<PathBuf>,
+    /// Persistent heal memory (learned + swarm immunity, FIRST/KNOWN/NOVEL).
+    pub heal_memory_path: Option<PathBuf>,
+    /// MemoryStore root: novel healed failures are written here as `Fix`
+    /// memories the proxy's recall layer can surface into Claude's context.
+    pub remember_into: Option<PathBuf>,
+}
+
+impl SupervisorOptions {
+    /// In-memory supervision with the given restart budget and no persistence.
+    pub fn new(max_restarts: usize) -> Self {
+        Self {
+            max_restarts,
+            ..Self::default()
+        }
+    }
+}
+
 /// Run `command args...` under self-healing supervision.
 ///
-/// When `vibe_path` is `Some` and any failure tokens were absorbed, the
-/// supervised session's W̃ is EMA-merged into the master vibe at that path on
-/// completion — the program's failure history becomes persistent memory that
-/// outlives the run.
+/// Persistence is opt-in via [`SupervisorOptions`]: the run's adapted W̃ can
+/// EMA-merge into a master vibe, heals are remembered for prophylactic
+/// immunity, and novel healed failures can be written into the recall memory
+/// store so the program's lived failure history reaches the reasoning layer.
 pub fn run_supervised(
     pipeline: &InferencePipeline,
     command: &str,
     args: &[String],
-    max_restarts: usize,
-    vibe_path: Option<&Path>,
-    heal_memory_path: Option<&Path>,
+    opts: &SupervisorOptions,
 ) -> CResult<RunReport> {
+    let max_restarts = opts.max_restarts;
+    let vibe_path = opts.vibe_path.as_deref();
+    let heal_memory_path = opts.heal_memory_path.as_deref();
     let mut report = RunReport {
         success: false,
         attempts: 0,
@@ -373,6 +399,7 @@ pub fn run_supervised(
 
         // 3. Heal the environment (new heals only — never loop on the same fix).
         let mut applied_new_heal = false;
+        let mut new_heal_descs: Vec<String> = Vec::new();
         for path in extract_missing_paths(&trace)
             .into_iter()
             .take(MAX_HEALS_PER_ATTEMPT)
@@ -383,8 +410,28 @@ pub fn run_supervised(
             if let Some(heal) = heal_missing_path(&path) {
                 println!("[axiom-run]   heal: {heal}");
                 healed_paths.insert(path);
+                new_heal_descs.push(heal.to_string());
                 report.heals.push(heal);
                 applied_new_heal = true;
+            }
+        }
+
+        // 3a. Bridge to the reasoning layer: a NOVEL/first-seen fault we just
+        //     healed is exactly the kind of lived experience worth surfacing to
+        //     Claude later. Write it into the recall memory store as a `Fix`,
+        //     using the measured tension (CE) as its salience. KNOWN faults are
+        //     already remembered; we don't re-log them.
+        let is_novel = !matches!(novelty, Some(crate::heal_memory::Novelty::Known));
+        if applied_new_heal && is_novel {
+            if let Some(root) = opts.remember_into.as_deref() {
+                remember_failure_fix(
+                    pipeline,
+                    root,
+                    &command_line,
+                    report.exit_code,
+                    &new_heal_descs,
+                    ce_before,
+                );
             }
         }
 
@@ -444,6 +491,63 @@ fn finalize_memory(
     }
     if let Err(e) = mem.save() {
         eprintln!("[axiom-run] heal memory save skipped: {e}");
+    }
+}
+
+/// Write a healed novel failure into the recall memory store as a `Fix`, so the
+/// proxy's recall layer can later surface it into Claude's context. Best-effort:
+/// any failure (embed/open/append) is logged and swallowed — supervision must
+/// never break because the recall store is unavailable.
+fn remember_failure_fix(
+    pipeline: &InferencePipeline,
+    root: &Path,
+    command_line: &str,
+    exit_code: Option<i32>,
+    heal_descs: &[String],
+    tension_ce: f32,
+) {
+    let heals = if heal_descs.is_empty() {
+        "no environmental heal".to_string()
+    } else {
+        heal_descs.join("; ")
+    };
+    let body = format!(
+        "Program `{command_line}` failed (exit {exit:?}) and Axiom self-healed it: {heals}. \
+         If this command fails again in this environment, apply that fix.",
+        exit = exit_code
+    );
+    let store = match crate::memory_store::MemoryStore::open(root) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[axiom-run] recall memory unavailable ({e}); skipping remember");
+            return;
+        }
+    };
+    let embedding = match crate::embedder::embed_text(pipeline, &body) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[axiom-run] embed failed ({e}); skipping remember");
+            return;
+        }
+    };
+    let rec = crate::memory_store::MemoryRecord {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        scope: "personal".to_string(),
+        ts: crate::memory_store::now_secs(),
+        kind: crate::memory_store::MemoryKind::Fix,
+        body,
+        embedding,
+        // The failure's tension IS its salience.
+        drift_at_ingest: tension_ce,
+        supersedes: None,
+        tombstone: false,
+    };
+    match store.append(&rec) {
+        Ok(()) => println!(
+            "[axiom-run]   remembered fix for the reasoning layer (recall id={})",
+            rec.id
+        ),
+        Err(e) => eprintln!("[axiom-run] remember append failed: {e}"),
     }
 }
 

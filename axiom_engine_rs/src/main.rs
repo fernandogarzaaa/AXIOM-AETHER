@@ -680,18 +680,24 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             // Learned immunity is on by default (~/.axiom/heal_memory.json);
             // AXIOM_HEAL_MEMORY overrides the path, "0"/"off" disables it.
             let heal_memory_path = heal_memory::HealMemory::default_path();
+            // Opt-in: AXIOM_RUN_REMEMBER=1 writes novel healed failures into the
+            // recall memory store (AXIOM_MEMORY_DIR or the default), so the proxy
+            // can surface them into Claude's context later.
+            let remember_into = (std::env::var("AXIOM_RUN_REMEMBER").as_deref() == Ok("1"))
+                .then(|| {
+                    std::env::var("AXIOM_MEMORY_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| std::path::PathBuf::from("checkpoints/memory"))
+                });
+            let opts = self_heal::SupervisorOptions {
+                max_restarts,
+                vibe_path,
+                heal_memory_path,
+                remember_into,
+            };
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
-                .spawn(move || {
-                    self_heal::run_supervised(
-                        &pipeline,
-                        &program,
-                        &args,
-                        max_restarts,
-                        vibe_path.as_deref(),
-                        heal_memory_path.as_deref(),
-                    )
-                })
+                .spawn(move || self_heal::run_supervised(&pipeline, &program, &args, &opts))
                 .map_err(|e| candle_core::Error::Msg(format!("supervisor thread failed: {e}")))?
                 .join()
                 .map_err(|_| candle_core::Error::Msg("supervisor thread panicked".into()))??;

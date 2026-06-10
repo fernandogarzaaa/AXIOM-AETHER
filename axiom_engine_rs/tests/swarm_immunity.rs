@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use axiom_engine::config::AxiomConfig;
 use axiom_engine::heal_memory::{fingerprint, HealMemory};
 use axiom_engine::inference::InferencePipeline;
-use axiom_engine::self_heal::{run_supervised, Heal};
+use axiom_engine::self_heal::{run_supervised, Heal, SupervisorOptions};
 use axiom_engine::server::{create_router, AppState};
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
@@ -41,7 +41,12 @@ fn supervise(
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
-            run_supervised(&pipeline, &cmd, &args, 3, None, Some(&heal_memory)).unwrap()
+            let opts = SupervisorOptions {
+                max_restarts: 3,
+                heal_memory_path: Some(heal_memory),
+                ..SupervisorOptions::default()
+            };
+            run_supervised(&pipeline, &cmd, &args, &opts).unwrap()
         })
         .unwrap()
         .join()

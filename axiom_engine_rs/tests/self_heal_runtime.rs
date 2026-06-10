@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use axiom_engine::config::AxiomConfig;
 use axiom_engine::inference::InferencePipeline;
-use axiom_engine::self_heal::{run_supervised, Heal};
+use axiom_engine::self_heal::{run_supervised, Heal, SupervisorOptions};
 use candle_core::Device;
 
 fn tiny_pipeline() -> InferencePipeline {
@@ -55,19 +55,28 @@ fn supervise_full(
     vibe_path: Option<PathBuf>,
     heal_memory: Option<PathBuf>,
 ) -> axiom_engine::self_heal::RunReport {
+    supervise_opts(
+        pipeline,
+        cmd,
+        args,
+        SupervisorOptions {
+            max_restarts,
+            vibe_path,
+            heal_memory_path: heal_memory,
+            remember_into: None,
+        },
+    )
+}
+
+fn supervise_opts(
+    pipeline: InferencePipeline,
+    cmd: String,
+    args: Vec<String>,
+    opts: SupervisorOptions,
+) -> axiom_engine::self_heal::RunReport {
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || {
-            run_supervised(
-                &pipeline,
-                &cmd,
-                &args,
-                max_restarts,
-                vibe_path.as_deref(),
-                heal_memory.as_deref(),
-            )
-            .unwrap()
-        })
+        .spawn(move || run_supervised(&pipeline, &cmd, &args, &opts).unwrap())
         .unwrap()
         .join()
         .unwrap()
@@ -326,6 +335,44 @@ fn absorption_is_deep_without_memory_history() {
     );
     assert!(!report.success);
     assert_eq!(report.absorption_passes, 3);
+}
+
+#[test]
+fn novel_healed_failure_is_written_to_recall_memory() {
+    use axiom_engine::memory_store::{MemoryKind, MemoryStore};
+
+    let base = unique_tmp("remember_env");
+    let target = base.join("out").join("r.txt");
+    let mem_root = unique_tmp("recall_store");
+    let script = format!("echo x > {}", target.display());
+
+    let report = supervise_opts(
+        tiny_pipeline(),
+        "sh".into(),
+        vec!["-c".into(), script],
+        SupervisorOptions {
+            max_restarts: 3,
+            remember_into: Some(mem_root.clone()),
+            ..SupervisorOptions::default()
+        },
+    );
+    assert!(report.success);
+
+    // The healed novel failure must be recorded as a Fix memory the proxy can recall.
+    let store = MemoryStore::open(&mem_root).unwrap();
+    let records = store.load_scope("personal");
+    assert_eq!(records.len(), 1, "one novel healed failure → one memory");
+    let rec = &records[0];
+    assert!(matches!(rec.kind, MemoryKind::Fix));
+    assert!(rec.body.contains("self-healed"));
+    assert!(
+        rec.body.contains(&base.join("out").display().to_string()),
+        "memory body must name the directory heal"
+    );
+    assert!(!rec.embedding.is_empty(), "memory must be embedded for recall");
+
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&mem_root);
 }
 
 #[test]

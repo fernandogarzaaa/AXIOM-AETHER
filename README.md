@@ -225,6 +225,25 @@ The same report is exposed to agents as the **`axiom_immunity`** MCP tool — so
 Claude, debugging a command that fails in your environment, can ask Axiom what
 it already knows about that program's failures and the heals it now applies.
 
+### Closing the loop: runtime experience → reasoning context
+
+With `AXIOM_RUN_REMEMBER=1`, a **novel** failure that the supervisor heals is
+written into the recall memory store (`AXIOM_MEMORY_DIR`, default
+`checkpoints/memory`) as a `Fix` memory — using the measured **tension (CE) as
+its salience**. That is the same store `axiom_recall` / the proxy's recall
+layer reads from, so a fault the *runtime* lived through becomes knowledge the
+*reasoning layer* surfaces later:
+
+```text
+[axiom-run]   heal: created directory /build/dist
+[axiom-run]   remembered fix for the reasoning layer (recall id=…)
+# → "Program `…` failed (exit 2) and Axiom self-healed it: created directory
+#    /build/dist. If this command fails again in this environment, apply that fix."
+```
+
+This is the bridge the project is named for: the self-healing runtime and the
+cognitive layer share one memory.
+
 Honesty notes: source-artifact patching lives in the Poly JIT hypervisor path,
 not here; restarting a process is not literally resuming a suspended thread
 (v1 targets batch/idempotent programs); and with an unbaked checkpoint the CE
