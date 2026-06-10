@@ -28,6 +28,7 @@ mod model_meta;
 mod openai_forwarder;
 mod pairs;
 mod poly_jit;
+mod prime;
 mod q_manifold;
 mod quantization;
 mod sandbox;
@@ -580,6 +581,41 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 eprintln!("[axiom] {err}");
             }
         },
+        AxiomCommand::Prime { path } => {
+            // Build the production model exactly as the server/LSP do (BPE +
+            // checkpoint when present, legacy fresh-init otherwise), then absorb
+            // the target codebase into the persistent vibe memory.
+            let device = device_from_str(
+                &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            )?;
+            // Same small CPU-friendly legacy base the other runtime modes use;
+            // resolve_production_model upgrades it to the scaled BPE model when
+            // the checkpoint artifacts are present. (AxiomConfig::default() is the
+            // 7B-scale blueprint — far too large to init/adapt on CPU here.)
+            let legacy = AxiomConfig {
+                d_model: 64,
+                n_layers: 2,
+                vocab_size: 256,
+                lr_inner: 1e-3,
+                norm_eps: 1e-6,
+            };
+            let (cfg, ckpt) = resolve_production_model(legacy, DEFAULT_CHECKPOINT_PATH);
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
+                context_api_url: None,
+                context_api_key: None,
+                max_context_tokens: 0,
+            };
+            let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            // Persist the vibe next to the repo by default (matches the proxy's
+            // default), overridable with AXIOM_VIBE_PATH.
+            let vibe_path = std::env::var("AXIOM_VIBE_PATH")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH)
+                });
+            prime::run_prime(&path, &pipeline, &vibe_path)?;
+        }
         AxiomCommand::Swarm { command } => match command {
             SwarmCommand::Connect { ip } => {
                 let peer = cli::normalize_peer(&ip);

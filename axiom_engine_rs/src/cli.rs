@@ -28,6 +28,12 @@ pub enum AxiomCommand {
         /// Directory to mount into the hypervisor.
         path: PathBuf,
     },
+    /// Warm-start the persistent vibe memory by absorbing a codebase through TTT.
+    Prime {
+        /// Directory to crawl and absorb (defaults to the current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Manage DWE swarm peers.
     Swarm {
         #[command(subcommand)]
