@@ -2117,6 +2117,12 @@ async fn compressed_messages_path(
         obj.remove("session_id");
     }
 
+    // Active immunity: if the conversation references a command Axiom has
+    // already learned to heal, inject a short advisory so Claude gets the fix
+    // without anyone asking — the self-healing loop running autonomously. Only
+    // fires on a precise command-signature match with a concrete learned heal.
+    inject_immunity_advisory(&state, &mut outbound, &user_query_text, &heavy_combined);
+
     // Record live compression stats for the dashboard: original vs forwarded
     // payload size and how many heavy messages were absorbed this request.
     let bytes_in = serde_json::to_string(body)
@@ -2818,6 +2824,38 @@ async fn expand_symbol_handler(State(state): State<AppState>, Json(body): Json<V
         )
             .into_response(),
     }
+}
+
+/// Prepend an `<axiom_immunity>` advisory to the outbound payload's last user
+/// turn when the conversation references a command Axiom has learned to heal.
+/// Disabled by `AXIOM_IMMUNITY_INJECT=0`; a no-op when heal memory is
+/// unconfigured or nothing matches.
+fn inject_immunity_advisory(
+    state: &AppState,
+    outbound: &mut Value,
+    user_query: &str,
+    heavy_context: &str,
+) {
+    if std::env::var("AXIOM_IMMUNITY_INJECT").as_deref() == Ok("0") {
+        return;
+    }
+    let Some(path) = state.heal_memory_path.as_ref() else {
+        return;
+    };
+    let text = format!("{user_query}\n{heavy_context}");
+    let advisories = crate::heal_memory::HealMemory::load(path).advisories_for_text(&text);
+    if advisories.is_empty() {
+        return;
+    }
+    let mut block = String::from("<axiom_immunity>\nAxiom has prior self-healing experience with commands referenced here:\n");
+    for a in &advisories {
+        block.push_str("- ");
+        block.push_str(a);
+        block.push('\n');
+    }
+    block.push_str("</axiom_immunity>");
+    eprintln!("[axiom-ttt] injected immunity advisory ({} command(s))", advisories.len());
+    crate::anthropic_forwarder::prepend_block_to_last_user_turn(outbound, &block);
 }
 
 /// `GET /v1/immunity` — export this node's heal memory for swarm peers.

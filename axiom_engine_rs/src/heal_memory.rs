@@ -85,6 +85,32 @@ pub struct HealMemory {
     data: MemoryFile,
 }
 
+/// Shell wrappers whose raw `-c` snippets are too generic to advise on.
+const SHELL_WRAPPERS: [&str; 9] = [
+    "sh", "bash", "zsh", "dash", "fish", "cmd", "cmd.exe", "powershell", "pwsh",
+];
+
+/// A lowercase, matchable signature for a command line — the program name plus
+/// its first non-flag argument (e.g. "cargo build", "pytest", "npm test").
+/// Returns `None` for shell wrappers and trivially short signatures, so
+/// advisory matching stays precise (no false positives on prose).
+pub fn command_signature(command_line: &str) -> Option<String> {
+    let tokens: Vec<&str> = command_line.split_whitespace().collect();
+    let first = tokens.first()?;
+    if SHELL_WRAPPERS.contains(&first.to_ascii_lowercase().as_str()) {
+        return None;
+    }
+    // program + first argument that isn't a flag or a redirection/path.
+    let mut sig: Vec<String> = vec![first.to_ascii_lowercase()];
+    if let Some(arg) = tokens.iter().skip(1).find(|t| {
+        !t.starts_with('-') && !t.starts_with('/') && !t.contains('>') && !t.contains('<')
+    }) {
+        sig.push(arg.to_ascii_lowercase());
+    }
+    let joined = sig.join(" ");
+    (joined.len() >= 3).then_some(joined)
+}
+
 /// Stable fingerprint of a supervised command line.
 pub fn fingerprint(command: &str, args: &[String]) -> String {
     let mut hasher = Sha256::new();
@@ -157,6 +183,44 @@ impl HealMemory {
                     out.push_str(&format!("      - {}\n", d.display()));
                 }
             }
+        }
+        out
+    }
+
+    /// Advisory lines for any learned program whose command is referenced in
+    /// `text`. Only programs with concrete heals (directory pre-creation) and a
+    /// non-generic command signature qualify — so this never fires on bare
+    /// shell snippets, and a match means Axiom genuinely knows a fix.
+    pub fn advisories_for_text(&self, text: &str) -> Vec<String> {
+        let haystack = text.to_ascii_lowercase();
+        let mut out = Vec::new();
+        let mut records: Vec<&ProgramRecord> = self
+            .data
+            .programs
+            .values()
+            .filter(|r| !r.dirs.is_empty())
+            .collect();
+        records.sort_by(|a, b| a.command.cmp(&b.command));
+        for r in records {
+            let Some(sig) = command_signature(&r.command) else {
+                continue;
+            };
+            if !haystack.contains(&sig) {
+                continue;
+            }
+            let dirs = r
+                .dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!(
+                "`{}` has failed in this environment before; Axiom's learned fix: \
+                 create director{} {}. Apply preemptively if it fails again.",
+                r.command,
+                if r.dirs.len() == 1 { "y" } else { "ies" },
+                dirs
+            ));
         }
         out
     }
@@ -407,6 +471,35 @@ mod tests {
     fn report_text_empty_memory_is_friendly() {
         let mem = HealMemory::load(tmp("empty_report"));
         assert!(mem.report_text(None).contains("has not learned any program failures"));
+    }
+
+    #[test]
+    fn command_signature_skips_shells_and_keeps_real_tools() {
+        assert_eq!(command_signature("cargo build --release").as_deref(), Some("cargo build"));
+        assert_eq!(command_signature("pytest").as_deref(), Some("pytest"));
+        assert_eq!(command_signature("npm test").as_deref(), Some("npm test"));
+        // shell wrappers and their snippets are too generic to advise on
+        assert_eq!(command_signature("sh -c echo hi > /x/y"), None);
+        assert_eq!(command_signature("bash -c make"), None);
+    }
+
+    #[test]
+    fn advisories_fire_only_on_referenced_healable_commands() {
+        let mut mem = HealMemory::load(tmp("advis"));
+        let fp = fingerprint("cargo", &["build".into()]);
+        mem.remember_dirs(&fp, "cargo build", &[PathBuf::from("/repo/target")]);
+        // A program with no learned dirs must never produce an advisory.
+        let fp2 = fingerprint("pytest", &[]);
+        mem.observe_failure(&fp2, "pytest", 5.0);
+
+        let hit = mem.advisories_for_text("why does cargo build keep failing in CI?");
+        assert_eq!(hit.len(), 1);
+        assert!(hit[0].contains("cargo build") && hit[0].contains("/repo/target"));
+
+        // pytest is referenced but has no learned heal → no advisory.
+        assert!(mem.advisories_for_text("my pytest run is slow").is_empty());
+        // cargo not mentioned → no advisory.
+        assert!(mem.advisories_for_text("unrelated question about npm").is_empty());
     }
 
     #[test]

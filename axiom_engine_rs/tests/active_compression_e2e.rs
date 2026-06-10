@@ -162,6 +162,86 @@ async fn compression_strips_heavy_context_and_forwards_lean_payload() {
 }
 
 #[tokio::test]
+async fn proxy_injects_immunity_advisory_for_known_failing_command() {
+    use axiom_engine::heal_memory::{fingerprint, HealMemory};
+
+    let (mock_addr, captured) = start_mock_anthropic().await;
+
+    // Pre-seed heal memory: Axiom has learned `cargo build` needs ./target.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mem_path = std::env::temp_dir().join(format!("axiom_inject_{nanos}.json"));
+    let mut mem = HealMemory::load(&mem_path);
+    mem.remember_dirs(
+        &fingerprint("cargo", &["build".into()]),
+        "cargo build",
+        &[std::path::PathBuf::from("/repo/target")],
+    );
+    mem.save().unwrap();
+
+    let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
+    let forwarder =
+        AnthropicForwarder::new(Some("k".to_string()), Some(format!("http://{mock_addr}")));
+    let state = AppState::new(pipeline, "axiom-inject".to_string())
+        .with_anthropic_forwarder(Some(forwarder))
+        .with_compressor_config(CompressorConfig {
+            enabled: true,
+            heavy_message_threshold_tokens: 50,
+            recall_top_k: 8,
+        })
+        .with_heal_memory_path(Some(mem_path.clone()));
+    let app = create_router(state);
+
+    let heavy_text: String = (0..200).map(|i| format!("code{i}")).collect::<Vec<_>>().join(" ");
+    let req_body = json!({
+        "model": "claude-opus-4-7",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": heavy_text},
+            {"role": "user", "content": "why does cargo build keep failing here?"}
+        ],
+        "session_id": "inject-1"
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(req_body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let received = captured.lock().await.clone();
+    let combined: String = received[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| match m.get("content") {
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str).map(str::to_string))
+                .collect(),
+            _ => vec![],
+        })
+        .collect::<Vec<_>>()
+        .concat();
+
+    assert!(
+        combined.contains("<axiom_immunity>"),
+        "the proxy must inject the immunity advisory for a known-failing command"
+    );
+    assert!(
+        combined.contains("cargo build") && combined.contains("/repo/target"),
+        "advisory must name the command and its learned heal"
+    );
+
+    let _ = std::fs::remove_file(&mem_path);
+}
+
+#[tokio::test]
 async fn compression_off_uses_local_pipeline_path() {
     // When compression is disabled, /v1/messages must NOT call out to
     // the (configured but unused) forwarder — the local pipeline path

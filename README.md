@@ -244,6 +244,25 @@ layer reads from, so a fault the *runtime* lived through becomes knowledge the
 This is the bridge the project is named for: the self-healing runtime and the
 cognitive layer share one memory.
 
+### Active immunity in the proxy
+
+The loop also runs *without anyone asking*. When a compressed `/v1/messages`
+request references a command Axiom has already learned to heal, the proxy
+injects a short `<axiom_immunity>` advisory into the outbound payload:
+
+```text
+<axiom_immunity>
+Axiom has prior self-healing experience with commands referenced here:
+- `cargo build` has failed in this environment before; Axiom's learned fix:
+  create directory ./target. Apply preemptively if it fails again.
+</axiom_immunity>
+```
+
+Matching is deliberately precise — a program-name + sub-command signature must
+appear in the conversation **and** Axiom must hold a concrete learned heal for
+it — so it never fires on prose or bare shell snippets. Disable with
+`AXIOM_IMMUNITY_INJECT=0`.
+
 Honesty notes: source-artifact patching lives in the Poly JIT hypervisor path,
 not here; restarting a process is not literally resuming a suspended thread
 (v1 targets batch/idempotent programs); and with an unbaked checkpoint the CE
