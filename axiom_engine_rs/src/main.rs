@@ -713,10 +713,21 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 std::process::exit(report.exit_code.unwrap_or(1));
             }
         }
-        AxiomCommand::Immunity { query } => {
+        AxiomCommand::Immunity { query, prune } => {
             match heal_memory::HealMemory::default_path() {
                 Some(path) => {
-                    let memory = heal_memory::HealMemory::load(&path);
+                    let mut memory = heal_memory::HealMemory::load(&path);
+                    if prune {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let forgotten = memory.prune_stale(now);
+                        memory
+                            .save()
+                            .map_err(|e| candle_core::Error::Msg(format!("save failed: {e}")))?;
+                        println!("[axiom] pruned {forgotten} faded heal record(s).\n");
+                    }
                     println!("{}", memory.report_text(query.as_deref()));
                     println!("\n[axiom] heal memory: {}", path.display());
                 }

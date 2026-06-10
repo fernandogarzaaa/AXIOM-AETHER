@@ -57,10 +57,14 @@ pub enum AxiomCommand {
         command: SwarmCommand,
     },
     /// Report what Axiom has learned about program failures (acquired immunity):
-    /// remembered heals and per-program failure-tension history.
+    /// remembered heals, per-program failure-tension history, and confidence.
     Immunity {
         /// Optional case-insensitive command substring to filter by.
         query: Option<String>,
+        /// Forget faded heals: drop records whose confidence has decayed below
+        /// the prune floor (memory waning → clonal deletion).
+        #[arg(long)]
+        prune: bool,
     },
 }
 

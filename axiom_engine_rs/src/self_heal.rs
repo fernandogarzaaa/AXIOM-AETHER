@@ -527,6 +527,19 @@ fn finalize_memory(
             })
             .collect();
         mem.remember_dirs(fp, command_line, &dirs);
+        // Affinity maturation: if immunity was applied *and* the run succeeded,
+        // reinforce this program's confidence (and reset its waning clock).
+        let immunity_applied = report
+            .heals
+            .iter()
+            .any(|h| matches!(h, Heal::Immunized(_)));
+        if immunity_applied {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            mem.reinforce_immunity(fp, now);
+        }
     }
     if let Err(e) = mem.save() {
         eprintln!("[axiom-run] heal memory save skipped: {e}");

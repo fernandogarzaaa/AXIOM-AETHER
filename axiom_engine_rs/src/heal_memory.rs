@@ -24,7 +24,21 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Current unix time in seconds (0 if the clock is before the epoch).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// What the memory knows about one supervised program.
+///
+/// The confidence fields model an adaptive-immunity lifecycle: a freshly
+/// learned heal is *tentative*; each time immunizing the program produces a
+/// successful run the confidence matures toward 1.0 (affinity maturation);
+/// and confidence wanes with time since last reinforcement (memory waning),
+/// so heals that are never exercised again fade and can be pruned.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProgramRecord {
     /// Human-readable command line (for inspection of the JSON; the map key is
@@ -36,6 +50,50 @@ pub struct ProgramRecord {
     pub ce_mean: f32,
     /// Number of failures folded into `ce_mean`.
     pub ce_count: u32,
+    /// Stored (pre-decay) immunity confidence in 0..1. Defaulted for records
+    /// written before the confidence lifecycle existed.
+    #[serde(default)]
+    pub confidence: f32,
+    /// Times immunizing this program preceded a successful run.
+    #[serde(default)]
+    pub immunizations: u32,
+    /// Unix seconds of the last confidence reinforcement (for waning).
+    #[serde(default)]
+    pub last_reinforced: u64,
+}
+
+/// Half-life (days) of unreinforced immunity confidence.
+const CONFIDENCE_HALFLIFE_DAYS: f32 = 30.0;
+/// Confidence a heal starts at when first learned (tentative).
+const INITIAL_CONFIDENCE: f32 = 0.5;
+/// EMA rate at which successful reuse matures confidence toward 1.0.
+const MATURATION_RATE: f32 = 0.34;
+/// Decayed-confidence floor below which `prune_stale` forgets a record.
+const PRUNE_FLOOR: f32 = 0.05;
+
+impl ProgramRecord {
+    /// Confidence after time-decay relative to `now` (unix secs). Heals never
+    /// reinforced (`last_reinforced == 0`) report their stored confidence.
+    pub fn confidence_now(&self, now: u64) -> f32 {
+        if self.last_reinforced == 0 || self.confidence <= 0.0 {
+            return self.confidence;
+        }
+        let age_days = now.saturating_sub(self.last_reinforced) as f32 / 86_400.0;
+        self.confidence * 0.5f32.powf(age_days / CONFIDENCE_HALFLIFE_DAYS)
+    }
+
+    /// A human label for a decayed-confidence value.
+    pub fn confidence_label(c: f32) -> &'static str {
+        if c >= 0.85 {
+            "established"
+        } else if c >= 0.6 {
+            "proven"
+        } else if c >= 0.3 {
+            "tentative"
+        } else {
+            "faded"
+        }
+    }
 }
 
 /// Classification of a fresh failure against the program's tension history.
@@ -179,12 +237,18 @@ impl HealMemory {
         }
         // Stable output: most-experienced programs first.
         records.sort_by(|a, b| b.ce_count.cmp(&a.ce_count).then(a.command.cmp(&b.command)));
+        let now = now_secs();
         let mut out = format!("Acquired immunity ({} program(s)):\n", records.len());
         for r in records {
+            let c = r.confidence_now(now);
             out.push_str(&format!("\n• {}\n", r.command));
             out.push_str(&format!(
-                "    failures observed: {}   mean tension (CE): {:.3}\n",
-                r.ce_count, r.ce_mean
+                "    confidence: {:.2} ({}, immunizations: {})   failures observed: {}   mean tension (CE): {:.3}\n",
+                c,
+                ProgramRecord::confidence_label(c),
+                r.immunizations,
+                r.ce_count,
+                r.ce_mean
             ));
             if r.dirs.is_empty() {
                 out.push_str("    learned heals: none (no directory heals)\n");
@@ -225,10 +289,22 @@ impl HealMemory {
                 .map(|d| d.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let c = r.confidence_now(now_secs());
+            // Phrase by matured confidence: an established fix is asserted, a
+            // tentative one is offered as a possibility.
+            let preamble = if c >= 0.6 {
+                format!(
+                    "`{}` reliably fails in this environment (fixed {} time(s)); Axiom's established fix",
+                    r.command, r.immunizations
+                )
+            } else {
+                format!(
+                    "`{}` has failed in this environment before; Axiom's tentative fix",
+                    r.command
+                )
+            };
             out.push(format!(
-                "`{}` has failed in this environment before; Axiom's learned fix: \
-                 create director{} {}. Apply preemptively if it fails again.",
-                r.command,
+                "{preamble}: create director{} {}. Apply preemptively if it fails again.",
                 if r.dirs.len() == 1 { "y" } else { "ies" },
                 dirs
             ));
@@ -323,6 +399,34 @@ impl HealMemory {
                 record.dirs.push(d.clone());
             }
         }
+        // A freshly learned heal is tentative until reuse proves it.
+        if record.confidence <= 0.0 {
+            record.confidence = INITIAL_CONFIDENCE;
+        }
+    }
+
+    /// Reinforce a program's immunity after immunizing it preceded a successful
+    /// run — affinity maturation: confidence EMAs toward 1.0 and the waning
+    /// clock resets. Pre-decays the stored confidence to `now` first so repeated
+    /// reinforcement after long gaps doesn't over-credit a faded memory.
+    pub fn reinforce_immunity(&mut self, fp: &str, now: u64) {
+        if let Some(r) = self.data.programs.get_mut(fp) {
+            let decayed = r.confidence_now(now).max(INITIAL_CONFIDENCE * 0.5);
+            r.confidence = decayed + MATURATION_RATE * (1.0 - decayed);
+            r.immunizations += 1;
+            r.last_reinforced = now;
+        }
+    }
+
+    /// Forget records whose decayed confidence has fallen below the prune floor
+    /// (memory waning → clonal deletion). Returns the number forgotten. Heals
+    /// never reinforced are kept (they have not had a chance to mature or fade).
+    pub fn prune_stale(&mut self, now: u64) -> usize {
+        let before = self.data.programs.len();
+        self.data
+            .programs
+            .retain(|_, r| r.last_reinforced == 0 || r.confidence_now(now) >= PRUNE_FLOOR);
+        before - self.data.programs.len()
     }
 
     /// Serialize the whole memory for transfer to a swarm peer.
@@ -363,6 +467,12 @@ impl HealMemory {
                             / total as f32;
                         ours.ce_count = total;
                     }
+                    // Combine fleet immunity experience: confidence takes the
+                    // stronger of the two, immunizations sum, and the waning
+                    // clock advances to the most recent reinforcement.
+                    ours.confidence = ours.confidence.max(theirs.confidence);
+                    ours.immunizations += theirs.immunizations;
+                    ours.last_reinforced = ours.last_reinforced.max(theirs.last_reinforced);
                 }
             }
         }
@@ -526,6 +636,53 @@ mod tests {
         assert!(mem.advisories_for_text("my pytest run is slow").is_empty());
         // cargo not mentioned → no advisory.
         assert!(mem.advisories_for_text("unrelated question about npm").is_empty());
+    }
+
+    #[test]
+    fn confidence_matures_with_reuse_and_wanes_with_time() {
+        let mut mem = HealMemory::load(tmp("conf"));
+        let fp = fingerprint("cargo", &["build".into()]);
+        let now = 1_000_000_000u64;
+
+        // Freshly learned → tentative.
+        mem.remember_dirs(&fp, "cargo build", &[PathBuf::from("target")]);
+        assert!((mem.record(&fp).unwrap().confidence - 0.5).abs() < 1e-6);
+
+        // Each successful reuse matures confidence toward 1.0 (monotone up).
+        let mut prev = mem.record(&fp).unwrap().confidence_now(now);
+        for k in 1..=3 {
+            mem.reinforce_immunity(&fp, now + k);
+            let c = mem.record(&fp).unwrap().confidence_now(now + k);
+            assert!(c > prev, "reuse {k} must raise confidence ({prev} -> {c})");
+            prev = c;
+        }
+        assert_eq!(mem.record(&fp).unwrap().immunizations, 3);
+        assert!(prev >= 0.6, "after 3 reuses confidence should be 'proven'+");
+
+        // Waning: a full half-life later, confidence ~halves.
+        let later = now + 3 + (CONFIDENCE_HALFLIFE_DAYS as u64) * 86_400;
+        let decayed = mem.record(&fp).unwrap().confidence_now(later);
+        assert!(decayed < prev * 0.6, "confidence must wane over a half-life");
+    }
+
+    #[test]
+    fn prune_forgets_only_faded_reinforced_heals() {
+        let mut mem = HealMemory::load(tmp("prune"));
+        let now = 2_000_000_000u64;
+
+        // A reinforced-then-ancient heal → should be pruned.
+        let faded = fingerprint("old", &[]);
+        mem.remember_dirs(&faded, "old", &[PathBuf::from("a")]);
+        mem.reinforce_immunity(&faded, now - 3650 * 86_400); // ~10 years ago
+
+        // A never-reinforced heal → kept (hasn't had a chance to mature/fade).
+        let fresh = fingerprint("new", &[]);
+        mem.remember_dirs(&fresh, "new", &[PathBuf::from("b")]);
+
+        let pruned = mem.prune_stale(now);
+        assert_eq!(pruned, 1);
+        assert!(mem.record(&faded).is_none(), "ancient heal forgotten");
+        assert!(mem.record(&fresh).is_some(), "unreinforced heal retained");
     }
 
     #[test]

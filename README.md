@@ -219,6 +219,27 @@ What actually happens on a failure:
    `axiom swarm immunity nodeA:3000`; the same program then succeeds
    **first-try on node B, where it had never run before**.
 
+### Adaptive immune confidence (maturation + waning)
+
+Heals carry a confidence that follows an adaptive-immunity lifecycle:
+
+- **Tentative** when first learned (0.50).
+- **Affinity maturation** — each time immunizing a program precedes a
+  successful run, confidence matures toward 1.0 (`tentative → proven →
+  established`). Established fixes are asserted in proxy advisories; tentative
+  ones are offered as possibilities.
+- **Waning** — confidence decays with time since last reinforcement (30-day
+  half-life), so heals never exercised again fade.
+- **Forgetting** — `axiom immunity --prune` drops faded records (clonal
+  deletion). Fleet merges combine confidence (stronger wins, immunizations sum).
+
+```text
+$ axiom run -- sh -c 'echo x > artifacts/o.bin'   # learn
+  confidence: 0.50 (tentative, immunizations: 0)
+# …after three successful reuses…
+  confidence: 0.86 (established, immunizations: 3)
+```
+
 ### Inspecting acquired immunity
 
 What Axiom has learned is queryable by both the operator and an AI agent:
