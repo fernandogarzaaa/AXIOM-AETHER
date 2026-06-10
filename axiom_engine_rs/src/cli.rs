@@ -47,6 +47,10 @@ pub enum AxiomCommand {
         /// Restart budget after the first attempt.
         #[arg(long, default_value_t = 3)]
         max_restarts: usize,
+        /// Predict from learned immunity whether the command would fail now,
+        /// then exit WITHOUT running it (anticipatory pre-flight).
+        #[arg(long)]
+        dry_run: bool,
         /// The command to supervise, followed by its arguments.
         #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
         command: Vec<String>,
@@ -57,10 +61,14 @@ pub enum AxiomCommand {
         command: SwarmCommand,
     },
     /// Report what Axiom has learned about program failures (acquired immunity):
-    /// remembered heals and per-program failure-tension history.
+    /// remembered heals, per-program failure-tension history, and confidence.
     Immunity {
         /// Optional case-insensitive command substring to filter by.
         query: Option<String>,
+        /// Forget faded heals: drop records whose confidence has decayed below
+        /// the prune floor (memory waning → clonal deletion).
+        #[arg(long)]
+        prune: bool,
     },
 }
 

@@ -2843,8 +2843,11 @@ fn inject_immunity_advisory(
         return;
     };
     let text = format!("{user_query}\n{heavy_context}");
-    let advisories = crate::heal_memory::HealMemory::load(path).advisories_for_text(&text);
-    if advisories.is_empty() {
+    let memory = crate::heal_memory::HealMemory::load(path);
+    let advisories = memory.advisories_for_text(&text);
+    // Cross-reactive (analogical) hints from sibling commands — advisory only.
+    let hints = memory.cross_reactive_hints(&text);
+    if advisories.is_empty() && hints.is_empty() {
         return;
     }
     let mut block = String::from("<axiom_immunity>\nAxiom has prior self-healing experience with commands referenced here:\n");
@@ -2853,8 +2856,17 @@ fn inject_immunity_advisory(
         block.push_str(a);
         block.push('\n');
     }
+    for h in &hints {
+        block.push_str("- ");
+        block.push_str(h);
+        block.push('\n');
+    }
     block.push_str("</axiom_immunity>");
-    eprintln!("[axiom-ttt] injected immunity advisory ({} command(s))", advisories.len());
+    eprintln!(
+        "[axiom-ttt] injected immunity advisory ({} command(s), {} cross-reactive hint(s))",
+        advisories.len(),
+        hints.len()
+    );
     crate::anthropic_forwarder::prepend_block_to_last_user_turn(outbound, &block);
 }
 

@@ -64,6 +64,7 @@ fn supervise_full(
             vibe_path,
             heal_memory_path: heal_memory,
             remember_into: None,
+            anchor: None,
         },
     )
 }
@@ -335,6 +336,161 @@ fn absorption_is_deep_without_memory_history() {
     );
     assert!(!report.success);
     assert_eq!(report.absorption_passes, 3);
+}
+
+#[test]
+fn immunity_is_location_invariant_across_working_directories() {
+    use axiom_engine::self_heal::Heal::{CreatedDirectory, Immunized};
+
+    // Same command, run in two different working directories. A relative-path
+    // heal learned in dir A must transfer to dir B — a location the program has
+    // never run in — because the heal is remembered relative to the anchor.
+    let dir_a = unique_tmp("loc_a");
+    let dir_b = unique_tmp("loc_b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let memory = unique_tmp("loc_mem").with_extension("json");
+    // cwd-relative output path — identical command string → identical fingerprint.
+    let args = vec!["-c".to_string(), "echo built > build/out/app.bin".to_string()];
+
+    let mk = |anchor: PathBuf| SupervisorOptions {
+        max_restarts: 3,
+        heal_memory_path: Some(memory.clone()),
+        anchor: Some(anchor),
+        ..SupervisorOptions::default()
+    };
+
+    // Run 1 in dir A: fails on missing build/out, heals it, succeeds, learns.
+    let a = supervise_opts(tiny_pipeline(), "sh".into(), args.clone(), mk(dir_a.clone()));
+    assert!(a.success);
+    assert_eq!(a.heals, vec![CreatedDirectory(dir_a.join("build").join("out"))]);
+
+    // Run 2 in dir B: never ran here, yet immunity pre-creates build/out under B
+    // and the program succeeds on the first attempt.
+    assert!(!dir_b.join("build").join("out").exists());
+    let b = supervise_opts(tiny_pipeline(), "sh".into(), args, mk(dir_b.clone()));
+    assert!(b.success);
+    assert_eq!(b.attempts, 1, "portable immunity → first-try success in a new location");
+    assert_eq!(b.heals, vec![Immunized(dir_b.join("build").join("out"))]);
+    assert!(dir_b.join("build").join("out").join("app.bin").exists());
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_file(&memory);
+}
+
+#[test]
+fn predicts_failure_from_missing_prerequisites_before_running() {
+    use axiom_engine::heal_memory::{fingerprint, HealMemory};
+    use axiom_engine::self_heal::predict_failure;
+
+    let anchor = unique_tmp("predict_anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let memory = unique_tmp("predict_mem").with_extension("json");
+
+    // Teach Axiom that this command needs ./build/out (relative).
+    let mut mem = HealMemory::load(&memory);
+    mem.remember_dirs(
+        &fingerprint("sh", &["-c".into(), "echo x > build/out/r".into()]),
+        "sh -c echo x > build/out/r",
+        &[PathBuf::from("build/out")],
+    );
+    mem.save().unwrap();
+
+    let opts = |anchor: PathBuf| SupervisorOptions {
+        heal_memory_path: Some(memory.clone()),
+        anchor: Some(anchor),
+        ..SupervisorOptions::default()
+    };
+    let cmd = "sh".to_string();
+    let args = vec!["-c".to_string(), "echo x > build/out/r".to_string()];
+
+    // Prerequisite missing under the anchor → failure predicted before running.
+    let p = predict_failure(&cmd, &args, &opts(anchor.clone()));
+    assert!(p.likely, "missing prerequisite must predict failure");
+    assert_eq!(p.missing_prerequisites, vec![anchor.join("build").join("out")]);
+
+    // Create it → prediction flips to no-failure (prerequisites satisfied).
+    std::fs::create_dir_all(anchor.join("build").join("out")).unwrap();
+    let p2 = predict_failure(&cmd, &args, &opts(anchor.clone()));
+    assert!(!p2.likely);
+    assert!(p2.missing_prerequisites.is_empty());
+
+    // An unknown command yields no prediction.
+    let p3 = predict_failure("totally", &["unknown".into()], &opts(anchor.clone()));
+    assert!(!p3.likely);
+    assert!(p3.rationale.contains("no prior experience"));
+
+    let _ = std::fs::remove_dir_all(&anchor);
+    let _ = std::fs::remove_file(&memory);
+}
+
+#[cfg(unix)]
+#[test]
+fn heals_missing_execute_bit_on_a_script() {
+    use axiom_engine::self_heal::Heal::MadeExecutable;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = unique_tmp("execbit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("build.sh");
+    std::fs::write(&script, "#!/bin/sh\necho ran\n").unwrap();
+    // Non-executable (rw-r--r--).
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Supervise the script directly: spawn fails with PermissionDenied → chmod
+    // +x heal → retry → success.
+    let report = supervise(
+        tiny_pipeline(),
+        script.display().to_string(),
+        vec![],
+        3,
+    );
+    assert!(report.success, "must run after the execute-bit heal");
+    assert_eq!(report.heals, vec![MadeExecutable(script.clone())]);
+    let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+    assert!(mode & 0o111 != 0, "execute bit must be set");
+    // Contents are never touched by the heal.
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), "#!/bin/sh\necho ran\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diagnoses_and_remembers_missing_env_var() {
+    use axiom_engine::heal_memory::{fingerprint, HealMemory};
+
+    let memory = unique_tmp("envmem").with_extension("json");
+    // Fails citing a missing env var (a name not set in this process).
+    let script = "echo 'error: AXIOM_FAKE_TOKEN_XYZ must be set' >&2; exit 1";
+    let args = vec!["-c".to_string(), script.to_string()];
+    let report = supervise_opts(
+        tiny_pipeline(),
+        "sh".into(),
+        args.clone(),
+        SupervisorOptions {
+            max_restarts: 3,
+            heal_memory_path: Some(memory.clone()),
+            ..SupervisorOptions::default()
+        },
+    );
+
+    // Can't fabricate the value → run fails, but a diagnostic is surfaced…
+    assert!(!report.success);
+    assert!(
+        report.diagnostics.iter().any(|d| d.contains("AXIOM_FAKE_TOKEN_XYZ")),
+        "missing env var must be diagnosed: {:?}",
+        report.diagnostics
+    );
+    // …and the requirement is remembered for advisories / `axiom immunity`.
+    let fp = fingerprint("sh", &args);
+    let mem = HealMemory::load(&memory);
+    assert_eq!(
+        mem.record(&fp).map(|r| r.required_env.clone()),
+        Some(vec!["AXIOM_FAKE_TOKEN_XYZ".to_string()])
+    );
+
+    let _ = std::fs::remove_file(&memory);
 }
 
 #[test]

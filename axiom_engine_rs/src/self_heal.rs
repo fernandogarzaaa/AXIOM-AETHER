@@ -73,6 +73,9 @@ pub enum Heal {
     /// Learned immunity: a directory this program needed in a past run,
     /// re-created prophylactically *before* the first attempt.
     Immunized(PathBuf),
+    /// A file the program tried to execute lacked the execute bit; `chmod +x`
+    /// was applied (the file's contents are never touched).
+    MadeExecutable(PathBuf),
 }
 
 impl std::fmt::Display for Heal {
@@ -85,6 +88,7 @@ impl std::fmt::Display for Heal {
             Heal::Immunized(p) => {
                 write!(f, "immunity: pre-created remembered directory {}", p.display())
             }
+            Heal::MadeExecutable(p) => write!(f, "made executable (chmod +x) {}", p.display()),
         }
     }
 }
@@ -119,6 +123,10 @@ pub struct RunReport {
     /// Total TTT absorption passes run across all failures. Tension-gated: a
     /// novel/first-seen fault is absorbed harder than a familiar one.
     pub absorption_passes: usize,
+    /// Non-corrective findings surfaced to the operator (e.g. a required
+    /// environment variable Axiom cannot fabricate). Recorded and reported, but
+    /// they do not by themselves justify a restart.
+    pub diagnostics: Vec<String>,
 }
 
 /// Absorption passes for a familiar (KNOWN) failure: light reinforcement, the
@@ -208,13 +216,23 @@ pub fn extract_missing_paths(trace: &str) -> Vec<PathBuf> {
             }
         }
         // Unquoted candidates: any whitespace- or colon-delimited word that
-        // looks like a path. Covers `cat: /a/b: No such file or directory` and
-        // `sh: 1: cannot create /a/b/out.txt: Directory nonexistent`, where the
-        // path sits mid-token rather than at a colon boundary.
+        // looks like a path. Covers `cat: /a/b: No such file or directory`,
+        // `sh: 1: cannot create /a/b/out.txt: Directory nonexistent`, and bare
+        // *relative* paths like `build/out/app.bin` (which is what a shell
+        // prints when the program used a cwd-relative path — the portable case).
         for word in line.split(|c: char| c.is_whitespace() || c == ':') {
             let t = word.trim().trim_end_matches([',', ';']);
-            if (t.starts_with('/') || t.starts_with("./")) && t.len() > 1 && seen.insert(t.into())
-            {
+            if t.len() <= 1 || t.contains("://") || seen.contains(t) {
+                continue; // too short, a URL, or already captured
+            }
+            let absolute = t.starts_with('/') || t.starts_with("./");
+            let relative_path = t.contains('/')
+                && t
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_');
+            if absolute || relative_path {
+                seen.insert(t.to_string());
                 found.push(PathBuf::from(t));
             }
         }
@@ -225,24 +243,130 @@ pub fn extract_missing_paths(trace: &str) -> Vec<PathBuf> {
 /// Apply the missing-directory heal for one implicated path.
 ///
 /// A component with an extension is treated as a file → its parent directory is
-/// created; otherwise the path itself is created. Only `create_dir_all` is ever
-/// performed — nothing is deleted or written.
-fn heal_missing_path(path: &Path) -> Option<Heal> {
-    let dir = if path
+/// created; otherwise the path itself is created. Relative paths (as they often
+/// appear in error traces) resolve against `anchor` — the supervised process's
+/// working directory — so the heal lands where the program actually looked.
+/// Only `create_dir_all` is ever performed — nothing is deleted or written.
+fn heal_missing_path(path: &Path, anchor: &Path) -> Option<Heal> {
+    let resolved = if path.is_relative() {
+        anchor.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let dir = if resolved
         .file_name()
         .and_then(|n| n.to_str())
         .map(|n| n.contains('.'))
         .unwrap_or(false)
     {
-        path.parent()?.to_path_buf()
+        resolved.parent()?.to_path_buf()
     } else {
-        path.to_path_buf()
+        resolved
     };
     if dir.as_os_str().is_empty() || dir.exists() {
         return None;
     }
     std::fs::create_dir_all(&dir).ok()?;
     Some(Heal::CreatedDirectory(dir))
+}
+
+/// Extract paths implicated in a "Permission denied" failure trace — candidate
+/// targets for the execute-bit heal. Same path-token heuristic as
+/// [`extract_missing_paths`], gated on the permission-denied phrase.
+pub fn extract_permission_denied_paths(trace: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in trace.lines() {
+        if !line.to_ascii_lowercase().contains("permission denied") {
+            continue;
+        }
+        for raw in line.split(|c: char| c.is_whitespace() || c == ':') {
+            let t = raw.trim().trim_matches(|c| c == '\'' || c == '"' || c == ',' || c == ';');
+            if t.len() <= 1 || t.contains("://") || seen.contains(t) {
+                continue;
+            }
+            let looks_path = t.starts_with('/')
+                || t.starts_with("./")
+                || (t.contains('/')
+                    && t.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_'));
+            if looks_path {
+                seen.insert(t.to_string());
+                found.push(PathBuf::from(t));
+            }
+        }
+    }
+    found
+}
+
+/// Extract environment-variable names a trace reports as required-but-unset.
+/// Recognised phrasings (broad but anchored on "environment variable" / "env
+/// var" / "must be set" / "is not set" near an UPPER_SNAKE identifier):
+///   * `FOO environment variable not set`
+///   * `missing required environment variable: API_TOKEN`
+///   * `error: BAR must be set`
+///   * `KeyError: 'DATABASE_URL'` on a line mentioning environ/env
+pub fn extract_required_env_vars(trace: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in trace.lines() {
+        let lower = line.to_ascii_lowercase();
+        let env_context = lower.contains("environment variable")
+            || lower.contains("env var")
+            || lower.contains("environ")
+            || lower.contains("must be set")
+            || lower.contains("is not set")
+            || lower.contains("not set");
+        if !env_context {
+            continue;
+        }
+        // UPPER_SNAKE identifiers, the near-universal convention for env var
+        // names. Requiring an underscore keeps precision high: it admits
+        // API_TOKEN / DATABASE_URL while rejecting all-caps log words like
+        // FATAL / ERROR / WARNING that share a line with "must be set".
+        for raw in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            let t = raw.trim();
+            if t.len() >= 3
+                && t.contains('_')
+                && t.chars().any(|c| c.is_ascii_alphabetic())
+                && t.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && seen.insert(t.to_string())
+            {
+                found.push(t.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// Apply the execute-bit heal: if `path` (resolved against `anchor`) is an
+/// existing regular file lacking the execute bit, add it (`chmod +x`). Never
+/// touches file contents; a no-op on non-Unix or when already executable.
+fn heal_permission_denied(path: &Path, anchor: &Path) -> Option<Heal> {
+    let resolved = crate::heal_memory::resolve_dir(path, anchor);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(&resolved).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o111 != 0 {
+            return None; // already executable
+        }
+        let mut perms = meta.permissions();
+        perms.set_mode(mode | 0o111);
+        std::fs::set_permissions(&resolved, perms).ok()?;
+        Some(Heal::MadeExecutable(resolved))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = resolved;
+        None
+    }
 }
 
 fn tail(s: &str, max: usize) -> &str {
@@ -270,6 +394,12 @@ pub struct SupervisorOptions {
     /// MemoryStore root: novel healed failures are written here as `Fix`
     /// memories the proxy's recall layer can surface into Claude's context.
     pub remember_into: Option<PathBuf>,
+    /// Working directory for the supervised process and the anchor for
+    /// location-invariant immunity: heals under this dir are remembered
+    /// *relative* to it and re-anchored here on immunize, so a fix learned in
+    /// one checkout (or on another machine, via swarm immunity) applies in
+    /// another. `None` → the current process working directory.
+    pub anchor: Option<PathBuf>,
 }
 
 impl SupervisorOptions {
@@ -278,6 +408,73 @@ impl SupervisorOptions {
         Self {
             max_restarts,
             ..Self::default()
+        }
+    }
+}
+
+/// An anticipatory failure prediction made *before* a command runs, from
+/// accumulated immunity (missing learned prerequisites).
+#[derive(Debug, Clone)]
+pub struct FailurePrediction {
+    /// True when the command is predicted to fail as the environment stands.
+    pub likely: bool,
+    /// Learned prerequisite directories that are currently missing (resolved).
+    pub missing_prerequisites: Vec<PathBuf>,
+    /// Matured confidence of the underlying immunity (0 when unknown).
+    pub confidence: f32,
+    /// Human-readable explanation.
+    pub rationale: String,
+}
+
+/// Predict, before running, whether `command args...` is likely to fail in the
+/// current environment — purely from learned immunity (no execution, no model).
+/// This is the anticipatory counterpart to the reactive supervisor.
+pub fn predict_failure(command: &str, args: &[String], opts: &SupervisorOptions) -> FailurePrediction {
+    let anchor = opts
+        .anchor
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let Some(path) = opts.heal_memory_path.as_deref() else {
+        return FailurePrediction {
+            likely: false,
+            missing_prerequisites: Vec::new(),
+            confidence: 0.0,
+            rationale: "heal memory disabled — no basis to predict".into(),
+        };
+    };
+    let fp = crate::heal_memory::fingerprint(command, args);
+    let mem = crate::heal_memory::HealMemory::load(path);
+    if mem.record(&fp).is_none() {
+        return FailurePrediction {
+            likely: false,
+            missing_prerequisites: Vec::new(),
+            confidence: 0.0,
+            rationale: "no prior experience with this command".into(),
+        };
+    }
+    let (missing, confidence) = mem.missing_prerequisites(&fp, &anchor);
+    if missing.is_empty() {
+        FailurePrediction {
+            likely: false,
+            missing_prerequisites: missing,
+            confidence,
+            rationale: "all learned prerequisites already satisfied".into(),
+        }
+    } else {
+        let list = missing
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        FailurePrediction {
+            likely: true,
+            rationale: format!(
+                "predicting failure (confidence {confidence:.2}): {} missing learned prerequisite(s): {list}",
+                missing.len()
+            ),
+            missing_prerequisites: missing,
+            confidence,
         }
     }
 }
@@ -297,6 +494,13 @@ pub fn run_supervised(
     let max_restarts = opts.max_restarts;
     let vibe_path = opts.vibe_path.as_deref();
     let heal_memory_path = opts.heal_memory_path.as_deref();
+    // Anchor = supervised process working directory = the frame heals are made
+    // portable against. Defaults to the current process cwd.
+    let anchor = opts
+        .anchor
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
     let mut report = RunReport {
         success: false,
         attempts: 0,
@@ -305,6 +509,7 @@ pub fn run_supervised(
         tension: Vec::new(),
         tokens_absorbed: 0,
         absorption_passes: 0,
+        diagnostics: Vec::new(),
     };
     // One session for the whole supervised lifetime: every failure compounds
     // into the same fast-weights.
@@ -312,13 +517,20 @@ pub fn run_supervised(
     let mut healed_paths: HashSet<PathBuf> = HashSet::new();
     let mut transient_retries = 0usize;
 
+    // Anticipatory pre-flight: predict failure from learned immunity before the
+    // command runs, so the proactive immunization below has a stated rationale.
+    let prediction = predict_failure(command, args, opts);
+    if prediction.likely {
+        println!("[axiom-run] pre-flight: {}", prediction.rationale);
+    }
+
     // Learned immunity: re-create what this program needed in past runs BEFORE
     // the first attempt, so remembered failure modes never recur.
     let command_line = format!("{command} {}", args.join(" "));
     let fp = crate::heal_memory::fingerprint(command, args);
     let mut memory = heal_memory_path.map(crate::heal_memory::HealMemory::load);
     if let Some(mem) = memory.as_ref() {
-        for dir in mem.immunize(&fp) {
+        for dir in mem.immunize_anchored(&fp, &anchor) {
             let heal = Heal::Immunized(dir.clone());
             println!("[axiom-run] {heal}");
             healed_paths.insert(dir);
@@ -329,9 +541,36 @@ pub fn run_supervised(
     for attempt in 1..=max_restarts + 1 {
         report.attempts = attempt;
         let started = Instant::now();
-        let output = Command::new(command).args(args).output().map_err(|e| {
-            candle_core::Error::Msg(format!("failed to spawn '{command}': {e}"))
-        })?;
+        let output = match Command::new(command)
+            .args(args)
+            .current_dir(&anchor)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // The program itself isn't executable. Try the exec-bit heal on
+                // its path, then retry; if it can't be healed, surface the error.
+                if attempt <= max_restarts {
+                    if let Some(heal) = heal_permission_denied(Path::new(command), &anchor) {
+                        if !healed_paths.contains(Path::new(command)) {
+                            println!("[axiom-run]   heal: {heal}");
+                            healed_paths.insert(PathBuf::from(command));
+                            report.heals.push(heal);
+                            println!("[axiom-run] environment healed — restarting");
+                            continue;
+                        }
+                    }
+                }
+                return Err(candle_core::Error::Msg(format!(
+                    "failed to spawn '{command}': {e}"
+                )));
+            }
+            Err(e) => {
+                return Err(candle_core::Error::Msg(format!(
+                    "failed to spawn '{command}': {e}"
+                )))
+            }
+        };
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         // The supervised program's output still belongs to the user.
@@ -346,7 +585,7 @@ pub fn run_supervised(
                 started.elapsed().as_secs_f32()
             );
             commit_to_vibe(pipeline, &states, &report, vibe_path);
-            finalize_memory(memory.as_mut(), &fp, &command_line, &report);
+            finalize_memory(memory.as_mut(), &fp, &command_line, &report, &anchor);
             return Ok(report);
         }
 
@@ -407,12 +646,52 @@ pub fn run_supervised(
             if healed_paths.contains(&path) {
                 continue;
             }
-            if let Some(heal) = heal_missing_path(&path) {
+            if let Some(heal) = heal_missing_path(&path, &anchor) {
                 println!("[axiom-run]   heal: {heal}");
                 healed_paths.insert(path);
                 new_heal_descs.push(heal.to_string());
                 report.heals.push(heal);
                 applied_new_heal = true;
+            }
+        }
+
+        // 3-exec. A different pathogen class: a file the program tried to run
+        // lacked the execute bit. `chmod +x` it (contents untouched).
+        for path in extract_permission_denied_paths(&trace)
+            .into_iter()
+            .take(MAX_HEALS_PER_ATTEMPT)
+        {
+            if healed_paths.contains(&path) {
+                continue;
+            }
+            if let Some(heal) = heal_permission_denied(&path, &anchor) {
+                println!("[axiom-run]   heal: {heal}");
+                healed_paths.insert(path);
+                new_heal_descs.push(heal.to_string());
+                report.heals.push(heal);
+                applied_new_heal = true;
+            }
+        }
+
+        // 3-env. A diagnostic pathogen class: a required environment variable
+        // is unset. Axiom cannot fabricate a value, so it does NOT mark a heal
+        // (no blind restart) — it surfaces an actionable diagnostic once and
+        // remembers the requirement so advisories/`axiom immunity` can tell the
+        // operator (and Claude) to export it.
+        for var in extract_required_env_vars(&trace) {
+            if std::env::var_os(&var).is_some() {
+                continue; // already set in the environment — not the problem
+            }
+            let diag = format!(
+                "requires environment variable {var} (unset) — set it and re-run; \
+                 Axiom cannot safely fabricate its value"
+            );
+            if !report.diagnostics.contains(&diag) {
+                println!("[axiom-run]   diagnosis: {diag}");
+                report.diagnostics.push(diag);
+                if let Some(mem) = memory.as_mut() {
+                    mem.remember_env_requirement(&fp, &command_line, &[var]);
+                }
             }
         }
 
@@ -454,13 +733,13 @@ pub fn run_supervised(
         if !applied_new_heal {
             println!("[axiom-run] no applicable heal for this failure — stopping");
             commit_to_vibe(pipeline, &states, &report, vibe_path);
-            finalize_memory(memory.as_mut(), &fp, &command_line, &report);
+            finalize_memory(memory.as_mut(), &fp, &command_line, &report, &anchor);
             return Ok(report);
         }
         if attempt == max_restarts + 1 {
             println!("[axiom-run] restart budget exhausted");
             commit_to_vibe(pipeline, &states, &report, vibe_path);
-            finalize_memory(memory.as_mut(), &fp, &command_line, &report);
+            finalize_memory(memory.as_mut(), &fp, &command_line, &report, &anchor);
             return Ok(report);
         }
         println!("[axiom-run] environment healed — restarting");
@@ -476,18 +755,38 @@ fn finalize_memory(
     fp: &str,
     command_line: &str,
     report: &RunReport,
+    anchor: &Path,
 ) {
     let Some(mem) = memory else { return };
     if report.success {
+        // Remember directory heals *relative to the anchor* when they live
+        // under it, so immunity is portable to other checkouts/machines; heals
+        // outside the anchor stay absolute. Immunized dirs are included (the
+        // run proved them) — remember_dirs dedups against what's already stored.
         let dirs: Vec<PathBuf> = report
             .heals
             .iter()
             .filter_map(|h| match h {
-                Heal::CreatedDirectory(p) => Some(p.clone()),
+                Heal::CreatedDirectory(p) | Heal::Immunized(p) => {
+                    Some(crate::heal_memory::relativize_dir(p, anchor))
+                }
                 _ => None,
             })
             .collect();
         mem.remember_dirs(fp, command_line, &dirs);
+        // Affinity maturation: if immunity was applied *and* the run succeeded,
+        // reinforce this program's confidence (and reset its waning clock).
+        let immunity_applied = report
+            .heals
+            .iter()
+            .any(|h| matches!(h, Heal::Immunized(_)));
+        if immunity_applied {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            mem.reinforce_immunity(fp, now);
+        }
     }
     if let Err(e) = mem.save() {
         eprintln!("[axiom-run] heal memory save skipped: {e}");
@@ -615,6 +914,24 @@ mod tests {
     }
 
     #[test]
+    fn extracts_required_env_vars_from_varied_phrasings() {
+        assert_eq!(
+            extract_required_env_vars("error: API_TOKEN environment variable not set"),
+            vec!["API_TOKEN"]
+        );
+        assert_eq!(
+            extract_required_env_vars("missing required environment variable: DATABASE_URL"),
+            vec!["DATABASE_URL"]
+        );
+        assert_eq!(
+            extract_required_env_vars("FATAL: SECRET_KEY must be set"),
+            vec!["SECRET_KEY"]
+        );
+        // No env context → nothing, even with an UPPER_SNAKE token present.
+        assert!(extract_required_env_vars("compiled OK with FLAG_X enabled").is_empty());
+    }
+
+    #[test]
     fn heal_creates_parent_for_file_like_paths() {
         let base = std::env::temp_dir().join(format!(
             "axiom_heal_{}",
@@ -624,10 +941,28 @@ mod tests {
                 .as_nanos()
         ));
         let file_path = base.join("deep").join("out.txt");
-        let heal = heal_missing_path(&file_path).expect("heal must apply");
+        // Absolute path → anchor is ignored.
+        let heal = heal_missing_path(&file_path, Path::new("/unused")).expect("heal must apply");
         assert_eq!(heal, Heal::CreatedDirectory(base.join("deep")));
         assert!(base.join("deep").exists());
         assert!(!file_path.exists(), "heal must never create the file itself");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn relative_trace_path_heals_under_anchor() {
+        let anchor = std::env::temp_dir().join(format!(
+            "axiom_anchor_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&anchor).unwrap();
+        // A relative path from a trace resolves against the anchor (child cwd).
+        let heal = heal_missing_path(Path::new("build/out.bin"), &anchor).expect("heal applies");
+        assert_eq!(heal, Heal::CreatedDirectory(anchor.join("build")));
+        assert!(anchor.join("build").exists());
+        let _ = std::fs::remove_dir_all(&anchor);
     }
 }

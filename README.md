@@ -181,10 +181,16 @@ What actually happens on a failure:
    program's failure history compounds.
 3. **Environmental heal** — deterministic, safe policies repair what the
    process cannot survive: missing directories (`ENOENT` / `Directory
-   nonexistent` → `mkdir -p`), and recognised **transient faults**
-   (`Connection refused/reset/timed out`, DNS, EAGAIN) where waiting *is* the
-   heal — a bounded backoff-retry (max 2). Heals only ever create directories
-   or wait — never delete, overwrite, or fabricate file content.
+   nonexistent` → `mkdir -p`); a **missing execute bit** (`Permission denied`
+   on a file the program tried to run → `chmod +x`, contents never touched);
+   and recognised **transient faults** (`Connection refused/reset/timed out`,
+   DNS, EAGAIN) where waiting *is* the heal — a bounded backoff-retry (max 2).
+   Heals only ever create directories, add an execute bit, or wait — never
+   delete, overwrite, or fabricate file content. A **missing required
+   environment variable** is *diagnosed* (not fixed — a value can't be safely
+   fabricated): Axiom surfaces an actionable message, remembers the requirement,
+   and feeds it to `axiom immunity` and the proxy advisory so the operator (and
+   Claude) know to export it.
 4. **Continue** — restart up to `--max-restarts` (default 3), but **only when a
    new heal was applied**: an unhealed environment is never blindly replayed,
    and the child's exit code is preserved on give-up.
@@ -202,7 +208,14 @@ What actually happens on a failure:
    own life history. Run a program once: crash → heal → success. Wipe the
    environment and run it again: `immunity: pre-created remembered directory …`
    → success on attempt 1 with **zero failure tokens absorbed**.
-7. **Swarm immunity** — heals learned anywhere immunize the whole fleet. The
+7. **Portable (location-invariant) immunity** — a heal under the working
+   directory is remembered *relative* to it and re-anchored on immunize, so a
+   fix learned in one checkout applies in another — and, via swarm immunity,
+   on another machine. Learn `dist/` in `/home/alice/projA`; the same command
+   in `/home/bob/projB` is immunized to `/home/bob/projB/dist` and succeeds on
+   the first attempt, a location it never ran in. Heals outside the working
+   directory stay absolute.
+8. **Swarm immunity** — heals learned anywhere immunize the whole fleet. The
    server exports its heal memory at `GET /v1/immunity` and accepts a peer's at
    `POST /v1/immunity/merge`; `axiom swarm immunity <host:port>` pulls a peer
    and merges in one command. Merges are conservative: directory lists are
@@ -211,6 +224,61 @@ What actually happens on a failure:
    weakened. Demonstrated: a program crashes once on node A; node B runs
    `axiom swarm immunity nodeA:3000`; the same program then succeeds
    **first-try on node B, where it had never run before**.
+
+### Anticipatory immunity (pre-failure prediction)
+
+Acquired immunity also lets Axiom predict a failure *before the command runs* —
+no model, no execution, just learned prerequisites checked against the current
+environment:
+
+```bash
+axiom run --dry-run -- cargo build   # predict only, don't execute
+# [axiom-run] dry-run prediction: LIKELY TO FAIL — 1 missing learned
+#             prerequisite(s): /repo/target
+```
+
+Every real run does this as a silent pre-flight: if a learned prerequisite is
+missing it logs `pre-flight: predicting failure …` and then immunizes
+proactively, so the predicted failure never happens. This turns the immune
+system from reactive + prophylactic into genuinely *anticipatory*.
+
+### Cross-reactive immunity (generalization by analogy)
+
+Like antibodies that recognize a pathogen similar to one seen before, Axiom
+generalizes a heal across a **program family**: if `cargo build` learned it
+needs `target/`, then a never-seen `cargo test` referenced in the conversation
+gets an analogical **hint** in the proxy's `<axiom_immunity>` block —
+
+```text
+- cross-reactive hint: a sibling `cargo build` previously needed directory
+  target; a different `cargo …` invocation here may need the same (Axiom has
+  not applied it).
+```
+
+These are advisory **only** — never auto-applied — so a wrong analogy costs
+nothing. Fires only for multi-sub-command families, never for a directly-known
+command (that's a direct advisory) or an unrelated program.
+
+### Adaptive immune confidence (maturation + waning)
+
+Heals carry a confidence that follows an adaptive-immunity lifecycle:
+
+- **Tentative** when first learned (0.50).
+- **Affinity maturation** — each time immunizing a program precedes a
+  successful run, confidence matures toward 1.0 (`tentative → proven →
+  established`). Established fixes are asserted in proxy advisories; tentative
+  ones are offered as possibilities.
+- **Waning** — confidence decays with time since last reinforcement (30-day
+  half-life), so heals never exercised again fade.
+- **Forgetting** — `axiom immunity --prune` drops faded records (clonal
+  deletion). Fleet merges combine confidence (stronger wins, immunizations sum).
+
+```text
+$ axiom run -- sh -c 'echo x > artifacts/o.bin'   # learn
+  confidence: 0.50 (tentative, immunizations: 0)
+# …after three successful reuses…
+  confidence: 0.86 (established, immunizations: 3)
+```
 
 ### Inspecting acquired immunity
 

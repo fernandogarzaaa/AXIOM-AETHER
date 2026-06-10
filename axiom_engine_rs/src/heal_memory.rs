@@ -18,13 +18,27 @@
 //! `~/.axiom/heal_memory.json`). Only directory heals are remembered: transient
 //! retries are situational and never replayed prophylactically.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Current unix time in seconds (0 if the clock is before the epoch).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// What the memory knows about one supervised program.
+///
+/// The confidence fields model an adaptive-immunity lifecycle: a freshly
+/// learned heal is *tentative*; each time immunizing the program produces a
+/// successful run the confidence matures toward 1.0 (affinity maturation);
+/// and confidence wanes with time since last reinforcement (memory waning),
+/// so heals that are never exercised again fade and can be pruned.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProgramRecord {
     /// Human-readable command line (for inspection of the JSON; the map key is
@@ -32,10 +46,59 @@ pub struct ProgramRecord {
     pub command: String,
     /// Directories this program needed created in the past.
     pub dirs: Vec<PathBuf>,
+    /// Environment variables this program reported as required-but-unset. A
+    /// value cannot be safely fabricated, so these are surfaced as diagnostics
+    /// (in advisories / `axiom immunity`) rather than auto-applied.
+    #[serde(default)]
+    pub required_env: Vec<String>,
     /// Running mean of failure-trace cross-entropy.
     pub ce_mean: f32,
     /// Number of failures folded into `ce_mean`.
     pub ce_count: u32,
+    /// Stored (pre-decay) immunity confidence in 0..1. Defaulted for records
+    /// written before the confidence lifecycle existed.
+    #[serde(default)]
+    pub confidence: f32,
+    /// Times immunizing this program preceded a successful run.
+    #[serde(default)]
+    pub immunizations: u32,
+    /// Unix seconds of the last confidence reinforcement (for waning).
+    #[serde(default)]
+    pub last_reinforced: u64,
+}
+
+/// Half-life (days) of unreinforced immunity confidence.
+const CONFIDENCE_HALFLIFE_DAYS: f32 = 30.0;
+/// Confidence a heal starts at when first learned (tentative).
+const INITIAL_CONFIDENCE: f32 = 0.5;
+/// EMA rate at which successful reuse matures confidence toward 1.0.
+const MATURATION_RATE: f32 = 0.34;
+/// Decayed-confidence floor below which `prune_stale` forgets a record.
+const PRUNE_FLOOR: f32 = 0.05;
+
+impl ProgramRecord {
+    /// Confidence after time-decay relative to `now` (unix secs). Heals never
+    /// reinforced (`last_reinforced == 0`) report their stored confidence.
+    pub fn confidence_now(&self, now: u64) -> f32 {
+        if self.last_reinforced == 0 || self.confidence <= 0.0 {
+            return self.confidence;
+        }
+        let age_days = now.saturating_sub(self.last_reinforced) as f32 / 86_400.0;
+        self.confidence * 0.5f32.powf(age_days / CONFIDENCE_HALFLIFE_DAYS)
+    }
+
+    /// A human label for a decayed-confidence value.
+    pub fn confidence_label(c: f32) -> &'static str {
+        if c >= 0.85 {
+            "established"
+        } else if c >= 0.6 {
+            "proven"
+        } else if c >= 0.3 {
+            "tentative"
+        } else {
+            "faded"
+        }
+    }
 }
 
 /// Classification of a fresh failure against the program's tension history.
@@ -122,6 +185,28 @@ pub fn fingerprint(command: &str, args: &[String]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Express `dir` relative to `anchor` when it lives under it (making the heal
+/// portable across checkouts/machines); otherwise return `dir` unchanged so
+/// out-of-tree absolute heals are preserved verbatim.
+pub fn relativize_dir(dir: &Path, anchor: &Path) -> PathBuf {
+    match dir.strip_prefix(anchor) {
+        Ok(rel) if rel.as_os_str().is_empty() => PathBuf::from("."),
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => dir.to_path_buf(),
+    }
+}
+
+/// Inverse of [`relativize_dir`]: resolve a stored heal against `anchor`. A
+/// relative heal is anchored here (portable immunity); an absolute heal is used
+/// verbatim.
+pub fn resolve_dir(dir: &Path, anchor: &Path) -> PathBuf {
+    if dir.is_relative() {
+        anchor.join(dir)
+    } else {
+        dir.to_path_buf()
+    }
+}
+
 impl HealMemory {
     /// Load the memory at `path`, or start empty when missing/corrupt (a bad
     /// memory file must never break a run).
@@ -168,12 +253,18 @@ impl HealMemory {
         }
         // Stable output: most-experienced programs first.
         records.sort_by(|a, b| b.ce_count.cmp(&a.ce_count).then(a.command.cmp(&b.command)));
+        let now = now_secs();
         let mut out = format!("Acquired immunity ({} program(s)):\n", records.len());
         for r in records {
+            let c = r.confidence_now(now);
             out.push_str(&format!("\n• {}\n", r.command));
             out.push_str(&format!(
-                "    failures observed: {}   mean tension (CE): {:.3}\n",
-                r.ce_count, r.ce_mean
+                "    confidence: {:.2} ({}, immunizations: {})   failures observed: {}   mean tension (CE): {:.3}\n",
+                c,
+                ProgramRecord::confidence_label(c),
+                r.immunizations,
+                r.ce_count,
+                r.ce_mean
             ));
             if r.dirs.is_empty() {
                 out.push_str("    learned heals: none (no directory heals)\n");
@@ -182,6 +273,12 @@ impl HealMemory {
                 for d in &r.dirs {
                     out.push_str(&format!("      - {}\n", d.display()));
                 }
+            }
+            if !r.required_env.is_empty() {
+                out.push_str(&format!(
+                    "    requires env vars (set before running): {}\n",
+                    r.required_env.join(", ")
+                ));
             }
         }
         out
@@ -198,7 +295,7 @@ impl HealMemory {
             .data
             .programs
             .values()
-            .filter(|r| !r.dirs.is_empty())
+            .filter(|r| !r.dirs.is_empty() || !r.required_env.is_empty())
             .collect();
         records.sort_by(|a, b| a.command.cmp(&b.command));
         for r in records {
@@ -208,6 +305,77 @@ impl HealMemory {
             if !haystack.contains(&sig) {
                 continue;
             }
+            if !r.dirs.is_empty() {
+                let dirs = r
+                    .dirs
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let c = r.confidence_now(now_secs());
+                // Phrase by matured confidence: an established fix is asserted, a
+                // tentative one is offered as a possibility.
+                let preamble = if c >= 0.6 {
+                    format!(
+                        "`{}` reliably fails in this environment (fixed {} time(s)); Axiom's established fix",
+                        r.command, r.immunizations
+                    )
+                } else {
+                    format!(
+                        "`{}` has failed in this environment before; Axiom's tentative fix",
+                        r.command
+                    )
+                };
+                out.push(format!(
+                    "{preamble}: create director{} {}. Apply preemptively if it fails again.",
+                    if r.dirs.len() == 1 { "y" } else { "ies" },
+                    dirs
+                ));
+            }
+            if !r.required_env.is_empty() {
+                out.push(format!(
+                    "`{}` requires environment variable(s) {} to be set — Axiom cannot \
+                     fabricate the value(s); ensure they are exported.",
+                    r.command,
+                    r.required_env.join(", ")
+                ));
+            }
+        }
+        out
+    }
+
+    /// Cross-reactive immunity: analogical hints from *sibling* commands in the
+    /// same program family (same executable, different sub-command) that carry
+    /// learned heals. Fires when the program name is referenced in `text` but
+    /// the sibling's exact signature is not — generalizing immunity by analogy.
+    /// These are advisory ONLY (never auto-applied), so a wrong analogy costs
+    /// nothing. Capped to keep proxy payloads lean.
+    pub fn cross_reactive_hints(&self, text: &str) -> Vec<String> {
+        let hay = text.to_ascii_lowercase();
+        let mut out = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut records: Vec<&ProgramRecord> = self
+            .data
+            .programs
+            .values()
+            .filter(|r| !r.dirs.is_empty())
+            .collect();
+        records.sort_by(|a, b| a.command.cmp(&b.command));
+        for r in records {
+            let Some(sig) = command_signature(&r.command) else {
+                continue;
+            };
+            // Cross-reactivity is for multi-sub-command families ("cargo build"),
+            // not single-command tools, and the exact command must NOT already be
+            // referenced (that path is a direct advisory, not an analogy).
+            let mut parts = sig.splitn(2, ' ');
+            let prog = parts.next().unwrap_or("");
+            if parts.next().is_none() || prog.len() < 3 || hay.contains(&sig) {
+                continue;
+            }
+            if !hay.contains(prog) || !seen.insert(format!("{prog}:{:?}", r.dirs)) {
+                continue;
+            }
             let dirs = r
                 .dirs
                 .iter()
@@ -215,12 +383,16 @@ impl HealMemory {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push(format!(
-                "`{}` has failed in this environment before; Axiom's learned fix: \
-                 create director{} {}. Apply preemptively if it fails again.",
+                "cross-reactive hint: a sibling `{}` previously needed director{} {}; \
+                 a different `{prog} …` invocation here may need the same (Axiom has \
+                 not applied it).",
                 r.command,
                 if r.dirs.len() == 1 { "y" } else { "ies" },
                 dirs
             ));
+            if out.len() >= 3 {
+                break;
+            }
         }
         out
     }
@@ -239,16 +411,45 @@ impl HealMemory {
     /// Re-create every remembered directory that is missing. Returns the dirs
     /// actually created now (the immunization applied to *this* environment).
     pub fn immunize(&self, fp: &str) -> Vec<PathBuf> {
+        let anchor = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.immunize_anchored(fp, &anchor)
+    }
+
+    /// Re-create remembered-but-missing directories, re-anchoring *relative*
+    /// heals to `anchor` (the supervised process's working directory). This is
+    /// what makes immunity location-invariant: a heal learned as `target` in
+    /// one checkout is applied as `<anchor>/target` here. Absolute heals are
+    /// used verbatim. Returns the resolved absolute paths actually created.
+    pub fn immunize_anchored(&self, fp: &str, anchor: &Path) -> Vec<PathBuf> {
         let Some(record) = self.data.programs.get(fp) else {
             return Vec::new();
         };
         let mut applied = Vec::new();
         for dir in &record.dirs {
-            if !dir.exists() && std::fs::create_dir_all(dir).is_ok() {
-                applied.push(dir.clone());
+            let resolved = resolve_dir(dir, anchor);
+            if !resolved.exists() && std::fs::create_dir_all(&resolved).is_ok() {
+                applied.push(resolved);
             }
         }
         applied
+    }
+
+    /// Anticipatory immunity: the program's learned prerequisite directories
+    /// that are *currently missing* (re-anchored). A non-empty result predicts
+    /// the program would fail right now for want of those directories — before
+    /// it is ever run. Returns `(resolved_missing_dirs, confidence)`; an unknown
+    /// program yields an empty list.
+    pub fn missing_prerequisites(&self, fp: &str, anchor: &Path) -> (Vec<PathBuf>, f32) {
+        let Some(record) = self.data.programs.get(fp) else {
+            return (Vec::new(), 0.0);
+        };
+        let missing = record
+            .dirs
+            .iter()
+            .map(|d| resolve_dir(d, anchor))
+            .filter(|d| !d.exists())
+            .collect();
+        (missing, record.confidence_now(now_secs()))
     }
 
     /// Fold one failure's tension into the program's CE history and classify it
@@ -297,6 +498,56 @@ impl HealMemory {
                 record.dirs.push(d.clone());
             }
         }
+        // A freshly learned heal is tentative until reuse proves it.
+        if record.confidence <= 0.0 {
+            record.confidence = INITIAL_CONFIDENCE;
+        }
+    }
+
+    /// Record environment variables a program reported as required-but-unset, so
+    /// they can be surfaced as diagnostics. Deduplicates; creates the record if
+    /// this is the program's first observation.
+    pub fn remember_env_requirement(&mut self, fp: &str, command_line: &str, vars: &[String]) {
+        if vars.is_empty() {
+            return;
+        }
+        let record = self
+            .data
+            .programs
+            .entry(fp.to_string())
+            .or_insert_with(|| ProgramRecord {
+                command: command_line.to_string(),
+                ..ProgramRecord::default()
+            });
+        for v in vars {
+            if !record.required_env.contains(v) {
+                record.required_env.push(v.clone());
+            }
+        }
+    }
+
+    /// Reinforce a program's immunity after immunizing it preceded a successful
+    /// run — affinity maturation: confidence EMAs toward 1.0 and the waning
+    /// clock resets. Pre-decays the stored confidence to `now` first so repeated
+    /// reinforcement after long gaps doesn't over-credit a faded memory.
+    pub fn reinforce_immunity(&mut self, fp: &str, now: u64) {
+        if let Some(r) = self.data.programs.get_mut(fp) {
+            let decayed = r.confidence_now(now).max(INITIAL_CONFIDENCE * 0.5);
+            r.confidence = decayed + MATURATION_RATE * (1.0 - decayed);
+            r.immunizations += 1;
+            r.last_reinforced = now;
+        }
+    }
+
+    /// Forget records whose decayed confidence has fallen below the prune floor
+    /// (memory waning → clonal deletion). Returns the number forgotten. Heals
+    /// never reinforced are kept (they have not had a chance to mature or fade).
+    pub fn prune_stale(&mut self, now: u64) -> usize {
+        let before = self.data.programs.len();
+        self.data
+            .programs
+            .retain(|_, r| r.last_reinforced == 0 || r.confidence_now(now) >= PRUNE_FLOOR);
+        before - self.data.programs.len()
     }
 
     /// Serialize the whole memory for transfer to a swarm peer.
@@ -337,6 +588,12 @@ impl HealMemory {
                             / total as f32;
                         ours.ce_count = total;
                     }
+                    // Combine fleet immunity experience: confidence takes the
+                    // stronger of the two, immunizations sum, and the waning
+                    // clock advances to the most recent reinforcement.
+                    ours.confidence = ours.confidence.max(theirs.confidence);
+                    ours.immunizations += theirs.immunizations;
+                    ours.last_reinforced = ours.last_reinforced.max(theirs.last_reinforced);
                 }
             }
         }
@@ -468,6 +725,43 @@ mod tests {
     }
 
     #[test]
+    fn cross_reactive_hints_generalize_within_a_program_family() {
+        let mut mem = HealMemory::load(tmp("xreact"));
+        mem.remember_dirs(
+            &fingerprint("cargo", &["build".into()]),
+            "cargo build",
+            &[PathBuf::from("target")],
+        );
+
+        // A sibling sub-command (`cargo test`) referenced but never learned →
+        // analogical hint from `cargo build`.
+        let hints = mem.cross_reactive_hints("why does cargo test fail in CI?");
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].contains("cargo build") && hints[0].contains("target"));
+
+        // The exact command directly referenced → NOT a cross-reactive hint
+        // (that's a direct advisory's job).
+        assert!(mem.cross_reactive_hints("cargo build broke").is_empty());
+
+        // A different program family → no analogy.
+        assert!(mem.cross_reactive_hints("npm test failing").is_empty());
+    }
+
+    #[test]
+    fn env_requirement_surfaces_in_advisory_and_report() {
+        let mut mem = HealMemory::load(tmp("envadv"));
+        let fp = fingerprint("cargo", &["run".into()]);
+        mem.remember_env_requirement(&fp, "cargo run", &["DATABASE_URL".into()]);
+
+        let adv = mem.advisories_for_text("why does cargo run fail?");
+        assert!(
+            adv.iter().any(|a| a.contains("DATABASE_URL") && a.contains("environment variable")),
+            "env requirement must surface as an advisory: {adv:?}"
+        );
+        assert!(mem.report_text(None).contains("requires env vars"));
+    }
+
+    #[test]
     fn report_text_empty_memory_is_friendly() {
         let mem = HealMemory::load(tmp("empty_report"));
         assert!(mem.report_text(None).contains("has not learned any program failures"));
@@ -500,6 +794,53 @@ mod tests {
         assert!(mem.advisories_for_text("my pytest run is slow").is_empty());
         // cargo not mentioned → no advisory.
         assert!(mem.advisories_for_text("unrelated question about npm").is_empty());
+    }
+
+    #[test]
+    fn confidence_matures_with_reuse_and_wanes_with_time() {
+        let mut mem = HealMemory::load(tmp("conf"));
+        let fp = fingerprint("cargo", &["build".into()]);
+        let now = 1_000_000_000u64;
+
+        // Freshly learned → tentative.
+        mem.remember_dirs(&fp, "cargo build", &[PathBuf::from("target")]);
+        assert!((mem.record(&fp).unwrap().confidence - 0.5).abs() < 1e-6);
+
+        // Each successful reuse matures confidence toward 1.0 (monotone up).
+        let mut prev = mem.record(&fp).unwrap().confidence_now(now);
+        for k in 1..=3 {
+            mem.reinforce_immunity(&fp, now + k);
+            let c = mem.record(&fp).unwrap().confidence_now(now + k);
+            assert!(c > prev, "reuse {k} must raise confidence ({prev} -> {c})");
+            prev = c;
+        }
+        assert_eq!(mem.record(&fp).unwrap().immunizations, 3);
+        assert!(prev >= 0.6, "after 3 reuses confidence should be 'proven'+");
+
+        // Waning: a full half-life later, confidence ~halves.
+        let later = now + 3 + (CONFIDENCE_HALFLIFE_DAYS as u64) * 86_400;
+        let decayed = mem.record(&fp).unwrap().confidence_now(later);
+        assert!(decayed < prev * 0.6, "confidence must wane over a half-life");
+    }
+
+    #[test]
+    fn prune_forgets_only_faded_reinforced_heals() {
+        let mut mem = HealMemory::load(tmp("prune"));
+        let now = 2_000_000_000u64;
+
+        // A reinforced-then-ancient heal → should be pruned.
+        let faded = fingerprint("old", &[]);
+        mem.remember_dirs(&faded, "old", &[PathBuf::from("a")]);
+        mem.reinforce_immunity(&faded, now - 3650 * 86_400); // ~10 years ago
+
+        // A never-reinforced heal → kept (hasn't had a chance to mature/fade).
+        let fresh = fingerprint("new", &[]);
+        mem.remember_dirs(&fresh, "new", &[PathBuf::from("b")]);
+
+        let pruned = mem.prune_stale(now);
+        assert_eq!(pruned, 1);
+        assert!(mem.record(&faded).is_none(), "ancient heal forgotten");
+        assert!(mem.record(&fresh).is_some(), "unreinforced heal retained");
     }
 
     #[test]
