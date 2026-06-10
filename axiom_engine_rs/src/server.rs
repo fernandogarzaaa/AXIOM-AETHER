@@ -54,7 +54,7 @@ use crate::hamiltonian::QuantumRuntimeStatus;
 use crate::inference::InferencePipeline;
 use crate::metrics;
 use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarderError};
-use crate::poly_jit::{PolyJitEngine, PolyJitStatus};
+use crate::poly_jit::{PolyJitEngine, PolyJitRunRequest, PolyJitReport, PolyJitStatus};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
 use crate::sandbox::{SandboxController, SandboxDiagnostic};
 use crate::surprisal::{ExactAttentionResidualCache, ExactResidualTelemetry};
@@ -1113,6 +1113,43 @@ struct HypervisorMountResponse {
     mount: VfsMountReport,
     warmed: Vec<VfsReadReport>,
     vfs: VfsStats,
+}
+
+#[derive(Debug, Deserialize)]
+struct HypervisorReadRequest {
+    /// Path under the mounted root to read and absorb into the session's W̃.
+    path: String,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HypervisorReadResponse {
+    read: VfsReadReport,
+    vfs: VfsStats,
+}
+
+#[derive(Debug, Deserialize)]
+struct HypervisorJitRunRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
+    /// Source artifact the Poly JIT may patch. When set, it is backed up before
+    /// the run and restored if the repair does not ultimately pass.
+    #[serde(default)]
+    source_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HypervisorJitRunResponse {
+    report: PolyJitReport,
+    /// True when a failed repair left the source restored to its original bytes.
+    source_restored: bool,
+    jit: PolyJitStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -2706,6 +2743,129 @@ async fn hypervisor_mount(
 }
 
 /// `GET /v1/hypervisor/jit_status` — report current user-mode JIT/VFS state.
+/// `POST /v1/hypervisor/read` — absorb a single mounted file into a session's
+/// fast-weights incrementally (after `mount`), returning the read report and
+/// live VFS stats. The path is confined to the mounted root.
+async fn hypervisor_read(
+    State(state): State<AppState>,
+    Json(req): Json<HypervisorReadRequest>,
+) -> Result<Json<HypervisorReadResponse>, ApiError> {
+    if req.path.trim().is_empty() {
+        return Err(ApiError::BadRequest("path is required".into()));
+    }
+    let session_id = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("hypervisor-vfs");
+    let read = state
+        .neural_vfs
+        .read_file_and_prefill(
+            req.path.trim(),
+            session_id,
+            state.pipeline.clone(),
+            state.ttt_sessions.clone(),
+        )
+        .await
+        .map_err(ApiError::BadRequest)?;
+    Ok(Json(HypervisorReadResponse {
+        read,
+        vfs: state.neural_vfs.status(),
+    }))
+}
+
+/// `POST /v1/hypervisor/jit_run` — drive the Poly JIT closed loop: run a
+/// command; on failure feed the fault trace into the session's W̃ (TTT) and
+/// apply a bounded, deterministic source patch (Q-TTT-ranked candidates), then
+/// retry — up to the engine's step cap. SAFETY: when a `source_path` is given
+/// it is backed up first and **restored** if the repair does not pass, so a
+/// failed attempt never leaves the artifact corrupted.
+async fn hypervisor_jit_run(
+    State(state): State<AppState>,
+    Json(req): Json<HypervisorJitRunRequest>,
+) -> Result<Json<HypervisorJitRunResponse>, ApiError> {
+    if req.command.trim().is_empty() {
+        return Err(ApiError::BadRequest("command is required".into()));
+    }
+    let session_id = req
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("hypervisor-jit")
+        .to_string();
+    let source_path = req.source_path.clone();
+    // Back up the source so a failed repair is always reversible.
+    let backup = match source_path.as_deref() {
+        Some(p) => Some(
+            tokio::fs::read_to_string(p)
+                .await
+                .map_err(|e| ApiError::BadRequest(format!("cannot read source_path: {e}")))?,
+        ),
+        None => None,
+    };
+
+    let run_req = PolyJitRunRequest {
+        session_id: session_id.clone(),
+        command: req.command,
+        args: req.args,
+        working_dir: req.working_dir,
+        source_path: source_path.clone(),
+    };
+
+    let cache_path = compression_cache_path();
+    let report = state
+        .poly_jit
+        .run_with_feedback(run_req, |diag| {
+            // Feed each fault trace into the session's fast-weights (TTT).
+            let state = state.clone();
+            let cache_path = cache_path.clone();
+            async move {
+                let message = format!(
+                    "poly-jit fault at step {} (exit {:?})",
+                    diag.step, diag.status_code
+                );
+                let trace = format!("{}\n{}", diag.stdout, diag.stderr);
+                // TTT feedback is auxiliary: a cache hiccup must never abort the
+                // repair loop, so failures are logged and swallowed.
+                if let Err(e) = state
+                    .adapt_feedback_to_cache(
+                        TttFeedbackRequest {
+                            session_id: diag.session_id.clone(),
+                            message,
+                            feedback_type: Some("poly_jit_fault".to_string()),
+                            trace: Some(trace),
+                        },
+                        &cache_path,
+                    )
+                    .await
+                {
+                    eprintln!("[poly-jit] TTT feedback skipped: {e:?}");
+                }
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("poly-jit run failed: {e}")))?;
+
+    // SAFETY: restore the original source if the repair did not pass.
+    let mut source_restored = false;
+    if !report.passed {
+        if let (Some(p), Some(b)) = (source_path.as_deref(), backup.as_ref()) {
+            if tokio::fs::write(p, b).await.is_ok() {
+                source_restored = true;
+            }
+        }
+    }
+
+    Ok(Json(HypervisorJitRunResponse {
+        report,
+        source_restored,
+        jit: state.poly_jit.status(),
+    }))
+}
+
 async fn hypervisor_jit_status(State(state): State<AppState>) -> Json<HypervisorJitStatusResponse> {
     Json(HypervisorJitStatusResponse {
         jit: state.poly_jit.status(),
@@ -2760,6 +2920,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/ttt/sessions/:id", delete(ttt_session_drop))
         .route("/v1/ttt/feedback", post(ttt_feedback))
         .route("/v1/hypervisor/mount", post(hypervisor_mount))
+        .route("/v1/hypervisor/read", post(hypervisor_read))
+        .route("/v1/hypervisor/jit_run", post(hypervisor_jit_run))
         .route("/v1/hypervisor/jit_status", get(hypervisor_jit_status))
         .route(
             "/v1/hypervisor/quantum_coherent_state",

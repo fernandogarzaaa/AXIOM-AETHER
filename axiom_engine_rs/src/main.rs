@@ -36,6 +36,7 @@ mod q_manifold;
 mod quantization;
 mod sandbox;
 mod self_heal;
+mod solve;
 mod server;
 mod skeleton;
 mod surprisal;
@@ -646,6 +647,59 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             };
             let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
             bench::run_bench(&path, &pipeline)?;
+        }
+        AxiomCommand::Solve {
+            max_rounds,
+            max_restarts,
+            source,
+            command,
+        } => {
+            let (program, args) = command
+                .split_first()
+                .ok_or_else(|| candle_core::Error::Msg("axiom solve needs a command".into()))?;
+            let program = program.clone();
+            let args = args.to_vec();
+            let opts = solve::SolveOptions {
+                max_rounds,
+                max_restarts,
+                heal_memory_path: heal_memory::HealMemory::default_path(),
+                anchor: None,
+                source_path: source,
+            };
+            let device = device_from_str(
+                &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            )?;
+            let (cfg, ckpt) =
+                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
+                context_api_url: None,
+                context_api_key: None,
+                max_context_tokens: 0,
+            };
+            let pipeline =
+                InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            let report = std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn(move || solve::solve(&pipeline, &program, &args, &opts))
+                .map_err(|e| candle_core::Error::Msg(format!("solve thread failed: {e}")))?
+                .join()
+                .map_err(|_| candle_core::Error::Msg("solve thread panicked".into()))??;
+            println!(
+                "[axiom-solve] result: {} after {} round(s); {} env-heal(s); source_patched={}; {} diagnostic(s); {} token(s) absorbed",
+                if report.solved { "SOLVED" } else { "UNSOLVED" },
+                report.rounds,
+                report.env_heals.len(),
+                report.source_patched,
+                report.diagnostics.len(),
+                report.tokens_absorbed
+            );
+            for d in &report.diagnostics {
+                println!("[axiom-solve]   diagnostic: {d}");
+            }
+            if !report.solved {
+                std::process::exit(report.final_exit.unwrap_or(1));
+            }
         }
         AxiomCommand::Run {
             max_restarts,
