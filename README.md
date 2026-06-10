@@ -188,6 +188,17 @@ What actually happens on a failure:
 5. **Persist (opt-in)** — with `AXIOM_RUN_VIBE=1`, the run's adapted W̃ is
    EMA-merged into the master vibe on completion: the program's failure history
    becomes memory that outlives the process.
+6. **Learned immunity** — every successful heal is remembered against a stable
+   fingerprint of the command (`~/.axiom/heal_memory.json`, human-auditable;
+   `AXIOM_HEAL_MEMORY` overrides the path, `0`/`off` disables). The next run of
+   the same program — even in a **fresh environment** — is immunized first:
+   remembered directories are re-created *before* the first attempt, so the
+   failure never recurs. The memory also tracks each program's failure-tension
+   history (running CE mean) and classifies every new failure as
+   **FIRST / KNOWN / NOVEL** against it — the drift gate aimed at a program's
+   own life history. Run a program once: crash → heal → success. Wipe the
+   environment and run it again: `immunity: pre-created remembered directory …`
+   → success on attempt 1 with **zero failure tokens absorbed**.
 
 Honesty notes: source-artifact patching lives in the Poly JIT hypervisor path,
 not here; restarting a process is not literally resuming a suspended thread

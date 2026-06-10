@@ -15,6 +15,7 @@ mod embedder;
 mod encoder;
 mod hamiltonian;
 mod hardware;
+mod heal_memory;
 mod inference;
 mod jit_streamer;
 mod kernel;
@@ -676,6 +677,13 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|_| std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH))
             });
+            // Learned immunity is on by default (~/.axiom/heal_memory.json);
+            // AXIOM_HEAL_MEMORY overrides the path, "0"/"off" disables it.
+            let heal_memory_path = match std::env::var("AXIOM_HEAL_MEMORY") {
+                Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
+                Ok(v) => Some(std::path::PathBuf::from(v)),
+                Err(_) => dirs::home_dir().map(|h| h.join(".axiom").join("heal_memory.json")),
+            };
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
                 .spawn(move || {
@@ -685,6 +693,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                         &args,
                         max_restarts,
                         vibe_path.as_deref(),
+                        heal_memory_path.as_deref(),
                     )
                 })
                 .map_err(|e| candle_core::Error::Msg(format!("supervisor thread failed: {e}")))?

@@ -70,6 +70,9 @@ pub enum Heal {
     CreatedDirectory(PathBuf),
     /// A recognised transient fault: backed off and retried.
     TransientRetry(&'static str),
+    /// Learned immunity: a directory this program needed in a past run,
+    /// re-created prophylactically *before* the first attempt.
+    Immunized(PathBuf),
 }
 
 impl std::fmt::Display for Heal {
@@ -78,6 +81,9 @@ impl std::fmt::Display for Heal {
             Heal::CreatedDirectory(p) => write!(f, "created directory {}", p.display()),
             Heal::TransientRetry(phrase) => {
                 write!(f, "transient fault (\"{phrase}\") — backing off and retrying")
+            }
+            Heal::Immunized(p) => {
+                write!(f, "immunity: pre-created remembered directory {}", p.display())
             }
         }
     }
@@ -242,6 +248,7 @@ pub fn run_supervised(
     args: &[String],
     max_restarts: usize,
     vibe_path: Option<&Path>,
+    heal_memory_path: Option<&Path>,
 ) -> CResult<RunReport> {
     let mut report = RunReport {
         success: false,
@@ -256,6 +263,20 @@ pub fn run_supervised(
     let mut states = pipeline.init_session_states()?;
     let mut healed_paths: HashSet<PathBuf> = HashSet::new();
     let mut transient_retries = 0usize;
+
+    // Learned immunity: re-create what this program needed in past runs BEFORE
+    // the first attempt, so remembered failure modes never recur.
+    let command_line = format!("{command} {}", args.join(" "));
+    let fp = crate::heal_memory::fingerprint(command, args);
+    let mut memory = heal_memory_path.map(crate::heal_memory::HealMemory::load);
+    if let Some(mem) = memory.as_ref() {
+        for dir in mem.immunize(&fp) {
+            let heal = Heal::Immunized(dir.clone());
+            println!("[axiom-run] {heal}");
+            healed_paths.insert(dir);
+            report.heals.push(heal);
+        }
+    }
 
     for attempt in 1..=max_restarts + 1 {
         report.attempts = attempt;
@@ -277,6 +298,7 @@ pub fn run_supervised(
                 started.elapsed().as_secs_f32()
             );
             commit_to_vibe(pipeline, &states, &report, vibe_path);
+            finalize_memory(memory.as_mut(), &fp, &command_line, &report);
             return Ok(report);
         }
 
@@ -307,6 +329,10 @@ pub fn run_supervised(
             "[axiom-run]   tension: CE {ce_before:.3} -> {ce_after:.3} after absorption ({} tokens)",
             ids.len()
         );
+        if let Some(mem) = memory.as_mut() {
+            let novelty = mem.observe_failure(&fp, &command_line, ce_before);
+            println!("[axiom-run]   failure mode: {novelty} (vs this program's tension history)");
+        }
         report.tension.push(TensionSample {
             attempt,
             ce_before,
@@ -349,16 +375,44 @@ pub fn run_supervised(
         if !applied_new_heal {
             println!("[axiom-run] no applicable heal for this failure — stopping");
             commit_to_vibe(pipeline, &states, &report, vibe_path);
+            finalize_memory(memory.as_mut(), &fp, &command_line, &report);
             return Ok(report);
         }
         if attempt == max_restarts + 1 {
             println!("[axiom-run] restart budget exhausted");
             commit_to_vibe(pipeline, &states, &report, vibe_path);
+            finalize_memory(memory.as_mut(), &fp, &command_line, &report);
             return Ok(report);
         }
         println!("[axiom-run] environment healed — restarting");
     }
     Ok(report)
+}
+
+/// Persist what this run taught the heal memory: the failure-tension history is
+/// always saved; directory heals are remembered only when the run ultimately
+/// SUCCEEDED (a dir created during a failing run is not proven medicine).
+fn finalize_memory(
+    memory: Option<&mut crate::heal_memory::HealMemory>,
+    fp: &str,
+    command_line: &str,
+    report: &RunReport,
+) {
+    let Some(mem) = memory else { return };
+    if report.success {
+        let dirs: Vec<PathBuf> = report
+            .heals
+            .iter()
+            .filter_map(|h| match h {
+                Heal::CreatedDirectory(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        mem.remember_dirs(fp, command_line, &dirs);
+    }
+    if let Err(e) = mem.save() {
+        eprintln!("[axiom-run] heal memory save skipped: {e}");
+    }
 }
 
 /// Persist the supervised session's adapted W̃ into the master vibe, when a
