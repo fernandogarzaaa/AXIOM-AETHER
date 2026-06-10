@@ -181,10 +181,12 @@ What actually happens on a failure:
    program's failure history compounds.
 3. **Environmental heal** — deterministic, safe policies repair what the
    process cannot survive: missing directories (`ENOENT` / `Directory
-   nonexistent` → `mkdir -p`), and recognised **transient faults**
-   (`Connection refused/reset/timed out`, DNS, EAGAIN) where waiting *is* the
-   heal — a bounded backoff-retry (max 2). Heals only ever create directories
-   or wait — never delete, overwrite, or fabricate file content.
+   nonexistent` → `mkdir -p`); a **missing execute bit** (`Permission denied`
+   on a file the program tried to run → `chmod +x`, contents never touched);
+   and recognised **transient faults** (`Connection refused/reset/timed out`,
+   DNS, EAGAIN) where waiting *is* the heal — a bounded backoff-retry (max 2).
+   Heals only ever create directories, add an execute bit, or wait — never
+   delete, overwrite, or fabricate file content.
 4. **Continue** — restart up to `--max-restarts` (default 3), but **only when a
    new heal was applied**: an unhealed environment is never blindly replayed,
    and the child's exit code is preserved on give-up.

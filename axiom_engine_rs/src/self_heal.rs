@@ -73,6 +73,9 @@ pub enum Heal {
     /// Learned immunity: a directory this program needed in a past run,
     /// re-created prophylactically *before* the first attempt.
     Immunized(PathBuf),
+    /// A file the program tried to execute lacked the execute bit; `chmod +x`
+    /// was applied (the file's contents are never touched).
+    MadeExecutable(PathBuf),
 }
 
 impl std::fmt::Display for Heal {
@@ -85,6 +88,7 @@ impl std::fmt::Display for Heal {
             Heal::Immunized(p) => {
                 write!(f, "immunity: pre-created remembered directory {}", p.display())
             }
+            Heal::MadeExecutable(p) => write!(f, "made executable (chmod +x) {}", p.display()),
         }
     }
 }
@@ -262,6 +266,64 @@ fn heal_missing_path(path: &Path, anchor: &Path) -> Option<Heal> {
     Some(Heal::CreatedDirectory(dir))
 }
 
+/// Extract paths implicated in a "Permission denied" failure trace — candidate
+/// targets for the execute-bit heal. Same path-token heuristic as
+/// [`extract_missing_paths`], gated on the permission-denied phrase.
+pub fn extract_permission_denied_paths(trace: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in trace.lines() {
+        if !line.to_ascii_lowercase().contains("permission denied") {
+            continue;
+        }
+        for raw in line.split(|c: char| c.is_whitespace() || c == ':') {
+            let t = raw.trim().trim_matches(|c| c == '\'' || c == '"' || c == ',' || c == ';');
+            if t.len() <= 1 || t.contains("://") || seen.contains(t) {
+                continue;
+            }
+            let looks_path = t.starts_with('/')
+                || t.starts_with("./")
+                || (t.contains('/')
+                    && t.chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_'));
+            if looks_path {
+                seen.insert(t.to_string());
+                found.push(PathBuf::from(t));
+            }
+        }
+    }
+    found
+}
+
+/// Apply the execute-bit heal: if `path` (resolved against `anchor`) is an
+/// existing regular file lacking the execute bit, add it (`chmod +x`). Never
+/// touches file contents; a no-op on non-Unix or when already executable.
+fn heal_permission_denied(path: &Path, anchor: &Path) -> Option<Heal> {
+    let resolved = crate::heal_memory::resolve_dir(path, anchor);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(&resolved).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o111 != 0 {
+            return None; // already executable
+        }
+        let mut perms = meta.permissions();
+        perms.set_mode(mode | 0o111);
+        std::fs::set_permissions(&resolved, perms).ok()?;
+        Some(Heal::MadeExecutable(resolved))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = resolved;
+        None
+    }
+}
+
 fn tail(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
@@ -433,11 +495,36 @@ pub fn run_supervised(
     for attempt in 1..=max_restarts + 1 {
         report.attempts = attempt;
         let started = Instant::now();
-        let output = Command::new(command)
+        let output = match Command::new(command)
             .args(args)
             .current_dir(&anchor)
             .output()
-            .map_err(|e| candle_core::Error::Msg(format!("failed to spawn '{command}': {e}")))?;
+        {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // The program itself isn't executable. Try the exec-bit heal on
+                // its path, then retry; if it can't be healed, surface the error.
+                if attempt <= max_restarts {
+                    if let Some(heal) = heal_permission_denied(Path::new(command), &anchor) {
+                        if !healed_paths.contains(Path::new(command)) {
+                            println!("[axiom-run]   heal: {heal}");
+                            healed_paths.insert(PathBuf::from(command));
+                            report.heals.push(heal);
+                            println!("[axiom-run] environment healed — restarting");
+                            continue;
+                        }
+                    }
+                }
+                return Err(candle_core::Error::Msg(format!(
+                    "failed to spawn '{command}': {e}"
+                )));
+            }
+            Err(e) => {
+                return Err(candle_core::Error::Msg(format!(
+                    "failed to spawn '{command}': {e}"
+                )))
+            }
+        };
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         // The supervised program's output still belongs to the user.
@@ -514,6 +601,24 @@ pub fn run_supervised(
                 continue;
             }
             if let Some(heal) = heal_missing_path(&path, &anchor) {
+                println!("[axiom-run]   heal: {heal}");
+                healed_paths.insert(path);
+                new_heal_descs.push(heal.to_string());
+                report.heals.push(heal);
+                applied_new_heal = true;
+            }
+        }
+
+        // 3-exec. A different pathogen class: a file the program tried to run
+        // lacked the execute bit. `chmod +x` it (contents untouched).
+        for path in extract_permission_denied_paths(&trace)
+            .into_iter()
+            .take(MAX_HEALS_PER_ATTEMPT)
+        {
+            if healed_paths.contains(&path) {
+                continue;
+            }
+            if let Some(heal) = heal_permission_denied(&path, &anchor) {
                 println!("[axiom-run]   heal: {heal}");
                 healed_paths.insert(path);
                 new_heal_descs.push(heal.to_string());

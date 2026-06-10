@@ -425,6 +425,37 @@ fn predicts_failure_from_missing_prerequisites_before_running() {
     let _ = std::fs::remove_file(&memory);
 }
 
+#[cfg(unix)]
+#[test]
+fn heals_missing_execute_bit_on_a_script() {
+    use axiom_engine::self_heal::Heal::MadeExecutable;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = unique_tmp("execbit");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("build.sh");
+    std::fs::write(&script, "#!/bin/sh\necho ran\n").unwrap();
+    // Non-executable (rw-r--r--).
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Supervise the script directly: spawn fails with PermissionDenied → chmod
+    // +x heal → retry → success.
+    let report = supervise(
+        tiny_pipeline(),
+        script.display().to_string(),
+        vec![],
+        3,
+    );
+    assert!(report.success, "must run after the execute-bit heal");
+    assert_eq!(report.heals, vec![MadeExecutable(script.clone())]);
+    let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+    assert!(mode & 0o111 != 0, "execute bit must be set");
+    // Contents are never touched by the heal.
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), "#!/bin/sh\necho ran\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn novel_healed_failure_is_written_to_recall_memory() {
     use axiom_engine::memory_store::{MemoryKind, MemoryStore};
