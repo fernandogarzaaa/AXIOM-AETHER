@@ -2139,7 +2139,10 @@ async fn compressed_messages_path(
     })?;
 
     // First attempt: forward the lean, compressed payload.
-    match forwarder.forward_messages_json(&outbound, client_auth).await {
+    match forwarder
+        .forward_messages_json(&outbound, client_auth)
+        .await
+    {
         Ok(value) => Ok(value),
         Err(err) => {
             // Graceful degradation: a compression-side fault (or a transient

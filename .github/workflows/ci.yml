@@ -1,0 +1,54 @@
+name: CI
+
+# Build + test gate for every pull request and for pushes to working branches.
+# The existing release.yml only runs on version tags, so until now nothing
+# verified a branch or PR before merge. This closes that gap.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "claude/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build & test (Rust)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            axiom_engine_rs/target
+          key: ci-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+          restore-keys: ci-${{ runner.os }}-
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
+
+      - name: Build (release)
+        working-directory: axiom_engine_rs
+        run: cargo build --release --locked
+
+      - name: Test
+        working-directory: axiom_engine_rs
+        run: cargo test --release --locked
