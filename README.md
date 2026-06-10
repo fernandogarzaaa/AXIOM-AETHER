@@ -372,6 +372,54 @@ For a larger/lower-CE model, raise `AXIOM_DMODEL`/`AXIOM_NLAYERS`/`AXIOM_MAX_TOK
 
 ---
 
+## The drivable hypervisor
+
+The closed-loop hypervisor is exposed over the API, not just observable:
+
+- `POST /v1/hypervisor/mount` + `POST /v1/hypervisor/read` — mount a directory
+  into the safe user-mode Neural VFS and absorb files into a session's `W̃`
+  incrementally (structural digest → TTT prefill), returning drift telemetry.
+- `POST /v1/hypervisor/jit_run` — drive the **Poly JIT** closed loop: run a
+  command; on failure feed the fault trace into `W̃` and apply a bounded,
+  Q-TTT-ranked, **reversible** source patch, then retry. A given `source_path`
+  is backed up first and **restored byte-for-byte** if the repair doesn't pass,
+  so a failed attempt never corrupts the artifact. This is *source* healing —
+  the complement to `axiom run`'s *environment* healing.
+- `GET /v1/hypervisor/jit_status`, `/v1/hypervisor/quantum_coherent_state` —
+  Poly JIT + Q-TTT manifold telemetry.
+
+---
+
+## Pillar 3 — Autonomy: `axiom solve`
+
+The third pillar is the autonomous orchestrator that chains every subsystem into
+one closed loop that drives a failing target to green and remembers how:
+
+```bash
+axiom solve --source src/lib.rs -- cargo test    # drive `cargo test` to green
+```
+
+Each round: (1) run the verify command under **environment self-healing**
+(Pillar 2 — missing dirs / exec-bit / transients, with immunity + tension
+absorption); if still red and `--source` is set, (2) drive **Poly JIT source
+repair** (reversible, Q-TTT-ranked); (3) on success, what worked is persisted
+(heal memory). The loop stops early when a round makes no progress, and on
+failure the source is restored. One report unifies the provenance:
+
+```text
+[axiom-solve] round 1: environment heal solved it
+[axiom-solve] result: SOLVED after 1 round(s); 1 env-heal(s); source_patched=false; …
+# or, when code is the problem:
+[axiom-solve] round 1: source repair solved it (patched=true)
+```
+
+Honest scope: environment heals are corrective; source repair is the bounded
+deterministic patch set (Q-TTT-ranked, always reversible); whole-project Pillar-1
+priming remains `axiom prime` (the supervisor absorbs each fault trace into `W̃`
+during the loop).
+
+---
+
 ## Quick Start
 
 ### One-line install
