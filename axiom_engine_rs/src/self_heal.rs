@@ -341,6 +341,53 @@ pub fn extract_required_env_vars(trace: &str) -> Vec<String> {
     found
 }
 
+/// Surface non-correctable conditions as actionable diagnostics (Axiom cannot
+/// safely auto-fix these — it makes the failure legible rather than fabricating
+/// a fix). Currently: disk full (`ENOSPC`) and missing executables
+/// (`command not found`). Returns one human-readable line per finding.
+pub fn extract_diagnostics(trace: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push = |s: String, out: &mut Vec<String>| {
+        if seen.insert(s.clone()) {
+            out.push(s);
+        }
+    };
+    for line in trace.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("no space left on device") {
+            push(
+                "disk full (ENOSPC) — free space and re-run; Axiom cannot reclaim space safely"
+                    .to_string(),
+                &mut out,
+            );
+        }
+        if lower.contains("command not found") || lower.contains(": not found") {
+            // The command is the colon-segment immediately before the marker:
+            // e.g. "bash: line 1: foo: command not found" → "foo".
+            let segs: Vec<&str> = line.split(':').map(str::trim).collect();
+            let marker = segs
+                .iter()
+                .position(|s| s.contains("command not found") || *s == "not found");
+            if let Some(i) = marker {
+                if let Some(cmd) = i.checked_sub(1).and_then(|j| segs.get(j)) {
+                    let cmd = cmd.trim();
+                    if !cmd.is_empty() && !cmd.contains(char::is_whitespace) {
+                        push(
+                            format!(
+                                "missing executable `{cmd}` — install it or fix PATH; \
+                                 Axiom cannot install software"
+                            ),
+                            &mut out,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Apply the execute-bit heal: if `path` (resolved against `anchor`) is an
 /// existing regular file lacking the execute bit, add it (`chmod +x`). Never
 /// touches file contents; a no-op on non-Unix or when already executable.
@@ -695,6 +742,15 @@ pub fn run_supervised(
             }
         }
 
+        // 3-diag. Other non-correctable conditions (disk full, missing
+        // executable): surface once as a legible diagnostic, no heal/restart.
+        for diag in extract_diagnostics(&trace) {
+            if !report.diagnostics.contains(&diag) {
+                println!("[axiom-run]   diagnosis: {diag}");
+                report.diagnostics.push(diag);
+            }
+        }
+
         // 3a. Bridge to the reasoning layer: a NOVEL/first-seen fault we just
         //     healed is exactly the kind of lived experience worth surfacing to
         //     Claude later. Write it into the recall memory store as a `Fix`,
@@ -911,6 +967,17 @@ mod tests {
     fn ignores_lines_without_enoent_phrases() {
         let trace = "error: something else entirely about /tmp/ax/file";
         assert!(extract_missing_paths(trace).is_empty());
+    }
+
+    #[test]
+    fn extracts_diagnostics_for_disk_full_and_missing_command() {
+        assert!(extract_diagnostics("cp: error writing '/out': No space left on device")
+            .iter()
+            .any(|d| d.contains("disk full")));
+        let d = extract_diagnostics("bash: line 1: ghostscript: command not found");
+        assert!(d.iter().any(|s| s.contains("ghostscript") && s.contains("missing executable")));
+        // Clean trace → no diagnostics.
+        assert!(extract_diagnostics("all good here").is_empty());
     }
 
     #[test]
