@@ -22,8 +22,25 @@ pub struct AxiomConfig {
     pub norm_eps: f32,
 }
 
-impl Default for AxiomConfig {
-    fn default() -> Self {
+impl AxiomConfig {
+    /// Small CPU-friendly runtime dims — what the server, prime, bench, and the
+    /// init bootstrap actually instantiate when no scaled checkpoint is present.
+    pub fn runtime_small() -> Self {
+        Self {
+            d_model: 64,
+            n_layers: 2,
+            vocab_size: 256,
+            lr_inner: 1e-3,
+            norm_eps: 1e-6,
+        }
+    }
+
+    /// The 7B-scale architectural blueprint. NEVER instantiate a runtime model
+    /// from this on commodity hardware: materialising 32 layers of
+    /// [4096 × 4096] fast-weights hangs/OOMs a CPU host (observed). It exists
+    /// for documentation and sizing math only — which is why `Default` is the
+    /// safe runtime config instead.
+    pub fn blueprint_7b() -> Self {
         Self {
             d_model: 4096,
             n_layers: 32,
@@ -31,6 +48,12 @@ impl Default for AxiomConfig {
             lr_inner: 1e-3,
             norm_eps: 1e-6,
         }
+    }
+}
+
+impl Default for AxiomConfig {
+    fn default() -> Self {
+        Self::runtime_small()
     }
 }
 
