@@ -188,6 +188,26 @@ What actually happens on a failure:
 5. **Persist (opt-in)** — with `AXIOM_RUN_VIBE=1`, the run's adapted W̃ is
    EMA-merged into the master vibe on completion: the program's failure history
    becomes memory that outlives the process.
+6. **Learned immunity** — every successful heal is remembered against a stable
+   fingerprint of the command (`~/.axiom/heal_memory.json`, human-auditable;
+   `AXIOM_HEAL_MEMORY` overrides the path, `0`/`off` disables). The next run of
+   the same program — even in a **fresh environment** — is immunized first:
+   remembered directories are re-created *before* the first attempt, so the
+   failure never recurs. The memory also tracks each program's failure-tension
+   history (running CE mean) and classifies every new failure as
+   **FIRST / KNOWN / NOVEL** against it — the drift gate aimed at a program's
+   own life history. Run a program once: crash → heal → success. Wipe the
+   environment and run it again: `immunity: pre-created remembered directory …`
+   → success on attempt 1 with **zero failure tokens absorbed**.
+7. **Swarm immunity** — heals learned anywhere immunize the whole fleet. The
+   server exports its heal memory at `GET /v1/immunity` and accepts a peer's at
+   `POST /v1/immunity/merge`; `axiom swarm immunity <host:port>` pulls a peer
+   and merges in one command. Merges are conservative: directory lists are
+   unioned, tension histories combine as a count-weighted mean (a peer with 100
+   observed failures outweighs one with 2), and local learning is never
+   weakened. Demonstrated: a program crashes once on node A; node B runs
+   `axiom swarm immunity nodeA:3000`; the same program then succeeds
+   **first-try on node B, where it had never run before**.
 
 Honesty notes: source-artifact patching lives in the Poly JIT hypervisor path,
 not here; restarting a process is not literally resuming a suspended thread

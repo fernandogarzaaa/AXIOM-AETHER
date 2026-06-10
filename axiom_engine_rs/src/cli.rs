@@ -87,6 +87,12 @@ pub enum SwarmCommand {
         /// Peer IP or host:port. Bare hosts default to port 9191.
         ip: String,
     },
+    /// Pull a peer's heal memory and merge it into this node's (swarm
+    /// immunity): heals learned anywhere in the fleet immunize this machine.
+    Immunity {
+        /// Peer Axiom server, host:port (the HTTP proxy port, e.g. 3000).
+        peer: String,
+    },
 }
 
 #[derive(Debug)]

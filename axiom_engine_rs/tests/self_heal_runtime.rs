@@ -44,10 +44,29 @@ fn supervise_with_vibe(
     max_restarts: usize,
     vibe_path: Option<PathBuf>,
 ) -> axiom_engine::self_heal::RunReport {
+    supervise_full(pipeline, cmd, args, max_restarts, vibe_path, None)
+}
+
+fn supervise_full(
+    pipeline: InferencePipeline,
+    cmd: String,
+    args: Vec<String>,
+    max_restarts: usize,
+    vibe_path: Option<PathBuf>,
+    heal_memory: Option<PathBuf>,
+) -> axiom_engine::self_heal::RunReport {
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
-            run_supervised(&pipeline, &cmd, &args, max_restarts, vibe_path.as_deref()).unwrap()
+            run_supervised(
+                &pipeline,
+                &cmd,
+                &args,
+                max_restarts,
+                vibe_path.as_deref(),
+                heal_memory.as_deref(),
+            )
+            .unwrap()
         })
         .unwrap()
         .join()
@@ -171,6 +190,89 @@ fn transient_retries_are_bounded() {
     assert!(!report.success);
     assert_eq!(report.attempts, 3, "1 attempt + MAX_TRANSIENT_RETRIES");
     assert_eq!(report.heals.len(), 2);
+}
+
+#[test]
+fn learned_immunity_pre_heals_a_fresh_environment() {
+    use axiom_engine::self_heal::Heal::{CreatedDirectory, Immunized};
+
+    let base = unique_tmp("immunity");
+    let out_dir = base.join("out");
+    let target = out_dir.join("result.txt");
+    let memory = unique_tmp("immunity_mem").with_extension("json");
+    let script = format!("echo run-output > {}", target.display());
+    let args = vec!["-c".to_string(), script];
+
+    // Run 1: fails on the missing dir, heals reactively, succeeds, learns.
+    let first = supervise_full(
+        tiny_pipeline(),
+        "sh".into(),
+        args.clone(),
+        3,
+        None,
+        Some(memory.clone()),
+    );
+    assert!(first.success);
+    assert_eq!(first.attempts, 2);
+    assert_eq!(first.heals, vec![CreatedDirectory(out_dir.clone())]);
+
+    // Fresh environment: the directory is gone again.
+    std::fs::remove_dir_all(&base).unwrap();
+    assert!(!out_dir.exists());
+
+    // Run 2: immunity pre-creates the remembered dir → zero failures.
+    let second = supervise_full(
+        tiny_pipeline(),
+        "sh".into(),
+        args,
+        3,
+        None,
+        Some(memory.clone()),
+    );
+    assert!(second.success);
+    assert_eq!(second.attempts, 1, "immunized run must succeed first try");
+    assert_eq!(second.heals, vec![Immunized(out_dir.clone())]);
+    assert_eq!(second.tokens_absorbed, 0, "no failure ever happened");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap().trim(),
+        "run-output"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_file(&memory);
+}
+
+#[test]
+fn immunity_is_per_command_fingerprint() {
+    // A different command line must not inherit another program's immunity.
+    let base = unique_tmp("immunity_other");
+    let memory = unique_tmp("immunity_other_mem").with_extension("json");
+    let script_a = format!("echo a > {}", base.join("a").join("f.txt").display());
+
+    let first = supervise_full(
+        tiny_pipeline(),
+        "sh".into(),
+        vec!["-c".into(), script_a],
+        3,
+        None,
+        Some(memory.clone()),
+    );
+    assert!(first.success);
+
+    // Different command: must start with no immunity heals applied.
+    let other = supervise_full(
+        tiny_pipeline(),
+        "sh".into(),
+        vec!["-c".into(), "true".into()],
+        3,
+        None,
+        Some(memory.clone()),
+    );
+    assert!(other.success);
+    assert!(other.heals.is_empty(), "no inherited immunity across commands");
+
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_file(&memory);
 }
 
 #[test]

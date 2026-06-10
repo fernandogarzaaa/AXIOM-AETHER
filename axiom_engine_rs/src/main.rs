@@ -15,6 +15,7 @@ mod embedder;
 mod encoder;
 mod hamiltonian;
 mod hardware;
+mod heal_memory;
 mod inference;
 mod jit_streamer;
 mod kernel;
@@ -676,6 +677,13 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|_| std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH))
             });
+            // Learned immunity is on by default (~/.axiom/heal_memory.json);
+            // AXIOM_HEAL_MEMORY overrides the path, "0"/"off" disables it.
+            let heal_memory_path = match std::env::var("AXIOM_HEAL_MEMORY") {
+                Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
+                Ok(v) => Some(std::path::PathBuf::from(v)),
+                Err(_) => dirs::home_dir().map(|h| h.join(".axiom").join("heal_memory.json")),
+            };
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
                 .spawn(move || {
@@ -685,6 +693,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                         &args,
                         max_restarts,
                         vibe_path.as_deref(),
+                        heal_memory_path.as_deref(),
                     )
                 })
                 .map_err(|e| candle_core::Error::Msg(format!("supervisor thread failed: {e}")))?
@@ -716,6 +725,41 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 );
                 println!("[axiom] config: {}", paths.config.display());
                 println!("[axiom] restart the daemon to apply updated peer routing.");
+            }
+            SwarmCommand::Immunity { peer } => {
+                // Resolve the same local memory the supervisor learns into.
+                let local = match std::env::var("AXIOM_HEAL_MEMORY") {
+                    Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
+                    Ok(v) => Some(std::path::PathBuf::from(v)),
+                    Err(_) => dirs::home_dir().map(|h| h.join(".axiom").join("heal_memory.json")),
+                };
+                let Some(local) = local else {
+                    return Err(candle_core::Error::Msg(
+                        "heal memory disabled (AXIOM_HEAL_MEMORY=0) — nothing to merge into".into(),
+                    ));
+                };
+                let base = if peer.starts_with("http://") || peer.starts_with("https://") {
+                    peer.clone()
+                } else {
+                    format!("http://{peer}")
+                };
+                let url = format!("{}/v1/immunity", base.trim_end_matches('/'));
+                let peer_json = reqwest::blocking::get(&url)
+                    .and_then(|r| r.error_for_status())
+                    .and_then(|r| r.text())
+                    .map_err(|e| candle_core::Error::Msg(format!("peer fetch failed: {e}")))?;
+                let mut memory = heal_memory::HealMemory::load(&local);
+                let report = memory
+                    .merge_json(&peer_json)
+                    .map_err(candle_core::Error::Msg)?;
+                memory
+                    .save()
+                    .map_err(|e| candle_core::Error::Msg(format!("memory save failed: {e}")))?;
+                println!(
+                    "[axiom] swarm immunity merged from {url}: +{} new program(s), {} merged, +{} dir(s)",
+                    report.programs_added, report.programs_merged, report.dirs_added
+                );
+                println!("[axiom] local memory: {}", local.display());
             }
         },
     }
