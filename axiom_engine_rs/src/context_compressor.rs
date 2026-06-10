@@ -453,6 +453,10 @@ pub struct CompressionControls {
     messages_compressed: std::sync::atomic::AtomicU64,
     bytes_in: std::sync::atomic::AtomicU64,
     bytes_out: std::sync::atomic::AtomicU64,
+    /// Count of requests where the compressed forward failed and we transparently
+    /// retried upstream with the original uncompressed payload (graceful
+    /// degradation — a compression-side fault never costs the client a turn).
+    degraded_fallbacks: std::sync::atomic::AtomicU64,
 }
 
 impl CompressionControls {
@@ -465,6 +469,7 @@ impl CompressionControls {
             messages_compressed: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
+            degraded_fallbacks: AtomicU64::new(0),
         }
     }
 
@@ -493,6 +498,19 @@ impl CompressionControls {
         self.bytes_out.fetch_add(bytes_out, Relaxed);
     }
 
+    /// Record one transparent uncompressed-retry after a recoverable compressed
+    /// forward failure (see `should_retry_uncompressed`).
+    pub fn record_degraded_fallback(&self) {
+        self.degraded_fallbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Number of requests served via the uncompressed fallback path.
+    pub fn degraded_fallbacks(&self) -> u64 {
+        self.degraded_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// (requests, messages_compressed, bytes_in, bytes_out)
     pub fn counters(&self) -> (u64, u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -502,6 +520,32 @@ impl CompressionControls {
             self.bytes_in.load(Relaxed),
             self.bytes_out.load(Relaxed),
         )
+    }
+}
+
+/// Decide whether a failed *compressed* upstream forward should be retried once
+/// with the original uncompressed payload.
+///
+/// The contract: a fault introduced by Axiom's own compression (or a transient
+/// upstream/network hiccup) must never cost the client their turn. We retry when
+/// the original payload has a real chance of succeeding where the compressed one
+/// failed, and we deliberately do **not** retry failures the original payload
+/// cannot fix:
+///
+/// * `Network` — transient connectivity / upstream reset → retry.
+/// * `Upstream { 5xx }` — upstream server error → retry.
+/// * `Upstream { 400 }` — a Bad Request that our injected fingerprint/skeleton
+///   block plausibly caused → retry with the untouched body.
+/// * `Upstream { 401/403/407/429/other 4xx }` — auth, permission, or rate-limit.
+///   The original payload cannot fix these and re-sending a 429 is harmful → no retry.
+/// * `MissingAuth` / `Decode` — no credential, or we *did* get a response we just
+///   could not parse → retrying the original changes nothing → no retry.
+pub fn should_retry_uncompressed(err: &crate::anthropic_forwarder::ForwarderError) -> bool {
+    use crate::anthropic_forwarder::ForwarderError;
+    match err {
+        ForwarderError::Network(_) => true,
+        ForwarderError::Upstream { status, .. } => *status >= 500 || *status == 400,
+        ForwarderError::Decode(_) | ForwarderError::MissingAuth => false,
     }
 }
 
