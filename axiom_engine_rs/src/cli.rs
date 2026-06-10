@@ -46,6 +46,11 @@ pub struct InitArgs {
     /// Skip automatic base-model download during initialization.
     #[arg(long)]
     pub no_fetch: bool,
+    /// Skip bootstrapping a local checkpoint. By default `init` trains a small
+    /// model locally (no network) when none exists, so the proxy never boots on
+    /// random weights.
+    #[arg(long)]
+    pub no_train: bool,
 }
 
 #[derive(Debug, Subcommand)]

@@ -1,4 +1,5 @@
 pub mod anthropic_forwarder;
+pub mod bootstrap;
 pub mod claude_backend;
 pub mod cluster;
 pub mod config;
