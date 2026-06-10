@@ -269,6 +269,36 @@ not here; restarting a process is not literally resuming a suspended thread
 sits near `ln(vocab)` (uniform) — the tension *plumbing* is always real, the
 sharpness of the signal comes from the trained semantic model.
 
+### Making the tension signal sharp (CPU training)
+
+The tension/drift signal is only as discriminative as the model behind it. One
+command trains a real, converged checkpoint on a commodity CPU (no GPU):
+
+```bash
+./scripts/train_cpu_quickstart.sh
+```
+
+It stages a corpus from the repo's own source + docs, trains a vocab-8000
+ByteLevel BPE tokenizer, trains a d128/2-layer TTT model under early-stopping on
+held-out cross-entropy, and runs the acceptance eval. A validated 4-core CPU run
+(~17 min, step cap 4000):
+
+| Metric | Value |
+|---|---|
+| val_ce (held-out, train split) | **4.93** (vs uniform `ln(8000)=8.99`) |
+| held-out CE (unseen `server.rs`) | 4.41 |
+| clean code CE | ~4.7 |
+| **anomaly CE** (high-entropy fixture) | **9.74** |
+| **drift separation margin** | **+4.93** → ACCEPTANCE **PASS** |
+| recalibrated drift gate | 7.28 |
+
+With this model active (`AXIOM_PRODUCTION_BPE=1`), a process-failure trace in
+`axiom run` scores a real CE (~7.6, above the 7.28 gate → correctly flagged
+anomalous) instead of the flat `ln(vocab)` of the bootstrap model — so the
+FIRST/KNOWN/NOVEL classification and the drift gate become genuinely meaningful.
+For a larger/lower-CE model, raise `AXIOM_DMODEL`/`AXIOM_NLAYERS`/`AXIOM_MAX_TOKENS`
+(slower per step on CPU), or use `scripts/train_d384.sh` on a 6 GB GPU.
+
 ---
 
 ## Quick Start
