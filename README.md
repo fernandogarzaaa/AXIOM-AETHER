@@ -19,6 +19,7 @@ It runs as a local-first Rust runtime with several compatible surfaces:
    Q-TTT simulated tensor optimization, SR-TTT exact residual memory, DWE binary
    tensor deltas, and localized swarm telemetry.
 
+[![CI](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/ci.yml/badge.svg)](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/ci.yml)
 [![Release Binaries](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/release.yml/badge.svg)](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/release.yml)
 [![Docker](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/docker.yml/badge.svg)](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/docker.yml)
 
@@ -117,6 +118,7 @@ verified end-to-end through the proxy:
 | **Claude-readable digest** | The opaque neural fingerprint (vocab indices + Frobenius norms) is meaningless to a *different* model, so compressing real code made answers worse. Axiom now ships a **structural skeleton** — doc summary + imports + declaration signatures, bodies elided — that Claude can actually read. Axiom's TTT capability is untouched (the session still absorbs the context); the drift signal (`recall_norm` + `state_hash`) rides along as digest attributes. **~80 % smaller on the wire, still answerable.** (`src/skeleton.rs`) |
 | **Multi-language + prose-safe** | The skeletonizer covers Rust/Go/Python/JS-TS/Java/C#, detects brace-language methods with no leading keyword, excludes control-flow headers, and falls back to a head+tail **prose excerpt** for non-code so plain text is never erased. |
 | **Hardware auto-optimization** | `src/hardware.rs` + `--mode doctor`: detects GPU/VRAM/CPU/RAM and recommends safe per-role devices. A **co-tenancy guard** keeps the proxy on CPU whenever a training job holds the GPU — the fix for VRAM OOM contention on small cards. `--device auto` honours it. |
+| **Graceful degradation** | A compression-side fault never costs you a turn. If a *compressed* `/v1/messages` or `/v1/chat/completions` forward fails in a recoverable way (transient network, upstream `5xx`, or a `400` the injected digest could have caused), the proxy retries **once** with the original uncompressed payload. Auth / rate-limit / permission failures (`401/403/407/429`) are surfaced immediately — never retried. The fallback count is exposed at `GET /v1/config` (`counters.degraded_fallbacks`). |
 
 ---
 
