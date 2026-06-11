@@ -33,6 +33,7 @@ mod openai_forwarder;
 mod pairs;
 mod poly_jit;
 mod prime;
+mod provenance;
 mod q_manifold;
 mod quantization;
 mod sandbox;
@@ -836,10 +837,29 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     format!("http://{peer}")
                 };
                 let url = format!("{}/v1/immunity", base.trim_end_matches('/'));
-                let peer_json = reqwest::blocking::get(&url)
+                let fetched = reqwest::blocking::get(&url)
                     .and_then(|r| r.error_for_status())
                     .and_then(|r| r.text())
                     .map_err(|e| candle_core::Error::Msg(format!("peer fetch failed: {e}")))?;
+                // Verify the peer's tamper-evident provenance before trusting it
+                // (full SHA-256 always; HMAC when AXIOM_FLEET_KEY is set).
+                let fleet_key = std::env::var("AXIOM_FLEET_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())
+                    .map(|k| k.into_bytes());
+                let peer_json = match serde_json::from_str::<provenance::SignedExport>(&fetched) {
+                    Ok(export) => provenance::verify_export(&export, fleet_key.as_deref())
+                        .map(str::to_string)
+                        .map_err(|e| {
+                            candle_core::Error::Msg(format!("peer provenance rejected: {e}"))
+                        })?,
+                    Err(_) if fleet_key.is_some() => {
+                        return Err(candle_core::Error::Msg(
+                            "AXIOM_FLEET_KEY set but peer returned an unsigned payload".into(),
+                        ))
+                    }
+                    Err(_) => fetched, // back-compat: unsigned peer
+                };
                 let mut memory = heal_memory::HealMemory::load(&local);
                 let report = memory
                     .merge_json(&peer_json)
@@ -848,8 +868,9 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     .save()
                     .map_err(|e| candle_core::Error::Msg(format!("memory save failed: {e}")))?;
                 println!(
-                    "[axiom] swarm immunity merged from {url}: +{} new program(s), {} merged, +{} dir(s)",
-                    report.programs_added, report.programs_merged, report.dirs_added
+                    "[axiom] swarm immunity merged from {url}: +{} new program(s), {} merged, +{} dir(s), {} conflict(s), {} byzantine-rejected",
+                    report.programs_added, report.programs_merged, report.dirs_added,
+                    report.belief_conflicts, report.byzantine_rejected
                 );
                 println!("[axiom] local memory: {}", local.display());
             }
