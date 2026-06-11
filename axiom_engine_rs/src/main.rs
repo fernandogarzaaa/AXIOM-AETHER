@@ -1,3 +1,4 @@
+mod adaptive;
 mod anthropic_forwarder;
 mod bench;
 mod belief;

@@ -2010,10 +2010,41 @@ async fn compressed_messages_path(
     let cfg = state.compressor_config.clone();
     // Threshold is read live from the runtime controls so a dashboard can retune
     // it without a restart; top_k stays a startup constant.
-    let threshold = state.controls.threshold();
+    let base_threshold = state.controls.threshold();
     let top_k = cfg.recall_top_k;
 
-    let partitioned = partition_messages_for_state(state, &messages, threshold)?;
+    let mut threshold = base_threshold;
+    let mut partitioned = partition_messages_for_state(state, &messages, threshold)?;
+
+    // Confidence-gated adaptive compression (opt-in, AXIOM_ADAPTIVE_COMPRESS=1):
+    // if the heavy context is surprising to the model (CE above the drift gate
+    // → novel/high-information, unsafe to skeletonize), raise the threshold so
+    // more is forwarded verbatim. The drift signal that flags hallucination on
+    // the response path here gates the compression budget on the request path.
+    if std::env::var("AXIOM_ADAPTIVE_COMPRESS").as_deref() == Ok("1")
+        && !partitioned.heavy_context.is_empty()
+    {
+        let heavy_text = partitioned
+            .heavy_context
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(ce) = mean_surprisal(state, &heavy_text) {
+            let gate = std::env::var("AXIOM_DRIFT_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(7.03);
+            let eff = crate::adaptive::adaptive_threshold(base_threshold, ce, gate);
+            if eff != threshold {
+                eprintln!(
+                    "[axiom-ttt] adaptive compression: heavy surprisal {ce:.2} vs gate {gate:.2} → threshold {threshold} -> {eff}"
+                );
+                threshold = eff;
+                partitioned = partition_messages_for_state(state, &messages, threshold)?;
+            }
+        }
+    }
 
     // Resolve / create the TTT session. Precedence: the X-Axiom-Session-Id
     // header (passed in as session_override), then a body `session_id`, then
@@ -2226,12 +2257,96 @@ async fn compressed_messages_path(
         }
     };
 
+    // Self-correction (opt-in, AXIOM_GROUND_CORRECT=1): if the answer makes
+    // claims unsupported by the absorbed context, send ONE bounded follow-up
+    // asking the model to revise grounded in that context, and return the
+    // revision. Moves from *flagging* hallucinations to *reducing* them. Costs
+    // one extra upstream call only when claims are actually flagged.
+    if std::env::var("AXIOM_GROUND_CORRECT").as_deref() == Ok("1") {
+        if let Some(revised) =
+            ground_correct_round(&forwarder, client_auth, &outbound, &forwarded, &heavy_combined)
+                .await
+        {
+            forwarded = revised;
+        }
+    }
+
     // Auto grounding-verification (opt-in): annotate the response in place with
     // any claims not grounded in the context we just absorbed — hallucination
     // flagging with nobody asking. Never alters the answer text itself; appends
     // a clearly-marked advisory only when claims are flagged.
     annotate_response_grounding(&mut forwarded, &heavy_combined);
     Ok(forwarded)
+}
+
+/// Extract the concatenated assistant text from an Anthropic `/v1/messages`
+/// response (`content[].text`).
+fn assistant_text(value: &Value) -> String {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// One bounded self-correction round. Returns the revised response only if the
+/// answer had unsupported claims AND the corrective re-ask succeeded; otherwise
+/// `None` (caller keeps the original). The follow-up reuses the *compressed*
+/// outbound context, so correction stays token-efficient.
+async fn ground_correct_round(
+    forwarder: &AnthropicForwarder,
+    client_auth: &ClientAuth,
+    outbound: &Value,
+    forwarded: &Value,
+    evidence: &str,
+) -> Option<Value> {
+    if evidence.trim().is_empty() {
+        return None;
+    }
+    let answer = assistant_text(forwarded);
+    let report = crate::hallucination::verify(&answer, evidence);
+    let flagged = report.flagged();
+    if flagged.is_empty() {
+        return None;
+    }
+    let claim_list = flagged
+        .iter()
+        .map(|c| format!("- {}", c.claim))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let correction = format!(
+        "Your previous answer contained claims that are NOT supported by the provided context:\n{claim_list}\n\n\
+         Revise your answer so every factual claim is grounded in the provided context. \
+         Remove or explicitly mark as uncertain anything the context does not support. \
+         Return only the corrected answer."
+    );
+
+    // Build the follow-up: the (compressed) turns we sent + the assistant's
+    // answer + the correction request.
+    let mut payload = outbound.clone();
+    let messages = payload.get_mut("messages").and_then(Value::as_array_mut)?;
+    messages.push(serde_json::json!({"role": "assistant", "content": answer}));
+    messages.push(serde_json::json!({"role": "user", "content": correction}));
+
+    match forwarder.forward_messages_json(&payload, client_auth).await {
+        Ok(revised) => {
+            eprintln!(
+                "[axiom-ttt] self-correction: re-asked to ground {} flagged claim(s)",
+                flagged.len()
+            );
+            Some(revised)
+        }
+        Err(e) => {
+            eprintln!("[axiom-ttt] self-correction skipped (re-ask failed: {e})");
+            None
+        }
+    }
 }
 
 /// Pure: the grounding advisory block for an assistant `text` against
@@ -3117,6 +3232,16 @@ fn claim_ce(pipeline: &InferencePipeline, states: &[candle_core::Tensor], ids: &
     candle_nn::loss::cross_entropy(&l2d, &tgt).ok()?.to_scalar::<f32>().ok()
 }
 
+/// Mean next-token cross-entropy of `text` under a fresh (unadapted) model —
+/// "how surprising is this to the model." Bounded to a token budget so the
+/// adaptive-compression gate stays cheap. Locks the pipeline briefly.
+fn mean_surprisal(state: &AppState, text: &str) -> Option<f32> {
+    let pipeline = state.pipeline.lock().ok()?;
+    let ids: Vec<u32> = pipeline.encode_text(text).into_iter().take(256).collect();
+    let states = pipeline.init_session_states().ok()?;
+    claim_ce(&pipeline, &states, &ids)
+}
+
 /// Neural-surprisal grounding lifts per claim: `CE_base − CE_context`, where the
 /// context is absorbed into W̃ via TTT once and reused. Positive ⇒ the absorbed
 /// evidence predicts the claim (grounded). Returns a map claim→lift.
@@ -3674,6 +3799,62 @@ mod tests {
         .expect("ungrounded claim must produce an advisory");
         assert!(block.contains("<axiom_grounding"));
         assert!(block.contains("COBOL") || block.contains("moon"));
+    }
+
+    async fn start_mock_upstream(reply_text: &'static str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "content": [{"type": "text", "text": reply_text}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (format!("http://{addr}"), calls)
+    }
+
+    #[tokio::test]
+    async fn self_correction_reasks_and_returns_grounded_revision() {
+        use std::sync::atomic::Ordering;
+        // Mock upstream returns a grounded revision on the corrective re-ask.
+        let (base, calls) = start_mock_upstream("Axiom uses online test-time training.").await;
+        let forwarder = crate::anthropic_forwarder::AnthropicForwarder::new(Some("k".into()), Some(base));
+        let outbound = serde_json::json!({"model":"m","max_tokens":64,
+            "messages":[{"role":"user","content":"summarize the doc"}]});
+        let ungrounded = serde_json::json!({"content":[{"type":"text",
+            "text":"Axiom was funded by NASA in 1972."}]});
+        let evidence = "Axiom is an inference engine with online test-time training.";
+        let revised = ground_correct_round(&forwarder, &ClientAuth::default(), &outbound, &ungrounded, evidence).await;
+        assert!(revised.is_some(), "flagged claim must trigger a corrective re-ask");
+        assert!(assistant_text(&revised.unwrap()).contains("test-time training"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one corrective re-ask");
+    }
+
+    #[tokio::test]
+    async fn self_correction_is_noop_when_answer_is_grounded() {
+        use std::sync::atomic::Ordering;
+        let (base, calls) = start_mock_upstream("unused").await;
+        let forwarder = crate::anthropic_forwarder::AnthropicForwarder::new(Some("k".into()), Some(base));
+        let outbound = serde_json::json!({"model":"m","max_tokens":64,
+            "messages":[{"role":"user","content":"summarize"}]});
+        let grounded = serde_json::json!({"content":[{"type":"text",
+            "text":"Axiom uses online test-time training."}]});
+        let evidence = "Axiom is an inference engine with online test-time training.";
+        let revised = ground_correct_round(&forwarder, &ClientAuth::default(), &outbound, &grounded, evidence).await;
+        assert!(revised.is_none(), "grounded answer → no re-ask");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no upstream call when nothing is flagged");
     }
 
     #[test]

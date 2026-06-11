@@ -464,6 +464,26 @@ Exposed as `POST /v1/verify` and the **`axiom_verify`** MCP tool (which an agent
 calls before asserting facts from a document/codebase; it returns isError when
 any claim is unsupported, so the agent notices).
 
+### Self-correction (reduce, not just flag)
+
+With `AXIOM_GROUND_CORRECT=1`, when the model's answer contains claims
+unsupported by the absorbed context, the proxy sends ONE bounded follow-up
+asking it to revise grounded in that context, and returns the revision — moving
+from *flagging* hallucinations to *reducing* them. Costs one extra upstream call
+only when claims are actually flagged; the follow-up reuses the compressed
+context, so it stays token-efficient.
+
+### Confidence-gated adaptive compression
+
+With `AXIOM_ADAPTIVE_COMPRESS=1`, the drift signal gates the compression budget
+on the request path: predictable context (surprisal ≤ the drift gate) keeps the
+aggressive base threshold, while surprising/novel context (above the gate —
+which the model can't reconstruct and Claude needs verbatim) raises the
+threshold so more is forwarded intact. The same signal that flags hallucination
+on the response path decides how hard to compress on the request path.
+(`adaptive.rs` — bounded to ≤2× the base threshold; signal sharpens with the
+trained model.)
+
 ### Grounding-gated expansion — saving tokens *while* reducing hallucination
 
 The keystone that unifies Axiom's two goals: **the hallucination check controls
