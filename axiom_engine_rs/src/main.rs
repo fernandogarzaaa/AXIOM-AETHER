@@ -1,5 +1,6 @@
 mod anthropic_forwarder;
 mod bench;
+mod belief;
 mod bootstrap;
 mod claude_backend;
 mod cli;
