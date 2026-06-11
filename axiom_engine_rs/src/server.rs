@@ -2929,6 +2929,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/v1/swarm/matrix_state", get(swarm_matrix_state))
         .route("/v1/expand", post(expand_symbol_handler))
+        .route("/v1/verify", post(verify_grounding))
         .route("/v1/immunity", get(get_immunity))
         .route("/v1/immunity/merge", post(post_immunity_merge))
         .route("/v1/config", get(get_config).post(post_config))
@@ -3030,6 +3031,47 @@ fn inject_immunity_advisory(
         hints.len()
     );
     crate::anthropic_forwarder::prepend_block_to_last_user_turn(outbound, &block);
+}
+
+/// `POST /v1/verify` — grounding verification. Body:
+/// `{"response": "...", "evidence": "..."}`. Returns per-claim verdicts
+/// (SUPPORTED/UNSUPPORTED/UNVERIFIED) plus the grounded fraction and the
+/// flagged (unsupported) claims — flags hallucinations *relative to the
+/// supplied evidence*, not universal fact-checking.
+async fn verify_grounding(Json(body): Json<Value>) -> Response {
+    let response = body.get("response").and_then(Value::as_str).unwrap_or("");
+    let evidence = body.get("evidence").and_then(Value::as_str).unwrap_or("");
+    if response.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "response is required"})),
+        )
+            .into_response();
+    }
+    let report = crate::hallucination::verify(response, evidence);
+    let claims: Vec<Value> = report
+        .claims
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "claim": c.claim,
+                "verdict": c.verdict.to_string(),
+                "support": c.support,
+                "confidence": c.confidence.mean(),
+                "uncertainty": c.confidence.variance().sqrt(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "grounded_fraction": report.grounded_fraction,
+        "supported": report.supported,
+        "unsupported": report.unsupported,
+        "unverified": report.unverified,
+        "flagged": report.flagged().iter().map(|c| &c.claim).collect::<Vec<_>>(),
+        "claims": claims,
+        "note": "grounding verification against supplied evidence; lexical tier does not catch vocabulary-sharing contradictions",
+    }))
+    .into_response()
 }
 
 /// `GET /v1/immunity` — export this node's heal memory for swarm peers.

@@ -15,6 +15,7 @@ mod dwe;
 mod embedder;
 mod encoder;
 mod hamiltonian;
+mod hallucination;
 mod hardware;
 mod heal_memory;
 mod inference;
