@@ -54,6 +54,12 @@ pub struct ClaimVerdict {
     pub verdict: Verdict,
     /// Confidence in the verdict, carrying uncertainty (Beta over support).
     pub confidence: BetaBelief,
+    /// Optional neural grounding-lift: how much absorbing the context reduced
+    /// the claim's surprisal under W̃ (`CE_base − CE_context`). Positive ⇒ the
+    /// context predicts the claim (grounded); ≤0 ⇒ the context did not help —
+    /// the contradiction signature the lexical tier alone misses. `None` when
+    /// the neural tier was not run.
+    pub lift: Option<f32>,
 }
 
 /// Aggregate grounding report for a response.
@@ -167,41 +173,16 @@ fn best_support(claim_tokens: &[String], evidence_spans: &[Vec<String>]) -> f32 
     best
 }
 
-/// Verify a response's claims against `evidence`, returning a grounding report.
-pub fn verify(response: &str, evidence: &str) -> GroundingReport {
-    let evidence_spans: Vec<Vec<String>> = sentences(evidence)
-        .iter()
-        .map(|s| content_tokens(s))
-        .filter(|t| !t.is_empty())
-        .collect();
-
-    let mut claims = Vec::new();
+/// Recompute the aggregate report fields from a claim list.
+fn tally(claims: Vec<ClaimVerdict>) -> GroundingReport {
     let (mut supported, mut unsupported, mut unverified) = (0usize, 0usize, 0usize);
-
-    for claim in extract_claims(response) {
-        let toks = content_tokens(&claim);
-        let support = best_support(&toks, &evidence_spans);
-        let verdict = if support >= SUPPORT_HIGH {
-            supported += 1;
-            Verdict::Supported
-        } else if support < SUPPORT_LOW {
-            unsupported += 1;
-            Verdict::Unsupported
-        } else {
-            unverified += 1;
-            Verdict::Unverified
-        };
-        // Confidence in support, with evidence strength ∝ claim length so a
-        // short claim's verdict carries more uncertainty.
-        let strength = (toks.len() as f32).clamp(2.0, 12.0);
-        claims.push(ClaimVerdict {
-            claim,
-            support,
-            verdict,
-            confidence: BetaBelief::from_confidence(support, strength),
-        });
+    for c in &claims {
+        match c.verdict {
+            Verdict::Supported => supported += 1,
+            Verdict::Unsupported => unsupported += 1,
+            Verdict::Unverified => unverified += 1,
+        }
     }
-
     let total = claims.len();
     let grounded_fraction = if total == 0 {
         0.0
@@ -215,6 +196,73 @@ pub fn verify(response: &str, evidence: &str) -> GroundingReport {
         unverified,
         grounded_fraction,
     }
+}
+
+/// Verify a response's claims against `evidence`, returning a grounding report.
+pub fn verify(response: &str, evidence: &str) -> GroundingReport {
+    let evidence_spans: Vec<Vec<String>> = sentences(evidence)
+        .iter()
+        .map(|s| content_tokens(s))
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let mut claims = Vec::new();
+    for claim in extract_claims(response) {
+        let toks = content_tokens(&claim);
+        let support = best_support(&toks, &evidence_spans);
+        let verdict = if support >= SUPPORT_HIGH {
+            Verdict::Supported
+        } else if support < SUPPORT_LOW {
+            Verdict::Unsupported
+        } else {
+            Verdict::Unverified
+        };
+        // Confidence in support, with evidence strength ∝ claim length so a
+        // short claim's verdict carries more uncertainty.
+        let strength = (toks.len() as f32).clamp(2.0, 12.0);
+        claims.push(ClaimVerdict {
+            claim,
+            support,
+            verdict,
+            confidence: BetaBelief::from_confidence(support, strength),
+            lift: None,
+        });
+    }
+    tally(claims)
+}
+
+/// A lexically-"supported" claim is demoted only when absorbing the context
+/// made it *meaningfully more* surprising (lift below `-DEMOTE_MARGIN`) — the
+/// signature of a contradiction that merely reuses the vocabulary. A near-zero
+/// lift means "no signal" (e.g. a weak/untrained model) and must NOT override
+/// the lexical verdict, so the margin is strictly negative.
+const DEMOTE_MARGIN: f32 = 0.5;
+
+/// Verify, then refine with the **neural-surprisal tier**: `lift(claim)` returns
+/// `CE_base − CE_context` for the claim under W̃ (positive ⇒ the absorbed
+/// context predicts it). A lexically-Supported claim with non-positive lift is
+/// downgraded to Unverified — this is how Axiom catches the vocabulary-sharing
+/// *contradictions* the lexical tier alone cannot. `lift` returning `None`
+/// leaves a claim's lexical verdict untouched.
+pub fn verify_with_signals<S>(response: &str, evidence: &str, mut lift: S) -> GroundingReport
+where
+    S: FnMut(&str) -> Option<f32>,
+{
+    let base = verify(response, evidence);
+    let claims = base
+        .claims
+        .into_iter()
+        .map(|mut c| {
+            if let Some(l) = lift(&c.claim) {
+                c.lift = Some(l);
+                if c.verdict == Verdict::Supported && l < -DEMOTE_MARGIN {
+                    c.verdict = Verdict::Unverified;
+                }
+            }
+            c
+        })
+        .collect();
+    tally(claims)
 }
 
 /// Result of verifying with grounding-gated expansion: the report before any
@@ -405,6 +453,47 @@ mod tests {
         assert_eq!(report.after.claims[0].verdict, Verdict::Supported);
         assert_eq!(report.resolved_claims.len(), 1);
         assert!(report.after.grounded_fraction > report.before.grounded_fraction);
+    }
+
+    #[test]
+    fn neural_tier_catches_the_contradiction_lexical_misses() {
+        // The contradiction reuses the evidence's vocabulary, so the lexical tier
+        // alone scores it SUPPORTED (see verdict_contradiction_blind_spot). The
+        // neural tier supplies a non-positive grounding lift (the trained model
+        // is NOT helped by the context for this claim) → it is demoted.
+        let contradiction = "The drift gate does not separate clean code from anomalies.";
+        // Mock the lift the trained model would produce: ≤0 for the contradiction.
+        let report = verify_with_signals(contradiction, EVIDENCE, |_claim| Some(-1.2));
+        assert_eq!(
+            report.claims[0].verdict,
+            Verdict::Unverified,
+            "neural tier must demote a lexically-supported contradiction"
+        );
+        assert_eq!(report.claims[0].lift, Some(-1.2));
+    }
+
+    #[test]
+    fn neural_tier_no_signal_does_not_override_lexical() {
+        // A weak/untrained model yields ~0 lift for everything; that must NOT
+        // demote a lexically-grounded claim (no false positives on no signal).
+        let report = verify_with_signals(
+            "Axiom uses online test-time training.",
+            EVIDENCE,
+            |_claim| Some(0.0),
+        );
+        assert_eq!(report.claims[0].verdict, Verdict::Supported);
+    }
+
+    #[test]
+    fn neural_tier_keeps_genuinely_grounded_claims() {
+        // A real, grounded claim: positive lift (context predicts it) → stays Supported.
+        let report = verify_with_signals(
+            "Axiom uses online test-time training.",
+            EVIDENCE,
+            |_claim| Some(2.5),
+        );
+        assert_eq!(report.claims[0].verdict, Verdict::Supported);
+        assert_eq!(report.claims[0].lift, Some(2.5));
     }
 
     #[test]

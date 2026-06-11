@@ -3033,6 +3033,51 @@ fn inject_immunity_advisory(
     crate::anthropic_forwarder::prepend_block_to_last_user_turn(outbound, &block);
 }
 
+/// Mean next-token cross-entropy of `ids` through a clone of `states` (the
+/// states are not mutated). Mirrors `eval_model`/`self_heal` CE scoring.
+fn claim_ce(pipeline: &InferencePipeline, states: &[candle_core::Tensor], ids: &[u32]) -> Option<f32> {
+    if ids.len() < 2 {
+        return None;
+    }
+    let dev = pipeline.device();
+    let mut probe = states.to_vec();
+    let input = candle_core::Tensor::from_vec(ids[..ids.len() - 1].to_vec(), (1, ids.len() - 1), dev).ok()?;
+    let logits = pipeline.model().forward_lm(&input, &mut probe).ok()?;
+    let (_, t, v) = logits.dims3().ok()?;
+    let l2d = logits.squeeze(0).ok()?.reshape((t, v)).ok()?;
+    let tgt = candle_core::Tensor::from_vec(ids[1..].to_vec(), (ids.len() - 1,), dev).ok()?;
+    candle_nn::loss::cross_entropy(&l2d, &tgt).ok()?.to_scalar::<f32>().ok()
+}
+
+/// Neural-surprisal grounding lifts per claim: `CE_base − CE_context`, where the
+/// context is absorbed into W̃ via TTT once and reused. Positive ⇒ the absorbed
+/// evidence predicts the claim (grounded). Returns a map claim→lift.
+fn neural_lifts(
+    pipeline: &InferencePipeline,
+    evidence: &str,
+    claims: &[String],
+) -> std::collections::HashMap<String, f32> {
+    let mut out = std::collections::HashMap::new();
+    let base = match pipeline.init_session_states() {
+        Ok(s) => s,
+        Err(_) => return out,
+    };
+    let mut ctx = base.clone();
+    let ev_ids = pipeline.encode_text(evidence);
+    if adapt_session_blocking(pipeline, &mut ctx, &ev_ids).is_err() {
+        return out;
+    }
+    for claim in claims {
+        let ids = pipeline.encode_text(claim);
+        if let (Some(ce_base), Some(ce_ctx)) =
+            (claim_ce(pipeline, &base, &ids), claim_ce(pipeline, &ctx, &ids))
+        {
+            out.insert(claim.clone(), ce_base - ce_ctx);
+        }
+    }
+    out
+}
+
 /// `POST /v1/verify` — grounding verification. Body:
 /// `{"response": "...", "evidence": "..."}`. Returns per-claim verdicts
 /// (SUPPORTED/UNSUPPORTED/UNVERIFIED) plus the grounded fraction and the
@@ -3056,6 +3101,7 @@ async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>
             "support": c.support,
             "confidence": c.confidence.mean(),
             "uncertainty": c.confidence.variance().sqrt(),
+            "grounding_lift": c.lift,
         })
     };
 
@@ -3096,6 +3142,39 @@ async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>
             "flagged": report.after.flagged().iter().map(|c| &c.claim).collect::<Vec<_>>(),
             "claims": report.after.claims.iter().map(&claim_json).collect::<Vec<_>>(),
             "note": "tokens were spent only on claims the skeleton could not ground; expansion pulled only those claims' referenced symbols",
+        }))
+        .into_response();
+    }
+
+    // Neural-surprisal tier: when `neural:true`, compute per-claim grounding
+    // lift against the context-adapted W̃ and demote lexically-supported claims
+    // the model finds surprising (the contradiction-catcher). Model-dependent:
+    // sharp with the trained checkpoint, near-flat on the bootstrap model.
+    let neural = body.get("neural").and_then(Value::as_bool).unwrap_or(false);
+    if neural {
+        let claims = crate::hallucination::extract_claims(response);
+        let pipeline = state.pipeline.clone();
+        let evidence_s = evidence.to_string();
+        let lifts = tokio::task::spawn_blocking(move || {
+            let p = pipeline.lock().ok()?;
+            Some(neural_lifts(&p, &evidence_s, &claims))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        let report = crate::hallucination::verify_with_signals(response, evidence, |claim| {
+            lifts.get(claim).copied()
+        });
+        return Json(serde_json::json!({
+            "mode": "lexical+neural",
+            "grounded_fraction": report.grounded_fraction,
+            "supported": report.supported,
+            "unsupported": report.unsupported,
+            "unverified": report.unverified,
+            "flagged": report.flagged().iter().map(|c| &c.claim).collect::<Vec<_>>(),
+            "claims": report.claims.iter().map(&claim_json).collect::<Vec<_>>(),
+            "note": "neural tier demotes lexically-supported claims with non-positive grounding lift (surprisal under the context-adapted W̃); signal sharpness scales with the trained model",
         }))
         .into_response();
     }
