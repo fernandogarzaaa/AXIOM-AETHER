@@ -459,6 +459,28 @@ Exposed as `POST /v1/verify` and the **`axiom_verify`** MCP tool (which an agent
 calls before asserting facts from a document/codebase; it returns isError when
 any claim is unsupported, so the agent notices).
 
+### Grounding-gated expansion — saving tokens *while* reducing hallucination
+
+The keystone that unifies Axiom's two goals: **the hallucination check controls
+the token budget.** Compress aggressively (forward only the skeleton), then let
+grounding decide where it was unsafe to drop detail:
+
+```bash
+curl -s -XPOST localhost:3000/v1/verify -d '{
+  "response": "checksum computes the crc32 polynomial fold over the data.",
+  "evidence": "<the lean skeleton: signatures only>",
+  "session_id": "<compression session>", "expand": true
+}'
+# → grounded_fraction_before 0.0 → after 1.0
+#   expanded_symbols: ["checksum"]   (only the claim's dependency was un-compressed)
+```
+
+For each claim the skeleton cannot ground, Axiom expands **only that claim's
+referenced symbols** (via `/v1/expand` over the stored source) and re-verifies.
+Tokens are spent back *surgically* — never across the board — so compression
+stays maximal and precision is restored exactly where grounding proves it was
+needed. (`verify_with_gated_expansion`.)
+
 **Honest scope:** this checks *support against the supplied evidence*, not
 universal fact-checking. The lexical tier flags **unsupported** claims (no
 overlap) but — like every lexical verifier — does not reliably catch fluent

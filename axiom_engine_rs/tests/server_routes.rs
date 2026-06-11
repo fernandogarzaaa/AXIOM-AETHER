@@ -146,3 +146,49 @@ async fn list_models_returns_200() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn verify_grounding_gated_expansion_spends_tokens_only_where_needed() {
+    // Build state, store the full source for a session (as the compressor would),
+    // then verify a claim the skeleton alone cannot ground.
+    let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
+    let state = AppState::new(pipeline, "axiom-gate-test".to_string());
+    let full_source = "pub fn parse_header(buf: &[u8]) -> Header { read(buf) }\n\
+        pub fn checksum(data: &[u8]) -> u32 { computes crc32 polynomial fold over data }";
+    state.store_source("gate-1", full_source.to_string());
+    let app = create_router(state);
+
+    // Evidence = the lean skeleton (signatures only). The claim's detail lives
+    // only in the elided checksum body.
+    let body = serde_json::json!({
+        "response": "checksum computes the crc32 polynomial fold over the data.",
+        "evidence": "pub fn parse_header(buf: &[u8]) -> Header. pub fn checksum(data: &[u8]) -> u32.",
+        "session_id": "gate-1",
+        "expand": true,
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/verify")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    assert_eq!(v["mode"], "grounding_gated_expansion");
+    let before = v["grounded_fraction_before"].as_f64().unwrap();
+    let after = v["grounded_fraction_after"].as_f64().unwrap();
+    assert!(after > before, "expansion must improve grounding ({before} -> {after})");
+    assert!(
+        v["expanded_symbols"].as_array().unwrap().contains(&serde_json::json!("checksum")),
+        "only the referenced symbol should be expanded: {:?}",
+        v["expanded_symbols"]
+    );
+    assert!(v["expansion_bytes"].as_u64().unwrap() > 0);
+}
