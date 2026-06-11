@@ -2192,11 +2192,11 @@ async fn compressed_messages_path(
     })?;
 
     // First attempt: forward the lean, compressed payload.
-    match forwarder
+    let mut forwarded = match forwarder
         .forward_messages_json(&outbound, client_auth)
         .await
     {
-        Ok(value) => Ok(value),
+        Ok(value) => value,
         Err(err) => {
             // Graceful degradation: a compression-side fault (or a transient
             // upstream/network hiccup) must never cost the client their turn. If
@@ -2216,14 +2216,82 @@ async fn compressed_messages_path(
                 if let Some(obj) = fallback.as_object_mut() {
                     obj.remove("session_id");
                 }
-                return forwarder
+                forwarder
                     .forward_messages_json(&fallback, client_auth)
                     .await
-                    .map_err(map_anthropic_forwarder_error);
+                    .map_err(map_anthropic_forwarder_error)?
+            } else {
+                return Err(map_anthropic_forwarder_error(err));
             }
-            Err(map_anthropic_forwarder_error(err))
+        }
+    };
+
+    // Auto grounding-verification (opt-in): annotate the response in place with
+    // any claims not grounded in the context we just absorbed — hallucination
+    // flagging with nobody asking. Never alters the answer text itself; appends
+    // a clearly-marked advisory only when claims are flagged.
+    annotate_response_grounding(&mut forwarded, &heavy_combined);
+    Ok(forwarded)
+}
+
+/// Pure: the grounding advisory block for an assistant `text` against
+/// `evidence`, or `None` when nothing is flagged.
+fn grounding_advisory_block(text: &str, evidence: &str) -> Option<String> {
+    if text.trim().is_empty() || evidence.trim().is_empty() {
+        return None;
+    }
+    let report = crate::hallucination::verify(text, evidence);
+    let flagged = report.flagged();
+    if flagged.is_empty() {
+        return None;
+    }
+    let mut block = format!(
+        "\n\n<axiom_grounding grounded_fraction=\"{:.2}\">\nThe following claims are not grounded in the provided context — verify before relying on them:",
+        report.grounded_fraction
+    );
+    for c in &flagged {
+        block.push_str(&format!("\n  - {}", c.claim));
+    }
+    block.push_str("\n</axiom_grounding>");
+    Some(block)
+}
+
+/// Append a grounding advisory to the last `text` content block of an Anthropic
+/// `/v1/messages` response, in place. Opt-in via `AXIOM_VERIFY_RESPONSES=1`.
+fn annotate_response_grounding(value: &mut Value, evidence: &str) {
+    if std::env::var("AXIOM_VERIFY_RESPONSES").as_deref() != Ok("1") {
+        return;
+    }
+    // Concatenate assistant text blocks for verification.
+    let text: String = value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let Some(block) = grounding_advisory_block(&text, evidence) else {
+        return;
+    };
+    // Append to the last text block (or push one if none exist).
+    if let Some(blocks) = value.get_mut("content").and_then(Value::as_array_mut) {
+        if let Some(last) = blocks
+            .iter_mut()
+            .rev()
+            .find(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        {
+            if let Some(t) = last.get("text").and_then(Value::as_str) {
+                last["text"] = Value::String(format!("{t}{block}"));
+            }
+        } else {
+            blocks.push(serde_json::json!({"type": "text", "text": block}));
         }
     }
+    eprintln!("[axiom-ttt] grounding: appended advisory for ungrounded response claims");
 }
 
 /// Map an Anthropic [`ForwarderError`] onto the client-facing [`ApiError`].
@@ -3592,6 +3660,46 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use candle_core::{DType, Device};
     use tower::ServiceExt;
+
+    #[test]
+    fn grounding_advisory_only_when_claims_flagged() {
+        let evidence = "Axiom is an inference engine with online test-time training.";
+        // Fully grounded → no advisory.
+        assert!(grounding_advisory_block("Axiom uses online test-time training.", evidence).is_none());
+        // Ungrounded claim → advisory naming it.
+        let block = grounding_advisory_block(
+            "Axiom was written in COBOL and launched on the moon.",
+            evidence,
+        )
+        .expect("ungrounded claim must produce an advisory");
+        assert!(block.contains("<axiom_grounding"));
+        assert!(block.contains("COBOL") || block.contains("moon"));
+    }
+
+    #[test]
+    fn annotate_response_grounding_respects_env_flag() {
+        // Single test (sequential) to avoid racing on the process-global env var.
+        let evidence = "Axiom uses online test-time training.";
+        let make = || serde_json::json!({
+            "content": [{"type": "text", "text": "Axiom was funded by NASA in 1972."}]
+        });
+
+        // Disabled → response untouched.
+        std::env::remove_var("AXIOM_VERIFY_RESPONSES");
+        let mut off = make();
+        let before = off.clone();
+        annotate_response_grounding(&mut off, evidence);
+        assert_eq!(off, before, "disabled → response untouched");
+
+        // Enabled → advisory appended in place, original answer preserved.
+        std::env::set_var("AXIOM_VERIFY_RESPONSES", "1");
+        let mut on = make();
+        annotate_response_grounding(&mut on, evidence);
+        std::env::remove_var("AXIOM_VERIFY_RESPONSES");
+        let text = on["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("<axiom_grounding"), "advisory must be appended");
+        assert!(text.starts_with("Axiom was funded by NASA"), "original answer preserved");
+    }
 
     fn build_pipeline() -> InferencePipeline {
         use crate::config::AxiomConfig;
