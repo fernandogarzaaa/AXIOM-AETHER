@@ -439,6 +439,35 @@ during the loop).
 
 ---
 
+## Grounding verification (hallucination flagging)
+
+Axiom's honest answer to hallucination is **grounding verification**: flag the
+claims in a response that aren't supported by the supplied evidence/context —
+the material Axiom already absorbs. Default tier is deterministic and
+model-free (lexical containment); confidence is a Beta belief carrying
+uncertainty.
+
+```bash
+curl -s -XPOST localhost:3000/v1/verify -d '{
+  "response": "Axiom uses online test-time training. It was funded by NASA in 1972.",
+  "evidence": "Axiom is an inference engine with online test-time training ..."
+}'
+# → "It was funded by NASA in 1972" : UNSUPPORTED (flagged); grounded_fraction 0.5
+```
+
+Exposed as `POST /v1/verify` and the **`axiom_verify`** MCP tool (which an agent
+calls before asserting facts from a document/codebase; it returns isError when
+any claim is unsupported, so the agent notices).
+
+**Honest scope:** this checks *support against the supplied evidence*, not
+universal fact-checking. The lexical tier flags **unsupported** claims (no
+overlap) but — like every lexical verifier — does not reliably catch fluent
+*contradictions* that reuse the evidence's wording (the
+`verdict_contradiction_blind_spot` test pins this). An optional neural surprisal
+tier (against the context-adapted W̃) is the next rung.
+
+---
+
 ## Quick Start
 
 ### One-line install

@@ -339,6 +339,18 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "axiom_verify",
+                "description": "Grounding verification: given your draft `response` and the `evidence` it should be grounded in, flag factual claims NOT supported by that evidence (likely hallucinations relative to the context). Returns per-claim verdicts (SUPPORTED/UNSUPPORTED/UNVERIFIED), the grounded fraction, and the flagged claims. Use before asserting facts from a document/codebase. Note: this checks support against the supplied evidence; it is not universal fact-checking and the lexical tier does not catch contradictions that reuse the evidence's wording.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "response": { "type": "string", "description": "The answer/claims to verify." },
+                        "evidence": { "type": "string", "description": "The source text the response must be grounded in." }
+                    },
+                    "required": ["response", "evidence"]
+                }
+            },
+            {
                 "name": "axiom_immunity",
                 "description": "Report what Axiom has learned about program failures from supervised `axiom run` executions: the heals it now applies prophylactically (e.g. directories it pre-creates) and each program's failure-tension history. Use when debugging a command that fails in the user's environment — Axiom may already know the fix.",
                 "inputSchema": {
@@ -501,6 +513,31 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     success_response(id, tool_text_result(&format!("forget failed: {e}"), true))
                 }
             }
+        }
+        "axiom_verify" => {
+            let response = args.get("response").and_then(Value::as_str).unwrap_or("");
+            let evidence = args.get("evidence").and_then(Value::as_str).unwrap_or("");
+            if response.trim().is_empty() {
+                return error_response(id, -32602, "axiom_verify requires non-empty 'response'");
+            }
+            let report = crate::hallucination::verify(response, evidence);
+            let mut text = format!(
+                "Grounding: {}/{} claims supported ({:.0}% grounded).",
+                report.supported,
+                report.claims.len(),
+                report.grounded_fraction * 100.0
+            );
+            let flagged = report.flagged();
+            if flagged.is_empty() {
+                text.push_str(" No unsupported claims.");
+            } else {
+                text.push_str("\nUNSUPPORTED (not grounded in the evidence):");
+                for c in flagged {
+                    text.push_str(&format!("\n  - {}", c.claim));
+                }
+            }
+            // isError=true when anything is unsupported, so the agent notices.
+            success_response(id, tool_text_result(&text, report.unsupported > 0))
         }
         "axiom_immunity" => {
             let query = args
@@ -874,7 +911,7 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));

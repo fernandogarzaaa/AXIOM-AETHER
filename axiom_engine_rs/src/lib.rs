@@ -13,6 +13,7 @@ pub mod dwe;
 pub mod embedder;
 pub mod encoder;
 pub mod hamiltonian;
+pub mod hallucination;
 pub mod hardware;
 pub mod heal_memory;
 pub mod inference;
