@@ -405,6 +405,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_evidence_flags_all_claims() {
+        let r = verify("Axiom uses test-time training. It runs locally in Rust.", "");
+        assert!(r.claims.len() >= 2);
+        assert_eq!(r.supported, 0);
+        assert_eq!(r.flagged().len(), r.claims.len(), "no evidence => every claim unsupported");
+        assert_eq!(r.grounded_fraction, 0.0);
+    }
+
+    #[test]
     fn empty_response_has_no_claims() {
         let r = verify("", EVIDENCE);
         assert_eq!(r.claims.len(), 0);

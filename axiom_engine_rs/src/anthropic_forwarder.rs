@@ -70,6 +70,7 @@ impl AnthropicForwarder {
     ///   * **Auth-passthrough mode** — no env key (e.g. a Claude *subscription*
     ///     that authenticates via OAuth). The proxy relays the client's own
     ///     `Authorization` / `x-api-key` headers upstream verbatim.
+    ///
     /// The compression-mode flag is checked separately by
     /// [`CompressorConfig::from_env`].
     pub fn from_env() -> Option<Self> {

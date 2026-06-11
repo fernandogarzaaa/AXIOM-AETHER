@@ -181,6 +181,19 @@ mod tests {
     }
 
     #[test]
+    fn wrong_schema_is_rejected() {
+        let mut e = sign_export("payload", None);
+        e.schema = "not_axiom".into();
+        assert_eq!(verify_export(&e, None), Err(ProvenanceError::BadSchema));
+    }
+
+    #[test]
+    fn empty_payload_roundtrips() {
+        let e = sign_export("", None);
+        assert_eq!(verify_export(&e, None).unwrap(), "");
+    }
+
+    #[test]
     fn unsigned_roundtrip_verifies() {
         let e = sign_export("hello memory", None);
         assert_eq!(verify_export(&e, None).unwrap(), "hello memory");

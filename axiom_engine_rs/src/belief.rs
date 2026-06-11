@@ -158,6 +158,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_confidence_clamps_extremes_and_stays_finite() {
+        for c in [0.0f32, 1.0, -5.0, 9.0] {
+            let b = BetaBelief::from_confidence(c, 10.0);
+            assert!(b.alpha > 0.0 && b.beta > 0.0);
+            assert!(b.mean().is_finite() && b.variance().is_finite());
+        }
+    }
+
+    #[test]
     fn uncertainty_separates_one_success_from_many() {
         let mut few = BetaBelief::uniform();
         few.reinforce(); // 1/1 → Beta(2,1): high mean, high variance

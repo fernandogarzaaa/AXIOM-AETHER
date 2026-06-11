@@ -65,13 +65,24 @@ printf '#!/bin/sh\necho fail >&2\nexit 1\n' > "$TMP/verify.sh"
     && ok "solve repaired the source and reached green" || bad "solve did not reach green"
 
 step "grounding verification (server: flag an ungrounded claim) — Pillar against hallucination"
-AXIOM_TTT_COMPRESS=1 "$BIN" --mode server --port 38999 > "$TMP/srv.log" 2>&1 &
-SRV=$!
-for _ in $(seq 1 40); do curl -s -m1 http://127.0.0.1:38999/v1/models >/dev/null 2>&1 && break; sleep 0.25; done
-VERIFY=$(curl -s -m5 -X POST http://127.0.0.1:38999/v1/verify -H 'content-type: application/json' \
-    -d '{"response":"Axiom uses online test-time training. It was funded by NASA in 1972.","evidence":"Axiom is an inference engine with online test-time training."}')
-kill $SRV 2>/dev/null
-echo "$VERIFY" | grep -qiE "NASA|unsupported|flagged" && ok "verify flagged the ungrounded claim" || bad "verify did not flag"
+if ! command -v curl >/dev/null 2>&1; then
+    printf '  \033[33mSKIP\033[0m grounding (curl not available)\n'
+else
+    PORT="${AXIOM_DEMO_PORT:-38999}"
+    AXIOM_TTT_COMPRESS=1 "$BIN" --mode server --port "$PORT" > "$TMP/srv.log" 2>&1 &
+    SRV=$!
+    UP=0
+    for _ in $(seq 1 40); do curl -s -m1 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 && { UP=1; break; }; sleep 0.25; done
+    if [ "$UP" -eq 1 ]; then
+        VERIFY=$(curl -s -m5 -X POST "http://127.0.0.1:$PORT/v1/verify" -H 'content-type: application/json' \
+            -d '{"response":"Axiom uses online test-time training. It was funded by NASA in 1972.","evidence":"Axiom is an inference engine with online test-time training."}')
+        echo "$VERIFY" | grep -qiE "NASA|unsupported|flagged" && ok "verify flagged the ungrounded claim" || bad "verify did not flag"
+    else
+        bad "server did not come up on port $PORT"
+    fi
+    kill "$SRV" 2>/dev/null
+    wait "$SRV" 2>/dev/null
+fi
 
 step "summary"
 printf '\n  %d passed, %d failed\n\n' "$PASS" "$FAIL"
