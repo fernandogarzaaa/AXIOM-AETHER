@@ -3042,12 +3042,20 @@ async fn get_immunity(State(state): State<AppState>) -> Response {
             .into_response();
     };
     let memory = crate::heal_memory::HealMemory::load(path);
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        memory.to_json(),
-    )
-        .into_response()
+    // Wrap the export with tamper-evident provenance (full SHA-256 + optional
+    // HMAC when AXIOM_FLEET_KEY is set) so peers can verify before trusting.
+    let fleet_key = fleet_key();
+    let signed = crate::provenance::sign_export(&memory.to_json(), fleet_key.as_deref());
+    Json(signed).into_response()
+}
+
+/// The shared fleet secret for swarm-immunity authentication, from
+/// `AXIOM_FLEET_KEY`. `None` → exports are hashed but not signed.
+fn fleet_key() -> Option<Vec<u8>> {
+    std::env::var("AXIOM_FLEET_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .map(|k| k.into_bytes())
 }
 
 /// `POST /v1/immunity/merge` — fold a peer's exported heal memory into this
@@ -3063,7 +3071,33 @@ async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Res
             .into_response();
     };
     let mut memory = crate::heal_memory::HealMemory::load(path);
-    match memory.merge_json(&body) {
+    // If the body is a signed export, verify provenance before trusting it.
+    // A raw heal-memory JSON (no schema marker) is still accepted for
+    // back-compat — but if a fleet key is configured, unsigned input is refused.
+    let fleet_key = fleet_key();
+    let payload: String = match serde_json::from_str::<crate::provenance::SignedExport>(&body) {
+        Ok(export) => match crate::provenance::verify_export(&export, fleet_key.as_deref()) {
+            Ok(verified) => verified.to_string(),
+            Err(e) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": format!("provenance rejected: {e}")})),
+                )
+                    .into_response();
+            }
+        },
+        Err(_) if fleet_key.is_some() => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "fleet key configured but peer sent an unsigned (raw) payload"
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => body.clone(), // back-compat: unsigned raw payload, no key required
+    };
+    match memory.merge_json(&payload) {
         Ok(report) => {
             if let Err(e) = memory.save() {
                 return (
@@ -3077,6 +3111,8 @@ async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Res
                 "programs_added": report.programs_added,
                 "programs_merged": report.programs_merged,
                 "dirs_added": report.dirs_added,
+                "belief_conflicts": report.belief_conflicts,
+                "byzantine_rejected": report.byzantine_rejected,
             }))
             .into_response()
         }

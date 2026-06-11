@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::belief::BetaBelief;
+
 /// Current unix time in seconds (0 if the clock is before the epoch).
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -55,8 +57,9 @@ pub struct ProgramRecord {
     pub ce_mean: f32,
     /// Number of failures folded into `ce_mean`.
     pub ce_count: u32,
-    /// Stored (pre-decay) immunity confidence in 0..1. Defaulted for records
-    /// written before the confidence lifecycle existed.
+    /// Back-compat scalar mirror of `belief.mean()` (kept so older readers and
+    /// JSON inspection still see a confidence number). The Beta belief is the
+    /// source of truth.
     #[serde(default)]
     pub confidence: f32,
     /// Times immunizing this program preceded a successful run.
@@ -65,26 +68,52 @@ pub struct ProgramRecord {
     /// Unix seconds of the last confidence reinforcement (for waning).
     #[serde(default)]
     pub last_reinforced: u64,
+    /// Beta-distribution belief (estimate + uncertainty) — the source of truth
+    /// for confidence. `None` on legacy records; migrated from the scalar on
+    /// first access.
+    #[serde(default)]
+    pub belief: Option<BetaBelief>,
 }
 
 /// Half-life (days) of unreinforced immunity confidence.
 const CONFIDENCE_HALFLIFE_DAYS: f32 = 30.0;
-/// Confidence a heal starts at when first learned (tentative).
-const INITIAL_CONFIDENCE: f32 = 0.5;
-/// EMA rate at which successful reuse matures confidence toward 1.0.
-const MATURATION_RATE: f32 = 0.34;
-/// Decayed-confidence floor below which `prune_stale` forgets a record.
-const PRUNE_FLOOR: f32 = 0.05;
+/// A belief whose time-decay has pushed its variance to/above this (near the
+/// uniform prior's 0.083) has lost its evidence and is forgettable.
+const FADED_VARIANCE: f32 = 0.07;
+/// Cap on a peer-reported belief's total pseudocount mass — beyond this it is
+/// treated as fabricated certainty (byzantine) and rejected from a merge.
+const MAX_PEER_EVIDENCE: f32 = 1.0e4;
 
 impl ProgramRecord {
-    /// Confidence after time-decay relative to `now` (unix secs). Heals never
-    /// reinforced (`last_reinforced == 0`) report their stored confidence.
-    pub fn confidence_now(&self, now: u64) -> f32 {
-        if self.last_reinforced == 0 || self.confidence <= 0.0 {
-            return self.confidence;
+    /// The stored Beta belief, migrating a legacy scalar-confidence record into
+    /// a Beta on first access (evidence ≈ the immunization count).
+    fn base_belief(&self) -> BetaBelief {
+        self.belief.unwrap_or_else(|| {
+            if self.confidence > 0.0 {
+                BetaBelief::from_confidence(self.confidence, (self.immunizations + 2) as f32)
+            } else {
+                BetaBelief::uniform()
+            }
+        })
+    }
+
+    /// Time-decay factor in [0,1] since the last reinforcement (0 = none).
+    fn decay_factor(&self, now: u64) -> f32 {
+        if self.last_reinforced == 0 {
+            return 0.0;
         }
         let age_days = now.saturating_sub(self.last_reinforced) as f32 / 86_400.0;
-        self.confidence * 0.5f32.powf(age_days / CONFIDENCE_HALFLIFE_DAYS)
+        1.0 - 0.5f32.powf(age_days / CONFIDENCE_HALFLIFE_DAYS)
+    }
+
+    /// The belief regressed toward the uniform prior by its age (waning).
+    pub fn belief_now(&self, now: u64) -> BetaBelief {
+        self.base_belief().decayed(self.decay_factor(now))
+    }
+
+    /// Decayed mean — the scalar confidence, for callers that want a number.
+    pub fn confidence_now(&self, now: u64) -> f32 {
+        self.belief_now(now).mean()
     }
 
     /// A human label for a decayed-confidence value.
@@ -139,6 +168,11 @@ pub struct MergeReport {
     pub programs_merged: usize,
     /// New remembered directories gained from the peer.
     pub dirs_added: usize,
+    /// Programs whose belief was irreconcilable under Dempster-Shafer (peer and
+    /// local strongly disagreed) — the local belief was kept, peer's rejected.
+    pub belief_conflicts: usize,
+    /// Peer records rejected as byzantine (implausible belief parameters).
+    pub byzantine_rejected: usize,
 }
 
 /// Persistent heal memory, loaded eagerly and saved explicitly.
@@ -256,12 +290,13 @@ impl HealMemory {
         let now = now_secs();
         let mut out = format!("Acquired immunity ({} program(s)):\n", records.len());
         for r in records {
-            let c = r.confidence_now(now);
+            let belief = r.belief_now(now);
             out.push_str(&format!("\n• {}\n", r.command));
             out.push_str(&format!(
-                "    confidence: {:.2} ({}, immunizations: {})   failures observed: {}   mean tension (CE): {:.3}\n",
-                c,
-                ProgramRecord::confidence_label(c),
+                "    confidence: {:.2} ±{:.2} ({}, immunizations: {})   failures observed: {}   mean tension (CE): {:.3}\n",
+                belief.mean(),
+                belief.variance().sqrt(),
+                belief.label(),
                 r.immunizations,
                 r.ce_count,
                 r.ce_mean
@@ -312,10 +347,10 @@ impl HealMemory {
                     .map(|d| d.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                let c = r.confidence_now(now_secs());
-                // Phrase by matured confidence: an established fix is asserted, a
-                // tentative one is offered as a possibility.
-                let preamble = if c >= 0.6 {
+                // Phrase by the Beta belief: an *established* fix (high mean AND
+                // low variance — genuinely settled evidence) is asserted; a
+                // high-mean-but-uncertain or low-mean fix is merely offered.
+                let preamble = if r.belief_now(now_secs()).is_established() {
                     format!(
                         "`{}` reliably fails in this environment (fixed {} time(s)); Axiom's established fix",
                         r.command, r.immunizations
@@ -498,9 +533,12 @@ impl HealMemory {
                 record.dirs.push(d.clone());
             }
         }
-        // A freshly learned heal is tentative until reuse proves it.
-        if record.confidence <= 0.0 {
-            record.confidence = INITIAL_CONFIDENCE;
+        // A freshly learned heal is tentative: the uniform prior Beta(1,1) —
+        // mean 0.5, maximum uncertainty — until reuse accumulates evidence.
+        if record.belief.is_none() {
+            let b = BetaBelief::uniform();
+            record.confidence = b.mean();
+            record.belief = Some(b);
         }
     }
 
@@ -527,26 +565,30 @@ impl HealMemory {
     }
 
     /// Reinforce a program's immunity after immunizing it preceded a successful
-    /// run — affinity maturation: confidence EMAs toward 1.0 and the waning
-    /// clock resets. Pre-decays the stored confidence to `now` first so repeated
-    /// reinforcement after long gaps doesn't over-credit a faded memory.
+    /// run — affinity maturation: add a success pseudocount to the Beta belief
+    /// (raising the mean, lowering variance) and reset the waning clock. The
+    /// belief is first decayed to `now` so reinforcement after a long gap builds
+    /// on a faded (re-uncertain) memory rather than over-crediting it.
     pub fn reinforce_immunity(&mut self, fp: &str, now: u64) {
         if let Some(r) = self.data.programs.get_mut(fp) {
-            let decayed = r.confidence_now(now).max(INITIAL_CONFIDENCE * 0.5);
-            r.confidence = decayed + MATURATION_RATE * (1.0 - decayed);
+            let mut b = r.belief_now(now);
+            b.reinforce();
+            r.confidence = b.mean();
+            r.belief = Some(b);
             r.immunizations += 1;
             r.last_reinforced = now;
         }
     }
 
-    /// Forget records whose decayed confidence has fallen below the prune floor
-    /// (memory waning → clonal deletion). Returns the number forgotten. Heals
-    /// never reinforced are kept (they have not had a chance to mature or fade).
+    /// Forget records whose belief has decayed back to near-uniform uncertainty
+    /// (its evidence lost to waning → clonal deletion). Returns the number
+    /// forgotten. Never-reinforced heals are kept (they have not had a chance to
+    /// mature or fade).
     pub fn prune_stale(&mut self, now: u64) -> usize {
         let before = self.data.programs.len();
         self.data
             .programs
-            .retain(|_, r| r.last_reinforced == 0 || r.confidence_now(now) >= PRUNE_FLOOR);
+            .retain(|_, r| r.last_reinforced == 0 || r.belief_now(now).variance() < FADED_VARIANCE);
         before - self.data.programs.len()
     }
 
@@ -555,18 +597,32 @@ impl HealMemory {
         serde_json::to_string_pretty(&self.data).unwrap_or_else(|_| "{}".into())
     }
 
-    /// Merge a peer's exported memory into this one (swarm immunity).
+    /// Merge a peer's exported memory into this one (swarm immunity), with
+    /// epistemic + byzantine-resistant trust rules:
     ///
-    /// Semantics per program fingerprint: directory lists are unioned, and the
-    /// failure-tension history is combined as a count-weighted mean — so a peer
-    /// with 100 observed failures outweighs one with 2. Unknown programs are
-    /// adopted wholesale. A malformed peer payload is rejected without touching
-    /// local state.
+    /// * **Byzantine gate** — a peer record whose belief parameters are
+    ///   implausible (NaN/∞/negative, or fabricated-certainty pseudocounts) is
+    ///   rejected outright (`byzantine_rejected`).
+    /// * **Dempster-Shafer combination** — for a program both sides know, the
+    ///   two Beta beliefs are combined via DS evidence combination: agreeing
+    ///   peers *compound* evidence (mean up, variance down); irreconcilable
+    ///   peers raise a conflict, the local belief is kept, and the peer's is
+    ///   rejected (`belief_conflicts`) rather than silently averaged.
+    /// * Directory lists are unioned; failure-tension is count-weighted-mean.
+    ///
+    /// A malformed peer payload is rejected without touching local state.
     pub fn merge_json(&mut self, peer_json: &str) -> Result<MergeReport, String> {
         let peer: MemoryFile =
             serde_json::from_str(peer_json).map_err(|e| format!("invalid peer memory: {e}"))?;
         let mut report = MergeReport::default();
         for (fp, theirs) in peer.programs {
+            // Byzantine gate: a peer cannot inject malformed/fabricated beliefs.
+            if let Some(pb) = theirs.belief {
+                if !pb.is_plausible(MAX_PEER_EVIDENCE) {
+                    report.byzantine_rejected += 1;
+                    continue;
+                }
+            }
             match self.data.programs.get_mut(&fp) {
                 None => {
                     report.programs_added += 1;
@@ -575,9 +631,9 @@ impl HealMemory {
                 }
                 Some(ours) => {
                     report.programs_merged += 1;
-                    for d in theirs.dirs {
-                        if !ours.dirs.contains(&d) {
-                            ours.dirs.push(d);
+                    for d in &theirs.dirs {
+                        if !ours.dirs.contains(d) {
+                            ours.dirs.push(d.clone());
                             report.dirs_added += 1;
                         }
                     }
@@ -588,12 +644,20 @@ impl HealMemory {
                             / total as f32;
                         ours.ce_count = total;
                     }
-                    // Combine fleet immunity experience: confidence takes the
-                    // stronger of the two, immunizations sum, and the waning
-                    // clock advances to the most recent reinforcement.
-                    ours.confidence = ours.confidence.max(theirs.confidence);
-                    ours.immunizations += theirs.immunizations;
-                    ours.last_reinforced = ours.last_reinforced.max(theirs.last_reinforced);
+                    // Dempster-Shafer belief combination with conflict detection.
+                    match ours.base_belief().combine_ds(&theirs.base_belief()) {
+                        Ok(combined) => {
+                            ours.confidence = combined.mean();
+                            ours.belief = Some(combined);
+                            ours.immunizations += theirs.immunizations;
+                            ours.last_reinforced =
+                                ours.last_reinforced.max(theirs.last_reinforced);
+                        }
+                        Err(_conflict) => {
+                            // Irreconcilable: keep our belief, reject theirs.
+                            report.belief_conflicts += 1;
+                        }
+                    }
                 }
             }
         }
@@ -701,6 +765,50 @@ mod tests {
         assert!(ours.merge_json("{broken").is_err());
         // Local state untouched.
         assert_eq!(ours.record(&fp).unwrap().dirs, vec![PathBuf::from("/keep")]);
+    }
+
+    #[test]
+    fn merge_flags_dempster_shafer_conflict_and_keeps_local() {
+        let fp = fingerprint("prog", &[]);
+        let now = 1_000_000_000u64;
+        // Ours: strongly-established belief (many successes).
+        let mut ours = HealMemory::load(tmp("merge_conf_a"));
+        ours.remember_dirs(&fp, "prog", &[PathBuf::from("/a")]);
+        for k in 0..12 {
+            ours.reinforce_immunity(&fp, now + k);
+        }
+        let our_mean = ours.record(&fp).unwrap().belief_now(now + 12).mean();
+
+        // Theirs: a strongly-negative belief for the same program (penalized).
+        let mut theirs = HealMemory::load(tmp("merge_conf_b"));
+        theirs.remember_dirs(&fp, "prog", &[PathBuf::from("/a")]);
+        if let Some(r) = theirs.data.programs.get_mut(&fp) {
+            r.belief = Some(crate::belief::BetaBelief { alpha: 1.0, beta: 11.0 });
+        }
+
+        let report = ours.merge_json(&theirs.to_json()).unwrap();
+        assert_eq!(report.belief_conflicts, 1, "irreconcilable beliefs flagged");
+        // Local belief kept (not averaged into the peer's low value).
+        assert!((ours.record(&fp).unwrap().belief_now(now + 12).mean() - our_mean).abs() < 1e-3);
+    }
+
+    #[test]
+    fn merge_rejects_byzantine_fabricated_certainty() {
+        let fp = fingerprint("prog", &[]);
+        let mut ours = HealMemory::load(tmp("merge_byz_a"));
+        ours.remember_dirs(&fp, "prog", &[PathBuf::from("/a")]);
+
+        // Peer injects a fabricated-certainty belief (absurd pseudocount mass).
+        let mut theirs = HealMemory::load(tmp("merge_byz_b"));
+        theirs.remember_dirs(&fp, "prog", &[PathBuf::from("/evil")]);
+        if let Some(r) = theirs.data.programs.get_mut(&fp) {
+            r.belief = Some(crate::belief::BetaBelief { alpha: 1.0e9, beta: 1.0 });
+        }
+
+        let report = ours.merge_json(&theirs.to_json()).unwrap();
+        assert_eq!(report.byzantine_rejected, 1);
+        // The peer's directory must NOT have been merged in.
+        assert_eq!(ours.record(&fp).unwrap().dirs, vec![PathBuf::from("/a")]);
     }
 
     #[test]
@@ -816,11 +924,18 @@ mod tests {
         }
         assert_eq!(mem.record(&fp).unwrap().immunizations, 3);
         assert!(prev >= 0.6, "after 3 reuses confidence should be 'proven'+");
+        let rec = mem.record(&fp).unwrap();
+        let fresh = rec.belief_now(now + 3);
+        assert!(fresh.is_established(), "after 3 reuses the belief is established");
 
-        // Waning: a full half-life later, confidence ~halves.
-        let later = now + 3 + (CONFIDENCE_HALFLIFE_DAYS as u64) * 86_400;
-        let decayed = mem.record(&fp).unwrap().confidence_now(later);
-        assert!(decayed < prev * 0.6, "confidence must wane over a half-life");
+        // Waning: long after the last reuse the belief regresses toward the
+        // uniform prior — staleness becomes *uncertainty* (higher variance,
+        // mean drifting back toward 0.5), not a confidence driven to zero.
+        let later = now + 3 + 4 * (CONFIDENCE_HALFLIFE_DAYS as u64) * 86_400;
+        let stale = rec.belief_now(later);
+        assert!(!stale.is_established(), "a waned belief is no longer established");
+        assert!(stale.variance() > fresh.variance(), "waning raises uncertainty");
+        assert!(stale.mean() < fresh.mean(), "mean regresses toward 0.5");
     }
 
     #[test]

@@ -283,6 +283,25 @@ $ axiom run -- sh -c 'echo x > artifacts/o.bin'   # learn
   confidence: 0.86 (established, immunizations: 3)
 ```
 
+### Verifiable epistemic swarm (provenance + Beta beliefs)
+
+Swarm-immunity exchange is tamper-evident and epistemically honest — combining
+ideas absorbed from ChimeraLang (epistemics) and chimeralang-mcp (integrity):
+
+- **Provenance (verify-before-trust).** `GET /v1/immunity` returns a *signed
+  export* — the heal-memory payload wrapped with a full SHA-256 and, when
+  `AXIOM_FLEET_KEY` is set, an HMAC-SHA256 for peer authentication. The merge
+  endpoint and `axiom swarm immunity` verify the hash (and HMAC) **before**
+  trusting a peer; a tampered payload or a wrong/missing key is rejected.
+- **Beta-belief confidence.** Each heal's reliability is a `Beta(α,β)` belief
+  carrying estimate *and* uncertainty. "Established" requires high mean AND low
+  variance, so one lucky 1/1 success stays tentative; staleness decays the
+  belief toward the uniform prior (uncertainty), not toward zero.
+- **Dempster-Shafer merge.** Peer beliefs combine via DS evidence combination:
+  agreeing peers compound evidence; irreconcilable peers raise a conflict and
+  the local belief is kept (never silently averaged). A byzantine gate rejects
+  fabricated-certainty peer beliefs.
+
 ### Inspecting acquired immunity
 
 What Axiom has learned is queryable by both the operator and an AI agent:

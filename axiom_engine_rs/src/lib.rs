@@ -1,4 +1,5 @@
 pub mod anthropic_forwarder;
+pub mod belief;
 pub mod bench;
 pub mod bootstrap;
 pub mod claude_backend;
@@ -30,6 +31,7 @@ pub mod openai_forwarder;
 pub mod pairs;
 pub mod poly_jit;
 pub mod prime;
+pub mod provenance;
 pub mod q_manifold;
 pub mod quantization;
 pub mod sandbox;

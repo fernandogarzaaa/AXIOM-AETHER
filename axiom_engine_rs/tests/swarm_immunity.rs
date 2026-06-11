@@ -120,6 +120,61 @@ async fn immunity_endpoints_export_and_merge() {
 }
 
 #[tokio::test]
+async fn merge_rejects_tampered_signed_export() {
+    // The export is a signed envelope; mutate its payload after signing and the
+    // merge endpoint must reject it on the hash check (verify-before-trust).
+    let mem_a = unique_tmp("tamper_a").with_extension("json");
+    let mut a = HealMemory::load(&mem_a);
+    a.remember_dirs(&fingerprint("prog", &[]), "prog", &[PathBuf::from("/x")]);
+    a.save().unwrap();
+    let app = create_router(
+        AppState::new(
+            tokio::task::spawn_blocking(tiny_pipeline).await.unwrap(),
+            "node".into(),
+        )
+        .with_heal_memory_path(Some(mem_a.clone())),
+    );
+    let exported = {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/immunity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        String::from_utf8(to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap()
+    };
+    // Tamper: inject an extra directory into the payload without re-hashing.
+    let tampered = exported.replace("/x", "/x\\\",\\\"/evil-injected");
+
+    let mem_b = unique_tmp("tamper_b").with_extension("json");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/immunity/merge")
+                .header("content-type", "application/json")
+                .body(Body::from(tampered))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // The router for app used mem_a's path; build a fresh node for the merge.
+    let _ = mem_b;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a tampered signed export must be rejected by provenance"
+    );
+
+    let _ = std::fs::remove_file(&mem_a);
+}
+
+#[tokio::test]
 async fn immunity_endpoints_disabled_without_path() {
     let app = create_router(AppState::new(
         tokio::task::spawn_blocking(tiny_pipeline).await.unwrap(),
