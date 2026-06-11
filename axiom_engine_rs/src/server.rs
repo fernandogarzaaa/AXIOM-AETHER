@@ -3038,7 +3038,7 @@ fn inject_immunity_advisory(
 /// (SUPPORTED/UNSUPPORTED/UNVERIFIED) plus the grounded fraction and the
 /// flagged (unsupported) claims — flags hallucinations *relative to the
 /// supplied evidence*, not universal fact-checking.
-async fn verify_grounding(Json(body): Json<Value>) -> Response {
+async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
     let response = body.get("response").and_then(Value::as_str).unwrap_or("");
     let evidence = body.get("evidence").and_then(Value::as_str).unwrap_or("");
     if response.trim().is_empty() {
@@ -3048,27 +3048,66 @@ async fn verify_grounding(Json(body): Json<Value>) -> Response {
         )
             .into_response();
     }
-    let report = crate::hallucination::verify(response, evidence);
-    let claims: Vec<Value> = report
-        .claims
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "claim": c.claim,
-                "verdict": c.verdict.to_string(),
-                "support": c.support,
-                "confidence": c.confidence.mean(),
-                "uncertainty": c.confidence.variance().sqrt(),
-            })
+
+    let claim_json = |c: &crate::hallucination::ClaimVerdict| {
+        serde_json::json!({
+            "claim": c.claim,
+            "verdict": c.verdict.to_string(),
+            "support": c.support,
+            "confidence": c.confidence.mean(),
+            "uncertainty": c.confidence.variance().sqrt(),
         })
-        .collect();
+    };
+
+    // Grounding-gated expansion: when `expand` is set with a `session_id`, the
+    // skeleton is the lean evidence and any claim it cannot ground triggers an
+    // expansion of ONLY that claim's referenced symbols (from the stored
+    // source), then a re-verify. Tokens are spent back surgically.
+    let expand = body.get("expand").and_then(Value::as_bool).unwrap_or(false);
+    let session_id = body.get("session_id").and_then(Value::as_str).unwrap_or("");
+    if expand && !session_id.is_empty() {
+        let source = state
+            .source_store
+            .read()
+            .ok()
+            .and_then(|m| m.get(session_id).cloned());
+        let Some(source) = source else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "no stored source for session_id (expired or never compressed)",
+                    "session_id": session_id,
+                })),
+            )
+                .into_response();
+        };
+        let report = crate::hallucination::verify_with_gated_expansion(
+            response,
+            evidence,
+            |sym| crate::skeleton::expand_symbol(&source, sym),
+        );
+        return Json(serde_json::json!({
+            "mode": "grounding_gated_expansion",
+            "grounded_fraction_before": report.before.grounded_fraction,
+            "grounded_fraction_after": report.after.grounded_fraction,
+            "expanded_symbols": report.expanded_symbols,
+            "expansion_bytes": report.expansion_bytes,
+            "resolved_claims": report.resolved_claims,
+            "flagged": report.after.flagged().iter().map(|c| &c.claim).collect::<Vec<_>>(),
+            "claims": report.after.claims.iter().map(&claim_json).collect::<Vec<_>>(),
+            "note": "tokens were spent only on claims the skeleton could not ground; expansion pulled only those claims' referenced symbols",
+        }))
+        .into_response();
+    }
+
+    let report = crate::hallucination::verify(response, evidence);
     Json(serde_json::json!({
         "grounded_fraction": report.grounded_fraction,
         "supported": report.supported,
         "unsupported": report.unsupported,
         "unverified": report.unverified,
         "flagged": report.flagged().iter().map(|c| &c.claim).collect::<Vec<_>>(),
-        "claims": claims,
+        "claims": report.claims.iter().map(&claim_json).collect::<Vec<_>>(),
         "note": "grounding verification against supplied evidence; lexical tier does not catch vocabulary-sharing contradictions",
     }))
     .into_response()

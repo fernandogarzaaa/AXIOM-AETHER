@@ -217,6 +217,105 @@ pub fn verify(response: &str, evidence: &str) -> GroundingReport {
     }
 }
 
+/// Result of verifying with grounding-gated expansion: the report before any
+/// expansion, the report after expanding only the unsupported claims'
+/// dependencies, and what that targeted expansion cost/resolved.
+#[derive(Debug, Clone)]
+pub struct GatedVerifyReport {
+    pub before: GroundingReport,
+    pub after: GroundingReport,
+    /// Symbols whose bodies were expanded to ground a flagged claim.
+    pub expanded_symbols: Vec<String>,
+    /// Claims that went from not-Supported to Supported after expansion.
+    pub resolved_claims: Vec<String>,
+    /// Bytes of evidence added by expansion — the *only* tokens spent back, and
+    /// only on claims grounding could not confirm from the skeleton alone.
+    pub expansion_bytes: usize,
+}
+
+/// Cap on symbol expansions per verification so a pathological response cannot
+/// trigger unbounded un-compression.
+const MAX_EXPANSIONS: usize = 8;
+
+/// Identifier-like candidate symbols referenced in a claim (snake_case,
+/// CamelCase, or any alnum token ≥3 chars). Over-generation is fine: the
+/// resolver returns `None` for non-symbols.
+fn candidate_symbols(claim: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in claim.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        let t = raw.trim();
+        if t.len() >= 3 && t.chars().any(|c| c.is_ascii_alphabetic()) && seen.insert(t.to_string()) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// Verify with **grounding-gated expansion**: the keystone that saves tokens
+/// *while* reducing hallucination. Compress aggressively (the caller passes the
+/// lean skeleton as `evidence`); then, for each claim the skeleton could not
+/// ground, expand *only* the symbols that claim references (via `resolve`) and
+/// re-verify. Tokens are spent back surgically — only where grounding was
+/// uncertain — never across the board.
+pub fn verify_with_gated_expansion<F>(
+    response: &str,
+    evidence: &str,
+    mut resolve: F,
+) -> GatedVerifyReport
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let before = verify(response, evidence);
+    let mut expanded_symbols = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut extra = String::new();
+
+    for claim in before.claims.iter().filter(|c| c.verdict != Verdict::Supported) {
+        for sym in candidate_symbols(&claim.claim) {
+            if expanded_symbols.len() >= MAX_EXPANSIONS {
+                break;
+            }
+            if !seen.insert(sym.clone()) {
+                continue;
+            }
+            if let Some(body) = resolve(&sym) {
+                extra.push('\n');
+                extra.push_str(&body);
+                expanded_symbols.push(sym);
+            }
+        }
+    }
+
+    let after = if extra.is_empty() {
+        before.clone()
+    } else {
+        verify(response, &format!("{evidence}\n{extra}"))
+    };
+
+    // Claims that expansion rescued: not-Supported before, Supported after.
+    let before_bad: std::collections::HashSet<&str> = before
+        .claims
+        .iter()
+        .filter(|c| c.verdict != Verdict::Supported)
+        .map(|c| c.claim.as_str())
+        .collect();
+    let resolved_claims = after
+        .claims
+        .iter()
+        .filter(|c| c.verdict == Verdict::Supported && before_bad.contains(c.claim.as_str()))
+        .map(|c| c.claim.clone())
+        .collect();
+
+    GatedVerifyReport {
+        before,
+        after,
+        expanded_symbols,
+        resolved_claims,
+        expansion_bytes: extra.len(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +374,54 @@ mod tests {
             Verdict::Supported,
             "lexical grounding cannot catch vocabulary-sharing contradictions"
         );
+    }
+
+    #[test]
+    fn gated_expansion_grounds_a_claim_by_expanding_only_its_dependency() {
+        // Skeleton (lean evidence): only signatures, bodies elided.
+        let skeleton = "fn parse_header(buf: &[u8]) -> Header. fn checksum(data: &[u8]) -> u32.";
+        // The answer makes a claim about an implementation detail not in the skeleton.
+        let response = "checksum computes the crc32 polynomial fold over the data.";
+
+        // Resolver stands in for /v1/expand over the stored source: returns the
+        // elided body whose tokens ground the claim.
+        let resolve = |sym: &str| -> Option<String> {
+            match sym {
+                "checksum" => Some(
+                    "fn checksum(data: &[u8]) -> u32 { computes crc32 polynomial fold over data }"
+                        .to_string(),
+                ),
+                _ => None,
+            }
+        };
+
+        let report = verify_with_gated_expansion(response, skeleton, resolve);
+        // Before expansion the claim is not grounded by the skeleton alone…
+        assert_ne!(report.before.claims[0].verdict, Verdict::Supported);
+        // …expansion pulled ONLY the referenced symbol…
+        assert_eq!(report.expanded_symbols, vec!["checksum".to_string()]);
+        assert!(report.expansion_bytes > 0);
+        // …and re-verification now grounds it.
+        assert_eq!(report.after.claims[0].verdict, Verdict::Supported);
+        assert_eq!(report.resolved_claims.len(), 1);
+        assert!(report.after.grounded_fraction > report.before.grounded_fraction);
+    }
+
+    #[test]
+    fn gated_expansion_spends_nothing_when_already_grounded() {
+        // The skeleton already grounds the claim → no expansion, no tokens spent.
+        let mut resolver_calls = 0;
+        let report = verify_with_gated_expansion(
+            "Axiom uses online test-time training.",
+            EVIDENCE,
+            |_sym| {
+                resolver_calls += 1;
+                None
+            },
+        );
+        assert_eq!(report.before.claims[0].verdict, Verdict::Supported);
+        assert!(report.expanded_symbols.is_empty());
+        assert_eq!(report.expansion_bytes, 0, "no tokens spent when already grounded");
+        assert_eq!(resolver_calls, 0, "resolver not consulted for supported claims");
     }
 }
