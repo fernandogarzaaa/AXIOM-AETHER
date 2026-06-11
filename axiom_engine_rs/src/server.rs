@@ -2192,11 +2192,11 @@ async fn compressed_messages_path(
     })?;
 
     // First attempt: forward the lean, compressed payload.
-    match forwarder
+    let mut forwarded = match forwarder
         .forward_messages_json(&outbound, client_auth)
         .await
     {
-        Ok(value) => Ok(value),
+        Ok(value) => value,
         Err(err) => {
             // Graceful degradation: a compression-side fault (or a transient
             // upstream/network hiccup) must never cost the client their turn. If
@@ -2216,14 +2216,82 @@ async fn compressed_messages_path(
                 if let Some(obj) = fallback.as_object_mut() {
                     obj.remove("session_id");
                 }
-                return forwarder
+                forwarder
                     .forward_messages_json(&fallback, client_auth)
                     .await
-                    .map_err(map_anthropic_forwarder_error);
+                    .map_err(map_anthropic_forwarder_error)?
+            } else {
+                return Err(map_anthropic_forwarder_error(err));
             }
-            Err(map_anthropic_forwarder_error(err))
+        }
+    };
+
+    // Auto grounding-verification (opt-in): annotate the response in place with
+    // any claims not grounded in the context we just absorbed — hallucination
+    // flagging with nobody asking. Never alters the answer text itself; appends
+    // a clearly-marked advisory only when claims are flagged.
+    annotate_response_grounding(&mut forwarded, &heavy_combined);
+    Ok(forwarded)
+}
+
+/// Pure: the grounding advisory block for an assistant `text` against
+/// `evidence`, or `None` when nothing is flagged.
+fn grounding_advisory_block(text: &str, evidence: &str) -> Option<String> {
+    if text.trim().is_empty() || evidence.trim().is_empty() {
+        return None;
+    }
+    let report = crate::hallucination::verify(text, evidence);
+    let flagged = report.flagged();
+    if flagged.is_empty() {
+        return None;
+    }
+    let mut block = format!(
+        "\n\n<axiom_grounding grounded_fraction=\"{:.2}\">\nThe following claims are not grounded in the provided context — verify before relying on them:",
+        report.grounded_fraction
+    );
+    for c in &flagged {
+        block.push_str(&format!("\n  - {}", c.claim));
+    }
+    block.push_str("\n</axiom_grounding>");
+    Some(block)
+}
+
+/// Append a grounding advisory to the last `text` content block of an Anthropic
+/// `/v1/messages` response, in place. Opt-in via `AXIOM_VERIFY_RESPONSES=1`.
+fn annotate_response_grounding(value: &mut Value, evidence: &str) {
+    if std::env::var("AXIOM_VERIFY_RESPONSES").as_deref() != Ok("1") {
+        return;
+    }
+    // Concatenate assistant text blocks for verification.
+    let text: String = value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let Some(block) = grounding_advisory_block(&text, evidence) else {
+        return;
+    };
+    // Append to the last text block (or push one if none exist).
+    if let Some(blocks) = value.get_mut("content").and_then(Value::as_array_mut) {
+        if let Some(last) = blocks
+            .iter_mut()
+            .rev()
+            .find(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        {
+            if let Some(t) = last.get("text").and_then(Value::as_str) {
+                last["text"] = Value::String(format!("{t}{block}"));
+            }
+        } else {
+            blocks.push(serde_json::json!({"type": "text", "text": block}));
         }
     }
+    eprintln!("[axiom-ttt] grounding: appended advisory for ungrounded response claims");
 }
 
 /// Map an Anthropic [`ForwarderError`] onto the client-facing [`ApiError`].
@@ -3033,6 +3101,51 @@ fn inject_immunity_advisory(
     crate::anthropic_forwarder::prepend_block_to_last_user_turn(outbound, &block);
 }
 
+/// Mean next-token cross-entropy of `ids` through a clone of `states` (the
+/// states are not mutated). Mirrors `eval_model`/`self_heal` CE scoring.
+fn claim_ce(pipeline: &InferencePipeline, states: &[candle_core::Tensor], ids: &[u32]) -> Option<f32> {
+    if ids.len() < 2 {
+        return None;
+    }
+    let dev = pipeline.device();
+    let mut probe = states.to_vec();
+    let input = candle_core::Tensor::from_vec(ids[..ids.len() - 1].to_vec(), (1, ids.len() - 1), dev).ok()?;
+    let logits = pipeline.model().forward_lm(&input, &mut probe).ok()?;
+    let (_, t, v) = logits.dims3().ok()?;
+    let l2d = logits.squeeze(0).ok()?.reshape((t, v)).ok()?;
+    let tgt = candle_core::Tensor::from_vec(ids[1..].to_vec(), (ids.len() - 1,), dev).ok()?;
+    candle_nn::loss::cross_entropy(&l2d, &tgt).ok()?.to_scalar::<f32>().ok()
+}
+
+/// Neural-surprisal grounding lifts per claim: `CE_base − CE_context`, where the
+/// context is absorbed into W̃ via TTT once and reused. Positive ⇒ the absorbed
+/// evidence predicts the claim (grounded). Returns a map claim→lift.
+fn neural_lifts(
+    pipeline: &InferencePipeline,
+    evidence: &str,
+    claims: &[String],
+) -> std::collections::HashMap<String, f32> {
+    let mut out = std::collections::HashMap::new();
+    let base = match pipeline.init_session_states() {
+        Ok(s) => s,
+        Err(_) => return out,
+    };
+    let mut ctx = base.clone();
+    let ev_ids = pipeline.encode_text(evidence);
+    if adapt_session_blocking(pipeline, &mut ctx, &ev_ids).is_err() {
+        return out;
+    }
+    for claim in claims {
+        let ids = pipeline.encode_text(claim);
+        if let (Some(ce_base), Some(ce_ctx)) =
+            (claim_ce(pipeline, &base, &ids), claim_ce(pipeline, &ctx, &ids))
+        {
+            out.insert(claim.clone(), ce_base - ce_ctx);
+        }
+    }
+    out
+}
+
 /// `POST /v1/verify` — grounding verification. Body:
 /// `{"response": "...", "evidence": "..."}`. Returns per-claim verdicts
 /// (SUPPORTED/UNSUPPORTED/UNVERIFIED) plus the grounded fraction and the
@@ -3056,6 +3169,7 @@ async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>
             "support": c.support,
             "confidence": c.confidence.mean(),
             "uncertainty": c.confidence.variance().sqrt(),
+            "grounding_lift": c.lift,
         })
     };
 
@@ -3096,6 +3210,39 @@ async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>
             "flagged": report.after.flagged().iter().map(|c| &c.claim).collect::<Vec<_>>(),
             "claims": report.after.claims.iter().map(&claim_json).collect::<Vec<_>>(),
             "note": "tokens were spent only on claims the skeleton could not ground; expansion pulled only those claims' referenced symbols",
+        }))
+        .into_response();
+    }
+
+    // Neural-surprisal tier: when `neural:true`, compute per-claim grounding
+    // lift against the context-adapted W̃ and demote lexically-supported claims
+    // the model finds surprising (the contradiction-catcher). Model-dependent:
+    // sharp with the trained checkpoint, near-flat on the bootstrap model.
+    let neural = body.get("neural").and_then(Value::as_bool).unwrap_or(false);
+    if neural {
+        let claims = crate::hallucination::extract_claims(response);
+        let pipeline = state.pipeline.clone();
+        let evidence_s = evidence.to_string();
+        let lifts = tokio::task::spawn_blocking(move || {
+            let p = pipeline.lock().ok()?;
+            Some(neural_lifts(&p, &evidence_s, &claims))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        let report = crate::hallucination::verify_with_signals(response, evidence, |claim| {
+            lifts.get(claim).copied()
+        });
+        return Json(serde_json::json!({
+            "mode": "lexical+neural",
+            "grounded_fraction": report.grounded_fraction,
+            "supported": report.supported,
+            "unsupported": report.unsupported,
+            "unverified": report.unverified,
+            "flagged": report.flagged().iter().map(|c| &c.claim).collect::<Vec<_>>(),
+            "claims": report.claims.iter().map(&claim_json).collect::<Vec<_>>(),
+            "note": "neural tier demotes lexically-supported claims with non-positive grounding lift (surprisal under the context-adapted W̃); signal sharpness scales with the trained model",
         }))
         .into_response();
     }
@@ -3513,6 +3660,46 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use candle_core::{DType, Device};
     use tower::ServiceExt;
+
+    #[test]
+    fn grounding_advisory_only_when_claims_flagged() {
+        let evidence = "Axiom is an inference engine with online test-time training.";
+        // Fully grounded → no advisory.
+        assert!(grounding_advisory_block("Axiom uses online test-time training.", evidence).is_none());
+        // Ungrounded claim → advisory naming it.
+        let block = grounding_advisory_block(
+            "Axiom was written in COBOL and launched on the moon.",
+            evidence,
+        )
+        .expect("ungrounded claim must produce an advisory");
+        assert!(block.contains("<axiom_grounding"));
+        assert!(block.contains("COBOL") || block.contains("moon"));
+    }
+
+    #[test]
+    fn annotate_response_grounding_respects_env_flag() {
+        // Single test (sequential) to avoid racing on the process-global env var.
+        let evidence = "Axiom uses online test-time training.";
+        let make = || serde_json::json!({
+            "content": [{"type": "text", "text": "Axiom was funded by NASA in 1972."}]
+        });
+
+        // Disabled → response untouched.
+        std::env::remove_var("AXIOM_VERIFY_RESPONSES");
+        let mut off = make();
+        let before = off.clone();
+        annotate_response_grounding(&mut off, evidence);
+        assert_eq!(off, before, "disabled → response untouched");
+
+        // Enabled → advisory appended in place, original answer preserved.
+        std::env::set_var("AXIOM_VERIFY_RESPONSES", "1");
+        let mut on = make();
+        annotate_response_grounding(&mut on, evidence);
+        std::env::remove_var("AXIOM_VERIFY_RESPONSES");
+        let text = on["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("<axiom_grounding"), "advisory must be appended");
+        assert!(text.starts_with("Axiom was funded by NASA"), "original answer preserved");
+    }
 
     fn build_pipeline() -> InferencePipeline {
         use crate::config::AxiomConfig;
