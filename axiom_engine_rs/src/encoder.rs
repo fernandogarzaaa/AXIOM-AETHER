@@ -106,7 +106,7 @@ pub struct SelfAttention {
 
 impl SelfAttention {
     pub fn new(vb: VarBuilder, d_model: usize, n_heads: usize) -> Result<Self> {
-        assert!(d_model % n_heads == 0, "d_model must divide n_heads");
+        assert!(d_model.is_multiple_of(n_heads), "d_model must divide n_heads");
         Ok(Self {
             w_q: candle_nn::linear(d_model, d_model, vb.pp("w_q"))?,
             w_k: candle_nn::linear(d_model, d_model, vb.pp("w_k"))?,

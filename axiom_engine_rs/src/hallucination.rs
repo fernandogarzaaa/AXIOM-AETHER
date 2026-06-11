@@ -136,7 +136,7 @@ fn sentences(text: &str) -> Vec<String> {
 pub fn extract_claims(response: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut flush = |seg: &str, out: &mut Vec<String>| {
+    let flush = |seg: &str, out: &mut Vec<String>| {
         let s = seg.trim().trim_end_matches(['!', '.']).trim();
         if !s.is_empty() && content_tokens(s).len() >= 3 {
             out.push(s.to_string());

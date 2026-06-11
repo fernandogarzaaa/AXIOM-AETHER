@@ -24,21 +24,13 @@ pub struct HamiltonianFault {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct QuantumRuntimeStatus {
     pub total_optimizations: u64,
     pub total_collapses: u64,
     pub last_state: QuantumManifoldTelemetry,
 }
 
-impl Default for QuantumRuntimeStatus {
-    fn default() -> Self {
-        Self {
-            total_optimizations: 0,
-            total_collapses: 0,
-            last_state: QuantumManifoldTelemetry::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct QuantumPatchCandidate {

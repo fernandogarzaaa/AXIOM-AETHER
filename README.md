@@ -23,6 +23,11 @@ It runs as a local-first Rust runtime with several compatible surfaces:
 [![Release Binaries](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/release.yml/badge.svg)](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/release.yml)
 [![Docker](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/docker.yml/badge.svg)](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/docker.yml)
 
+> **Orientation:** [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) is a one-page
+> index of every surface (CLI, endpoints, MCP tools, env vars, the four pillars).
+> Run [`scripts/demo_end_to_end.sh`](scripts/demo_end_to_end.sh) to drive every
+> pillar on CPU (no network) with a PASS/FAIL per step.
+
 ---
 
 ## Current Runtime Snapshot

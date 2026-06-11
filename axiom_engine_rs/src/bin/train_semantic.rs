@@ -334,7 +334,7 @@ fn run() {
             step += 1;
             // Step-level heartbeat so long GPU runs are observable before the
             // first per-epoch eval (set AXIOM_LOG_EVERY>0 to enable).
-            if log_every > 0 && step % log_every == 0 {
+            if log_every > 0 && step.is_multiple_of(log_every) {
                 eprintln!(
                     "[train]   step {} loss~{:.4} step_ms={:.1} avg_step_ms={:.1} ({:.0}s)",
                     step,

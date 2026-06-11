@@ -2158,7 +2158,7 @@ async fn compressed_messages_path(
     // already learned to heal, inject a short advisory so Claude gets the fix
     // without anyone asking — the self-healing loop running autonomously. Only
     // fires on a precise command-signature match with a concrete learned heal.
-    inject_immunity_advisory(&state, &mut outbound, &user_query_text, &heavy_combined);
+    inject_immunity_advisory(state, &mut outbound, &user_query_text, &heavy_combined);
 
     // Record live compression stats for the dashboard: original vs forwarded
     // payload size and how many heavy messages were absorbed this request.
