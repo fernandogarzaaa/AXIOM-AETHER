@@ -394,6 +394,17 @@ FIRST/KNOWN/NOVEL classification and the drift gate become genuinely meaningful.
 For a larger/lower-CE model, raise `AXIOM_DMODEL`/`AXIOM_NLAYERS`/`AXIOM_MAX_TOKENS`
 (slower per step on CPU), or use `scripts/train_d384.sh` on a 6 GB GPU.
 
+**Scaling note — capacity must match corpus.** Naively bumping the CPU recipe to
+d256/4L on the *same* ~100–200k-token quickstart corpus is a regression, not an
+upgrade. A controlled run (LR 1e-3, warmup 300, grad-clip 0.5 — a cooler recipe,
+since the default LR 3e-3 diverges to NaN at this depth) reached only val_ce 6.62
+and **drift margin +2.03** before the box OOM-killed it after one epoch — *worse*
+separation than the d128/2L baseline's +3.9–4.9 on identical data. The extra
+parameters are undertrained and dilute the surprisal signal. The d256/4L figures
+quoted earlier (val_ce ≈ 3.18, margin +3.04) come from a **40 MB** corpus on GPU:
+the larger model only wins when the corpus grows with it. On the CPU quickstart
+path, **d128/2L is the right production checkpoint** — it is what ships.
+
 ---
 
 ## The drivable hypervisor
