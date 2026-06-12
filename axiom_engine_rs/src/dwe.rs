@@ -129,11 +129,10 @@ fn serialize_fragment_for_telemetry(
     fragment: &DweFragment,
     telemetry: &Arc<Mutex<DweTelemetry>>,
 ) -> Result<Vec<u8>, String> {
-    serialize_fragment(fragment).map_err(|err| {
+    serialize_fragment(fragment).inspect_err(|err| {
         update_telemetry(telemetry, |t| {
             t.last_error = Some(err.clone());
         });
-        err
     })
 }
 

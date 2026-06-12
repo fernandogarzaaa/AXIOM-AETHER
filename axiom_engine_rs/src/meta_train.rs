@@ -242,7 +242,7 @@ impl RepoFileDataset {
 
 fn is_excluded_dir(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-        if DEFAULT_EXCLUDED_DIRS.iter().any(|d| *d == name) {
+        if DEFAULT_EXCLUDED_DIRS.contains(&name) {
             return true;
         }
     }

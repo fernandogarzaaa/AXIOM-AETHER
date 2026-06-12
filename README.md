@@ -23,6 +23,11 @@ It runs as a local-first Rust runtime with several compatible surfaces:
 [![Release Binaries](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/release.yml/badge.svg)](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/release.yml)
 [![Docker](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/docker.yml/badge.svg)](https://github.com/fernandogarzaaa/AXIOM-AETHER/actions/workflows/docker.yml)
 
+> **Orientation:** [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md) is a one-page
+> index of every surface (CLI, endpoints, MCP tools, env vars, the four pillars).
+> Run [`scripts/demo_end_to_end.sh`](scripts/demo_end_to_end.sh) to drive every
+> pillar on CPU (no network) with a PASS/FAIL per step.
+
 ---
 
 ## Current Runtime Snapshot
@@ -389,6 +394,17 @@ FIRST/KNOWN/NOVEL classification and the drift gate become genuinely meaningful.
 For a larger/lower-CE model, raise `AXIOM_DMODEL`/`AXIOM_NLAYERS`/`AXIOM_MAX_TOKENS`
 (slower per step on CPU), or use `scripts/train_d384.sh` on a 6 GB GPU.
 
+**Scaling note — capacity must match corpus.** Naively bumping the CPU recipe to
+d256/4L on the *same* ~100–200k-token quickstart corpus is a regression, not an
+upgrade. A controlled run (LR 1e-3, warmup 300, grad-clip 0.5 — a cooler recipe,
+since the default LR 3e-3 diverges to NaN at this depth) reached only val_ce 6.62
+and **drift margin +2.03** before the box OOM-killed it after one epoch — *worse*
+separation than the d128/2L baseline's +3.9–4.9 on identical data. The extra
+parameters are undertrained and dilute the surprisal signal. The d256/4L figures
+quoted earlier (val_ce ≈ 3.18, margin +3.04) come from a **40 MB** corpus on GPU:
+the larger model only wins when the corpus grows with it. On the CPU quickstart
+path, **d128/2L is the right production checkpoint** — it is what ships.
+
 ---
 
 ## The drivable hypervisor
@@ -458,6 +474,26 @@ curl -s -XPOST localhost:3000/v1/verify -d '{
 Exposed as `POST /v1/verify` and the **`axiom_verify`** MCP tool (which an agent
 calls before asserting facts from a document/codebase; it returns isError when
 any claim is unsupported, so the agent notices).
+
+### Self-correction (reduce, not just flag)
+
+With `AXIOM_GROUND_CORRECT=1`, when the model's answer contains claims
+unsupported by the absorbed context, the proxy sends ONE bounded follow-up
+asking it to revise grounded in that context, and returns the revision — moving
+from *flagging* hallucinations to *reducing* them. Costs one extra upstream call
+only when claims are actually flagged; the follow-up reuses the compressed
+context, so it stays token-efficient.
+
+### Confidence-gated adaptive compression
+
+With `AXIOM_ADAPTIVE_COMPRESS=1`, the drift signal gates the compression budget
+on the request path: predictable context (surprisal ≤ the drift gate) keeps the
+aggressive base threshold, while surprising/novel context (above the gate —
+which the model can't reconstruct and Claude needs verbatim) raises the
+threshold so more is forwarded intact. The same signal that flags hallucination
+on the response path decides how hard to compress on the request path.
+(`adaptive.rs` — bounded to ≤2× the base threshold; signal sharpens with the
+trained model.)
 
 ### Grounding-gated expansion — saving tokens *while* reducing hallucination
 

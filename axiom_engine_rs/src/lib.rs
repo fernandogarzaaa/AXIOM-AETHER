@@ -1,3 +1,4 @@
+pub mod adaptive;
 pub mod anthropic_forwarder;
 pub mod belief;
 pub mod bench;

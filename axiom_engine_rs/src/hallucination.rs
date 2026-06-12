@@ -136,7 +136,7 @@ fn sentences(text: &str) -> Vec<String> {
 pub fn extract_claims(response: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut flush = |seg: &str, out: &mut Vec<String>| {
+    let flush = |seg: &str, out: &mut Vec<String>| {
         let s = seg.trim().trim_end_matches(['!', '.']).trim();
         if !s.is_empty() && content_tokens(s).len() >= 3 {
             out.push(s.to_string());
@@ -402,6 +402,15 @@ mod tests {
     #[test]
     fn questions_and_fragments_are_not_claims() {
         assert!(extract_claims("What is Axiom? Ok. Yes.").is_empty());
+    }
+
+    #[test]
+    fn empty_evidence_flags_all_claims() {
+        let r = verify("Axiom uses test-time training. It runs locally in Rust.", "");
+        assert!(r.claims.len() >= 2);
+        assert_eq!(r.supported, 0);
+        assert_eq!(r.flagged().len(), r.claims.len(), "no evidence => every claim unsupported");
+        assert_eq!(r.grounded_fraction, 0.0);
     }
 
     #[test]

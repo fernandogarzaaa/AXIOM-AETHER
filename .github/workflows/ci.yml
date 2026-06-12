@@ -52,3 +52,6 @@ jobs:
       - name: Test
         working-directory: axiom_engine_rs
         run: cargo test --release --locked
+
+      - name: End-to-end smoke (every pillar composes)
+        run: ./scripts/demo_end_to_end.sh

@@ -151,7 +151,7 @@ impl MasterVibe {
     pub fn prime_states(&self) -> Option<Vec<Tensor>> {
         self.master
             .as_ref()
-            .map(|m| m.iter().cloned().collect::<Vec<_>>())
+            .map(|m| m.to_vec())
     }
 
     /// EMA-merge one session's adapted W̃ states into the master.

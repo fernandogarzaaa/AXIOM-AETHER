@@ -250,7 +250,7 @@ fn fetch_base_model(url: &str, target: &Path) -> io::Result<()> {
     }
     let mut response = reqwest::blocking::get(url)
         .and_then(|r| r.error_for_status())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("model fetch failed: {e}")))?;
+        .map_err(|e| io::Error::other(format!("model fetch failed: {e}")))?;
     let total = response.content_length().unwrap_or(0);
     let pb = if total > 0 {
         ProgressBar::new(total)
