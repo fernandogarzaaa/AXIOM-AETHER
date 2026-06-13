@@ -3080,12 +3080,45 @@ async fn swarm_matrix_state(State(state): State<AppState>) -> Json<SwarmMatrixSt
 }
 
 // ---------------------------------------------------------------------------
+// Liveness / readiness probes (Kubernetes, Cloud Run, ALB health checks)
+// ---------------------------------------------------------------------------
+
+/// `GET /healthz` — liveness. Cheap and unconditional: if the process can
+/// answer, it is alive. Never touches the pipeline lock so a long in-flight
+/// generation can't make the orchestrator think the pod is dead and kill it.
+async fn healthz() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// `GET /readyz` — readiness. The server only binds its socket *after* the
+/// inference pipeline is assembled (see `run_server`), so reaching this
+/// handler already implies the model loaded. We additionally confirm the
+/// pipeline lock is reachable (not poisoned) and report the live model id so
+/// the probe doubles as a smoke check. Returns 503 if the lock is poisoned.
+async fn readyz(State(state): State<AppState>) -> Response {
+    match state.pipeline.try_lock() {
+        Ok(_) | Err(std::sync::TryLockError::WouldBlock) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ready", "model": state.model_id })),
+        )
+            .into_response(),
+        Err(std::sync::TryLockError::Poisoned(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "unavailable", "reason": "pipeline lock poisoned" })),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router construction
 // ---------------------------------------------------------------------------
 
 /// Build the axum Router with all API routes attached.
 pub fn create_router(state: AppState) -> Router {
     Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/metrics", get(export_metrics))
         .route("/v1/models", get(list_models))
         .route("/v1/completions", post(create_completion))
@@ -3932,6 +3965,44 @@ mod tests {
 
     async fn hydrate_test_cache(state: &AppState, path: &FsPath) -> usize {
         state.hydrate_compression_cache_from(path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_and_readiness_probes_report_up() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let ready = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(ready.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["model"], "axiom-ttt-test");
+
+        safe_drop(pipeline_arc).await;
     }
 
     #[tokio::test]

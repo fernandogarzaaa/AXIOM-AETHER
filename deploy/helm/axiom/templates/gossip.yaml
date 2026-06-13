@@ -1,0 +1,134 @@
+{{- if .Values.gossip.enabled }}
+{{- $fullName := include "axiom.fullname" . }}
+{{- $saName := include "axiom.gossipServiceAccountName" . }}
+# ---------------------------------------------------------------------------
+# Immunity gossip — propagates each node's learned heal-memory across the fleet.
+# Pulls every Ready pod's signed /v1/immunity export and folds it into the
+# others via /v1/immunity/merge. Exports are HMAC-signed when AXIOM_FLEET_KEY
+# is set, so a receiver verifies provenance before trusting a peer.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $saName }}
+  labels:
+    {{- include "axiom.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $saName }}
+  labels:
+    {{- include "axiom.labels" . | nindent 4 }}
+rules:
+  # Read the headless service's Endpoints to discover live pod IPs.
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $saName }}
+  labels:
+    {{- include "axiom.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $saName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullName }}-gossip
+  labels:
+    {{- include "axiom.labels" . | nindent 4 }}
+data:
+  gossip.sh: |
+    #!/bin/sh
+    # Fan learned immunity across the fleet. Requires curl + jq.
+    set -eu
+    NS="${POD_NAMESPACE}"
+    SVC="${HEADLESS_SERVICE}"
+    PORT="${AXIOM_TARGET_PORT}"
+    API="https://kubernetes.default.svc"
+    TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+    CACERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    IPS="$(curl -fsS --cacert "$CACERT" -H "Authorization: Bearer $TOKEN" \
+      "$API/api/v1/namespaces/$NS/endpoints/$SVC" \
+      | jq -r '.subsets[]?.addresses[]?.ip')"
+
+    if [ -z "$IPS" ]; then
+      echo "[gossip] no ready endpoints for $SVC — nothing to do"
+      exit 0
+    fi
+    echo "[gossip] fleet members:"; echo "$IPS"
+
+    for src in $IPS; do
+      export_json="$(curl -fsS --max-time 10 "http://$src:$PORT/v1/immunity" || true)"
+      if [ -z "$export_json" ]; then
+        echo "[gossip] $src: no export (immunity may be unconfigured) — skip"
+        continue
+      fi
+      for dst in $IPS; do
+        [ "$dst" = "$src" ] && continue
+        code="$(curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' \
+          -X POST "http://$dst:$PORT/v1/immunity/merge" \
+          -H 'content-type: application/json' --data "$export_json" || echo 000)"
+        echo "[gossip] $src -> $dst : $code"
+      done
+    done
+    echo "[gossip] round complete"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullName }}-gossip
+  labels:
+    {{- include "axiom.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.gossip.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.gossip.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            {{- include "axiom.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: gossip
+        spec:
+          serviceAccountName: {{ $saName }}
+          restartPolicy: {{ .Values.gossip.restartPolicy }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+          containers:
+            - name: gossip
+              image: {{ .Values.gossip.image | quote }}
+              command: ["/bin/sh", "/scripts/gossip.sh"]
+              env:
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: HEADLESS_SERVICE
+                  value: {{ include "axiom.headlessName" . | quote }}
+                - name: AXIOM_TARGET_PORT
+                  value: {{ .Values.service.targetPort | quote }}
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+          volumes:
+            - name: script
+              configMap:
+                name: {{ $fullName }}-gossip
+                defaultMode: 0555
+{{- end }}

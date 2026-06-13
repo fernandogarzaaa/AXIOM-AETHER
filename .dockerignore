@@ -1,0 +1,32 @@
+# Keep the build context lean and the image reproducible.
+# Rust build artifacts (rebuilt inside the image)
+target/
+axiom_engine_rs/target/
+**/*.rs.bk
+
+# Git + CI metadata
+.git/
+.github/
+.gitignore
+
+# Trained weights + caches — NEVER baked into the image. They are seeded at
+# runtime from AXIOM_CHECKPOINT_URL / AXIOM_TOKENIZER_URL (see scripts/docker_entrypoint.sh)
+# or mounted as a volume. Baking stale weights is a footgun.
+checkpoints/
+tokenizer_cache/
+
+# Logs and local scratch
+logs/
+*.log
+
+# Editor / OS cruft
+.vscode/
+.nvim.lua
+.idea/
+*.swp
+.DS_Store
+
+# Docs and Windows helpers that have no place in the runtime image
+docs/
+*.bat
+axiom_autostart_task.xml

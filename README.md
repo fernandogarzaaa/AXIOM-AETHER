@@ -555,12 +555,38 @@ tar -xzf axiom-ttt-*.tar.gz
 ./axiom-ttt-*/axiom_engine --mode server
 ```
 
-### Docker (multi-arch: linux/amd64 + linux/arm64)
+### Docker (linux/amd64)
 
 ```bash
 docker run -p 8080:8080 ghcr.io/fernandogarzaaa/axiom-aether:latest
 docker compose up   # alternative
 ```
+
+The image ships **without trained weights** (kept lean + reproducible). Seed the
+production checkpoint at boot from object storage / a release:
+
+```bash
+docker run -p 8080:8080 \
+  -e AXIOM_CHECKPOINT_URL=https://<store>/axiom_production_bpe.bin \
+  -e AXIOM_TOKENIZER_URL=https://<store>/axiom_bpe.json \
+  ghcr.io/fernandogarzaaa/axiom-aether:latest
+```
+
+It exposes `/healthz` (liveness) and `/readyz` (readiness) for orchestrator probes.
+
+### Kubernetes (Helm + self-converging fleet)
+
+```bash
+helm install axiom deploy/helm/axiom --namespace axiom --create-namespace \
+  --set checkpoint.url=https://<store>/axiom_production_bpe.bin \
+  --set checkpoint.tokenizerUrl=https://<store>/axiom_bpe.json \
+  --set secrets.fleetKey=$(openssl rand -hex 32)
+```
+
+N replicas behind probes + HPA, each learning locally; an immunity-gossip
+CronJob propagates each node's heal-memory across the fleet via the signed
+`/v1/immunity` endpoints — anti-fragile swarm immunity. Full guide:
+[`docs/DEPLOY_K8S.md`](docs/DEPLOY_K8S.md).
 
 ### From source (Rust 1.78+)
 
