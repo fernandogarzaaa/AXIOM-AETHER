@@ -1,0 +1,128 @@
+# Default values for the Axiom-TTT Helm chart.
+# Override with `-f my-values.yaml` or `--set key=value`.
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/fernandogarzaaa/axiom-aether
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Model weights — the image ships WITHOUT trained weights. Seed them at boot
+# from object storage / a GitHub release. Leave URLs empty to boot with a
+# random-initialized model (smoke deploys only; drift signals are weak).
+# ---------------------------------------------------------------------------
+checkpoint:
+  url: ""          # -> AXIOM_CHECKPOINT_URL  (e.g. https://.../axiom_production_bpe.bin)
+  tokenizerUrl: "" # -> AXIOM_TOKENIZER_URL   (e.g. https://.../axiom_bpe.json)
+
+# ---------------------------------------------------------------------------
+# Runtime configuration (non-secret) — rendered into a ConfigMap.
+# ---------------------------------------------------------------------------
+config:
+  device: cpu            # cpu | cuda
+  rustLog: info
+  maxContextTokens: "4096"
+  productionBpe: "1"     # AXIOM_PRODUCTION_BPE — load the trained checkpoint dims from the sidecar
+  # Grounding / compression feature flags (off unless set):
+  groundCorrect: ""      # "1" to enable the self-correction loop
+  adaptiveCompress: ""   # "1" to enable confidence-gated adaptive compression
+  verifyResponses: ""    # "1" to auto-verify responses
+  # Heal-memory path: an emptyDir so each pod learns locally, then the fleet
+  # converges via the immunity gossip CronJob.
+  healMemoryPath: /app/state/heal_memory.json
+  extraEnv: {}           # arbitrary extra AXIOM_* env: { AXIOM_FOO: "bar" }
+
+# ---------------------------------------------------------------------------
+# Secrets — rendered into a Secret. Set these via --set or a sealed/external
+# secret in production; NEVER commit real values.
+# ---------------------------------------------------------------------------
+secrets:
+  # Shared fleet key — HMAC-signs immunity exports so peers verify before
+  # trusting. STRONGLY recommended when gossip is enabled. Generate with
+  # `openssl rand -hex 32`.
+  fleetKey: ""
+  anthropicApiKey: ""
+  contextApiKey: ""
+  # If you already manage these in an existing Secret, set existingSecret to
+  # its name and the chart will reference it instead of creating one.
+  existingSecret: ""
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+  annotations: {}
+
+# Headless service gives every pod a stable DNS A-record — the substrate the
+# immunity gossip job uses to enumerate the fleet.
+headlessService:
+  enabled: true
+
+# ---------------------------------------------------------------------------
+# Fleet convergence — a CronJob that pulls each pod's signed /v1/immunity
+# export and fans it out to the others' /v1/immunity/merge. Anti-fragile:
+# a fix any one node learns propagates to the whole fleet.
+# ---------------------------------------------------------------------------
+gossip:
+  enabled: true
+  schedule: "*/5 * * * *"        # every 5 minutes
+  # Image needs curl + jq. Override if you mirror images internally.
+  image: dwdraju/alpine-curl-jq:latest
+  backoffLimit: 1
+  restartPolicy: Never
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+# State volume for heal memory / TTT session checkpoints. emptyDir is correct
+# for the gossip-converged fleet model (per-pod local learning + gossip). Switch
+# to a PVC only for a single-replica deployment.
+persistence:
+  type: emptyDir          # emptyDir | pvc
+  size: 1Gi
+  storageClass: ""
+
+autoscaling:
+  enabled: false
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 75
+
+# Probe timings — startupProbe covers model load + checkpoint download.
+probes:
+  startup:
+    failureThreshold: 30   # 30 * 10s = up to 5 min for download + load
+    periodSeconds: 10
+  liveness:
+    periodSeconds: 20
+    failureThreshold: 3
+  readiness:
+    periodSeconds: 10
+    failureThreshold: 3
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

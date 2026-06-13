@@ -1,0 +1,23 @@
+Axiom-TTT deployed as "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Replicas:        {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.minReplicas }}–{{ .Values.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.replicaCount }}{{ end }}
+Image:           {{ .Values.image.repository }}:{{ .Values.image.tag }}
+Fleet gossip:    {{ if .Values.gossip.enabled }}ENABLED ({{ .Values.gossip.schedule }}){{ else }}disabled{{ end }}
+Checkpoint seed: {{ if .Values.checkpoint.url }}{{ .Values.checkpoint.url }}{{ else }}NONE — random-init (set checkpoint.url for a trained model){{ end }}
+
+1. Watch rollout:
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "axiom.fullname" . }}
+
+2. Port-forward and probe:
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "axiom.fullname" . }} 8080:{{ .Values.service.port }}
+   curl localhost:8080/readyz
+   curl localhost:8080/v1/models
+
+{{- if not .Values.secrets.fleetKey }}
+{{- if not .Values.secrets.existingSecret }}
+
+WARNING: secrets.fleetKey is empty. Immunity gossip will exchange UNSIGNED
+payloads. Set a shared key in production:
+   helm upgrade {{ .Release.Name }} ... --set secrets.fleetKey=$(openssl rand -hex 32)
+{{- end }}
+{{- end }}

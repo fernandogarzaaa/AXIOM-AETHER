@@ -1,0 +1,20 @@
+{{- if .Values.headlessService.enabled }}
+# Headless service: gives every pod a DNS A-record and an Endpoints object the
+# immunity gossip CronJob reads to enumerate the fleet. publishNotReadyAddresses
+# is false so gossip only targets Ready pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "axiom.headlessName" . }}
+  labels:
+    {{- include "axiom.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  ports:
+    - port: {{ .Values.service.targetPort }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "axiom.selectorLabels" . | nindent 4 }}
+{{- end }}

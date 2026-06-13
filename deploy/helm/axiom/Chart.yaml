@@ -1,0 +1,21 @@
+apiVersion: v2
+name: axiom
+description: >-
+  Axiom-TTT inference engine — OpenAI/Anthropic-compatible API with online
+  Test-Time Training, context compression, and a self-converging anti-fragile
+  fleet (swarm immunity via /v1/immunity gossip).
+type: application
+# Chart version — bump on chart changes.
+version: 0.1.0
+# Tracks the app; the image tag in values.yaml is the source of truth at deploy time.
+appVersion: "1.0.0"
+keywords:
+  - llm
+  - inference
+  - test-time-training
+  - anti-hallucination
+home: https://github.com/fernandogarzaaa/AXIOM-AETHER
+sources:
+  - https://github.com/fernandogarzaaa/AXIOM-AETHER
+maintainers:
+  - name: fernandogarzaaa
