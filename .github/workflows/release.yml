@@ -122,3 +122,59 @@ jobs:
         with:
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true
+
+  checkpoint:
+    name: Train & publish production checkpoint
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            axiom_engine_rs/target
+          key: ckpt-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+          restore-keys: ckpt-${{ runner.os }}-
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential python3
+
+      # Trains the d128/2L checkpoint on the repo's own corpus and runs the
+      # acceptance eval. The script exits non-zero unless clean-vs-anomaly
+      # separation PASSes, so a bad checkpoint never reaches a release.
+      - name: Train + validate checkpoint
+        run: ./scripts/train_cpu_quickstart.sh
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p ckpt_release
+          cp checkpoints/axiom_production_bpe.bin       ckpt_release/
+          cp checkpoints/axiom_production_bpe.meta.json ckpt_release/
+          cp checkpoints/axiom_bpe.json                 ckpt_release/
+          cp checkpoints/axiom_drift_gate.txt           ckpt_release/
+          sha256sum ckpt_release/* > ckpt_release/SHA256SUMS.txt
+          cat ckpt_release/SHA256SUMS.txt
+
+      # Stable, tag-independent asset names so Helm's checkpoint.url can point
+      # at releases/latest/download/<file>.
+      - name: Upload checkpoint assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ckpt_release/axiom_production_bpe.bin
+            ckpt_release/axiom_production_bpe.meta.json
+            ckpt_release/axiom_bpe.json
+            ckpt_release/axiom_drift_gate.txt
+            ckpt_release/SHA256SUMS.txt
+          fail_on_unmatched_files: true

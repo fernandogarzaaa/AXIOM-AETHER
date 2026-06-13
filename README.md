@@ -578,14 +578,17 @@ It exposes `/healthz` (liveness) and `/readyz` (readiness) for orchestrator prob
 
 ```bash
 helm install axiom deploy/helm/axiom --namespace axiom --create-namespace \
-  --set checkpoint.url=https://<store>/axiom_production_bpe.bin \
-  --set checkpoint.tokenizerUrl=https://<store>/axiom_bpe.json \
+  --set checkpoint.url=https://github.com/fernandogarzaaa/AXIOM-AETHER/releases/latest/download/axiom_production_bpe.bin \
+  --set checkpoint.tokenizerUrl=https://github.com/fernandogarzaaa/AXIOM-AETHER/releases/latest/download/axiom_bpe.json \
   --set secrets.fleetKey=$(openssl rand -hex 32)
 ```
 
 N replicas behind probes + HPA, each learning locally; an immunity-gossip
 CronJob propagates each node's heal-memory across the fleet via the signed
-`/v1/immunity` endpoints — anti-fragile swarm immunity. Full guide:
+`/v1/immunity` endpoints — anti-fragile swarm immunity. The `d128/2L`
+checkpoint is published as a release asset by the `release.yml` `checkpoint`
+job (trained + acceptance-gated in CI), so the URLs above are real. GPU overlay:
+`-f deploy/helm/axiom/values-gpu.yaml`. Full guide:
 [`docs/DEPLOY_K8S.md`](docs/DEPLOY_K8S.md).
 
 ### From source (Rust 1.78+)

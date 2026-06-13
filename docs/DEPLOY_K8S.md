@@ -12,11 +12,13 @@ a fix any one node discovers becomes shared knowledge.
 # 1. The image is published to GHCR on every push to main:
 #    ghcr.io/fernandogarzaaa/axiom-aether:latest
 
-# 2. Install with a trained checkpoint seeded at boot + a fleet key:
+# 2. Install with a trained checkpoint seeded at boot + a fleet key.
+#    The checkpoint is published as a GitHub release asset by the release
+#    workflow (see "Where the checkpoint comes from" below), so the URLs are real:
 helm install axiom deploy/helm/axiom \
   --namespace axiom --create-namespace \
-  --set checkpoint.url=https://<your-store>/axiom_production_bpe.bin \
-  --set checkpoint.tokenizerUrl=https://<your-store>/axiom_bpe.json \
+  --set checkpoint.url=https://github.com/fernandogarzaaa/AXIOM-AETHER/releases/latest/download/axiom_production_bpe.bin \
+  --set checkpoint.tokenizerUrl=https://github.com/fernandogarzaaa/AXIOM-AETHER/releases/latest/download/axiom_bpe.json \
   --set secrets.fleetKey=$(openssl rand -hex 32) \
   --set secrets.anthropicApiKey=$ANTHROPIC_API_KEY
 
@@ -99,12 +101,41 @@ Replicas are stateless for serving (model is read-only; TTT fast-weights are
 per-session in memory). New pods seed the checkpoint on boot and inherit the
 fleet's accumulated immunity at the next gossip round.
 
+## Where the checkpoint comes from
+
+The image ships without weights. The **release workflow** (`.github/workflows/release.yml`,
+on every `v*` tag) has a `checkpoint` job that trains the `d128/2L` model on the
+repo's own corpus, runs the acceptance eval (and fails the release if
+clean-vs-anomaly separation doesn't PASS), and uploads stable-named assets:
+
+| Asset | `--set` |
+|---|---|
+| `axiom_production_bpe.bin` | `checkpoint.url=.../releases/latest/download/axiom_production_bpe.bin` |
+| `axiom_bpe.json` | `checkpoint.tokenizerUrl=.../releases/latest/download/axiom_bpe.json` |
+| `axiom_production_bpe.meta.json` | (dims/vocab sidecar — informational) |
+| `axiom_drift_gate.txt` | (recalibrated gate — informational) |
+| `SHA256SUMS.txt` | integrity check |
+
+`releases/latest/download/<file>` always resolves to the newest release, so the
+Helm values above keep working across versions. Pin to a tag
+(`releases/download/v1.2.3/...`) for reproducibility.
+
 ## GPU
 
-Set `config.device=cuda` and add GPU resources/affinity via values
-(`resources.limits."nvidia.com/gpu": 1`, plus the matching `nodeSelector`).
-The CPU `d128/2L` checkpoint is the default; for a larger model see the
-"Scaling note" in the README — capacity must match the corpus.
+A ready-made overlay lives at `deploy/helm/axiom/values-gpu.yaml` — `cuda`
+device, `nvidia.com/gpu` requests/limits, GPU `nodeSelector` + toleration:
+
+```sh
+helm install axiom deploy/helm/axiom -f deploy/helm/axiom/values-gpu.yaml \
+  --set image.repository=<your-cuda-image> \
+  --set checkpoint.url=... --set checkpoint.tokenizerUrl=... \
+  --set secrets.fleetKey=$(openssl rand -hex 32)
+```
+
+The default GHCR image is **CPU-built**; for CUDA inference build an image with
+the candle `cuda` feature and point `image.repository`/`tag` at it. The CPU
+`d128/2L` checkpoint is the default; for a larger model see the "Scaling note"
+in the README — capacity must match the corpus.
 
 ## Local validation
 
