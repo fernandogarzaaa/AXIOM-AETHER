@@ -18,7 +18,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}   # fernandogarzaaa/axiom-aether
+  IMAGE_NAME: ${{ github.repository }}   # normalized to lowercase per-job (GHCR requires it)
 
 jobs:
   build:
@@ -39,6 +39,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # GHCR refs must be lowercase; github.repository preserves the repo's
+      # original casing (AXIOM-AETHER), so normalize it before any image ref.
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Sanitize platform name
         run: echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
@@ -94,6 +99,9 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
