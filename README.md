@@ -555,7 +555,7 @@ tar -xzf axiom-ttt-*.tar.gz
 ./axiom-ttt-*/axiom_engine --mode server
 ```
 
-### Docker (linux/amd64)
+### Docker (multi-arch: linux/amd64 + linux/arm64)
 
 ```bash
 docker run -p 8080:8080 ghcr.io/fernandogarzaaa/axiom-aether:latest
