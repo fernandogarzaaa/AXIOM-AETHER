@@ -1,0 +1,44 @@
+# GPU overlay for the Axiom-TTT chart.
+#   helm install axiom deploy/helm/axiom -f deploy/helm/axiom/values-gpu.yaml \
+#     --set checkpoint.url=... --set checkpoint.tokenizerUrl=... --set secrets.fleetKey=...
+#
+# Assumes the NVIDIA device plugin is installed and GPU nodes are labelled.
+# The published image is CPU-built; for CUDA inference, point image.repository
+# at a CUDA-enabled image you build with the candle `cuda` feature.
+
+image:
+  # Replace with your CUDA-enabled build (the default GHCR image is CPU-only).
+  repository: ghcr.io/fernandogarzaaa/axiom-aether
+  tag: cuda
+
+config:
+  device: cuda
+
+resources:
+  requests:
+    cpu: "1"
+    memory: 2Gi
+    nvidia.com/gpu: "1"
+  limits:
+    cpu: "4"
+    memory: 8Gi
+    nvidia.com/gpu: "1"
+
+# Schedule onto GPU nodes. Adjust the key to match your cluster's labels.
+nodeSelector:
+  nvidia.com/gpu.present: "true"
+
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+
+# GPU pods are heavier and slower to schedule; give them more headroom and
+# don't pin replicas high by default.
+replicaCount: 1
+
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
