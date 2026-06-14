@@ -89,6 +89,20 @@ Tune or disable:
 > The gossip image needs `curl` + `jq` (default `dwdraju/alpine-curl-jq`).
 > Override `gossip.image` if you mirror images internally.
 
+## Metrics
+
+The server exposes Prometheus metrics at `/metrics` (text exposition format). If
+you run the Prometheus Operator, enable a ServiceMonitor:
+
+```sh
+helm upgrade axiom deploy/helm/axiom --reuse-values \
+  --set metrics.serviceMonitor.enabled=true \
+  --set metrics.serviceMonitor.additionalLabels.release=kube-prometheus-stack
+```
+
+It scrapes only the api Service (the headless one is excluded), so each pod is
+scraped exactly once.
+
 ## Scaling
 
 ```sh
@@ -119,6 +133,10 @@ clean-vs-anomaly separation doesn't PASS), and uploads stable-named assets:
 `releases/latest/download/<file>` always resolves to the newest release, so the
 Helm values above keep working across versions. Pin to a tag
 (`releases/download/v1.2.3/...`) for reproducibility.
+
+You can cut a release either by pushing a `v*` tag or manually from the Actions
+tab (the workflow has a `workflow_dispatch` trigger that takes a `tag` input and
+creates the release at the selected ref).
 
 ## GPU
 

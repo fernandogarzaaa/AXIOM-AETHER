@@ -64,6 +64,19 @@ service:
 headlessService:
   enabled: true
 
+# Prometheus scraping of /metrics (text/plain;version=0.0.4 exposition format).
+# serviceMonitor requires the Prometheus Operator CRDs (monitoring.coreos.com/v1);
+# leave disabled if you don't run them.
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    # Labels Prometheus selects ServiceMonitors by, e.g. {release: kube-prometheus-stack}.
+    additionalLabels: {}
+    # Namespace to create the ServiceMonitor in (defaults to the release namespace).
+    namespace: ""
+
 # ---------------------------------------------------------------------------
 # Fleet convergence — a CronJob that pulls each pod's signed /v1/immunity
 # export and fans it out to the others' /v1/immunity/merge. Anti-fragile:
