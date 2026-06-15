@@ -4,10 +4,18 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/publish (e.g. v0.1.1). The release + tag are created at the selected ref."
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: axiom_engine
+  # On a tag push this is the tag; on manual dispatch it's the provided input.
+  VERSION: ${{ github.event.inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -97,7 +105,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          staging="axiom-ttt-${{ github.ref_name }}-${{ matrix.suffix }}"
+          staging="axiom-ttt-${{ env.VERSION }}-${{ matrix.suffix }}"
           mkdir -p "$staging"
           cp "axiom_engine_rs/target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "$staging/"
           cp README.md "$staging/"
@@ -109,7 +117,7 @@ jobs:
         if: matrix.ext == 'zip'
         shell: pwsh
         run: |
-          $staging = "axiom-ttt-${{ github.ref_name }}-${{ matrix.suffix }}"
+          $staging = "axiom-ttt-${{ env.VERSION }}-${{ matrix.suffix }}"
           New-Item -ItemType Directory -Path $staging | Out-Null
           Copy-Item "axiom_engine_rs\target\${{ matrix.target }}\release\${{ env.BINARY_NAME }}.exe" $staging\
           Copy-Item README.md $staging\
@@ -120,6 +128,7 @@ jobs:
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.VERSION }}
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true
 
@@ -171,6 +180,7 @@ jobs:
       - name: Upload checkpoint assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.VERSION }}
           files: |
             ckpt_release/axiom_production_bpe.bin
             ckpt_release/axiom_production_bpe.meta.json

@@ -4,6 +4,7 @@ metadata:
   name: {{ include "axiom.fullname" . }}
   labels:
     {{- include "axiom.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
   {{- with .Values.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
