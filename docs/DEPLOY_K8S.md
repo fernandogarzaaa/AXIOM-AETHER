@@ -115,6 +115,22 @@ Replicas are stateless for serving (model is read-only; TTT fast-weights are
 per-session in memory). New pods seed the checkpoint on boot and inherit the
 fleet's accumulated immunity at the next gossip round.
 
+## Availability & smoke test
+
+A **PodDisruptionBudget** (on by default for >1 replica) keeps a quorum serving
+through node drains and rolling upgrades — tune `podDisruptionBudget.minAvailable`
+(or `maxUnavailable`). It is skipped for a single replica, where a PDB would make
+the node undrainable.
+
+After install/upgrade, smoke-test the live release:
+
+```sh
+helm test axiom -n axiom
+```
+
+This runs a hook pod that probes `/readyz` and `/v1/models` through the Service
+and fails if either is unhealthy.
+
 ## Where the checkpoint comes from
 
 The image ships without weights. The **release workflow** (`.github/workflows/release.yml`,

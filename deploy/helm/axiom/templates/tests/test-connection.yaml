@@ -1,0 +1,32 @@
+{{- if .Values.tests.enabled }}
+# `helm test {{ .Release.Name }}` runs this pod: it probes the Service's readiness
+# and model endpoints. Non-zero exit fails the test. Hook-deleted after success.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "axiom.fullname" . }}-test-connection
+  labels:
+    {{- include "axiom.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+  containers:
+    - name: connection-test
+      image: {{ .Values.tests.image | quote }}
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          base="http://{{ include "axiom.fullname" . }}:{{ .Values.service.port }}"
+          echo "[test] GET $base/readyz"
+          curl -fsS --max-time 10 "$base/readyz" | grep -q '"status":"ready"'
+          echo "[test] GET $base/v1/models"
+          curl -fsS --max-time 10 "$base/v1/models" | grep -q '"object"'
+          echo "[test] OK"
+{{- end }}
