@@ -112,6 +112,21 @@ autoscaling:
   maxReplicas: 10
   targetCPUUtilizationPercentage: 75
 
+# Keep a quorum of pods serving during voluntary disruptions (node drains,
+# rolling upgrades). Only rendered when there's more than one replica (a PDB on a
+# single replica would block node drains entirely). Set maxUnavailable instead of
+# minAvailable if you prefer; leave the other empty.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+  maxUnavailable: ""
+
+# `helm test <release>` connectivity smoke test (probes /readyz + /v1/models
+# against the in-cluster Service). Image needs curl.
+tests:
+  enabled: true
+  image: curlimages/curl:8.11.1
+
 # Probe timings — startupProbe covers model load + checkpoint download.
 probes:
   startup:

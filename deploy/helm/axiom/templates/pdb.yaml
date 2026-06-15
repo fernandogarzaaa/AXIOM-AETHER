@@ -1,0 +1,19 @@
+{{- if and .Values.podDisruptionBudget.enabled (or .Values.autoscaling.enabled (gt (int .Values.replicaCount) 1)) }}
+# Protects fleet availability during voluntary disruptions. Skipped for a single
+# replica, where any PDB would make the node undrainable.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "axiom.fullname" . }}
+  labels:
+    {{- include "axiom.labels" . | nindent 4 }}
+spec:
+  {{- if .Values.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "axiom.selectorLabels" . | nindent 6 }}
+{{- end }}
