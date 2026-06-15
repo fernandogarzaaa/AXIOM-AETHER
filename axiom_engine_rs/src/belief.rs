@@ -141,6 +141,62 @@ impl BetaBelief {
         })
     }
 
+    /// Discount this belief's evidence toward the uniform prior by a reliability
+    /// coefficient in [0,1]: `reliability=1` keeps it intact, `reliability=0`
+    /// collapses it to `Beta(1,1)` (no influence). Used to down-weight a peer by
+    /// its trust (Beta-mean / FLTrust score) *before* combining, so a low-trust
+    /// peer cannot dominate a swarm merge.
+    pub fn discounted(&self, reliability: f32) -> BetaBelief {
+        let r = reliability.clamp(0.0, 1.0);
+        BetaBelief {
+            alpha: 1.0 + (self.alpha - 1.0) * r,
+            beta: 1.0 + (self.beta - 1.0) * r,
+        }
+    }
+
+    /// Reliability-weighted Dempster-Shafer combination: discount `other` by its
+    /// trust, then [`combine_ds`]. Still raises [`DsConflict`] on irreconcilable
+    /// (post-discount) evidence.
+    pub fn combine_ds_reliable(
+        &self,
+        other: &BetaBelief,
+        reliability: f32,
+    ) -> Result<BetaBelief, DsConflict> {
+        self.combine_ds(&other.discounted(reliability))
+    }
+
+    /// Murphy's-rule fusion: average the two sources' mass functions instead of
+    /// Dempster-normalizing through the conflict mass. This avoids Zadeh's
+    /// paradox — where two near-certain *conflicting* sources yield a verdict
+    /// neither supports — and is the recommended fallback when conflict is high.
+    pub fn murphy_average(&self, other: &BetaBelief) -> BetaBelief {
+        let t1 = self.evidence();
+        let t2 = other.evidence();
+        let m_yes = 0.5 * (self.alpha / t1 + other.alpha / t2);
+        let m_no = 0.5 * (self.beta / t1 + other.beta / t2);
+        let t = 0.5 * (t1 + t2);
+        BetaBelief {
+            alpha: (m_yes * t).max(1e-6),
+            beta: (m_no * t).max(1e-6),
+        }
+    }
+
+    /// Conflict-aware swarm merge that never errors: discount `other` by
+    /// `reliability`, Dempster-combine when reconcilable, else fall back to
+    /// [`murphy_average`]. Returns the fused belief plus `Some(conflict)` when the
+    /// Murphy fallback fired (so the caller can still log/alarm on the conflict).
+    pub fn combine_ds_conflict_aware(
+        &self,
+        other: &BetaBelief,
+        reliability: f32,
+    ) -> (BetaBelief, Option<DsConflict>) {
+        let discounted = other.discounted(reliability);
+        match self.combine_ds(&discounted) {
+            Ok(combined) => (combined, None),
+            Err(conflict) => (self.murphy_average(&discounted), Some(conflict)),
+        }
+    }
+
     /// True when the belief's parameters are well-formed and within sane bounds.
     /// Byzantine defence: a peer cannot inject NaN/∞/negative or absurdly large
     /// pseudocounts (fabricated certainty) into a swarm merge.
@@ -207,6 +263,35 @@ mod tests {
         let no = BetaBelief { alpha: 1.0, beta: 9.0 }; // strongly no
         let err = yes.combine_ds(&no).unwrap_err();
         assert!(err.conflict_mass > DS_CONFLICT_THRESHOLD);
+    }
+
+    #[test]
+    fn reliability_discount_reduces_peer_influence() {
+        let local = BetaBelief { alpha: 5.0, beta: 1.0 }; // confident yes
+        let peer = BetaBelief { alpha: 1.0, beta: 9.0 }; // confident no
+        // Full trust: the peer pulls the mean down hard.
+        let full = local.combine_ds_reliable(&peer, 1.0);
+        // Zero trust: the peer is collapsed to the uniform prior → no influence.
+        let none = local.combine_ds_reliable(&peer, 0.0).unwrap();
+        assert!((none.mean() - local.mean()).abs() < 1e-6, "reliability 0 ⇒ peer ignored");
+        if let Ok(full) = full {
+            assert!(full.mean() < none.mean(), "trusted disagreeing peer lowers the mean");
+        }
+    }
+
+    #[test]
+    fn conflict_aware_falls_back_to_murphy_without_erroring() {
+        let yes = BetaBelief { alpha: 9.0, beta: 1.0 };
+        let no = BetaBelief { alpha: 1.0, beta: 9.0 };
+        // Raw combine_ds errors on this conflict...
+        assert!(yes.combine_ds(&no).is_err());
+        // ...but the conflict-aware merge returns a finite Murphy average + flag.
+        let (fused, conflict) = yes.combine_ds_conflict_aware(&no, 1.0);
+        assert!(conflict.is_some(), "high conflict is still surfaced");
+        assert!(fused.mean().is_finite() && fused.alpha > 0.0 && fused.beta > 0.0);
+        // Murphy average of symmetric yes/no sits near 0.5 — supported by neither
+        // extreme, but not the paradoxical Dempster result.
+        assert!((fused.mean() - 0.5).abs() < 0.2, "murphy fusion is a sane midpoint");
     }
 
     #[test]

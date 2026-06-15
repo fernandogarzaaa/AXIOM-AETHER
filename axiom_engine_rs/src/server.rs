@@ -62,7 +62,7 @@ use crate::swarm_route::{LocalSwarmRouteMatrix, SwarmMatrixState};
 use crate::swarm_router::{SwarmChatResult, SwarmRouter};
 use crate::vfs::{NeuralVfs, VfsMountReport, VfsReadReport, VfsStats};
 use crate::vibe_memory::MasterVibe;
-use crate::weight_merge::{merge_checkpoint_files, MergeSummary};
+use crate::weight_merge::{fleet_dare_ties, merge_checkpoint_files_with, MergeSummary};
 
 const MAX_ACTIVE_VRAM_SESSIONS: usize = 32;
 
@@ -1691,7 +1691,10 @@ async fn cluster_merge(
         .map(PathBuf::from)
         .collect::<Vec<_>>();
     let output = PathBuf::from(req.output);
-    let summary = spawn_blocking(move || merge_checkpoint_files(&inputs, &output, alpha))
+    // Fleet merges use DARE-TIES (sign-elected, sparsified) rather than a uniform
+    // alpha-blend, so agreeing peers compound and conflicting deltas don't cancel.
+    let method = fleet_dare_ties(alpha);
+    let summary = spawn_blocking(move || merge_checkpoint_files_with(&inputs, &output, method))
         .await
         .map_err(|e| ApiError::Internal(format!("merge task join failed: {e}")))?
         .map_err(ApiError::BadRequest)?;
@@ -2336,11 +2339,32 @@ async fn ground_correct_round(
 
     match forwarder.forward_messages_json(&payload, client_auth).await {
         Ok(revised) => {
-            eprintln!(
-                "[axiom-ttt] self-correction: re-asked to ground {} flagged claim(s)",
-                flagged.len()
-            );
-            Some(revised)
+            // External-grounding guardrail: 2024 evidence (Huang et al. ICLR;
+            // TACL critical survey) shows intrinsic self-correction can *degrade*
+            // output. Keep the revision only if re-verifying it against the same
+            // evidence shows it is strictly *more* grounded than the original —
+            // i.e. gated on an external signal, not the model's self-critique.
+            let revised_answer = assistant_text(&revised);
+            if revised_answer.trim().is_empty() {
+                eprintln!("[axiom-ttt] self-correction rejected (revision was empty)");
+                return None;
+            }
+            let revised_report = crate::hallucination::verify(&revised_answer, evidence);
+            if revised_report.grounded_fraction > report.grounded_fraction {
+                eprintln!(
+                    "[axiom-ttt] self-correction accepted: grounded {:.2} → {:.2} ({} flagged claim(s) addressed)",
+                    report.grounded_fraction,
+                    revised_report.grounded_fraction,
+                    flagged.len()
+                );
+                Some(revised)
+            } else {
+                eprintln!(
+                    "[axiom-ttt] self-correction rejected: revision not better grounded ({:.2} → {:.2}); keeping original",
+                    report.grounded_fraction, revised_report.grounded_fraction
+                );
+                None
+            }
         }
         Err(e) => {
             eprintln!("[axiom-ttt] self-correction skipped (re-ask failed: {e})");
@@ -3888,6 +3912,23 @@ mod tests {
         let revised = ground_correct_round(&forwarder, &ClientAuth::default(), &outbound, &grounded, evidence).await;
         assert!(revised.is_none(), "grounded answer → no re-ask");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no upstream call when nothing is flagged");
+    }
+
+    #[tokio::test]
+    async fn self_correction_rejects_revision_that_is_not_more_grounded() {
+        use std::sync::atomic::Ordering;
+        // The re-ask returns an answer that is still ungrounded (shares nothing
+        // with the evidence), so the guardrail must reject it and keep None.
+        let (base, calls) = start_mock_upstream("Bananas ripen faster in zero gravity.").await;
+        let forwarder = crate::anthropic_forwarder::AnthropicForwarder::new(Some("k".into()), Some(base));
+        let outbound = serde_json::json!({"model":"m","max_tokens":64,
+            "messages":[{"role":"user","content":"summarize the doc"}]});
+        let ungrounded = serde_json::json!({"content":[{"type":"text",
+            "text":"Axiom was funded by NASA in 1972."}]});
+        let evidence = "Axiom is an inference engine with online test-time training.";
+        let revised = ground_correct_round(&forwarder, &ClientAuth::default(), &outbound, &ungrounded, evidence).await;
+        assert!(revised.is_none(), "a revision that is not better grounded must be rejected");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the re-ask still happened once");
     }
 
     #[test]
