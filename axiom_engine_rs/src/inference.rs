@@ -88,6 +88,22 @@ impl InferencePipeline {
             );
         }
 
+        // Optional Gated-DeltaNet forget gate α ∈ (0, 1] via AXIOM_FORGET_GATE.
+        // Parameter-free, so it applies to any checkpoint; default (unset) = 1.0
+        // = the ungated delta rule (existing behaviour). α < 1 decays retained
+        // fast-weight memory geometrically — relevance-aware forgetting + a
+        // bound on ‖W̃‖ (with the stabilize path's normalized keys).
+        if let Ok(raw) = std::env::var("AXIOM_FORGET_GATE") {
+            if let Ok(alpha) = raw.trim().parse::<f32>() {
+                if alpha.is_finite() && alpha > 0.0 && alpha < 1.0 {
+                    model.set_forget_gate(alpha);
+                    eprintln!("[+] Gated-DeltaNet forget gate ENABLED (α={alpha})");
+                } else if alpha != 1.0 {
+                    eprintln!("[!] Ignoring AXIOM_FORGET_GATE={raw} (must be in (0, 1])");
+                }
+            }
+        }
+
         let tokenizer = match runtime
             .tokenizer_path
             .as_ref()
