@@ -30,6 +30,14 @@ pub struct ModelMeta {
     /// This is training provenance only; inference remains unchanged.
     #[serde(default)]
     pub last_token_only: bool,
+    /// Whether this checkpoint was trained with the *learned* data-dependent
+    /// Gated-DeltaNet forget gate (a per-layer `w_α` projection that decides how
+    /// much memory to retain per token). It adds weights, so the model must be
+    /// built with it enabled to load such a checkpoint. `#[serde(default)]` → old
+    /// sidecars load as `false`, so the parameter-free path is used and existing
+    /// checkpoints are unaffected.
+    #[serde(default)]
+    pub learned_gate: bool,
 }
 
 impl ModelMeta {
@@ -136,6 +144,7 @@ mod tests {
             tokenizer: "t.json".into(),
             stabilize: true,
             last_token_only: true,
+            learned_gate: true,
         };
         let ckpt = std::env::temp_dir().join("axiom_meta_test.bin");
         let ckpt = ckpt.to_string_lossy().to_string();

@@ -44,13 +44,20 @@ engine, and a citation. Status: ✅ implemented · 🚧 scaffolded · ⬜ planne
 ## P2 — bigger / offline / research
 
 - 🚧 **Gated DeltaNet TTT core** (arXiv:2412.06464). The existing TTT update is
-  already the delta rule (`W̃ ← W̃(I − ηkkᵀ) + ηvkᵀ`). **Implemented:** the
-  forget-gate half — a parameter-free scalar gate α ∈ (0,1] on the retained-memory
-  term (`W̃ ← α·W̃(I − ηkkᵀ) + ηvkᵀ`), opt-in via `AXIOM_FORGET_GATE`, byte-identical
-  at α=1, so existing checkpoints are unaffected. With normalized keys this bounds
-  ‖W̃‖ (spectral radius ≤ α) — principled forgetting in place of the hard clamp.
-  **Follow-ups:** the *learned, data-dependent* gate (needs a new projection →
-  checkpoint-format bump) and the chunkwise (C=64) parallel form for throughput.
+  already the delta rule (`W̃ ← W̃(I − ηkkᵀ) + ηvkᵀ`). **Implemented:**
+  - the **scalar forget gate** — parameter-free α ∈ (0,1] on the retained-memory
+    term (`W̃ ← α·W̃(I − ηkkᵀ) + ηvkᵀ`), opt-in via `AXIOM_FORGET_GATE`,
+    byte-identical at α=1; with normalized keys spectral radius ≤ α.
+  - the **learned, data-dependent gate** — a per-layer `w_α: Linear(d→1)` so the
+    network decides what to forget per token: α_t = α_min + (1−α_min)·σ(w_α·x),
+    warm-started near α≈1 (`GATE_INIT_LOGIT`) so training departs from the proven
+    dynamics. Opt-in via `AXIOM_LEARNED_GATE` at training; recorded in the
+    `ModelMeta` sidecar (`learned_gate`) so inference builds the matching
+    architecture. Adds `w_alpha` weights → a checkpoint trained with it is needed;
+    default-off is parameter-identical, so existing d128/d256 checkpoints load
+    unchanged.
+  **Follow-ups:** train + eval a learned-gate checkpoint to quantify the gain vs
+  the ungated baseline; the chunkwise (C=64) parallel form for training throughput.
 - ⬜ **RWKV-7-style vector gating** (arXiv:2503.14456) — per-channel gate +
   in-context LR (more expressive than the scalar gate; also a checkpoint bump).
 - ⬜ **KV-cache eviction** (PyramidKV, arXiv:2406.02069) in the decode loop.

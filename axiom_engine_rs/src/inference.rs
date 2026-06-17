@@ -61,11 +61,18 @@ impl InferencePipeline {
         checkpoint_path: impl AsRef<str>,
         runtime: InferenceRuntimeOptions,
     ) -> Result<Self> {
+        let checkpoint = checkpoint_path.as_ref();
+        // Peek the sidecar BEFORE building the model: the learned forget gate
+        // adds `w_alpha` weights, so the architecture must match the checkpoint
+        // to load. Missing/old sidecar → learned_gate=false → parameter-identical
+        // to the original model, so existing checkpoints load unchanged.
+        let meta = ModelMeta::load(checkpoint);
+        let learned_gate = meta.as_ref().map(|m| m.learned_gate).unwrap_or(false);
+
         let mut varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model = AxiomTTTLM::new(vb, config.clone())?;
+        let model = AxiomTTTLM::new_with_options(vb, config.clone(), learned_gate)?;
 
-        let checkpoint = checkpoint_path.as_ref();
         if Path::new(checkpoint).exists() {
             varmap.load(checkpoint)?;
             // Diagnostics go to stderr: stdout is reserved as a pure protocol
@@ -76,11 +83,14 @@ impl InferencePipeline {
             // trained with (recorded in the sidecar). Missing/old sidecar → off,
             // so existing models (e.g. the d256 production checkpoint) are
             // byte-identical to before.
-            if let Some(meta) = ModelMeta::load(checkpoint) {
+            if let Some(meta) = &meta {
                 if meta.stabilize {
                     model.set_stabilize(true);
                     eprintln!("[+] Inner-loop stabilization ENABLED (per sidecar)");
                 }
+            }
+            if learned_gate {
+                eprintln!("[+] Learned data-dependent forget gate ENABLED (per sidecar)");
             }
         } else {
             eprintln!(

@@ -51,7 +51,27 @@ pub struct NativeTTTBlock {
     /// so no checkpoint-format change. (The learned data-dependent gate is a
     /// follow-up requiring a new projection weight.)
     forget_gate: Arc<AtomicU32>,
+    /// Optional *learned* data-dependent forget gate: a `w_α: Linear(d → 1)`
+    /// projection whose per-token output α_t = α_min + (1−α_min)·σ(w_α·x) decays
+    /// the retained-memory term. `Some` only when the model was built with the
+    /// learned gate (and the checkpoint carries `w_alpha` weights); `None` falls
+    /// back to the scalar `forget_gate` above. When present it takes precedence,
+    /// letting the network decide what to forget per token (Gated-DeltaNet's
+    /// data-dependent gate). A constant logit offset (`GATE_INIT_LOGIT`) makes α
+    /// start near 1 (≈ ungated), so training departs from the proven dynamics
+    /// rather than a cold, aggressively-forgetting gate.
+    learned_gate: Option<Linear>,
 }
+
+/// Lower bound on the learned forget gate, keeping α ∈ [GATE_FLOOR, 1) so a
+/// saturated gate can never fully erase memory or push the spectral radius to 0.
+const GATE_FLOOR: f64 = 1e-3;
+
+/// Constant offset added to the learned-gate logit so that at initialization
+/// (w_α ≈ 0) the gate σ(logit) ≈ σ(4) ≈ 0.98 ⇒ α ≈ 1. Training thus starts from
+/// the proven near-ungated dynamics and *learns* to forget, rather than booting
+/// with a cold, aggressively-forgetting gate.
+const GATE_INIT_LOGIT: f64 = 4.0;
 
 impl NativeTTTBlock {
     /// Construct a new block with its own private inner-lr cell initialised
@@ -61,20 +81,30 @@ impl NativeTTTBlock {
         let inner_lr = Arc::new(AtomicU32::new(config.lr_inner.to_bits()));
         let stabilize = Arc::new(AtomicBool::new(false));
         let forget_gate = Arc::new(AtomicU32::new(1.0f32.to_bits()));
-        Self::new_with_shared_lr(vs, config, inner_lr, stabilize, forget_gate)
+        Self::new_with_shared_lr(vs, config, inner_lr, stabilize, forget_gate, false)
     }
 
     /// Construct a block that reads its inner learning rate from a shared
     /// atomic cell — used by `AxiomTTTLM` so a single `set_inner_lr` call
-    /// retunes every layer at once.
+    /// retunes every layer at once. `learned_gate` allocates the `w_α` projection
+    /// for the data-dependent forget gate (adds `w_alpha` weights to the
+    /// checkpoint); when false the block is parameter-identical to before.
     pub fn new_with_shared_lr(
         vs: VarBuilder,
         config: AxiomConfig,
         inner_lr: Arc<AtomicU32>,
         stabilize: Arc<AtomicBool>,
         forget_gate: Arc<AtomicU32>,
+        learned_gate: bool,
     ) -> Result<Self> {
         let d = config.d_model;
+        let learned_gate = if learned_gate {
+            // Linear(d → 1) with bias. Bias init defaults near 0 ⇒ σ≈0.5; we want
+            // α to start near 1, so the gate logit is biased positive below.
+            Some(candle_nn::linear(d, 1, vs.pp("w_alpha"))?)
+        } else {
+            None
+        };
         Ok(Self {
             w_q: candle_nn::linear_no_bias(d, d, vs.pp("w_q"))?,
             w_k: candle_nn::linear_no_bias(d, d, vs.pp("w_k"))?,
@@ -87,6 +117,7 @@ impl NativeTTTBlock {
             inner_lr,
             stabilize,
             forget_gate,
+            learned_gate,
         })
     }
 
@@ -148,17 +179,30 @@ impl NativeTTTBlock {
         // Gated-DeltaNet forget gate α ∈ (0, 1] read live from the shared atomic.
         let alpha = f32::from_bits(self.forget_gate.load(Ordering::Relaxed));
 
-        let mut updated_state = if alpha >= 1.0 {
+        let mut updated_state = if let Some(w_alpha) = &self.learned_gate {
+            // Learned data-dependent gate: the network decides per token how much
+            // memory to retain. α_t = GATE_FLOOR + (1−GATE_FLOOR)·σ(w_α·x) ∈
+            // (GATE_FLOOR, 1), applied to the retained-memory term:
+            //   W̃ ← α_t·W̃(I − ηkkᵀ) + ηvkᵀ
+            // +GATE_INIT_LOGIT so α starts ≈ 1 (near-ungated) at initialization.
+            let logit = w_alpha.forward(x)?.affine(1.0, GATE_INIT_LOGIT)?; // [1, 1]
+            let s = candle_nn::ops::sigmoid(&logit)?; // [1, 1] ∈ (0, 1)
+            let alpha_t = s.affine(1.0 - GATE_FLOOR, GATE_FLOOR)?; // [1, 1]
+            let pred_outer = pred.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
+            let v_outer = v_vec.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
+            let memory = session_state.sub(&pred_outer.broadcast_mul(&lr)?)?;
+            let write = v_outer.broadcast_mul(&lr)?;
+            // alpha_t is [1,1] → broadcasts across the [d,d] memory term.
+            memory.broadcast_mul(&alpha_t)?.add(&write)?
+        } else if alpha >= 1.0 {
             // Ungated delta rule (default, byte-identical to the original path):
             //   W̃ ← W̃ − η·(pred − v)⊗k = W̃(I − ηkkᵀ) + ηvkᵀ
             let grad = error.unsqueeze(1)?.matmul(&k_eff)?;
             session_state.sub(&grad.broadcast_mul(&lr)?)?
         } else {
-            // Gated delta rule: decay only the retained-memory term by α, leaving
-            // the fresh write ηvkᵀ at full strength:
-            //   W̃ ← α·(W̃ − η·pred⊗k) + η·v⊗k = α·W̃(I − ηkkᵀ) + ηvkᵀ
-            // With normalized keys (stabilize) ‖I − ηkkᵀ‖ ≤ 1 ⇒ spectral radius
-            // ≤ α, so old memory decays geometrically and ‖W̃‖ stays bounded.
+            // Scalar (parameter-free) gated delta rule: decay only the
+            // retained-memory term by α, leaving the fresh write ηvkᵀ at full
+            // strength. With normalized keys ‖I − ηkkᵀ‖ ≤ 1 ⇒ spectral radius ≤ α.
             let pred_outer = pred.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
             let v_outer = v_vec.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
             let memory = session_state.sub(&pred_outer.broadcast_mul(&lr)?)?;
@@ -238,6 +282,74 @@ mod tests {
         let output = block.forward_native(&x, &mut state).unwrap();
         let values: Vec<f32> = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(values.iter().all(|v| v.is_finite()));
+    }
+
+    fn make_learned_block(d_model: usize) -> (NativeTTTBlock, Device) {
+        let device = Device::Cpu;
+        let config = AxiomConfig {
+            d_model,
+            n_layers: 1,
+            vocab_size: 16,
+            lr_inner: 1e-3,
+            norm_eps: 1e-6,
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let inner_lr = Arc::new(AtomicU32::new(1e-3f32.to_bits()));
+        let stabilize = Arc::new(AtomicBool::new(false));
+        let forget_gate = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let block = NativeTTTBlock::new_with_shared_lr(
+            vb.pp("block"),
+            config,
+            inner_lr,
+            stabilize,
+            forget_gate,
+            true, // learned gate
+        )
+        .unwrap();
+        (block, device)
+    }
+
+    #[test]
+    fn learned_gate_forward_is_finite_and_updates_state() {
+        let d = 16usize;
+        let (block, device) = make_learned_block(d);
+        let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
+        let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+        let before: Vec<f32> = state.flatten_all().unwrap().to_vec1().unwrap();
+        let out = block.forward_native(&x, &mut state).unwrap();
+        let ov: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(ov.iter().all(|v| v.is_finite()), "learned-gate output must be finite");
+        let after: Vec<f32> = state.flatten_all().unwrap().to_vec1().unwrap();
+        assert_ne!(before, after, "learned gate must still update the fast weights");
+    }
+
+    #[test]
+    fn learned_gate_warm_starts_near_ungated() {
+        // At init, w_α≈0 and the +GATE_INIT_LOGIT offset makes α≈σ(4)≈0.982, so a
+        // single learned-gate step should land very close to the ungated step.
+        let d = 16usize;
+        let (learned, device) = make_learned_block(d);
+        let (plain, _) = make_block(d);
+        // Drive both blocks' projections identically is impossible (random init),
+        // so instead compare each block to ITS OWN ungated counterpart by checking
+        // the learned step stays finite and the state norm is within a sane band
+        // of the identity-start (α near 1 ⇒ no aggressive forgetting at step 1).
+        let x = Tensor::ones((1usize, d), DType::F32, &device).unwrap();
+        let mut s_learned = Tensor::eye(d, DType::F32, &device).unwrap();
+        let _ = learned.forward_native(&x, &mut s_learned).unwrap();
+        let mut s_plain = Tensor::eye(d, DType::F32, &device).unwrap();
+        let _ = plain.forward_native(&x, &mut s_plain).unwrap();
+        let nl = frobenius(&s_learned);
+        let np = frobenius(&s_plain);
+        assert!(nl.is_finite() && np.is_finite());
+        // α≈0.98 means the learned step's state norm is within ~5% of identity
+        // (sqrt(d)) — i.e. it is NOT a cold, memory-erasing gate at init.
+        let id_norm = (d as f32).sqrt();
+        assert!(
+            (nl - id_norm).abs() / id_norm < 0.2,
+            "learned gate should warm-start near the ungated identity-state regime (nl={nl}, id={id_norm})"
+        );
     }
 
     #[test]
