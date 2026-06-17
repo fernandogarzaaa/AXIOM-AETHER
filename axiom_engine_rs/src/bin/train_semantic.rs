@@ -156,6 +156,25 @@ fn run() {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    // Learned data-dependent Gated-DeltaNet forget gate (adds a per-layer w_α
+    // projection). Recorded in the sidecar so inference builds the matching
+    // architecture. Off by default → parameter-identical to prior checkpoints.
+    //
+    // Resume safety: build the architecture the *resumed checkpoint* expects.
+    // The explicit env wins if set; otherwise we honor the checkpoint's sidecar.
+    // Without this, resuming a learned-gate checkpoint with the env unset would
+    // build the ungated arch, varmap.load would silently drop w_alpha (Lines
+    // ~210), and the next best-save would flip the sidecar back to false.
+    let learned_gate_env = std::env::var("AXIOM_LEARNED_GATE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let learned_gate_sidecar = if Path::new(&ckpt).exists() {
+        ModelMeta::load(&ckpt).map(|m| m.learned_gate)
+    } else {
+        None
+    };
+    let learned_gate = learned_gate_env.or(learned_gate_sidecar).unwrap_or(false);
+
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
 
     // --- Auto-size to VRAM (env override → nvidia-smi probe → CPU budget) ---
@@ -192,9 +211,11 @@ fn run() {
     };
     let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-    let model = AxiomTTTLM::new(vb, config.clone()).expect("build model");
+    let model =
+        AxiomTTTLM::new_with_options(vb, config.clone(), learned_gate).expect("build model");
     model.set_stabilize(stabilize);
     eprintln!("[train] inner-loop stabilization: {stabilize}");
+    eprintln!("[train] learned forget gate: {learned_gate}");
     eprintln!("[train] last-token-only fast loss: {last_token_only}");
 
     // RESUME: continue from an existing checkpoint when dims match.
@@ -373,6 +394,7 @@ fn run() {
                 tokenizer: bpe.clone(),
                 stabilize,
                 last_token_only,
+                learned_gate,
             }
             .save(&ckpt);
         } else {

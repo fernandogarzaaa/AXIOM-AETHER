@@ -46,6 +46,18 @@ impl AxiomTTTLM {
     /// Construct the full model, allocating all weights under the given
     /// `VarBuilder` scope.
     pub fn new(vs: VarBuilder, config: AxiomConfig) -> Result<Self> {
+        Self::new_with_options(vs, config, false)
+    }
+
+    /// Construct the model, optionally with the *learned* data-dependent forget
+    /// gate (a per-layer `w_α` projection — adds `w_alpha` weights, so a model
+    /// built with `learned_gate=true` can only load a checkpoint trained the same
+    /// way). `learned_gate=false` is parameter-identical to the original model.
+    pub fn new_with_options(
+        vs: VarBuilder,
+        config: AxiomConfig,
+        learned_gate: bool,
+    ) -> Result<Self> {
         let embeddings =
             candle_nn::embedding(config.vocab_size, config.d_model, vs.pp("embeddings"))?;
 
@@ -65,6 +77,7 @@ impl AxiomTTTLM {
                 inner_lr.clone(),
                 stabilize.clone(),
                 forget_gate.clone(),
+                learned_gate,
             )?);
         }
 
