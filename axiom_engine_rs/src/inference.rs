@@ -97,7 +97,11 @@ impl InferencePipeline {
             if let Ok(alpha) = raw.trim().parse::<f32>() {
                 if alpha.is_finite() && alpha > 0.0 && alpha < 1.0 {
                     model.set_forget_gate(alpha);
-                    eprintln!("[+] Gated-DeltaNet forget gate ENABLED (α={alpha})");
+                    // Log the *effective* gate: set_forget_gate clamps to
+                    // (1e-3, 1.0], so a tiny request like 1e-4 is applied as
+                    // 1e-3 — report what the model actually uses, not the request.
+                    let effective = model.forget_gate();
+                    eprintln!("[+] Gated-DeltaNet forget gate ENABLED (α={effective})");
                 } else if alpha != 1.0 {
                     eprintln!("[!] Ignoring AXIOM_FORGET_GATE={raw} (must be in (0, 1])");
                 }
