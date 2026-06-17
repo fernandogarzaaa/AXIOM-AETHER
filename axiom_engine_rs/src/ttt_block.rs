@@ -40,6 +40,17 @@ pub struct NativeTTTBlock {
     /// Off by default so the converged d256 path is byte-identical. Shared like
     /// `inner_lr` so one `set_stabilize` retunes the whole stack.
     stabilize: Arc<AtomicBool>,
+    /// Gated-DeltaNet forget gate α ∈ (0, 1] (raw f32 bits), shared across the
+    /// stack. The delta-rule update is `W̃ ← W̃(I − ηkkᵀ) + ηvkᵀ`; this multiplies
+    /// the *retained-memory* term by α, giving `W̃ ← α·W̃(I − ηkkᵀ) + ηvkᵀ`. With
+    /// α < 1 old memory decays geometrically; combined with bounded/normalized
+    /// keys (the `stabilize` path, where ‖I − ηkkᵀ‖ ≤ 1) this gives a spectral
+    /// radius ≤ α, a principled bound on ‖W̃‖ rather than the hard element clamp.
+    /// Default 1.0 is the identity: the update reduces to the exact ungated path
+    /// (byte-identical), so existing checkpoints are unaffected. Parameter-free,
+    /// so no checkpoint-format change. (The learned data-dependent gate is a
+    /// follow-up requiring a new projection weight.)
+    forget_gate: Arc<AtomicU32>,
 }
 
 impl NativeTTTBlock {
@@ -49,7 +60,8 @@ impl NativeTTTBlock {
     pub fn new(vs: VarBuilder, config: AxiomConfig) -> Result<Self> {
         let inner_lr = Arc::new(AtomicU32::new(config.lr_inner.to_bits()));
         let stabilize = Arc::new(AtomicBool::new(false));
-        Self::new_with_shared_lr(vs, config, inner_lr, stabilize)
+        let forget_gate = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        Self::new_with_shared_lr(vs, config, inner_lr, stabilize, forget_gate)
     }
 
     /// Construct a block that reads its inner learning rate from a shared
@@ -60,6 +72,7 @@ impl NativeTTTBlock {
         config: AxiomConfig,
         inner_lr: Arc<AtomicU32>,
         stabilize: Arc<AtomicBool>,
+        forget_gate: Arc<AtomicU32>,
     ) -> Result<Self> {
         let d = config.d_model;
         Ok(Self {
@@ -73,6 +86,7 @@ impl NativeTTTBlock {
             )?,
             inner_lr,
             stabilize,
+            forget_gate,
         })
     }
 
@@ -128,14 +142,30 @@ impl NativeTTTBlock {
         // error: [d_model]
         let error = pred.sub(&v_vec)?;
 
-        // Outer product: [d_model, 1] × [1, d_model] → [d_model, d_model]
-        let grad = error.unsqueeze(1)?.matmul(&k_eff)?;
-
-        // W_tilde update: W_tilde ← W_tilde − η · grad
         // η is read live from the shared atomic so meta-training can decay it.
         let eta = f32::from_bits(self.inner_lr.load(Ordering::Relaxed));
         let lr = Tensor::new(eta, session_state.device())?;
-        let mut updated_state = session_state.sub(&grad.broadcast_mul(&lr)?)?;
+        // Gated-DeltaNet forget gate α ∈ (0, 1] read live from the shared atomic.
+        let alpha = f32::from_bits(self.forget_gate.load(Ordering::Relaxed));
+
+        let mut updated_state = if alpha >= 1.0 {
+            // Ungated delta rule (default, byte-identical to the original path):
+            //   W̃ ← W̃ − η·(pred − v)⊗k = W̃(I − ηkkᵀ) + ηvkᵀ
+            let grad = error.unsqueeze(1)?.matmul(&k_eff)?;
+            session_state.sub(&grad.broadcast_mul(&lr)?)?
+        } else {
+            // Gated delta rule: decay only the retained-memory term by α, leaving
+            // the fresh write ηvkᵀ at full strength:
+            //   W̃ ← α·(W̃ − η·pred⊗k) + η·v⊗k = α·W̃(I − ηkkᵀ) + ηvkᵀ
+            // With normalized keys (stabilize) ‖I − ηkkᵀ‖ ≤ 1 ⇒ spectral radius
+            // ≤ α, so old memory decays geometrically and ‖W̃‖ stays bounded.
+            let pred_outer = pred.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
+            let v_outer = v_vec.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
+            let memory = session_state.sub(&pred_outer.broadcast_mul(&lr)?)?;
+            let write = v_outer.broadcast_mul(&lr)?;
+            let gate = Tensor::new(alpha, session_state.device())?;
+            memory.broadcast_mul(&gate)?.add(&write)?
+        };
         if stabilize {
             // Sync-free element backstop: a hard ceiling that NaN can never breach.
             updated_state = updated_state.clamp(-STAB_CLAMP, STAB_CLAMP)?;
@@ -208,6 +238,58 @@ mod tests {
         let output = block.forward_native(&x, &mut state).unwrap();
         let values: Vec<f32> = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(values.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn gate_one_is_identical_to_ungated_default() {
+        // α = 1.0 (default) must take the exact ungated path — bit-identical state.
+        let d = 16usize;
+        let (block, device) = make_block(d);
+        let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
+        let mut s_default = Tensor::eye(d, DType::F32, &device).unwrap();
+        let mut s_gate1 = Tensor::eye(d, DType::F32, &device).unwrap();
+        // Default block: gate already 1.0.
+        let _ = block.forward_native(&x, &mut s_default).unwrap();
+        // Explicitly set 1.0 and run a fresh state from the same input.
+        block.forget_gate.store(1.0f32.to_bits(), Ordering::Relaxed);
+        let _ = block.forward_native(&x, &mut s_gate1).unwrap();
+        let a: Vec<f32> = s_default.flatten_all().unwrap().to_vec1().unwrap();
+        let b: Vec<f32> = s_gate1.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(a, b, "α=1 must be bit-identical to the ungated path");
+    }
+
+    fn frobenius(state: &Tensor) -> f32 {
+        let v: Vec<f32> = state.flatten_all().unwrap().to_vec1().unwrap();
+        v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    }
+
+    #[test]
+    fn forget_gate_shrinks_steady_state_memory() {
+        // Deterministic input (no RNG) with normalized keys so both runs stay
+        // finite; the forget gate (α<1) must drive the fast-weight state to a
+        // strictly smaller steady-state norm than the ungated run — that
+        // geometric decay of retained memory is the whole point of the gate.
+        let d = 32usize;
+        let (block, device) = make_block(d);
+        block.stabilize.store(true, Ordering::Relaxed); // normalized keys → finite
+        let x = Tensor::ones((1usize, d), DType::F32, &device).unwrap();
+
+        let run = |alpha: f32| -> f32 {
+            block.forget_gate.store(alpha.to_bits(), Ordering::Relaxed);
+            let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+            for _ in 0..256 {
+                let _ = block.forward_native(&x, &mut state).unwrap();
+            }
+            frobenius(&state)
+        };
+
+        let ungated = run(1.0);
+        let gated = run(0.9);
+        assert!(ungated.is_finite() && gated.is_finite(), "states must stay finite");
+        assert!(
+            gated < ungated,
+            "forget gate must shrink retained memory (gated {gated} !< ungated {ungated})"
+        );
     }
 
     #[test]

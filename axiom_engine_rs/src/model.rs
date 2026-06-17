@@ -35,6 +35,11 @@ pub struct AxiomTTTLM {
     /// fast-weight update normalizes keys + clamps state so deep/wide models
     /// stay finite. Off by default (existing checkpoints unchanged).
     stabilize: Arc<AtomicBool>,
+    /// Shared Gated-DeltaNet forget gate α ∈ (0, 1] (raw f32 bits) read by every
+    /// `NativeTTTBlock`. α < 1 decays retained memory geometrically (bounded
+    /// state); default 1.0 is the identity (ungated, existing checkpoints
+    /// unchanged). Parameter-free, so no checkpoint-format change.
+    forget_gate: Arc<AtomicU32>,
 }
 
 impl AxiomTTTLM {
@@ -49,6 +54,8 @@ impl AxiomTTTLM {
         let inner_lr = Arc::new(AtomicU32::new(config.lr_inner.to_bits()));
         // Shared stabilization flag (off by default → existing models unchanged).
         let stabilize = Arc::new(AtomicBool::new(false));
+        // Shared forget gate, default 1.0 (ungated → existing models unchanged).
+        let forget_gate = Arc::new(AtomicU32::new(1.0f32.to_bits()));
 
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
@@ -57,6 +64,7 @@ impl AxiomTTTLM {
                 config.clone(),
                 inner_lr.clone(),
                 stabilize.clone(),
+                forget_gate.clone(),
             )?);
         }
 
@@ -72,6 +80,7 @@ impl AxiomTTTLM {
             config,
             inner_lr,
             stabilize,
+            forget_gate,
         })
     }
 
@@ -85,6 +94,24 @@ impl AxiomTTTLM {
     /// Whether inner-loop stabilization is currently enabled.
     pub fn stabilize(&self) -> bool {
         self.stabilize.load(Ordering::Relaxed)
+    }
+
+    /// Set the Gated-DeltaNet forget gate α ∈ (0, 1] across every TTT layer.
+    /// α < 1 makes retained memory decay geometrically (spectral radius ≤ α), a
+    /// principled bound on the fast-weight state; α = 1 is the ungated identity.
+    /// Values are clamped into (0, 1].
+    pub fn set_forget_gate(&self, alpha: f32) {
+        let a = if alpha.is_finite() {
+            alpha.clamp(1e-3, 1.0)
+        } else {
+            1.0
+        };
+        self.forget_gate.store(a.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Current Gated-DeltaNet forget gate α.
+    pub fn forget_gate(&self) -> f32 {
+        f32::from_bits(self.forget_gate.load(Ordering::Relaxed))
     }
 
     /// Set the inner test-time learning rate η used by every TTT layer on

@@ -43,9 +43,16 @@ engine, and a citation. Status: ✅ implemented · 🚧 scaffolded · ⬜ planne
 
 ## P2 — bigger / offline / research
 
-- ⬜ **Gated DeltaNet / RWKV-7 chunkwise TTT core** (arXiv:2412.06464, 2503.14456) —
-  the largest lift; a per-token fast-weight delta rule with a forget gate, in
-  closed form. Build the chunkwise (C=64) path; keep the d×d state in fp32.
+- 🚧 **Gated DeltaNet TTT core** (arXiv:2412.06464). The existing TTT update is
+  already the delta rule (`W̃ ← W̃(I − ηkkᵀ) + ηvkᵀ`). **Implemented:** the
+  forget-gate half — a parameter-free scalar gate α ∈ (0,1] on the retained-memory
+  term (`W̃ ← α·W̃(I − ηkkᵀ) + ηvkᵀ`), opt-in via `AXIOM_FORGET_GATE`, byte-identical
+  at α=1, so existing checkpoints are unaffected. With normalized keys this bounds
+  ‖W̃‖ (spectral radius ≤ α) — principled forgetting in place of the hard clamp.
+  **Follow-ups:** the *learned, data-dependent* gate (needs a new projection →
+  checkpoint-format bump) and the chunkwise (C=64) parallel form for throughput.
+- ⬜ **RWKV-7-style vector gating** (arXiv:2503.14456) — per-channel gate +
+  in-context LR (more expressive than the scalar gate; also a checkpoint bump).
 - ⬜ **KV-cache eviction** (PyramidKV, arXiv:2406.02069) in the decode loop.
 - ⬜ **EigenScore** second sampling-based detector (arXiv:2402.03744).
 - ⬜ **Sakana CMA-ES** offline merge-recipe tuning (arXiv:2403.13187).
