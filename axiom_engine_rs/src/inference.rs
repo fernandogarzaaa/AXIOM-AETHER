@@ -98,12 +98,22 @@ impl InferencePipeline {
             );
         }
 
-        // Optional Gated-DeltaNet forget gate α ∈ (0, 1] via AXIOM_FORGET_GATE.
-        // Parameter-free, so it applies to any checkpoint; default (unset) = 1.0
-        // = the ungated delta rule (existing behaviour). α < 1 decays retained
+        // Optional *scalar* Gated-DeltaNet forget gate α ∈ (0, 1] via
+        // AXIOM_FORGET_GATE. Parameter-free, applies to any checkpoint; default
+        // (unset) = 1.0 = the ungated delta rule. α < 1 decays retained
         // fast-weight memory geometrically — relevance-aware forgetting + a
         // bound on ‖W̃‖ (with the stabilize path's normalized keys).
-        if let Ok(raw) = std::env::var("AXIOM_FORGET_GATE") {
+        //
+        // When the *learned* gate is active, `forward_native` ignores the scalar
+        // gate entirely (the learned w_α takes precedence), so don't apply it —
+        // just note that the env var is being ignored, to avoid a misleading log.
+        if learned_gate {
+            if let Ok(raw) = std::env::var("AXIOM_FORGET_GATE") {
+                eprintln!(
+                    "[!] Ignoring AXIOM_FORGET_GATE={raw} — the learned forget gate takes precedence"
+                );
+            }
+        } else if let Ok(raw) = std::env::var("AXIOM_FORGET_GATE") {
             if let Ok(alpha) = raw.trim().parse::<f32>() {
                 if alpha.is_finite() && alpha > 0.0 && alpha < 1.0 {
                     model.set_forget_gate(alpha);

@@ -159,9 +159,21 @@ fn run() {
     // Learned data-dependent Gated-DeltaNet forget gate (adds a per-layer w_α
     // projection). Recorded in the sidecar so inference builds the matching
     // architecture. Off by default → parameter-identical to prior checkpoints.
-    let learned_gate = std::env::var("AXIOM_LEARNED_GATE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    //
+    // Resume safety: build the architecture the *resumed checkpoint* expects.
+    // The explicit env wins if set; otherwise we honor the checkpoint's sidecar.
+    // Without this, resuming a learned-gate checkpoint with the env unset would
+    // build the ungated arch, varmap.load would silently drop w_alpha (Lines
+    // ~210), and the next best-save would flip the sidecar back to false.
+    let learned_gate_env = std::env::var("AXIOM_LEARNED_GATE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let learned_gate_sidecar = if Path::new(&ckpt).exists() {
+        ModelMeta::load(&ckpt).map(|m| m.learned_gate)
+    } else {
+        None
+    };
+    let learned_gate = learned_gate_env.or(learned_gate_sidecar).unwrap_or(false);
 
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
 
