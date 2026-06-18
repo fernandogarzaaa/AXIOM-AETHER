@@ -56,8 +56,29 @@ engine, and a citation. Status: ✅ implemented · 🚧 scaffolded · ⬜ planne
     architecture. Adds `w_alpha` weights → a checkpoint trained with it is needed;
     default-off is parameter-identical, so existing d128/d256 checkpoints load
     unchanged.
-  **Follow-ups:** train + eval a learned-gate checkpoint to quantify the gain vs
-  the ungated baseline; the chunkwise (C=64) parallel form for training throughput.
+  **Validation** (CPU, d128/2L, vocab 8000, 1 epoch, 100k tokens, identical
+  corpus/recipe; learned gate vs ungated baseline — both PASS acceptance):
+
+  | metric | ungated | learned gate | Δ |
+  |---|---|---|---|
+  | val-CE (held-out train split) | 6.109 | **5.890** | **−0.22** ✅ |
+  | held-out CE (unseen `server.rs`) | 6.574 | **6.521** | −0.05 ✅ |
+  | clean CE (max) | 6.181 | 6.148 | — |
+  | anomaly CE | 8.634 | 8.379 | — |
+  | drift-separation margin | **+2.453** | +2.230 | −0.22 ⚠️ |
+
+  Honest read: the learned gate is a **net win on language modeling** (lower
+  val-CE ~3.6% and lower held-out CE → better generalization, exactly what
+  data-dependent forgetting should buy), but it **slightly narrows the
+  drift-detection margin** (it also models anomalies a bit better, shrinking the
+  clean-vs-anomaly gap). Small single-run numbers (noisy), but the direction is a
+  genuine tradeoff: better core modeling, marginally weaker anomaly separation —
+  so the learned gate is opt-in, not the default. Re-run at larger scale before
+  promoting; pair with the grounding pillar if used where drift-detection matters.
+
+  **Follow-ups:** larger-scale re-eval to de-noise the tradeoff; the chunkwise
+  (C=64) parallel form for training throughput; Titans-style momentum on the
+  update (parameter-free) to complement adaptive forgetting.
 - ⬜ **RWKV-7-style vector gating** (arXiv:2503.14456) — per-channel gate +
   in-context LR (more expressive than the scalar gate; also a checkpoint bump).
 - ⬜ **KV-cache eviction** (PyramidKV, arXiv:2406.02069) in the decode loop.

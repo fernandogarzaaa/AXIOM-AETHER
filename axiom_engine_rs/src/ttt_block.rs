@@ -326,29 +326,24 @@ mod tests {
 
     #[test]
     fn learned_gate_warm_starts_near_ungated() {
-        // At init, w_α≈0 and the +GATE_INIT_LOGIT offset makes α≈σ(4)≈0.982, so a
-        // single learned-gate step should land very close to the ungated step.
+        // Deterministic warm-start check, independent of the random w_α init.
+        // With ZERO input, q=k=v=0, so the delta update vanishes and the state
+        // becomes exactly α·I (memory term × α, write term zero). Hence
+        // ‖state‖_F = α·√d, and α = ‖state‖_F / √d. The +GATE_INIT_LOGIT offset
+        // must keep α ≈ 0.98 at init (only the small bias term moves it), i.e.
+        // warm-started near the ungated α = 1 rather than a cold, forgetting gate.
+        // (Using x=ones was flaky: w_α·ones depends on random weights.)
         let d = 16usize;
         let (learned, device) = make_learned_block(d);
-        let (plain, _) = make_block(d);
-        // Drive both blocks' projections identically is impossible (random init),
-        // so instead compare each block to ITS OWN ungated counterpart by checking
-        // the learned step stays finite and the state norm is within a sane band
-        // of the identity-start (α near 1 ⇒ no aggressive forgetting at step 1).
-        let x = Tensor::ones((1usize, d), DType::F32, &device).unwrap();
-        let mut s_learned = Tensor::eye(d, DType::F32, &device).unwrap();
-        let _ = learned.forward_native(&x, &mut s_learned).unwrap();
-        let mut s_plain = Tensor::eye(d, DType::F32, &device).unwrap();
-        let _ = plain.forward_native(&x, &mut s_plain).unwrap();
-        let nl = frobenius(&s_learned);
-        let np = frobenius(&s_plain);
-        assert!(nl.is_finite() && np.is_finite());
-        // α≈0.98 means the learned step's state norm is within ~5% of identity
-        // (sqrt(d)) — i.e. it is NOT a cold, memory-erasing gate at init.
-        let id_norm = (d as f32).sqrt();
+        let x = Tensor::zeros((1usize, d), DType::F32, &device).unwrap();
+        let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+        let _ = learned.forward_native(&x, &mut state).unwrap();
+        let nl = frobenius(&state);
+        let alpha = nl / (d as f32).sqrt(); // state = α·I ⇒ ‖state‖_F = α·√d
+        assert!(alpha.is_finite(), "state must stay finite");
         assert!(
-            (nl - id_norm).abs() / id_norm < 0.2,
-            "learned gate should warm-start near the ungated identity-state regime (nl={nl}, id={id_norm})"
+            (0.95..=1.0).contains(&alpha),
+            "learned gate must warm-start near α≈1 (got α≈{alpha})"
         );
     }
 
