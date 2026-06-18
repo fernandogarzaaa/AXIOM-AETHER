@@ -93,9 +93,9 @@ engine, and a citation. Status: ✅ implemented · 🚧 scaffolded · ⬜ planne
   anomaly separation — keep it opt-in, prefer it where LM quality matters and the
   grounding pillar covers anomaly detection.
 
-  **Follow-ups:** larger-scale re-eval to de-noise the tradeoff; the chunkwise
-  (C=64) parallel form for training throughput; Titans-style momentum on the
-  update (parameter-free) to complement adaptive forgetting.
+  **Follow-ups:** (the larger-scale de-noised re-eval above is done); the
+  chunkwise (C=64) parallel form for training throughput; Titans-style momentum
+  on the update (parameter-free) to complement adaptive forgetting.
 - ⬜ **RWKV-7-style vector gating** (arXiv:2503.14456) — per-channel gate +
   in-context LR (more expressive than the scalar gate; also a checkpoint bump).
 - ⬜ **KV-cache eviction** (PyramidKV, arXiv:2406.02069) in the decode loop.

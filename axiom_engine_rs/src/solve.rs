@@ -151,8 +151,19 @@ pub fn solve(
             // byte. This is the autonomous code-repair step: general proposals,
             // grounded acceptance.
             if let Some(backend) = ClaudeBackend::from_env() {
-                let failure_output = sup.diagnostics.join("\n");
                 let working_dir = opts.anchor.as_deref();
+                // Feed the model the REAL compile/test failure trace. The
+                // supervisor's `sup.diagnostics` only holds non-correctable
+                // *environment* diagnoses (missing env var, disk full) and is
+                // usually empty for ordinary source failures, so capture the
+                // verify command's stdout/stderr directly. Fall back to the env
+                // diagnoses only if the command produced no output.
+                let (_still_failing, trace) = run_verify_capture(command, args, working_dir);
+                let failure_output = if trace.trim().is_empty() {
+                    sup.diagnostics.join("\n")
+                } else {
+                    trace
+                };
                 let solved = llm_repair_round(
                     &backend,
                     command,
@@ -210,8 +221,26 @@ fn llm_repair_round(
             failure = failure_output,
             path = source_path.display(),
         );
-        match backend.generate(&prompt, 4096) {
-            Ok(text) => Some(strip_code_fences(&text)),
+        match backend.generate(&prompt, 8192) {
+            Ok(text) => {
+                let candidate = strip_code_fences(&text);
+                // Guard against a truncated full-file rewrite (response hit the
+                // token cap): if the corrected file comes back dramatically
+                // shorter than a non-trivial original, treat it as untrustworthy
+                // and skip — never risk persisting a cut-off file that only
+                // partially verifies. (Precise stop_reason detection from the
+                // backend is the more exact follow-up.)
+                if original.len() > 1024 && candidate.len() < original.len() / 2 {
+                    eprintln!(
+                        "[axiom-solve] LLM repair skipped (candidate {} B vs original {} B — likely truncated)",
+                        candidate.len(),
+                        original.len()
+                    );
+                    None
+                } else {
+                    Some(candidate)
+                }
+            }
             Err(e) => {
                 eprintln!("[axiom-solve] LLM repair skipped (backend error: {e})");
                 None
@@ -244,27 +273,118 @@ where
     if candidate.trim().is_empty() || candidate == original {
         return false;
     }
-    if std::fs::write(source_path, &candidate).is_err() {
+    if let Err(e) = std::fs::write(source_path, &candidate) {
+        // A failed write may have already truncated the file — restore first.
+        eprintln!("[axiom-solve] patch write failed; restoring original ({e})");
+        let _ = std::fs::write(source_path, &original);
         return false;
     }
     if run_verify(command, args, working_dir) {
         true
     } else {
         // Rejected: roll back byte-for-byte so a bad patch never persists.
-        let _ = std::fs::write(source_path, &original);
+        if let Err(e) = std::fs::write(source_path, &original) {
+            eprintln!("[axiom-solve] WARNING: failed to restore original after rejected patch: {e}");
+        }
         false
     }
 }
 
-/// Run the verify command and report whether it exited 0. Output is inherited so
-/// it surfaces in the solve log; callers that need the text capture it elsewhere.
+/// Default wall-clock cap for a single verify run (override with
+/// `AXIOM_SOLVE_VERIFY_TIMEOUT_SECS`). A hung verifier must never wedge the solve
+/// loop with a candidate already on disk — on timeout we kill it and report
+/// failure so the caller rolls back.
+fn verify_timeout() -> std::time::Duration {
+    let secs = std::env::var("AXIOM_SOLVE_VERIFY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(120);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Run the verify command, returning whether it exited 0. Bounded by
+/// [`verify_timeout`] (delegates to [`run_verify_capture`]).
 fn run_verify(command: &str, args: &[String], working_dir: Option<&Path>) -> bool {
+    run_verify_capture(command, args, working_dir).0
+}
+
+/// Run the verify command under a wall-clock timeout, returning
+/// `(success, combined stdout+stderr trace)` capped to the last ~4000 chars.
+/// stdout/stderr are drained on threads so a chatty verifier can't deadlock on a
+/// full pipe; on timeout the child is killed and `success` is false.
+fn run_verify_capture(
+    command: &str,
+    args: &[String],
+    working_dir: Option<&Path>,
+) -> (bool, String) {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+
     let mut cmd = std::process::Command::new(command);
-    cmd.args(args);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
-    matches!(cmd.status(), Ok(status) if status.success())
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (false, format!("failed to spawn verify command: {e}")),
+    };
+
+    // Drain both pipes concurrently to avoid a full-buffer deadlock.
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let out_h = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(ref mut o) = stdout {
+            let _ = o.read_to_string(&mut s);
+        }
+        s
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(ref mut e) = stderr {
+            let _ = e.read_to_string(&mut s);
+        }
+        s
+    });
+
+    let deadline = Instant::now() + verify_timeout();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    timed_out = true;
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => break None,
+        }
+    };
+
+    let mut trace = out_h.join().unwrap_or_default();
+    trace.push_str(&err_h.join().unwrap_or_default());
+    // Keep the tail (failures usually surface there); char-boundary safe.
+    let trace: String = {
+        let chars: Vec<char> = trace.chars().collect();
+        if chars.len() > 4000 {
+            chars[chars.len() - 4000..].iter().collect()
+        } else {
+            trace
+        }
+    };
+
+    match status {
+        Some(st) => (st.success(), trace),
+        None if timed_out => (false, format!("{trace}\n[verify timed out]")),
+        None => (false, trace),
+    }
 }
 
 /// Strip a single leading/trailing markdown code fence if the model wrapped the
@@ -275,12 +395,15 @@ fn strip_code_fences(text: &str) -> String {
         return text.to_string();
     }
     let mut lines: Vec<&str> = trimmed.lines().collect();
-    if lines.first().map(|l| l.starts_with("```")).unwrap_or(false) {
-        lines.remove(0); // opening fence (possibly ```rust)
+    // Only unwrap a *paired* fence — stripping a lone opening fence would corrupt
+    // legitimate content that happens to start with ```.
+    let has_opening = matches!(lines.first(), Some(l) if l.starts_with("```"));
+    let has_closing = lines.len() > 1 && matches!(lines.last(), Some(l) if l.trim() == "```");
+    if !(has_opening && has_closing) {
+        return text.to_string();
     }
-    if lines.last().map(|l| l.trim() == "```").unwrap_or(false) {
-        lines.pop(); // closing fence
-    }
+    lines.remove(0); // opening fence (possibly ```rust)
+    lines.pop(); // closing fence
     lines.join("\n")
 }
 
@@ -351,9 +474,24 @@ mod tests {
     }
 
     #[test]
-    fn strip_code_fences_unwraps_only_when_fenced() {
+    fn run_verify_capture_returns_stdout_stderr_and_status() {
+        let (ok, trace) = run_verify_capture(
+            "sh",
+            &["-c".into(), "echo out_marker; echo err_marker >&2; exit 3".into()],
+            None,
+        );
+        assert!(!ok, "exit 3 → not success");
+        assert!(trace.contains("out_marker"), "stdout captured");
+        assert!(trace.contains("err_marker"), "stderr captured");
+    }
+
+    #[test]
+    fn strip_code_fences_unwraps_only_paired_fences() {
         assert_eq!(strip_code_fences("fn main() {}"), "fn main() {}");
         assert_eq!(strip_code_fences("```rust\nfn main() {}\n```"), "fn main() {}");
         assert_eq!(strip_code_fences("```\nabc\ndef\n```"), "abc\ndef");
+        // A lone opening fence (no closing) must NOT be stripped — that would
+        // corrupt content that legitimately begins with ```.
+        assert_eq!(strip_code_fences("```rust\nfn x() {}"), "```rust\nfn x() {}");
     }
 }
