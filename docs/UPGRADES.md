@@ -76,9 +76,26 @@ engine, and a citation. Status: ✅ implemented · 🚧 scaffolded · ⬜ planne
   so the learned gate is opt-in, not the default. Re-run at larger scale before
   promoting; pair with the grounding pillar if used where drift-detection matters.
 
-  **Follow-ups:** larger-scale re-eval to de-noise the tradeoff; the chunkwise
-  (C=64) parallel form for training throughput; Titans-style momentum on the
-  update (parameter-free) to complement adaptive forgetting.
+  **De-noised re-run** (CPU, d128/2L, vocab 8000, **200k tokens, 8-epoch / 4000
+  step-cap recipe**, identical corpus; both PASS) — confirms the direction:
+
+  | metric | ungated | learned gate | Δ |
+  |---|---|---|---|
+  | val-CE (train) | 5.056 | 5.038 | ≈tied |
+  | held-out CE (unseen `server.rs`) | 5.482 | **5.347** | **−0.134** ✅ (~2.4%) |
+  | clean CE (max) | 5.003 | 4.883 | lower |
+  | anomaly CE | 8.698 | 8.430 | lower |
+  | drift-separation margin | **+3.695** | +3.548 | −0.148 ⚠️ |
+
+  At scale the durable win is **generalization** (held-out CE −2.4% on unseen
+  code); the drift margin again dips slightly but stays **healthy (+3.55)**. Net:
+  the learned gate genuinely sharpens core modeling at a small, principled cost to
+  anomaly separation — keep it opt-in, prefer it where LM quality matters and the
+  grounding pillar covers anomaly detection.
+
+  **Follow-ups:** (the larger-scale de-noised re-eval above is done); the
+  chunkwise (C=64) parallel form for training throughput; Titans-style momentum
+  on the update (parameter-free) to complement adaptive forgetting.
 - ⬜ **RWKV-7-style vector gating** (arXiv:2503.14456) — per-channel gate +
   in-context LR (more expressive than the scalar gate; also a checkpoint bump).
 - ⬜ **KV-cache eviction** (PyramidKV, arXiv:2406.02069) in the decode loop.
