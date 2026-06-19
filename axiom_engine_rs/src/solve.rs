@@ -119,6 +119,9 @@ pub fn solve(
 
         // --- Phase 2: source repair (Poly JIT), reversible ----------------
         if let Some(src) = opts.source_path.as_deref() {
+            // Single portable patch key, shared by fleet-reuse (try) and record,
+            // so a patch is only ever re-applied to the file it was learned for.
+            let rel = rel_path_for(src, opts.anchor.as_deref());
             let backup = std::fs::read_to_string(src).ok();
             let engine = PolyJitEngine::default();
             let run_req = PolyJitRunRequest {
@@ -161,7 +164,7 @@ pub fn solve(
                 let pm = crate::patch_memory::PatchMemory::load(pm_path);
                 let working_dir = opts.anchor.as_deref();
                 if let Some(sha) =
-                    pm.try_candidates(&fp, src, || run_verify(command, args, working_dir))
+                    pm.try_candidates(&fp, &rel, src, || run_verify(command, args, working_dir))
                 {
                     report.fleet_patched = true;
                     report.solved = true;
@@ -216,10 +219,6 @@ pub fn solve(
                     if let Some(pm_path) = opts.patch_memory_path.as_deref() {
                         if let Ok(content) = std::fs::read_to_string(src) {
                             let fp = crate::heal_memory::fingerprint(command, args);
-                            let rel = src
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| src.display().to_string());
                             let mut pm =
                                 crate::patch_memory::PatchMemory::load(pm_path);
                             pm.record_verified(&fp, &rel, &content);
@@ -381,6 +380,25 @@ fn verify_timeout() -> std::time::Duration {
         .filter(|&s| s > 0)
         .unwrap_or(120);
     std::time::Duration::from_secs(secs)
+}
+
+/// Portable key for a patched source file: anchor-relative when the source lives
+/// under the working dir (so the same logical file matches across checkouts and
+/// on different nodes), else the bare file name, else the full display path. This
+/// MUST be computed identically at record time and at try time so a patch is only
+/// ever re-applied to the file it was learned for.
+fn rel_path_for(src: &Path, anchor: Option<&Path>) -> String {
+    if let Some(a) = anchor {
+        if let Ok(stripped) = src.strip_prefix(a) {
+            let s = stripped.to_string_lossy();
+            if !s.is_empty() {
+                return s.into_owned();
+            }
+        }
+    }
+    src.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| src.display().to_string())
 }
 
 /// Run the verify command, returning whether it exited 0. Bounded by

@@ -130,6 +130,7 @@ impl PatchMemory {
     pub fn try_candidates<V>(
         &self,
         fingerprint: &str,
+        rel_path: &str,
         source_path: &Path,
         mut verify: V,
     ) -> Option<String>
@@ -140,8 +141,18 @@ impl PatchMemory {
         if candidates.is_empty() {
             return None;
         }
+        // Only ever write a candidate to the file it was recorded for. A single
+        // verify command (e.g. a broad `cargo test`) can cover many files and
+        // share one fingerprint; without this guard a patch learned for `a.rs`
+        // could be written to `b.rs` and kept if the suite still passes —
+        // corrupting the wrong file. Match the exact recorded rel_path (computed
+        // the same way at record time), so even same-named files in different
+        // directories never cross-apply.
         let original = std::fs::read_to_string(source_path).ok()?;
         for c in candidates {
+            if c.rel_path != rel_path {
+                continue; // recorded for a different source file
+            }
             if c.content == original {
                 continue; // already the current source
             }
@@ -189,7 +200,12 @@ impl PatchMemory {
         };
         for (fp, peer_list) in peer.by_fingerprint {
             let local = self.by_fingerprint.entry(fp).or_default();
-            for pc in peer_list {
+            for mut pc in peer_list {
+                // Never trust the peer-supplied hash: the signature proves the
+                // bytes weren't changed in transit, not that sha256 identifies
+                // content. Recompute from content so dedup, ranking, and logged
+                // patch IDs always reflect the real bytes.
+                pc.sha256 = sha256_hex(pc.content.as_bytes());
                 if let Some(existing) = local.iter_mut().find(|c| c.sha256 == pc.sha256) {
                     existing.verified_count =
                         existing.verified_count.saturating_add(pc.verified_count);
@@ -280,7 +296,7 @@ mod tests {
 
         // verify() = the file currently contains FIXED.
         let p = path.clone();
-        let applied = m.try_candidates("fp", &path, || {
+        let applied = m.try_candidates("fp", "f.txt", &path, || {
             std::fs::read_to_string(&p).map(|s| s.contains("FIXED")).unwrap_or(false)
         });
         assert!(applied.is_some(), "the locally-verifying patch is applied");
@@ -295,12 +311,34 @@ mod tests {
         let mut m = PatchMemory::new();
         m.record_verified("fp", "f.txt", "ALSO_WRONG");
         // verify() always false → no candidate accepted.
-        let applied = m.try_candidates("fp", &path, || false);
+        let applied = m.try_candidates("fp", "f.txt", &path, || false);
         assert!(applied.is_none());
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "ORIGINAL",
             "a never-verifying patch must leave the source byte-for-byte intact"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn try_candidates_never_cross_applies_to_a_different_rel_path() {
+        // A patch recorded for `src/a.rs` must never be written to `src/b.rs`,
+        // even when they share a fingerprint and verify() would pass. Without the
+        // rel_path guard a broad suite (one fingerprint, many files) could let an
+        // `a.rs` fix corrupt `b.rs`.
+        let path = std::env::temp_dir().join(format!("axiom_patchmem_xfile_{}.txt", std::process::id()));
+        std::fs::write(&path, "ORIGINAL_B").unwrap();
+        let mut m = PatchMemory::new();
+        m.record_verified("fp", "src/a.rs", "FIX_FOR_A"); // recorded for a.rs only
+
+        // Caller targets b.rs (rel_path "src/b.rs"); verify() would accept anything.
+        let applied = m.try_candidates("fp", "src/b.rs", &path, || true);
+        assert!(applied.is_none(), "a patch recorded for a.rs is not applied to b.rs");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ORIGINAL_B",
+            "the wrong-target file must be left byte-for-byte intact"
         );
         let _ = std::fs::remove_file(&path);
     }
