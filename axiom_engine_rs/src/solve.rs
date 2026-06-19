@@ -45,6 +45,10 @@ pub struct SolveOptions {
     pub anchor: Option<PathBuf>,
     /// When set, enables Poly JIT source repair against this artifact.
     pub source_path: Option<PathBuf>,
+    /// Verified-patch store for fleet patch sharing. When set, the loop tries
+    /// stored (incl. peer-merged) candidates — re-verified locally — before the
+    /// LLM, and records successful fixes here for export.
+    pub patch_memory_path: Option<PathBuf>,
 }
 
 /// Unified provenance of an autonomous solve.
@@ -59,6 +63,9 @@ pub struct SolveReport {
     /// True if an LLM-proposed, *verifier-gated* source patch made the target
     /// pass (only kept when the verify command independently went green).
     pub llm_patched: bool,
+    /// True if a patch from the verified-patch store (incl. peer-merged fleet
+    /// patches) was re-verified green locally and applied.
+    pub fleet_patched: bool,
     /// Non-correctable diagnostics surfaced (missing env var, disk full, …).
     pub diagnostics: Vec<String>,
     /// Exit code of the last verify attempt.
@@ -143,6 +150,30 @@ pub fn solve(
                 let _ = std::fs::write(src, b);
             }
 
+            // --- Phase 2.5: fleet patch reuse (re-verified locally) -----------
+            // Before spending an LLM call, try patches the verified-patch store
+            // already knows for this failure (including peer-merged fleet
+            // patches). SAFETY: each candidate is applied through
+            // PatchMemory::try_candidates, which re-runs THIS node's verify and
+            // keeps it only if green — a peer's patch is never trusted blindly.
+            if let Some(pm_path) = opts.patch_memory_path.as_deref() {
+                let fp = crate::heal_memory::fingerprint(command, args);
+                let pm = crate::patch_memory::PatchMemory::load(pm_path);
+                let working_dir = opts.anchor.as_deref();
+                if let Some(sha) =
+                    pm.try_candidates(&fp, src, || run_verify(command, args, working_dir))
+                {
+                    report.fleet_patched = true;
+                    report.solved = true;
+                    report.final_exit = Some(0);
+                    println!(
+                        "[axiom-solve] round {round}: fleet patch {} verified green locally",
+                        &sha[..sha.len().min(12)]
+                    );
+                    return Ok(report);
+                }
+            }
+
             // --- Phase 3: autonomous LLM repair (verifier-gated, reversible) ---
             // When the deterministic Poly-JIT patches don't fix it, ask the LLM
             // backend for a patch — but keep it ONLY if the verify command then
@@ -179,6 +210,22 @@ pub fn solve(
                     println!(
                         "[axiom-solve] round {round}: LLM-proposed patch verified green"
                     );
+                    // Record the verified fix so this node — and, via signed
+                    // gossip, the fleet — can reuse it next time this failure
+                    // signature recurs (always re-verified before trust).
+                    if let Some(pm_path) = opts.patch_memory_path.as_deref() {
+                        if let Ok(content) = std::fs::read_to_string(src) {
+                            let fp = crate::heal_memory::fingerprint(command, args);
+                            let rel = src
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| src.display().to_string());
+                            let mut pm =
+                                crate::patch_memory::PatchMemory::load(pm_path);
+                            pm.record_verified(&fp, &rel, &content);
+                            let _ = pm.save(pm_path);
+                        }
+                    }
                     return Ok(report);
                 }
             }

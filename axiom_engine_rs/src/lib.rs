@@ -31,6 +31,7 @@ pub mod model;
 pub mod model_meta;
 pub mod openai_forwarder;
 pub mod pairs;
+pub mod patch_memory;
 pub mod poly_jit;
 pub mod prime;
 pub mod provenance;
