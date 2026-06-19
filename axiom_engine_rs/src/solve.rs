@@ -197,10 +197,22 @@ pub fn solve(
     Ok(report)
 }
 
-/// Ask the LLM backend for a corrected source, then apply it under the
-/// verifier-gated reversible policy. Thin wrapper: it builds the prompt and
-/// delegates the apply/verify/rollback to [`apply_verified_patch`] (which is the
-/// unit-tested core). Returns true iff a proposed patch made the verify pass.
+/// Bounded number of LLM repair attempts per round (override with
+/// `AXIOM_SOLVE_LLM_ATTEMPTS`). Each attempt gets the previous attempt's verifier
+/// output as feedback — multi-step debugging, not one shot.
+fn llm_repair_attempts() -> usize {
+    std::env::var("AXIOM_SOLVE_LLM_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(3)
+}
+
+/// Ask the LLM backend for a corrected source and apply it under the
+/// verifier-gated, reversible, *iterative* policy: up to `llm_repair_attempts()`
+/// tries, each re-prompted with the latest verifier failure output. Returns true
+/// iff some attempt made the verify command pass. Thin wrapper over
+/// [`apply_verified_patch_iterative`] (the unit-tested core).
 fn llm_repair_round(
     backend: &ClaudeBackend,
     command: &str,
@@ -209,85 +221,106 @@ fn llm_repair_round(
     source_path: &Path,
     failure_output: &str,
 ) -> bool {
-    apply_verified_patch(command, args, working_dir, source_path, |original| {
-        let prompt = format!(
-            "A verification command is failing and you must fix the source so it passes.\n\n\
-             Command: {command} {args}\n\n\
-             Failure output:\n{failure}\n\n\
-             Current contents of {path}:\n```\n{original}\n```\n\n\
-             Return ONLY the complete corrected file contents — no explanation, no commentary, \
-             no markdown code fences.",
-            args = args.join(" "),
-            failure = failure_output,
-            path = source_path.display(),
-        );
-        match backend.generate(&prompt, 8192) {
-            Ok(text) => {
-                let candidate = strip_code_fences(&text);
-                // Guard against a truncated full-file rewrite (response hit the
-                // token cap): if the corrected file comes back dramatically
-                // shorter than a non-trivial original, treat it as untrustworthy
-                // and skip — never risk persisting a cut-off file that only
-                // partially verifies. (Precise stop_reason detection from the
-                // backend is the more exact follow-up.)
-                if original.len() > 1024 && candidate.len() < original.len() / 2 {
-                    eprintln!(
-                        "[axiom-solve] LLM repair skipped (candidate {} B vs original {} B — likely truncated)",
-                        candidate.len(),
-                        original.len()
-                    );
+    let max_attempts = llm_repair_attempts();
+    apply_verified_patch_iterative(
+        command,
+        args,
+        working_dir,
+        source_path,
+        max_attempts,
+        failure_output,
+        |failure, original| {
+            let prompt = format!(
+                "A verification command is failing and you must fix the source so it passes.\n\n\
+                 Command: {command} {args}\n\n\
+                 Failure output:\n{failure}\n\n\
+                 Current contents of {path}:\n```\n{original}\n```\n\n\
+                 Return ONLY the complete corrected file contents — no explanation, no commentary, \
+                 no markdown code fences.",
+                args = args.join(" "),
+                path = source_path.display(),
+            );
+            match backend.generate(&prompt, 8192) {
+                Ok(text) => {
+                    let candidate = strip_code_fences(&text);
+                    // Guard against a truncated full-file rewrite (response hit
+                    // the token cap): if the corrected file comes back
+                    // dramatically shorter than a non-trivial original, treat it
+                    // as untrustworthy and skip — never risk persisting a cut-off
+                    // file that only partially verifies.
+                    if original.len() > 1024 && candidate.len() < original.len() / 2 {
+                        eprintln!(
+                            "[axiom-solve] LLM repair skipped (candidate {} B vs original {} B — likely truncated)",
+                            candidate.len(),
+                            original.len()
+                        );
+                        None
+                    } else {
+                        Some(candidate)
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[axiom-solve] LLM repair skipped (backend error: {e})");
                     None
-                } else {
-                    Some(candidate)
                 }
             }
-            Err(e) => {
-                eprintln!("[axiom-solve] LLM repair skipped (backend error: {e})");
-                None
-            }
-        }
-    })
+        },
+    )
 }
 
-/// Verifier-gated, reversible patch application (the testable core of autonomous
-/// repair). `propose` is given the current source and returns a candidate; the
-/// candidate is written, the verify command re-run, and the patch **kept only if
-/// it goes green**. On any failure the original is restored byte-for-byte.
-fn apply_verified_patch<P>(
+/// Verifier-gated, reversible, iterative patch application (the testable core of
+/// autonomous repair). For up to `max_attempts`, `propose(failure, original)` is
+/// given the latest verifier failure output (seeded with `initial_failure`) plus
+/// the original source and returns a candidate; the candidate is written, the
+/// verify command re-run under a timeout, and **kept only if it goes green**. On
+/// any rejection the original is restored byte-for-byte and the captured failure
+/// trace feeds the next attempt. Returns true iff some attempt verified green.
+fn apply_verified_patch_iterative<P>(
     command: &str,
     args: &[String],
     working_dir: Option<&Path>,
     source_path: &Path,
-    propose: P,
+    max_attempts: usize,
+    initial_failure: &str,
+    mut propose: P,
 ) -> bool
 where
-    P: FnOnce(&str) -> Option<String>,
+    P: FnMut(&str, &str) -> Option<String>,
 {
     let Ok(original) = std::fs::read_to_string(source_path) else {
         return false;
     };
-    let Some(candidate) = propose(&original) else {
-        return false;
-    };
-    // No-op or empty candidate → nothing to verify.
-    if candidate.trim().is_empty() || candidate == original {
-        return false;
-    }
-    if let Err(e) = std::fs::write(source_path, &candidate) {
-        // A failed write may have already truncated the file — restore first.
-        eprintln!("[axiom-solve] patch write failed; restoring original ({e})");
-        let _ = std::fs::write(source_path, &original);
-        return false;
-    }
-    if run_verify(command, args, working_dir) {
-        true
-    } else {
-        // Rejected: roll back byte-for-byte so a bad patch never persists.
+    let mut failure = initial_failure.to_string();
+    for attempt in 1..=max_attempts.max(1) {
+        let Some(candidate) = propose(&failure, &original) else {
+            break; // no usable candidate / backend error → stop
+        };
+        // No-op or empty candidate → nothing to verify.
+        if candidate.trim().is_empty() || candidate == original {
+            break;
+        }
+        if let Err(e) = std::fs::write(source_path, &candidate) {
+            // A failed write may have already truncated the file — restore first.
+            eprintln!("[axiom-solve] patch write failed; restoring original ({e})");
+            let _ = std::fs::write(source_path, &original);
+            break;
+        }
+        let (green, trace) = run_verify_capture(command, args, working_dir);
+        if green {
+            if attempt > 1 {
+                eprintln!("[axiom-solve] LLM repair verified green on attempt {attempt}");
+            }
+            return true;
+        }
+        // Rejected: roll back byte-for-byte, feed this attempt's trace forward.
         if let Err(e) = std::fs::write(source_path, &original) {
             eprintln!("[axiom-solve] WARNING: failed to restore original after rejected patch: {e}");
         }
-        false
+        if !trace.trim().is_empty() {
+            failure = trace;
+        }
     }
+    false
 }
 
 /// Default wall-clock cap for a single verify run (override with
@@ -433,7 +466,9 @@ mod tests {
         let path = tmp("green.txt");
         std::fs::write(&path, "BROKEN").unwrap();
         let (cmd, args) = grep_fixed(&path);
-        let kept = apply_verified_patch(&cmd, &args, None, &path, |_orig| Some("FIXED".into()));
+        let kept = apply_verified_patch_iterative(&cmd, &args, None, &path, 1, "", |_f, _o| {
+            Some("FIXED".into())
+        });
         assert!(kept, "a patch that makes verify pass must be kept");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "FIXED");
         let _ = std::fs::remove_file(&path);
@@ -445,7 +480,9 @@ mod tests {
         std::fs::write(&path, "BROKEN").unwrap();
         let (cmd, args) = grep_fixed(&path);
         // Proposes a different-but-still-failing source → verify stays red.
-        let kept = apply_verified_patch(&cmd, &args, None, &path, |_orig| Some("STILL WRONG".into()));
+        let kept = apply_verified_patch_iterative(&cmd, &args, None, &path, 1, "", |_f, _o| {
+            Some("STILL WRONG".into())
+        });
         assert!(!kept, "a patch that does not pass verify must be rejected");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -460,10 +497,43 @@ mod tests {
         let path = tmp("noop.txt");
         std::fs::write(&path, "SAME").unwrap();
         let (cmd, args) = grep_fixed(&path);
-        assert!(!apply_verified_patch(&cmd, &args, None, &path, |o| Some(o.to_string())));
-        assert!(!apply_verified_patch(&cmd, &args, None, &path, |_| Some("   ".into())));
-        assert!(!apply_verified_patch(&cmd, &args, None, &path, |_| None));
+        assert!(!apply_verified_patch_iterative(&cmd, &args, None, &path, 1, "", |_f, o| Some(o.to_string())));
+        assert!(!apply_verified_patch_iterative(&cmd, &args, None, &path, 1, "", |_f, _o| Some("   ".into())));
+        assert!(!apply_verified_patch_iterative(&cmd, &args, None, &path, 1, "", |_f, _o| None));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "SAME");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn iterative_repair_retries_with_feedback_until_green() {
+        // First attempt (no prior failure) proposes a still-wrong source; once it
+        // receives a non-empty failure trace it proposes the fix. Verifies the
+        // loop retries AND threads the verifier output back into propose().
+        let path = tmp("iter.txt");
+        std::fs::write(&path, "BROKEN").unwrap();
+        // Verify emits a marker on stderr when failing, so the rejected attempt's
+        // trace is non-empty and gets threaded back as feedback (grep -q alone is
+        // silent, which would give no feedback to test with).
+        let cmd = "sh".to_string();
+        let args = vec![
+            "-c".to_string(),
+            format!("grep -q FIXED '{}' || {{ echo NEED_FIXED >&2; exit 1; }}", path.display()),
+        ];
+        let mut calls = 0usize;
+        let mut saw_feedback = false;
+        let kept = apply_verified_patch_iterative(&cmd, &args, None, &path, 3, "", |failure, _o| {
+            calls += 1;
+            if failure.trim().is_empty() {
+                Some("STILL WRONG".into()) // attempt 1: will be rejected
+            } else {
+                saw_feedback = true; // attempt 2 saw the prior verifier trace
+                Some("FIXED".into())
+            }
+        });
+        assert!(kept, "iterative repair should succeed once it proposes FIXED");
+        assert!(calls >= 2, "should have retried at least once (calls={calls})");
+        assert!(saw_feedback, "later attempts must receive the failure trace");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "FIXED");
         let _ = std::fs::remove_file(&path);
     }
 
