@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.venv/
 axiom_engine_rs/target/
 
 axiom_engine_rs/*.safetensors

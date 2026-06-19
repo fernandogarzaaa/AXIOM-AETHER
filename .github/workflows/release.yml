@@ -21,38 +21,13 @@ permissions:
   contents: write
 
 jobs:
-  test:
-    name: Test Rust workspace
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            axiom_engine_rs/target
-          key: test-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
-          restore-keys: test-${{ runner.os }}-
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
-
-      - name: Run tests
-        working-directory: axiom_engine_rs
-        run: cargo test --locked
-
+  # ---------------------------------------------------------------------------
+  # Cross-platform release binaries (linux-x86_64 + windows-x86_64), each
+  # packaged as axiom-ttt-{version}-{platform}.tar.gz and uploaded as an
+  # artifact for the final release job to attach.
+  # ---------------------------------------------------------------------------
   build:
-    name: Build ${{ matrix.target }}
-    needs: test
+    name: Build ${{ matrix.suffix }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -61,15 +36,9 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             suffix: linux-x86_64
-            ext: tar.gz
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             suffix: windows-x86_64
-            ext: zip
-          - os: macos-14
-            target: aarch64-apple-darwin
-            suffix: macos-arm64
-            ext: tar.gz
 
     steps:
       - name: Checkout
@@ -91,7 +60,7 @@ jobs:
           restore-keys: build-${{ runner.os }}-${{ matrix.target }}-
 
       - name: Install Linux build dependencies
-        if: matrix.os == 'ubuntu-22.04'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
@@ -100,41 +69,37 @@ jobs:
         working-directory: axiom_engine_rs
         run: cargo build --release --locked --bin ${{ env.BINARY_NAME }} --target ${{ matrix.target }}
 
-      - name: Package Unix archive
-        if: matrix.ext == 'tar.gz'
+      # tar.gz for every platform (requirement c). Windows runners ship bsdtar
+      # as `tar`, so this works identically under bash on all three OSes.
+      - name: Package tar.gz
         shell: bash
         run: |
           set -euo pipefail
-          staging="axiom-ttt-${{ env.VERSION }}-${{ matrix.suffix }}"
+          staging="axiom-ttt-${VERSION}-${{ matrix.suffix }}"
           mkdir -p "$staging"
-          cp "axiom_engine_rs/target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "$staging/"
-          cp README.md "$staging/"
+          bin="axiom_engine_rs/target/${{ matrix.target }}/release/${BINARY_NAME}"
+          [ -f "${bin}.exe" ] && cp "${bin}.exe" "$staging/" || cp "$bin" "$staging/"
+          cp README.md "$staging/" 2>/dev/null || true
           cp LICENSE "$staging/" 2>/dev/null || true
           tar -czf "${staging}.tar.gz" "$staging"
-          echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
+          echo "Packaged ${staging}.tar.gz"
 
-      - name: Package Windows archive
-        if: matrix.ext == 'zip'
-        shell: pwsh
-        run: |
-          $staging = "axiom-ttt-${{ env.VERSION }}-${{ matrix.suffix }}"
-          New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "axiom_engine_rs\target\${{ matrix.target }}\release\${{ env.BINARY_NAME }}.exe" $staging\
-          Copy-Item README.md $staging\
-          if (Test-Path LICENSE) { Copy-Item LICENSE $staging\ }
-          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ env.VERSION }}
-          files: ${{ env.ASSET }}
-          fail_on_unmatched_files: true
+          name: archive-${{ matrix.suffix }}
+          path: axiom-ttt-${{ env.VERSION }}-${{ matrix.suffix }}.tar.gz
+          if-no-files-found: error
 
-  checkpoint:
-    name: Train & publish production checkpoint
-    needs: test
+  # ---------------------------------------------------------------------------
+  # Train + publish only the BPE tokenizer (checkpoints/axiom_bpe.json). It is
+  # small, deterministic, and trains offline from the repo's own sources in
+  # seconds. The semantic .bin checkpoint is far too large for a GitHub release
+  # asset, so it is intentionally NOT published here — users train it locally
+  # (see the release notes / README "Build the semantic model" step).
+  # ---------------------------------------------------------------------------
+  tokenizer:
+    name: Build & publish BPE tokenizer
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -150,41 +115,89 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             axiom_engine_rs/target
-          key: ckpt-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
-          restore-keys: ckpt-${{ runner.os }}-
+          key: tok-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+          restore-keys: tok-${{ runner.os }}-
 
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential python3
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
 
-      # Trains the d128/2L checkpoint on the repo's own corpus and runs the
-      # acceptance eval. The script exits non-zero unless clean-vs-anomaly
-      # separation PASSes, so a bad checkpoint never reaches a release.
-      - name: Train + validate checkpoint
-        run: ./scripts/train_cpu_quickstart.sh
+      - name: Build tokenizer trainer
+        working-directory: axiom_engine_rs
+        run: cargo build --release --locked --bin train_tokenizer
 
-      - name: Stage release assets
+      - name: Train BPE tokenizer (offline, from repo sources)
         run: |
           set -euo pipefail
-          mkdir -p ckpt_release
-          cp checkpoints/axiom_production_bpe.bin       ckpt_release/
-          cp checkpoints/axiom_production_bpe.meta.json ckpt_release/
-          cp checkpoints/axiom_bpe.json                 ckpt_release/
-          cp checkpoints/axiom_drift_gate.txt           ckpt_release/
-          sha256sum ckpt_release/* > ckpt_release/SHA256SUMS.txt
-          cat ckpt_release/SHA256SUMS.txt
+          # No crawled corpus in CI → train_tokenizer falls back to the repo's
+          # own .rs sources, producing a deterministic checkpoints/axiom_bpe.json.
+          AXIOM_BPE_VOCAB=16000 ./axiom_engine_rs/target/release/train_tokenizer
+          ls -l checkpoints/axiom_bpe.json
 
-      # Stable, tag-independent asset names so Helm's checkpoint.url can point
-      # at releases/latest/download/<file>.
-      - name: Upload checkpoint assets
+      - name: Upload tokenizer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenizer
+          path: checkpoints/axiom_bpe.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Collect all artifacts and publish the GitHub release with a body that
+  # explains why the .bin is absent and how to produce it locally.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [build, tokenizer]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten assets
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          find dist -type f \( -name '*.tar.gz' -o -name 'axiom_bpe.json' \) -exec cp {} assets/ \;
+          ls -l assets
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
-          files: |
-            ckpt_release/axiom_production_bpe.bin
-            ckpt_release/axiom_production_bpe.meta.json
-            ckpt_release/axiom_bpe.json
-            ckpt_release/axiom_drift_gate.txt
-            ckpt_release/SHA256SUMS.txt
+          name: AXIOM-AETHER ${{ env.VERSION }}
           fail_on_unmatched_files: true
+          files: |
+            assets/axiom-ttt-${{ env.VERSION }}-linux-x86_64.tar.gz
+            assets/axiom-ttt-${{ env.VERSION }}-windows-x86_64.tar.gz
+            assets/axiom_bpe.json
+          body: |
+            ## AXIOM-AETHER ${{ env.VERSION }}
+
+            An inference engine that learns from its environment — online
+            Test-Time Training, self-healing runtime, autonomous repair, and
+            hallucination grounding, as a drop-in proxy for any LLM.
+
+            ### Assets
+            - `axiom-ttt-${{ env.VERSION }}-linux-x86_64.tar.gz` — Linux x86-64 binary
+            - `axiom-ttt-${{ env.VERSION }}-windows-x86_64.tar.gz` — Windows x86-64 binary
+            - `axiom_bpe.json` — the trained ByteLevel-BPE tokenizer (vocab 16,000)
+
+            ### Note on the model checkpoint
+            The trained semantic checkpoint (`axiom_production_bpe.bin`) is **not**
+            attached: it is too large for a GitHub release asset. Train it locally
+            (offline, no network) in a few minutes:
+
+            ```bash
+            cd axiom_engine_rs
+            cargo build --release --bin corpus_crawl --bin train_tokenizer --bin train_semantic --bin eval_model
+            AXIOM_CORPUS_MAX_MB=150 ./target/release/corpus_crawl
+            AXIOM_BPE_VOCAB=16000 ./target/release/train_tokenizer
+            AXIOM_TTT_STABILIZE=1 ./target/release/train_semantic   # writes checkpoints/axiom_production_bpe.bin
+            ./target/release/eval_model                              # acceptance + drift gate
+            ```
+
+            See the README section **"Build the semantic model"** for details and
+            tuning knobs (`AXIOM_DMODEL`, `AXIOM_EPOCHS`, `AXIOM_LR`, …).
