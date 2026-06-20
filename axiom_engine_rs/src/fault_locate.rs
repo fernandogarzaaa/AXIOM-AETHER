@@ -42,7 +42,12 @@ pub enum Language {
     JavaScript,
     TypeScript,
     Go,
+    /// A Maven-built JVM project (`pom.xml`) → `mvn test`.
     Java,
+    /// A Gradle-built JVM project (`build.gradle[.kts]`) → `gradle test`. Kept
+    /// distinct from [`Language::Java`] because the build tool, not the language,
+    /// determines the verify command — running `mvn` in a Gradle-only repo fails.
+    Gradle,
     Ruby,
 }
 
@@ -66,8 +71,12 @@ pub fn detect_language(root: &Path) -> Option<Language> {
     if has("package.json") {
         return Some(Language::JavaScript);
     }
-    if has("pom.xml") || has("build.gradle") || has("build.gradle.kts") {
+    // Maven before Gradle, but each maps to its own build tool's verify command.
+    if has("pom.xml") {
         return Some(Language::Java);
+    }
+    if has("build.gradle") || has("build.gradle.kts") {
+        return Some(Language::Gradle);
     }
     if has("Gemfile") {
         return Some(Language::Ruby);
@@ -85,6 +94,7 @@ pub fn default_verify(language: Language) -> (String, Vec<String>) {
         Language::JavaScript | Language::TypeScript => ("npm", &["test", "--silent"]),
         Language::Go => ("go", &["test", "./..."]),
         Language::Java => ("mvn", &["-q", "test"]),
+        Language::Gradle => ("gradle", &["test", "--quiet"]),
         Language::Ruby => ("rake", &["test"]),
     };
     (prog.to_string(), args.iter().map(|s| s.to_string()).collect())
@@ -364,5 +374,24 @@ src/real.rs:9:2: error";
         assert_eq!(prog, "go");
         assert_eq!(args, vec!["test", "./..."]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gradle_and_maven_select_their_own_build_tool() {
+        // A Gradle-only JVM project must verify with gradle, not mvn.
+        let gdir = std::env::temp_dir().join(format!("axiom_floc_gradle_{}", std::process::id()));
+        std::fs::create_dir_all(&gdir).unwrap();
+        std::fs::write(gdir.join("build.gradle.kts"), "plugins {}").unwrap();
+        assert_eq!(detect_language(&gdir), Some(Language::Gradle));
+        assert_eq!(default_verify(Language::Gradle).0, "gradle");
+        let _ = std::fs::remove_dir_all(&gdir);
+
+        // A Maven project still maps to mvn.
+        let mdir = std::env::temp_dir().join(format!("axiom_floc_maven_{}", std::process::id()));
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("pom.xml"), "<project/>").unwrap();
+        assert_eq!(detect_language(&mdir), Some(Language::Java));
+        assert_eq!(default_verify(Language::Java).0, "mvn");
+        let _ = std::fs::remove_dir_all(&mdir);
     }
 }
