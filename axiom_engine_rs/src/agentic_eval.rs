@@ -11,10 +11,11 @@
 //! model or network, so the score is reproducible in CI and means exactly what
 //! it says — "the autonomous loop fixed N of M broken repos end-to-end."
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::agentic::{agentic_loop, AttemptMemory, EditSet, ProposeContext, Proposer};
 use crate::inference::InferencePipeline;
-use crate::solve::{solve, SolveOptions};
+use crate::solve::{run_verify, run_verify_capture, solve, SolveOptions};
 
 /// A seeded broken project: files to materialize and the verify command that
 /// must be driven to green. The fix is reachable by the deterministic repair
@@ -27,24 +28,50 @@ pub struct EvalCase {
     /// Verify program + args, run with the project root as working dir.
     pub command: String,
     pub args: Vec<String>,
+    /// When non-empty, this case exercises the **agentic multi-file** path: a
+    /// deterministic scripted proposer applies these (relative path, contents)
+    /// as one atomic [`EditSet`] through [`agentic_loop`]. Used for fixtures
+    /// where no single-file repair passes the verifier, so the single-file
+    /// `solve` path cannot solve them — only a coordinated multi-file edit can.
+    pub agentic_fix: Vec<(String, String)>,
 }
 
 impl EvalCase {
-    fn new(
+    fn new(name: &str, files: &[(&str, &str)], command: &str, args: &[&str]) -> Self {
+        EvalCase {
+            name: name.to_string(),
+            files: files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect(),
+            command: command.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            agentic_fix: Vec::new(),
+        }
+    }
+
+    /// A case solved via the agentic multi-file transaction path: `fix` is the
+    /// coordinated edit-set a deterministic proposer applies atomically.
+    fn new_agentic(
         name: &str,
         files: &[(&str, &str)],
         command: &str,
         args: &[&str],
+        fix: &[(&str, &str)],
     ) -> Self {
-        EvalCase {
-            name: name.to_string(),
-            files: files
-                .iter()
-                .map(|(p, c)| (p.to_string(), c.to_string()))
-                .collect(),
-            command: command.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
-        }
+        let mut c = Self::new(name, files, command, args);
+        c.agentic_fix = fix.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        c
+    }
+}
+
+/// A deterministic [`Proposer`] (no LLM) that yields one predefined edit-set on
+/// its first call, then gives up. Lets the eval certify the agentic loop's
+/// atomic multi-file apply/verify/commit machinery offline and reproducibly.
+struct ScriptedProposer {
+    once: Option<EditSet>,
+}
+
+impl Proposer for ScriptedProposer {
+    fn propose(&mut self, _ctx: &ProposeContext) -> Option<EditSet> {
+        self.once.take()
     }
 }
 
@@ -179,6 +206,24 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                  echo './server.go:2:4: build failed'; exit 1; else exit 0; fi",
             ],
         ),
+        // 8. Coordinated multi-file: the verifier requires BOTH scripts to exit
+        //    0, but each is independently broken. No single-file repair passes,
+        //    so the single-file solve path cannot solve it — only the agentic
+        //    loop's atomic multi-file transaction (fix both, verify, commit) can.
+        EvalCase::new_agentic(
+            "agentic-multi-file-both-broken",
+            &[
+                ("a.sh", "#!/bin/sh\nexit 1\n"),
+                ("b.sh", "#!/bin/sh\nexit 1\n"),
+            ],
+            "sh",
+            &["-c", "sh a.sh && sh b.sh"],
+            // Coordinated fix: both files must go green together.
+            &[
+                ("a.sh", "#!/bin/sh\nexit 0\n"),
+                ("b.sh", "#!/bin/sh\nexit 0\n"),
+            ],
+        ),
     ]
 }
 
@@ -221,18 +266,48 @@ fn run_one(pipeline: &InferencePipeline, case: &EvalCase) -> std::io::Result<boo
         }
         std::fs::write(&path, content)?;
     }
-    let opts = SolveOptions {
-        max_rounds: 2,
-        max_restarts: 1,
-        anchor: Some(root.clone()),
-        source_path: None,         // force autonomous localization
-        patch_memory_path: None,   // isolate the eval from real fleet memory
-        ..SolveOptions::default()
+    let solved = if case.agentic_fix.is_empty() {
+        // Single-file repair path: the autonomous solve loop must localize and
+        // fix the fault itself (no caller-named source).
+        let opts = SolveOptions {
+            max_rounds: 2,
+            max_restarts: 1,
+            anchor: Some(root.clone()),
+            source_path: None,       // force autonomous localization
+            patch_memory_path: None, // isolate the eval from real fleet memory
+            ..SolveOptions::default()
+        };
+        solve(pipeline, &case.command, &case.args, &opts)
+            .map(|r| r.solved)
+            .unwrap_or(false)
+    } else {
+        solve_agentic_case(case, &root)
     };
-    let report = solve(pipeline, &case.command, &case.args, &opts);
-    let solved = report.map(|r| r.solved).unwrap_or(false);
     let _ = std::fs::remove_dir_all(&root);
     Ok(solved)
+}
+
+/// Run a coordinated multi-file case through the agentic loop with a scripted
+/// (deterministic, no-LLM) proposer that applies the case's `agentic_fix` as one
+/// atomic edit-set. Certifies the transaction apply/verify/commit machinery on a
+/// fixture the single-file path cannot solve.
+fn solve_agentic_case(case: &EvalCase, root: &Path) -> bool {
+    let mut edits = EditSet::new();
+    for (rel, content) in &case.agentic_fix {
+        edits = edits.with(root.join(rel), content.clone());
+    }
+    let mut proposer = ScriptedProposer { once: Some(edits) };
+    let mut memory = AttemptMemory::new();
+    let working_dir = Some(root);
+    let outcome = agentic_loop(
+        &format!("eval:{}", case.name),
+        3,
+        &mut memory,
+        &mut proposer,
+        || run_verify(&case.command, &case.args, working_dir),
+        || run_verify_capture(&case.command, &case.args, working_dir).1,
+    );
+    outcome.solved
 }
 
 fn unique_root(name: &str) -> PathBuf {
