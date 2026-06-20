@@ -41,8 +41,10 @@ pub enum AxiomCommand {
         path: PathBuf,
     },
     /// Autonomy (Pillar 3): drive a failing verify command to green by chaining
-    /// environment self-healing and (optionally) Poly JIT source repair, then
-    /// remembering what worked. `axiom solve [--source PATH] [--max-rounds N] -- <cmd>`.
+    /// environment self-healing and Poly JIT / LLM source repair, then
+    /// remembering what worked. With no --source, the faulty file is localized
+    /// automatically from the verify command's own output (works across Rust,
+    /// Python, JS/TS, Go, C/C++, …). `axiom solve [--source PATH] -- <cmd>`.
     Solve {
         /// Max environment-heal + source-repair rounds.
         #[arg(long, default_value_t = 2)]
@@ -50,7 +52,8 @@ pub enum AxiomCommand {
         /// Restart budget for the environment supervisor each round.
         #[arg(long, default_value_t = 3)]
         max_restarts: usize,
-        /// Enable Poly JIT source repair against this artifact (reversible).
+        /// Source file to repair (reversible). Optional: when omitted, the file
+        /// is auto-detected from the failure trace. Pass it to pin the target.
         #[arg(long)]
         source: Option<PathBuf>,
         /// The verify command to drive to green, followed by its arguments.
