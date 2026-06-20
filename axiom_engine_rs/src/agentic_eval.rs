@@ -155,7 +155,20 @@ fn run_one(pipeline: &InferencePipeline, case: &EvalCase) -> std::io::Result<boo
     let root = unique_root(&case.name);
     std::fs::create_dir_all(&root)?;
     for (rel, content) in &case.files {
-        let path = root.join(rel);
+        // EvalCase is public; never let a case write outside its sandbox root via
+        // an absolute path or a `..` escape.
+        let rel_path = std::path::Path::new(rel);
+        if rel_path.is_absolute()
+            || rel_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("eval case path escapes the sandbox root: {rel}"),
+            ));
+        }
+        let path = root.join(rel_path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

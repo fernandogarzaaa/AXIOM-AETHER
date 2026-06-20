@@ -261,6 +261,32 @@ pub fn candidate_sources(trace: &str, root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Constrain a (possibly caller-supplied) path to live under `root`, returning a
+/// canonicalized path or `None` if it would escape. Unlike [`best_source`], the
+/// path need not exist yet: if it doesn't, the **parent** must exist and resolve
+/// under `root` (so a brand-new file can be created in-tree, but `..`/absolute
+/// escapes are still rejected). This is the safety check for user-named edit
+/// targets (e.g. `axiom task --file`).
+pub fn contained_path(path: &Path, root: &Path) -> Option<PathBuf> {
+    let root_canon = root.canonicalize().ok()?;
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    if let Ok(canon) = joined.canonicalize() {
+        // Exists: require canonical containment.
+        return canon.starts_with(&root_canon).then_some(canon);
+    }
+    // Doesn't exist yet: validate via the canonical parent + the final segment.
+    let parent = joined.parent()?;
+    let file_name = joined.file_name()?;
+    let parent_canon = parent.canonicalize().ok()?;
+    parent_canon
+        .starts_with(&root_canon)
+        .then(|| parent_canon.join(file_name))
+}
+
 /// Line numbers the trace attributes to `target`, ranked by reference frequency
 /// and deduplicated. Intended as an **advisory hint** for a repair prompt — it
 /// matches by file name (not a canonical path), so an approximate match is fine:
@@ -415,6 +441,23 @@ src/real.rs:9:2: error";
         // A `..` traversal that resolves outside the root is rejected too.
         assert_eq!(best_source("../vendor/dep.rs:1:1: x", &project), None);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn contained_path_allows_in_root_and_rejects_escapes() {
+        let dir = std::env::temp_dir().join(format!("axiom_floc_contain_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "fn main() {}").unwrap();
+
+        // Existing in-root file → canonical path returned.
+        let got = contained_path(Path::new("src/lib.rs"), &dir).unwrap();
+        assert_eq!(got, dir.join("src/lib.rs").canonicalize().unwrap());
+        // New file whose parent exists in-root → allowed (for creation).
+        assert!(contained_path(Path::new("src/new.rs"), &dir).is_some());
+        // Absolute outside + `..` escape → rejected.
+        assert_eq!(contained_path(Path::new("/etc/passwd"), &dir), None);
+        assert_eq!(contained_path(Path::new("../escape.rs"), &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

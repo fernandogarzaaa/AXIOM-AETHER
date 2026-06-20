@@ -601,14 +601,23 @@ fn parse_multifile_response(text: &str, targets: &[PathBuf]) -> agentic::EditSet
     }
 
     let matches_target = |path_str: &str| -> Option<PathBuf> {
-        targets
+        // Exact full-path match wins outright.
+        if let Some(t) = targets.iter().find(|t| t.display().to_string() == path_str) {
+            return Some(t.clone());
+        }
+        // Basename fallback only when it is unambiguous (exactly one target has
+        // it) — otherwise `src/config.rs` vs `tests/config.rs` could cross-apply.
+        let by_name: Vec<&PathBuf> = targets
             .iter()
-            .find(|t| {
-                t.display().to_string() == path_str
-                    || t.file_name().map(|n| n.to_string_lossy().into_owned())
-                        == Some(path_str.to_string())
+            .filter(|t| {
+                t.file_name().map(|n| n.to_string_lossy().into_owned()) == Some(path_str.to_string())
             })
-            .cloned()
+            .collect();
+        if by_name.len() == 1 {
+            Some(by_name[0].clone())
+        } else {
+            None
+        }
     };
 
     let mut current: Option<(PathBuf, String)> = None;
@@ -877,12 +886,28 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             })?;
 
             // Decide which files the agent may edit: caller-named, else localized
-            // from the verifier's own failure output (ranked, in-root only).
+            // from the verifier's own failure output. EITHER way every target
+            // must canonically resolve under the project root — a --file outside
+            // the tree (absolute or `..`) is rejected, matching the safety bound
+            // already enforced on auto-localized candidates.
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let targets: Vec<PathBuf> = if !files.is_empty() {
-                files
+                let mut validated = Vec::with_capacity(files.len());
+                for f in &files {
+                    match fault_locate::contained_path(f, &root) {
+                        Some(p) => validated.push(p),
+                        None => {
+                            return Err(candle_core::Error::Msg(format!(
+                                "axiom task: --file {} is outside the project root — refusing \
+                                 to edit files outside the tree",
+                                f.display()
+                            )))
+                        }
+                    }
+                }
+                validated
             } else {
                 let (_ok, trace) = solve::run_verify_capture(&program, &args, None);
-                let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let cands = fault_locate::candidate_sources(&trace, &root);
                 if cands.is_empty() {
                     return Err(candle_core::Error::Msg(

@@ -58,15 +58,18 @@ impl EditSet {
         self.edits.is_empty()
     }
 
-    /// Stable content hash of the whole edit-set (sorted by path) — the identity
-    /// used to dedup attempts. Two edit-sets that touch the same files with the
-    /// same bytes hash identically regardless of proposal order.
+    /// Stable content hash of the *effective* edit-set — the identity used to
+    /// dedup attempts. Duplicate paths collapse last-write-wins (matching
+    /// [`Transaction::apply`]'s on-disk effect), so two edit-sets that leave the
+    /// same files with the same bytes hash identically regardless of proposal
+    /// order or redundant entries.
     pub fn fingerprint(&self) -> String {
-        let mut sorted: Vec<(&PathBuf, &String)> =
-            self.edits.iter().map(|e| (&e.path, &e.content)).collect();
-        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        let mut latest: BTreeMap<&PathBuf, &String> = BTreeMap::new();
+        for e in &self.edits {
+            latest.insert(&e.path, &e.content); // last write wins, like apply()
+        }
         let mut buf = String::new();
-        for (p, c) in sorted {
+        for (p, c) in latest {
             buf.push_str(&p.to_string_lossy());
             buf.push('\0');
             buf.push_str(c);
@@ -84,7 +87,9 @@ impl EditSet {
 /// a rejected multi-file change never half-applies.
 pub struct Transaction {
     /// path -> Some(original bytes) if it existed, None if it was newly created.
-    snapshot: BTreeMap<PathBuf, Option<String>>,
+    /// Raw bytes (not String) so a non-UTF8 file is restored byte-for-byte
+    /// rather than mistaken for "newly created" and deleted on rollback.
+    snapshot: BTreeMap<PathBuf, Option<Vec<u8>>>,
     applied: bool,
 }
 
@@ -101,7 +106,7 @@ impl Transaction {
                 // Same file targeted twice in one set: keep the first snapshot
                 // (the true pre-transaction state) and let the later write win.
             } else {
-                let original = std::fs::read_to_string(&edit.path).ok();
+                let original = std::fs::read(&edit.path).ok();
                 tx.snapshot.insert(edit.path.clone(), original);
             }
             if let Some(parent) = edit.path.parent() {
@@ -337,6 +342,37 @@ mod tests {
         assert_eq!(f1, f2, "same files+bytes hash identically regardless of order");
         let f3 = EditSet::new().with("a", "x").with("b", "z").fingerprint();
         assert_ne!(f1, f3, "different bytes hash differently");
+    }
+
+    #[test]
+    fn edit_set_fingerprint_collapses_duplicate_paths_last_write_wins() {
+        // Transaction::apply is last-write-wins for a repeated path, so the
+        // fingerprint must match the single-edit form with the same final bytes.
+        let dup = EditSet::new().with("a", "first").with("a", "final").fingerprint();
+        let single = EditSet::new().with("a", "final").fingerprint();
+        assert_eq!(dup, single, "redundant earlier write must not change identity");
+    }
+
+    #[test]
+    fn transaction_restores_non_utf8_files_byte_for_byte() {
+        let dir = tmp("binary");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("data.bin");
+        let original: &[u8] = &[0xff, 0x00, 0xfe, 0x80, b'h', b'i'];
+        std::fs::write(&bin, original).unwrap();
+
+        // Overwrite the (non-UTF8) file inside a transaction, then roll back.
+        let edits = EditSet::new().with(bin.clone(), "text overwrite");
+        {
+            let _tx = Transaction::apply(&edits).unwrap();
+            assert_eq!(std::fs::read_to_string(&bin).unwrap(), "text overwrite");
+        }
+        assert_eq!(
+            std::fs::read(&bin).unwrap(),
+            original,
+            "a non-UTF8 original must be restored byte-for-byte, not deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

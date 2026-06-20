@@ -11,7 +11,7 @@ rather than a claim.
 
 ## The loop
 
-```
+```text
 broken repo ──▶ detect language ──▶ self-select verify command
             ──▶ localize faulty file(s) across languages
             ──▶ propose an edit-set (deterministic Poly-JIT · fleet-shared patch · LLM)
@@ -67,7 +67,7 @@ real `solve` loop (localize → deterministic Poly-JIT repair → verify, all
 reversible) and reports the fraction it fixes end-to-end. The fixtures are
 deterministic so the score is reproducible in CI with **no model or network**:
 
-```
+```text
 [axiom-eval-agentic] autonomous repair capability:
   [PASS] shell-exit-flip
   [PASS] fixture-marker
