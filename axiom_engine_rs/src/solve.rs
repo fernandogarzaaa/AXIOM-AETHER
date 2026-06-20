@@ -118,7 +118,27 @@ pub fn solve(
         }
 
         // --- Phase 2: source repair (Poly JIT), reversible ----------------
-        if let Some(src) = opts.source_path.as_deref() {
+        // The repair phases need a target file. Use the caller-named source if
+        // given; otherwise localize the faulty file directly from the verify
+        // command's own output (compiler/test runner paths), which is what makes
+        // the loop language-general rather than hand-driven and Rust-bound.
+        let located: Option<PathBuf> = if opts.source_path.is_none() {
+            let working_dir = opts.anchor.as_deref();
+            let (_still_failing, trace) = run_verify_capture(command, args, working_dir);
+            let root = opts
+                .anchor
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let found = crate::fault_locate::best_source(&trace, &root);
+            if let Some(ref p) = found {
+                println!("[axiom-solve] round {round}: localized fault to {}", p.display());
+            }
+            found
+        } else {
+            None
+        };
+        if let Some(src) = opts.source_path.as_deref().or(located.as_deref()) {
             // Single portable patch key, shared by fleet-reuse (try) and record,
             // so a patch is only ever re-applied to the file it was learned for.
             let rel = rel_path_for(src, opts.anchor.as_deref());
