@@ -242,9 +242,23 @@ fn resolve_under_root(path: &Path, root: &Path) -> Option<PathBuf> {
 /// real file, or `None` if the trace names no existing source. This is the entry
 /// point the autonomous solver uses when the caller did not name a file.
 pub fn best_source(trace: &str, root: &Path) -> Option<PathBuf> {
-    locate_sites(trace)
-        .into_iter()
-        .find_map(|site| resolve_under_root(&site.path, root))
+    candidate_sources(trace, root).into_iter().next()
+}
+
+/// Every trace-referenced source file that resolves to a real file under `root`,
+/// ranked most-blamed first and deduplicated (by canonical path). The autonomous
+/// solver tries these in order so a failure that points at several files can
+/// still be repaired; [`best_source`] is simply the first of these.
+pub fn candidate_sources(trace: &str, root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for site in locate_sites(trace) {
+        if let Some(p) = resolve_under_root(&site.path, root) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// Line numbers the trace attributes to `target`, ranked by reference frequency
@@ -401,6 +415,28 @@ src/real.rs:9:2: error";
         // A `..` traversal that resolves outside the root is rejected too.
         assert_eq!(best_source("../vendor/dep.rs:1:1: x", &project), None);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn candidate_sources_lists_all_in_root_files_ranked_and_deduped() {
+        let dir = std::env::temp_dir().join(format!("axiom_floc_cands_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "fn b() {}").unwrap();
+
+        // b.rs is referenced more (ranks first); a.rs once; ghost.rs doesn't exist.
+        let trace = "\
+src/ghost.rs:1:1: error
+src/b.rs:2:1: error
+src/b.rs:9:1: error
+src/a.rs:3:1: error";
+        let cands = candidate_sources(trace, &dir);
+        let b = dir.join("src/b.rs").canonicalize().unwrap();
+        let a = dir.join("src/a.rs").canonicalize().unwrap();
+        assert_eq!(cands, vec![b.clone(), a], "ranked, in-root only, deduped");
+        // best_source is the top candidate.
+        assert_eq!(best_source(trace, &dir), Some(b));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

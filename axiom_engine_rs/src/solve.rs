@@ -117,12 +117,16 @@ pub fn solve(
             return Ok(report);
         }
 
-        // --- Phase 2: source repair (Poly JIT), reversible ----------------
+        // --- Phase 2/2.5/3: source repair, reversible ---------------------
         // The repair phases need a target file. Use the caller-named source if
-        // given; otherwise localize the faulty file directly from the verify
-        // command's own output (compiler/test runner paths), which is what makes
-        // the loop language-general rather than hand-driven and Rust-bound.
-        let located: Option<PathBuf> = if opts.source_path.is_none() {
+        // given; otherwise localize candidate files directly from the verify
+        // command's own output (compiler/test runner paths) — ranked
+        // most-blamed first — and try each in turn. This is what makes the loop
+        // language-general and able to handle a failure that points at more than
+        // one file, rather than hand-driven and single-file.
+        let candidates: Vec<PathBuf> = if let Some(s) = opts.source_path.as_deref() {
+            vec![s.to_path_buf()]
+        } else {
             let working_dir = opts.anchor.as_deref();
             let (_still_failing, trace) = run_verify_capture(command, args, working_dir);
             let root = opts
@@ -130,123 +134,20 @@ pub fn solve(
                 .clone()
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
-            let found = crate::fault_locate::best_source(&trace, &root);
-            if let Some(ref p) = found {
-                println!("[axiom-solve] round {round}: localized fault to {}", p.display());
-            }
-            found
-        } else {
-            None
-        };
-        if let Some(src) = opts.source_path.as_deref().or(located.as_deref()) {
-            // Single portable patch key, shared by fleet-reuse (try) and record,
-            // so a patch is only ever re-applied to the file it was learned for.
-            let rel = rel_path_for(src, opts.anchor.as_deref());
-            let backup = std::fs::read_to_string(src).ok();
-            let engine = PolyJitEngine::default();
-            let run_req = PolyJitRunRequest {
-                session_id: format!("solve-{round}"),
-                command: command.to_string(),
-                args: args.to_vec(),
-                working_dir: opts
-                    .anchor
-                    .as_ref()
-                    .map(|p| p.display().to_string()),
-                source_path: Some(src.display().to_string()),
-            };
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| candle_core::Error::Msg(format!("solve runtime: {e}")))?;
-            let poly = rt
-                .block_on(engine.run_with_feedback(run_req, |_diag| async { Ok(()) }))
-                .map_err(|e| candle_core::Error::Msg(format!("poly-jit: {e}")))?;
-            if poly.passed {
-                report.source_patched = poly.patched;
-                report.solved = true;
-                report.final_exit = Some(0);
-                println!("[axiom-solve] round {round}: source repair solved it (patched={})", poly.patched);
-                return Ok(report);
-            }
-            // Failed repair → restore the artifact byte-for-byte.
-            if let Some(b) = backup {
-                let _ = std::fs::write(src, b);
-            }
-
-            // --- Phase 2.5: fleet patch reuse (re-verified locally) -----------
-            // Before spending an LLM call, try patches the verified-patch store
-            // already knows for this failure (including peer-merged fleet
-            // patches). SAFETY: each candidate is applied through
-            // PatchMemory::try_candidates, which re-runs THIS node's verify and
-            // keeps it only if green — a peer's patch is never trusted blindly.
-            if let Some(pm_path) = opts.patch_memory_path.as_deref() {
-                let fp = crate::heal_memory::fingerprint(command, args);
-                let pm = crate::patch_memory::PatchMemory::load(pm_path);
-                let working_dir = opts.anchor.as_deref();
-                if let Some(sha) =
-                    pm.try_candidates(&fp, &rel, src, || run_verify(command, args, working_dir))
-                {
-                    report.fleet_patched = true;
-                    report.solved = true;
-                    report.final_exit = Some(0);
-                    println!(
-                        "[axiom-solve] round {round}: fleet patch {} verified green locally",
-                        &sha[..sha.len().min(12)]
-                    );
-                    return Ok(report);
-                }
-            }
-
-            // --- Phase 3: autonomous LLM repair (verifier-gated, reversible) ---
-            // When the deterministic Poly-JIT patches don't fix it, ask the LLM
-            // backend for a patch — but keep it ONLY if the verify command then
-            // goes green. The model never gets to "fix" anything that isn't
-            // independently verified; a rejected patch is rolled back byte-for-
-            // byte. This is the autonomous code-repair step: general proposals,
-            // grounded acceptance.
-            if let Some(backend) = ClaudeBackend::from_env() {
-                let working_dir = opts.anchor.as_deref();
-                // Feed the model the REAL compile/test failure trace. The
-                // supervisor's `sup.diagnostics` only holds non-correctable
-                // *environment* diagnoses (missing env var, disk full) and is
-                // usually empty for ordinary source failures, so capture the
-                // verify command's stdout/stderr directly. Fall back to the env
-                // diagnoses only if the command produced no output.
-                let (_still_failing, trace) = run_verify_capture(command, args, working_dir);
-                let failure_output = if trace.trim().is_empty() {
-                    sup.diagnostics.join("\n")
-                } else {
-                    trace
-                };
-                let solved = llm_repair_round(
-                    &backend,
-                    command,
-                    args,
-                    working_dir,
-                    src,
-                    &failure_output,
+            let cands = crate::fault_locate::candidate_sources(&trace, &root);
+            if let Some(first) = cands.first() {
+                println!(
+                    "[axiom-solve] round {round}: localized {} candidate file(s); first: {}",
+                    cands.len(),
+                    first.display()
                 );
-                if solved {
-                    report.llm_patched = true;
-                    report.solved = true;
-                    report.final_exit = Some(0);
-                    println!(
-                        "[axiom-solve] round {round}: LLM-proposed patch verified green"
-                    );
-                    // Record the verified fix so this node — and, via signed
-                    // gossip, the fleet — can reuse it next time this failure
-                    // signature recurs (always re-verified before trust).
-                    if let Some(pm_path) = opts.patch_memory_path.as_deref() {
-                        if let Ok(content) = std::fs::read_to_string(src) {
-                            let fp = crate::heal_memory::fingerprint(command, args);
-                            let mut pm =
-                                crate::patch_memory::PatchMemory::load(pm_path);
-                            pm.record_verified(&fp, &rel, &content);
-                            let _ = pm.save(pm_path);
-                        }
-                    }
-                    return Ok(report);
-                }
+            }
+            cands
+        };
+        for src in &candidates {
+            if attempt_source_repair(command, args, opts, round, &sup.diagnostics, src, &mut report)?
+            {
+                return Ok(report);
             }
         }
 
@@ -261,6 +162,122 @@ pub fn solve(
     }
 
     Ok(report)
+}
+
+/// Run the reversible repair phases against ONE target file:
+/// Phase 2 (Poly-JIT deterministic patches) → Phase 2.5 (fleet patch reuse,
+/// re-verified locally) → Phase 3 (verifier-gated LLM repair). Returns
+/// `Ok(true)` and sets the matching `report` flags if some phase made the verify
+/// command pass; `Ok(false)` if none did — each phase rolls its own candidate
+/// back byte-for-byte, so a non-fixing attempt leaves the file untouched and the
+/// caller can safely try the next candidate.
+#[allow(clippy::too_many_arguments)]
+fn attempt_source_repair(
+    command: &str,
+    args: &[String],
+    opts: &SolveOptions,
+    round: usize,
+    env_diagnostics: &[String],
+    src: &Path,
+    report: &mut SolveReport,
+) -> CResult<bool> {
+    // Single portable patch key, shared by fleet-reuse (try) and record, so a
+    // patch is only ever re-applied to the file it was learned for.
+    let rel = rel_path_for(src, opts.anchor.as_deref());
+    let backup = std::fs::read_to_string(src).ok();
+    let engine = PolyJitEngine::default();
+    let run_req = PolyJitRunRequest {
+        session_id: format!("solve-{round}"),
+        command: command.to_string(),
+        args: args.to_vec(),
+        working_dir: opts.anchor.as_ref().map(|p| p.display().to_string()),
+        source_path: Some(src.display().to_string()),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| candle_core::Error::Msg(format!("solve runtime: {e}")))?;
+    let poly = rt
+        .block_on(engine.run_with_feedback(run_req, |_diag| async { Ok(()) }))
+        .map_err(|e| candle_core::Error::Msg(format!("poly-jit: {e}")))?;
+    if poly.passed {
+        report.source_patched = poly.patched;
+        report.solved = true;
+        report.final_exit = Some(0);
+        println!(
+            "[axiom-solve] round {round}: source repair solved it (patched={})",
+            poly.patched
+        );
+        return Ok(true);
+    }
+    // Failed repair → restore the artifact byte-for-byte.
+    if let Some(b) = backup {
+        let _ = std::fs::write(src, b);
+    }
+
+    // --- Phase 2.5: fleet patch reuse (re-verified locally) -----------------
+    // Before spending an LLM call, try patches the verified-patch store already
+    // knows for this failure (including peer-merged fleet patches). SAFETY: each
+    // candidate is applied through PatchMemory::try_candidates, which re-runs
+    // THIS node's verify and keeps it only if green — a peer's patch is never
+    // trusted blindly.
+    if let Some(pm_path) = opts.patch_memory_path.as_deref() {
+        let fp = crate::heal_memory::fingerprint(command, args);
+        let pm = crate::patch_memory::PatchMemory::load(pm_path);
+        let working_dir = opts.anchor.as_deref();
+        if let Some(sha) =
+            pm.try_candidates(&fp, &rel, src, || run_verify(command, args, working_dir))
+        {
+            report.fleet_patched = true;
+            report.solved = true;
+            report.final_exit = Some(0);
+            println!(
+                "[axiom-solve] round {round}: fleet patch {} verified green locally",
+                &sha[..sha.len().min(12)]
+            );
+            return Ok(true);
+        }
+    }
+
+    // --- Phase 3: autonomous LLM repair (verifier-gated, reversible) --------
+    // When the deterministic Poly-JIT patches don't fix it, ask the LLM backend
+    // for a patch — but keep it ONLY if the verify command then goes green. The
+    // model never gets to "fix" anything that isn't independently verified; a
+    // rejected patch is rolled back byte-for-byte.
+    if let Some(backend) = ClaudeBackend::from_env() {
+        let working_dir = opts.anchor.as_deref();
+        // Feed the model the REAL compile/test failure trace. The supervisor's
+        // diagnostics only hold non-correctable *environment* diagnoses and are
+        // usually empty for ordinary source failures, so capture the verify
+        // command's stdout/stderr directly; fall back to env diagnoses only if
+        // the command produced no output.
+        let (_still_failing, trace) = run_verify_capture(command, args, working_dir);
+        let failure_output = if trace.trim().is_empty() {
+            env_diagnostics.join("\n")
+        } else {
+            trace
+        };
+        let solved = llm_repair_round(&backend, command, args, working_dir, src, &failure_output);
+        if solved {
+            report.llm_patched = true;
+            report.solved = true;
+            report.final_exit = Some(0);
+            println!("[axiom-solve] round {round}: LLM-proposed patch verified green");
+            // Record the verified fix so this node — and, via signed gossip, the
+            // fleet — can reuse it next time this failure signature recurs
+            // (always re-verified before trust).
+            if let Some(pm_path) = opts.patch_memory_path.as_deref() {
+                if let Ok(content) = std::fs::read_to_string(src) {
+                    let fp = crate::heal_memory::fingerprint(command, args);
+                    let mut pm = crate::patch_memory::PatchMemory::load(pm_path);
+                    pm.record_verified(&fp, &rel, &content);
+                    let _ = pm.save(pm_path);
+                }
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Bounded number of LLM repair attempts per round (override with
