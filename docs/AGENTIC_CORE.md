@@ -76,15 +76,19 @@ deterministic so the score is reproducible in CI with **no model or network**:
   [PASS] python-frame-localize
   [PASS] js-stack-localize
   [PASS] go-frame-localize
-score: 7/7 = 100%
+  [PASS] agentic-multi-file-both-broken
+score: 8/8 = 100%
 ```
 
 This is the honest headline: **the deterministic autonomous loop repairs 100% of
 the built-in fixtures with no LLM.** The suite spans fault localization across
 five trace dialects (shell, Rust `-->`, Python `File "…"`, JS stack, Go
 `file.go:line`) and multiple deterministic repair patterns, plus a multi-file
-case where the loop must pick the failing file among several. The LLM-driven
-`axiom task` extends the same verified loop to open-ended objectives; its success
-rate depends on the backing model and is bounded by the same verifier gate. Grow
-the suite (harder multi-file bugs, LLM-required cases) to make the number mean
-more.
+case where the loop must pick the failing file among several. The final case
+certifies the strictly harder class of **coordinated multi-file repair**: the
+verifier requires two independently-broken files to both go green, so no
+single-file fix passes — only the agentic loop's atomic multi-file transaction
+(fix both → verify → commit, else roll back) can solve it. The LLM-driven `axiom
+task` extends the same verified loop to open-ended objectives; its success rate
+depends on the backing model and is bounded by the same verifier gate. Grow the
+suite (LLM-required cases) to make the number mean more.
