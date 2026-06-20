@@ -119,6 +119,48 @@ fn solve_auto_localizes_source_from_trace_without_source_path() {
 }
 
 #[test]
+fn solve_tries_multiple_localized_candidates_until_one_repairs() {
+    // The verify command references TWO files: first.sh (harmless, exits 0, but
+    // cited first) and second.sh (the real failure, `exit 1`). With no
+    // source_path, the loop must localize both, fail to repair the first
+    // candidate, then repair the second — proving multi-candidate fallback.
+    let base = unique_tmp("multicand");
+    std::fs::create_dir_all(&base).unwrap();
+    let first = base.join("first.sh");
+    let second = base.join("second.sh");
+    std::fs::write(&first, "#!/bin/sh\necho 'first.sh:1:1: just a warning'\nexit 0\n").unwrap();
+    std::fs::write(&second, "#!/bin/sh\necho 'second.sh:2:1: boom' >&2\nexit 1\n").unwrap();
+
+    let report = run_solve(
+        "sh".into(),
+        vec![
+            "-c".into(),
+            format!("sh {}; sh {}", first.display(), second.display()),
+        ],
+        SolveOptions {
+            max_rounds: 2,
+            max_restarts: 1,
+            anchor: Some(base.clone()),
+            source_path: None,
+            ..SolveOptions::default()
+        },
+    );
+    assert!(report.solved, "the second candidate should be repaired");
+    assert!(report.source_patched);
+    assert!(
+        std::fs::read_to_string(&second).unwrap().contains("exit 0"),
+        "Poly JIT flipped the failing file (second.sh)"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&first).unwrap(),
+        "#!/bin/sh\necho 'first.sh:1:1: just a warning'\nexit 0\n",
+        "the non-failing first candidate is left byte-for-byte intact"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn solve_reports_unsolved_and_restores_source_on_failure() {
     // No env heal, no applicable patch (exit 3) → unsolved, source intact.
     let base = unique_tmp("unsolved");
