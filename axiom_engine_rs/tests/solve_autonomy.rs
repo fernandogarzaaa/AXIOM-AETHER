@@ -86,6 +86,39 @@ fn solve_via_source_repair_when_env_heal_insufficient() {
 }
 
 #[test]
+fn solve_auto_localizes_source_from_trace_without_source_path() {
+    // No source_path given: the loop must localize the faulty file from the
+    // verify command's own output, then Poly JIT repairs it. This is the
+    // language-general autonomy path — the user names no file.
+    let base = unique_tmp("autoloc");
+    std::fs::create_dir_all(&base).unwrap();
+    // prog.sh fails and prints a frame naming itself (relative to the anchor),
+    // and contains `exit 1` which Poly JIT flips to `exit 0`.
+    let prog = base.join("prog.sh");
+    std::fs::write(&prog, "#!/bin/sh\necho 'prog.sh:1:1: boom' >&2\nexit 1\n").unwrap();
+
+    let report = run_solve(
+        "sh".into(),
+        vec!["prog.sh".into()],
+        SolveOptions {
+            max_rounds: 2,
+            max_restarts: 1,
+            anchor: Some(base.clone()), // verify runs here; localization root
+            source_path: None,          // <-- the point: no named file
+            ..SolveOptions::default()
+        },
+    );
+    assert!(report.solved, "auto-localized source repair should solve it");
+    assert!(report.source_patched, "the localized file was patched");
+    assert!(
+        std::fs::read_to_string(&prog).unwrap().contains("exit 0"),
+        "Poly JIT flipped the localized file's exit code"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn solve_reports_unsolved_and_restores_source_on_failure() {
     // No env heal, no applicable patch (exit 3) → unsolved, source intact.
     let base = unique_tmp("unsolved");
