@@ -13,6 +13,7 @@ pub mod data_gen;
 pub mod dwe;
 pub mod embedder;
 pub mod encoder;
+pub mod fault_locate;
 pub mod hamiltonian;
 pub mod hallucination;
 pub mod hardware;

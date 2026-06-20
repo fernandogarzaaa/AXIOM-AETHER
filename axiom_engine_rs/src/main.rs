@@ -15,6 +15,7 @@ mod data_gen;
 mod dwe;
 mod embedder;
 mod encoder;
+mod fault_locate;
 mod hamiltonian;
 mod hallucination;
 mod hardware;
