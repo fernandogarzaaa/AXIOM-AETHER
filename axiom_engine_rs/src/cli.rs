@@ -57,7 +57,9 @@ pub enum AxiomCommand {
         #[arg(long)]
         source: Option<PathBuf>,
         /// The verify command to drive to green, followed by its arguments.
-        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        /// Optional: with none, the project language is detected and a default
+        /// check is used (e.g. `cargo test`, `pytest`, `go test`).
+        #[arg(trailing_var_arg = true, num_args = 0..)]
         command: Vec<String>,
     },
     /// Run a program under self-healing supervision: failures are absorbed into

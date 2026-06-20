@@ -660,11 +660,32 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             source,
             command,
         } => {
-            let (program, args) = command
-                .split_first()
-                .ok_or_else(|| candle_core::Error::Msg("axiom solve needs a command".into()))?;
-            let program = program.clone();
-            let args = args.to_vec();
+            let (program, args) = match command.split_first() {
+                Some((p, rest)) => (p.clone(), rest.to_vec()),
+                None => {
+                    // No command given: detect the project language and
+                    // self-select a default check, so `axiom solve` can run
+                    // fully hands-off — point it at a broken repo and it figures
+                    // out how to verify itself, then localizes and repairs.
+                    let root = std::env::current_dir().map_err(|e| {
+                        candle_core::Error::Msg(format!("axiom solve: cwd: {e}"))
+                    })?;
+                    let lang = fault_locate::detect_language(&root).ok_or_else(|| {
+                        candle_core::Error::Msg(
+                            "axiom solve: no command given and no recognizable project \
+                             (Cargo.toml / go.mod / pyproject.toml / package.json / …) \
+                             found — pass a verify command after `--`"
+                                .into(),
+                        )
+                    })?;
+                    let (p, a) = fault_locate::default_verify(lang);
+                    println!(
+                        "[axiom-solve] no command given; detected {lang:?} → `{p} {}`",
+                        a.join(" ")
+                    );
+                    (p, a)
+                }
+            };
             let opts = solve::SolveOptions {
                 max_rounds,
                 max_restarts,
