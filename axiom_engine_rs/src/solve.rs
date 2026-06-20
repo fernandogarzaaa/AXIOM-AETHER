@@ -218,6 +218,23 @@ pub fn solve(
                 } else {
                     trace
                 };
+                // Point the model at the exact line(s) the trace blames in this
+                // file, so it edits surgically instead of rescanning the whole
+                // file. Advisory only — the verifier still gates acceptance.
+                let hint_lines = crate::fault_locate::line_hints_for(&failure_output, src);
+                let fault_hint = if hint_lines.is_empty() {
+                    String::new()
+                } else {
+                    let shown: Vec<String> =
+                        hint_lines.iter().take(5).map(|l| l.to_string()).collect();
+                    format!(
+                        "The failure points at {} line(s): {}. Focus the fix there.\n\n",
+                        src.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        shown.join(", "),
+                    )
+                };
                 let solved = llm_repair_round(
                     &backend,
                     command,
@@ -225,6 +242,7 @@ pub fn solve(
                     working_dir,
                     src,
                     &failure_output,
+                    &fault_hint,
                 );
                 if solved {
                     report.llm_patched = true;
@@ -286,6 +304,7 @@ fn llm_repair_round(
     working_dir: Option<&Path>,
     source_path: &Path,
     failure_output: &str,
+    fault_hint: &str,
 ) -> bool {
     let max_attempts = llm_repair_attempts();
     apply_verified_patch_iterative(
@@ -300,6 +319,7 @@ fn llm_repair_round(
                 "A verification command is failing and you must fix the source so it passes.\n\n\
                  Command: {command} {args}\n\n\
                  Failure output:\n{failure}\n\n\
+                 {fault_hint}\
                  Current contents of {path}:\n```\n{original}\n```\n\n\
                  Return ONLY the complete corrected file contents — no explanation, no commentary, \
                  no markdown code fences.",
