@@ -198,18 +198,30 @@ pub fn locate_sites(trace: &str) -> Vec<FaultSite> {
     sites
 }
 
-/// Resolve a trace-reported path to a real file under `root`, if one exists.
+/// Resolve a trace-reported path to a real file that lives **under** `root`.
+///
+/// The returned path is fed straight into the reversible repair writes in
+/// [`crate::solve`], so it must never escape the project being repaired. A
+/// verifier frequently prints absolute frames for the stdlib, a dependency, or a
+/// virtualenv (e.g. a Python traceback through site-packages, or a Rust panic in
+/// `~/.cargo/registry/...`); accepting one because it merely exists would let
+/// auto-localization rewrite a file outside the project — and could shadow the
+/// real app source if the dependency frame is seen first. We therefore
+/// canonicalize both sides and require strict containment, which also defeats
+/// `..` traversal in relative frames.
 fn resolve_under_root(path: &Path, root: &Path) -> Option<PathBuf> {
-    if path.is_absolute() {
-        return if path.is_file() {
-            Some(path.to_path_buf())
-        } else {
-            None
-        };
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    if !candidate.is_file() {
+        return None;
     }
-    let joined = root.join(path);
-    if joined.is_file() {
-        Some(joined)
+    let root_canon = root.canonicalize().ok()?;
+    let cand_canon = candidate.canonicalize().ok()?;
+    if cand_canon.starts_with(&root_canon) {
+        Some(cand_canon)
     } else {
         None
     }
@@ -303,11 +315,43 @@ src/ghost.rs:3:1: error
 src/ghost.rs:4:1: error
 src/real.rs:9:2: error";
         let found = best_source(trace, &dir);
-        assert_eq!(found, Some(sub.join("real.rs")));
+        assert_eq!(found, Some(sub.join("real.rs").canonicalize().unwrap()));
 
         // A trace naming no existing file localizes nothing.
         assert_eq!(best_source("src/ghost.rs:1:1: error", &dir), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn best_source_rejects_existing_files_outside_the_root() {
+        // A real file that exists but lives OUTSIDE the project root (e.g. a
+        // dependency / stdlib / virtualenv frame) must never be localized — the
+        // repair loop writes to the returned path.
+        let base = std::env::temp_dir().join(format!("axiom_floc_esc_{}", std::process::id()));
+        let project = base.join("project");
+        let outside = base.join("vendor");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(project.join("src/app.rs"), "fn main() {}").unwrap();
+        let dep = outside.join("dep.rs");
+        std::fs::write(&dep, "// dependency").unwrap();
+
+        // Absolute dependency frame seen FIRST (more hits) must be skipped in
+        // favor of the in-root app source.
+        let trace = format!(
+            "thread panicked at {dep}:10:5\n{dep}:11:1: note\nsrc/app.rs:3:2: error",
+            dep = dep.display()
+        );
+        let found = best_source(&trace, &project);
+        assert_eq!(found, Some(project.join("src/app.rs").canonicalize().unwrap()));
+
+        // An absolute out-of-root frame on its own localizes nothing.
+        let only_dep = format!("{}:10:5: boom", dep.display());
+        assert_eq!(best_source(&only_dep, &project), None);
+
+        // A `..` traversal that resolves outside the root is rejected too.
+        assert_eq!(best_source("../vendor/dep.rs:1:1: x", &project), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
