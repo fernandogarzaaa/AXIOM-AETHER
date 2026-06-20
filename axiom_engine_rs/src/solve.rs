@@ -465,7 +465,7 @@ fn rel_path_for(src: &Path, anchor: Option<&Path>) -> String {
 
 /// Run the verify command, returning whether it exited 0. Bounded by
 /// [`verify_timeout`] (delegates to [`run_verify_capture`]).
-fn run_verify(command: &str, args: &[String], working_dir: Option<&Path>) -> bool {
+pub(crate) fn run_verify(command: &str, args: &[String], working_dir: Option<&Path>) -> bool {
     run_verify_capture(command, args, working_dir).0
 }
 
@@ -473,7 +473,7 @@ fn run_verify(command: &str, args: &[String], working_dir: Option<&Path>) -> boo
 /// `(success, combined stdout+stderr trace)` capped to the last ~4000 chars.
 /// stdout/stderr are drained on threads so a chatty verifier can't deadlock on a
 /// full pipe; on timeout the child is killed and `success` is false.
-fn run_verify_capture(
+pub(crate) fn run_verify_capture(
     command: &str,
     args: &[String],
     working_dir: Option<&Path>,

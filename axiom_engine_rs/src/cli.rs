@@ -62,6 +62,31 @@ pub enum AxiomCommand {
         #[arg(trailing_var_arg = true, num_args = 0..)]
         command: Vec<String>,
     },
+    /// Agentic Core: goal-directed autonomous coding. Drive a verify command to
+    /// green toward an objective, editing files under an all-or-nothing,
+    /// verifier-gated, reversible transaction loop (a rejected change is rolled
+    /// back byte-for-byte; identical failed changes are never retried). Repair is
+    /// the special case (omit --goal). `axiom task --goal "<desc>" [--file P]... -- <cmd>`.
+    Task {
+        /// What to accomplish, in natural language. Omit to mean "make the verify
+        /// command pass" (pure repair).
+        #[arg(long, default_value = "")]
+        goal: String,
+        /// A file the agent may edit (repeatable). With none, target files are
+        /// localized automatically from the verify command's failure output.
+        #[arg(long = "file")]
+        files: Vec<PathBuf>,
+        /// Max verifier-gated attempts.
+        #[arg(long, default_value_t = 4)]
+        max_attempts: usize,
+        /// The verify command that grounds acceptance, followed by its arguments.
+        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Measure the autonomous loop's capability as a reproducible score: run the
+    /// built-in seeded broken-repo fixtures through the real solve loop and report
+    /// how many it repairs end-to-end (deterministic, no LLM required).
+    EvalAgentic {},
     /// Run a program under self-healing supervision: failures are absorbed into
     /// the TTT fast-weights, the environment is repaired (e.g. missing
     /// directories created), and the program is restarted until it succeeds.
