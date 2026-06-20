@@ -120,16 +120,16 @@ The latest GitHub release publishes:
 
 | Asset | Purpose |
 |---|---|
-| `axiom-ttt-<version>-linux-x86_64.tar.gz` | Linux binary archive |
-| `axiom-ttt-<version>-windows-x86_64.zip` | Windows binary archive |
-| `axiom-ttt-<version>-macos-arm64.tar.gz` | macOS Apple Silicon binary archive |
+| `axiom-ttt-{version}-linux-x86_64.tar.gz` | Linux binary archive |
+| `axiom-ttt-{version}-windows-x86_64.zip` | Windows binary archive |
+| `axiom-ttt-{version}-macos-arm64.tar.gz` | macOS Apple Silicon binary archive |
 | `axiom_production_bpe.bin` | Release checkpoint |
 | `axiom_production_bpe.meta.json` | Checkpoint metadata |
 | `axiom_bpe.json` | Tokenizer |
 | `axiom_drift_gate.txt` | Drift threshold produced by the checkpoint job |
 | `SHA256SUMS.txt` | Release asset checksums |
 
-Release page: <https://github.com/fernandogarzaaa/AXIOM-AETHER/releases/latest>
+Release page: [latest AXIOM-AETHER release](https://github.com/fernandogarzaaa/AXIOM-AETHER/releases/latest)
 
 ## HTTP API
 
@@ -221,15 +221,15 @@ The runtime supports both legacy `--mode` operation and newer subcommands:
 ```text
 axiom --mode generate|train|server|mcp|lsp|meta-train|doctor
 axiom init [--no-fetch] [--no-train]
-axiom prime <dir>
-axiom bench <dir>
-axiom run [--dry-run] [--max-restarts N] -- <cmd>
-axiom solve [--source PATH] [--max-rounds N] -- <cmd>
+axiom prime {dir}
+axiom bench {dir}
+axiom run [--dry-run] [--max-restarts N] -- {cmd}
+axiom solve [--source PATH] [--max-rounds N] -- {cmd}
 axiom immunity [query] [--prune]
-axiom swarm connect <peer>
-axiom swarm immunity <host:port>
+axiom swarm connect {peer}
+axiom swarm immunity {host:port}
 axiom daemon start|stop|status
-axiom mount <dir>
+axiom mount {dir}
 ```
 
 Useful environment variables:
