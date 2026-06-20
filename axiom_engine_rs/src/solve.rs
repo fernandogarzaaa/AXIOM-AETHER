@@ -274,6 +274,26 @@ fn llm_repair_attempts() -> usize {
         .unwrap_or(3)
 }
 
+/// Build an advisory "focus the fix at line N" hint from a verifier failure for
+/// the file under repair, or "" when the trace blames no line in it. Recomputed
+/// per attempt so it always reflects the latest failure. Trailing blank line so
+/// it drops cleanly out of the prompt when empty.
+fn fault_hint_from(failure: &str, source_path: &Path) -> String {
+    let lines = crate::fault_locate::line_hints_for(failure, source_path);
+    if lines.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<String> = lines.iter().take(5).map(|l| l.to_string()).collect();
+    format!(
+        "The failure points at {} line(s): {}. Focus the fix there.\n\n",
+        source_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        shown.join(", "),
+    )
+}
+
 /// Ask the LLM backend for a corrected source and apply it under the
 /// verifier-gated, reversible, *iterative* policy: up to `llm_repair_attempts()`
 /// tries, each re-prompted with the latest verifier failure output. Returns true
@@ -296,10 +316,15 @@ fn llm_repair_round(
         max_attempts,
         failure_output,
         |failure, original| {
+            // Compute the line hint from the CURRENT failure each attempt — the
+            // iterative loop re-prompts with fresh verifier output, so a hint
+            // baked once before the loop would point at a stale line on retries.
+            let fault_hint = fault_hint_from(failure, source_path);
             let prompt = format!(
                 "A verification command is failing and you must fix the source so it passes.\n\n\
                  Command: {command} {args}\n\n\
                  Failure output:\n{failure}\n\n\
+                 {fault_hint}\
                  Current contents of {path}:\n```\n{original}\n```\n\n\
                  Return ONLY the complete corrected file contents — no explanation, no commentary, \
                  no markdown code fences.",

@@ -247,6 +247,45 @@ pub fn best_source(trace: &str, root: &Path) -> Option<PathBuf> {
         .find_map(|site| resolve_under_root(&site.path, root))
 }
 
+/// Line numbers the trace attributes to `target`, ranked by reference frequency
+/// and deduplicated. Intended as an **advisory hint** for a repair prompt — it
+/// matches by file name (not a canonical path), so an approximate match is fine:
+/// the worst case is pointing the model at a slightly wrong line, never an
+/// unsafe write. Returns an empty vec when the trace says nothing about `target`.
+pub fn line_hints_for(trace: &str, target: &Path) -> Vec<u32> {
+    let name = match target.file_name() {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    // Parse directly (not via locate_sites, which keeps only one line per path)
+    // so every distinct line for the target is captured, ranked by how often the
+    // trace cites it (stable: first-seen order breaks ties).
+    let mut order: Vec<u32> = Vec::new();
+    let mut freq: HashMap<u32, u32> = HashMap::new();
+    let mut consider = |p: &Path, line: u32| {
+        if p.file_name() == Some(name) {
+            let e = freq.entry(line).or_insert_with(|| {
+                order.push(line);
+                0
+            });
+            *e = e.saturating_add(1);
+        }
+    };
+    for raw in trace.lines() {
+        if let Some((p, l)) = parse_python_frame(raw) {
+            consider(&p, l);
+            continue;
+        }
+        for tok in raw.split_whitespace() {
+            if let Some((p, l)) = parse_inline_token(tok) {
+                consider(&p, l);
+            }
+        }
+    }
+    order.sort_by(|a, b| freq[b].cmp(&freq[a]));
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +413,20 @@ src/real.rs:9:2: error";
         assert_eq!(prog, "go");
         assert_eq!(args, vec!["test", "./..."]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_hints_rank_and_filter_to_the_target_file() {
+        let trace = "\
+src/widget.rs:42:18: error
+src/widget.rs:42:18: error
+src/widget.rs:50:9: error
+src/unrelated.rs:3:1: error";
+        // Matches by file name; the same line dedups; ranked by frequency.
+        let hints = line_hints_for(trace, Path::new("/abs/proj/src/widget.rs"));
+        assert_eq!(hints, vec![42, 50], "line 42 (2 hits) ranks before line 50 (1)");
+        // A file the trace never mentions yields no hint.
+        assert!(line_hints_for(trace, Path::new("src/ghost.rs")).is_empty());
     }
 
     #[test]
