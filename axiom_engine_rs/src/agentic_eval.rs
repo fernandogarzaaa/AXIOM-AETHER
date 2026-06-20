@@ -249,18 +249,13 @@ fn run_one(pipeline: &InferencePipeline, case: &EvalCase) -> std::io::Result<boo
     for (rel, content) in &case.files {
         // EvalCase is public; never let a case write outside its sandbox root via
         // an absolute path or a `..` escape.
-        let rel_path = std::path::Path::new(rel);
-        if rel_path.is_absolute()
-            || rel_path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
+        if !is_safe_rel(rel) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("eval case path escapes the sandbox root: {rel}"),
             ));
         }
-        let path = root.join(rel_path);
+        let path = root.join(rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -294,6 +289,12 @@ fn run_one(pipeline: &InferencePipeline, case: &EvalCase) -> std::io::Result<boo
 fn solve_agentic_case(case: &EvalCase, root: &Path) -> bool {
     let mut edits = EditSet::new();
     for (rel, content) in &case.agentic_fix {
+        // `agentic_fix` is public too: a committed transaction writes these
+        // paths, so an absolute/`..` escape must be refused (treat as unsolved)
+        // rather than allowed to overwrite files outside the sandbox root.
+        if !is_safe_rel(rel) {
+            return false;
+        }
         edits = edits.with(root.join(rel), content.clone());
     }
     let mut proposer = ScriptedProposer { once: Some(edits) };
@@ -308,6 +309,18 @@ fn solve_agentic_case(case: &EvalCase, root: &Path) -> bool {
         || run_verify_capture(&case.command, &case.args, working_dir).1,
     );
     outcome.solved
+}
+
+/// A case-supplied relative path is safe to materialize/commit under the sandbox
+/// root only if it is relative and contains no `..` traversal. Applied to both
+/// `EvalCase::files` (seed) and `EvalCase::agentic_fix` (committed edits), since
+/// both are public and a committed transaction writes the latter to disk.
+fn is_safe_rel(rel: &str) -> bool {
+    let p = Path::new(rel);
+    !p.is_absolute()
+        && !p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 fn unique_root(name: &str) -> PathBuf {
@@ -351,6 +364,30 @@ mod tests {
             report.summary()
         );
         assert!((report.score() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn unsafe_case_paths_are_rejected() {
+        // Both seed files and committed agentic-fix paths must reject escapes.
+        assert!(is_safe_rel("src/a.rs"));
+        assert!(is_safe_rel("a.sh"));
+        assert!(!is_safe_rel("/etc/passwd"));
+        assert!(!is_safe_rel("../escape.rs"));
+        assert!(!is_safe_rel("src/../../escape.rs"));
+
+        // An agentic case whose fix escapes the sandbox is refused (unsolved),
+        // never committed outside the root.
+        let case = EvalCase::new_agentic(
+            "escape-attempt",
+            &[("a.sh", "#!/bin/sh\nexit 1\n")],
+            "sh",
+            &["-c", "exit 1"],
+            &[("../../evil.sh", "pwned")],
+        );
+        let root = unique_root(&case.name);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!solve_agentic_case(&case, &root), "escaping fix must be refused");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
