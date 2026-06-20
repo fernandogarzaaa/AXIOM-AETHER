@@ -72,11 +72,19 @@ deterministic so the score is reproducible in CI with **no model or network**:
   [PASS] shell-exit-flip
   [PASS] fixture-marker
   [PASS] multi-file-pick-failing
-score: 3/3 = 100%
+  [PASS] rust-assert-flip
+  [PASS] python-frame-localize
+  [PASS] js-stack-localize
+  [PASS] go-frame-localize
+score: 7/7 = 100%
 ```
 
 This is the honest headline: **the deterministic autonomous loop repairs 100% of
-the built-in fixtures with no LLM.** The LLM-driven `axiom task` extends the same
-verified loop to open-ended objectives; its success rate depends on the backing
-model and is bounded by the same verifier gate. Grow the suite (more languages,
-harder multi-file bugs, LLM-required cases) to make the number mean more.
+the built-in fixtures with no LLM.** The suite spans fault localization across
+five trace dialects (shell, Rust `-->`, Python `File "…"`, JS stack, Go
+`file.go:line`) and multiple deterministic repair patterns, plus a multi-file
+case where the loop must pick the failing file among several. The LLM-driven
+`axiom task` extends the same verified loop to open-ended objectives; its success
+rate depends on the backing model and is bounded by the same verifier gate. Grow
+the suite (harder multi-file bugs, LLM-required cases) to make the number mean
+more.

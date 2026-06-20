@@ -132,6 +132,53 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             "sh",
             &["-c", "sh helper.sh; sh main.sh"],
         ),
+        // 4. Rust-format localization (`--> file:line`) + a second deterministic
+        //    repair pattern (the `assert_eq!(1, 2)` -> `(1, 1)` flip). The grep
+        //    guard fails while the bad assert is present and passes once flipped.
+        EvalCase::new(
+            "rust-assert-flip",
+            &[("widget.rs", "pub fn f() { assert_eq!(1, 2); }\n")],
+            "sh",
+            &[
+                "-c",
+                "if grep -q 'assert_eq!(1, 2)' widget.rs; then \
+                 echo 'error[E0001]'; echo '  --> widget.rs:1:14'; exit 1; else exit 0; fi",
+            ],
+        ),
+        // 5. Python-traceback localization (`File \"x.py\", line N`) + fixture
+        //    marker repair (FAIL -> PASS).
+        EvalCase::new(
+            "python-frame-localize",
+            &[("core.py", "# AXIOM_POLYJIT_FIXTURE_FAIL\n")],
+            "sh",
+            &[
+                "-c",
+                "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL core.py; then \
+                 echo '  File \"core.py\", line 1, in <module>'; exit 1; else exit 0; fi",
+            ],
+        ),
+        // 6. JS stack-frame localization (`at fn (file:line:col)`) + exit flip.
+        EvalCase::new(
+            "js-stack-localize",
+            &[("index.js", "// index.js\nprocess.exit 1\n")],
+            "sh",
+            &[
+                "-c",
+                "if grep -q 'exit 1' index.js; then \
+                 echo '    at Object.<anonymous> (index.js:2:9)'; exit 1; else exit 0; fi",
+            ],
+        ),
+        // 7. Go-format localization (`./pkg/file.go:line:col:`) + exit flip.
+        EvalCase::new(
+            "go-frame-localize",
+            &[("server.go", "package main\n// exit 1 placeholder\n")],
+            "sh",
+            &[
+                "-c",
+                "if grep -q 'exit 1' server.go; then \
+                 echo './server.go:2:4: build failed'; exit 1; else exit 0; fi",
+            ],
+        ),
     ]
 }
 
