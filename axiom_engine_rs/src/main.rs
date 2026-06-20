@@ -1,4 +1,6 @@
 mod adaptive;
+mod agentic;
+mod agentic_eval;
 mod anthropic_forwarder;
 mod bench;
 mod belief;
@@ -55,6 +57,7 @@ mod vibe_memory;
 mod weight_merge;
 
 use std::env;
+use std::path::PathBuf;
 
 use candle_core::{bail, Device, Result};
 use cli::{AxiomCommand, DaemonCommand, ParsedCli, SwarmCommand};
@@ -525,6 +528,131 @@ async fn run_main() -> Result<()> {
     Ok(())
 }
 
+/// The production [`agentic::Proposer`]: asks the LLM backend for corrected full
+/// file contents toward an objective, restricted to a fixed set of editable
+/// target files. Returns a multi-file [`agentic::EditSet`] which the agentic loop
+/// applies atomically and keeps only if the verifier passes — the model never
+/// gets to write anything that isn't independently verified.
+struct LlmTaskProposer<'a> {
+    backend: &'a claude_backend::ClaudeBackend,
+    program: &'a str,
+    args: &'a [String],
+    targets: Vec<PathBuf>,
+}
+
+impl agentic::Proposer for LlmTaskProposer<'_> {
+    fn propose(&mut self, ctx: &agentic::ProposeContext) -> Option<agentic::EditSet> {
+        let mut files_blob = String::new();
+        for t in &self.targets {
+            let content = std::fs::read_to_string(t).unwrap_or_default();
+            files_blob.push_str(&format!("\n=== FILE: {} ===\n{}\n", t.display(), content));
+        }
+        let prior = if ctx.rejected_so_far > 0 {
+            format!(
+                "\n{} earlier attempt(s) were rejected by the verifier; do something different.\n",
+                ctx.rejected_so_far
+            )
+        } else {
+            String::new()
+        };
+        let prompt = format!(
+            "You are an autonomous coding agent (attempt {attempt}). Objective: {objective}\n\n\
+             Verify command (must pass after your edit): {prog} {args}\n\n\
+             Latest verifier output:\n{fail}\n{prior}\n\
+             Current contents of the files you may edit:{files}\n\n\
+             Reply with the corrected FULL contents of EACH file you change, every file \
+             prefaced by a line `=== FILE: <path> ===` whose path exactly matches one above, \
+             followed by that file's complete new body. Include only files you actually change. \
+             No explanation, no commentary, no markdown code fences.",
+            attempt = ctx.attempt,
+            objective = ctx.objective,
+            prog = self.program,
+            args = self.args.join(" "),
+            fail = ctx.last_failure,
+            files = files_blob,
+        );
+        let text = self.backend.generate(&prompt, 8192).ok()?;
+        let edits = parse_multifile_response(&text, &self.targets);
+        if edits.is_empty() {
+            None
+        } else {
+            Some(edits)
+        }
+    }
+}
+
+/// Parse a model response into an [`agentic::EditSet`], restricted to `targets`
+/// (the agent may only write files it was explicitly allowed to edit — a safety
+/// boundary). Recognizes `=== FILE: <path> ===` section markers; if none are
+/// present and there is exactly one target, the whole (fence-stripped) response
+/// is treated as that file's new contents.
+fn parse_multifile_response(text: &str, targets: &[PathBuf]) -> agentic::EditSet {
+    const MARKER: &str = "=== FILE:";
+    let mut set = agentic::EditSet::new();
+
+    if !text.contains(MARKER) {
+        if targets.len() == 1 {
+            let body = strip_fences(text);
+            if !body.trim().is_empty() {
+                set = set.with(targets[0].clone(), body);
+            }
+        }
+        return set;
+    }
+
+    let matches_target = |path_str: &str| -> Option<PathBuf> {
+        // Exact full-path match wins outright.
+        if let Some(t) = targets.iter().find(|t| t.display().to_string() == path_str) {
+            return Some(t.clone());
+        }
+        // Basename fallback only when it is unambiguous (exactly one target has
+        // it) — otherwise `src/config.rs` vs `tests/config.rs` could cross-apply.
+        let by_name: Vec<&PathBuf> = targets
+            .iter()
+            .filter(|t| {
+                t.file_name().map(|n| n.to_string_lossy().into_owned()) == Some(path_str.to_string())
+            })
+            .collect();
+        if by_name.len() == 1 {
+            Some(by_name[0].clone())
+        } else {
+            None
+        }
+    };
+
+    let mut current: Option<(PathBuf, String)> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix(MARKER) {
+            if let Some((p, body)) = current.take() {
+                set = set.with(p, body.trim_end_matches('\n').to_string());
+            }
+            let path_str = rest.trim().trim_end_matches('=').trim();
+            current = matches_target(path_str).map(|p| (p, String::new()));
+        } else if let Some((_, ref mut body)) = current {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if let Some((p, body)) = current.take() {
+        set = set.with(p, body.trim_end_matches('\n').to_string());
+    }
+    set
+}
+
+/// Strip a single pair of surrounding ``` fences (with optional language tag)
+/// from a model response; leaves unfenced text untouched.
+fn strip_fences(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(after) = trimmed.strip_prefix("```") {
+        // Drop the rest of the opening fence line (possible language tag).
+        let body = after.splitn(2, '\n').nth(1).unwrap_or("");
+        if let Some(end) = body.rfind("```") {
+            return body[..end].trim_end().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
     match command {
         AxiomCommand::Init(args) => {
@@ -727,6 +855,138 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             }
             if !report.solved {
                 std::process::exit(report.final_exit.unwrap_or(1));
+            }
+        }
+        AxiomCommand::Task {
+            goal,
+            files,
+            max_attempts,
+            command,
+        } => {
+            let (program, args) = command
+                .split_first()
+                .ok_or_else(|| candle_core::Error::Msg("axiom task needs a verify command".into()))?;
+            let program = program.clone();
+            let args = args.to_vec();
+
+            // Already satisfied? For pure repair (no goal) a green verifier means
+            // there is nothing to do; for an explicit goal we always let the
+            // agent attempt it (the goal may be unobservable to the verifier yet).
+            if goal.trim().is_empty() && solve::run_verify(&program, &args, None) {
+                println!("[axiom-task] verify already passes — nothing to do");
+                return Ok(());
+            }
+
+            let backend = claude_backend::ClaudeBackend::from_env().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "axiom task needs an LLM backend — set ANTHROPIC_API_KEY (or AXIOM_* \
+                     equivalent). For deterministic repair without a model, use `axiom solve`."
+                        .into(),
+                )
+            })?;
+
+            // Decide which files the agent may edit: caller-named, else localized
+            // from the verifier's own failure output. EITHER way every target
+            // must canonically resolve under the project root — a --file outside
+            // the tree (absolute or `..`) is rejected, matching the safety bound
+            // already enforced on auto-localized candidates.
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let targets: Vec<PathBuf> = if !files.is_empty() {
+                let mut validated = Vec::with_capacity(files.len());
+                for f in &files {
+                    match fault_locate::contained_path(f, &root) {
+                        Some(p) => validated.push(p),
+                        None => {
+                            return Err(candle_core::Error::Msg(format!(
+                                "axiom task: --file {} is outside the project root — refusing \
+                                 to edit files outside the tree",
+                                f.display()
+                            )))
+                        }
+                    }
+                }
+                validated
+            } else {
+                let (_ok, trace) = solve::run_verify_capture(&program, &args, None);
+                let cands = fault_locate::candidate_sources(&trace, &root);
+                if cands.is_empty() {
+                    return Err(candle_core::Error::Msg(
+                        "axiom task: could not localize any file to edit from the verifier \
+                         output — pass one or more --file <path>"
+                            .into(),
+                    ));
+                }
+                cands
+            };
+            println!(
+                "[axiom-task] goal={:?}; editable files: {}",
+                if goal.is_empty() { "(repair)" } else { &goal },
+                targets
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+
+            let objective = if goal.trim().is_empty() {
+                format!("make `{program} {}` pass", args.join(" "))
+            } else {
+                goal.clone()
+            };
+            let mut proposer = LlmTaskProposer {
+                backend: &backend,
+                program: &program,
+                args: &args,
+                targets: targets.clone(),
+            };
+            let mut memory = agentic::AttemptMemory::new();
+            let p = program.clone();
+            let a = args.clone();
+            let verify = move || solve::run_verify(&p, &a, None);
+            let p2 = program.clone();
+            let a2 = args.clone();
+            let capture = move || solve::run_verify_capture(&p2, &a2, None).1;
+            let outcome = agentic::agentic_loop(
+                &objective,
+                max_attempts,
+                &mut memory,
+                &mut proposer,
+                verify,
+                capture,
+            );
+            println!(
+                "[axiom-task] result: {} after {} attempt(s); {} rejected candidate(s)",
+                if outcome.solved { "SOLVED" } else { "UNSOLVED" },
+                outcome.attempts,
+                outcome.rejected
+            );
+            if !outcome.solved {
+                std::process::exit(1);
+            }
+        }
+        AxiomCommand::EvalAgentic {} => {
+            let device = device_from_str(
+                &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
+            )?;
+            let (cfg, ckpt) =
+                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
+            let runtime = InferenceRuntimeOptions {
+                tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
+                context_api_url: None,
+                context_api_key: None,
+                max_context_tokens: 0,
+            };
+            let pipeline =
+                InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            let report = std::thread::Builder::new()
+                .stack_size(256 * 1024 * 1024)
+                .spawn(move || agentic_eval::run_eval(&pipeline, &agentic_eval::builtin_cases()))
+                .map_err(|e| candle_core::Error::Msg(format!("eval thread failed: {e}")))?
+                .join()
+                .map_err(|_| candle_core::Error::Msg("eval thread panicked".into()))?;
+            println!("[axiom-eval-agentic] autonomous repair capability:\n{}", report.summary());
+            if report.solved() != report.total() {
+                std::process::exit(1);
             }
         }
         AxiomCommand::Run {

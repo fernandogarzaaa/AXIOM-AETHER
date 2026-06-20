@@ -1,4 +1,6 @@
 pub mod adaptive;
+pub mod agentic;
+pub mod agentic_eval;
 pub mod anthropic_forwarder;
 pub mod belief;
 pub mod bench;
