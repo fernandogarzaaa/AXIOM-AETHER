@@ -33,6 +33,7 @@ mod model;
 mod model_meta;
 mod openai_forwarder;
 mod pairs;
+mod patch_memory;
 mod poly_jit;
 mod prime;
 mod provenance;
@@ -669,6 +670,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 heal_memory_path: heal_memory::HealMemory::default_path(),
                 anchor: None,
                 source_path: source,
+                patch_memory_path: patch_memory::PatchMemory::default_path(),
             };
             let device = device_from_str(
                 &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
