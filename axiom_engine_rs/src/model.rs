@@ -128,6 +128,20 @@ impl AxiomTTTLM {
         self.guards.set_anchor_strength(anchor_strength);
     }
 
+    /// Select the inner self-supervised loss form across every TTT layer
+    /// (B.6 ablation): `true` = normalized/contrastive multi-view objective,
+    /// `false` (default) = exact MSE reconstruction (byte-identical dynamics).
+    pub fn set_aux_loss_normalized(&self, on: bool) {
+        self.guards.set_aux_loss_normalized(on);
+    }
+
+    /// Whether the contrastive multi-view inner loss is currently enabled.
+    pub fn aux_loss_normalized(&self) -> bool {
+        self.guards
+            .aux_loss_normalized
+            .load(Ordering::Relaxed)
+    }
+
     /// Current safe-online-update guard settings as
     /// `(drift_reset_norm, update_min_error, anchor_strength)`.
     pub fn online_guards(&self) -> (f32, f32, f32) {

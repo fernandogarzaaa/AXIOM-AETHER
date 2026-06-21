@@ -108,6 +108,22 @@ pub struct OnlineGuards {
     /// update, `W̃ ← (1−λ)·W̃ + λ·I` pulls the state weakly back toward the
     /// meta-trained init. λ ∈ [0,1]; `0.0` disables anchoring.
     pub anchor_strength: AtomicU32,
+    /// **B.6 inner-loss ablation** (separate from the guards above). When `true`,
+    /// the self-supervised inner objective L2-normalizes both the predicted and
+    /// the value view before taking the error, turning the MSE reconstruction
+    /// loss into a directional / cosine ("contrastive multi-view") objective —
+    /// the TTT++ finding that a contrastive aux task can beat plain
+    /// reconstruction. `false` (default) is the exact reconstruction path, so the
+    /// dynamics stay byte-identical until enabled.
+    pub aux_loss_normalized: AtomicBool,
+}
+
+/// L2-normalize a 1-D `[d]` vector to unit length (with an epsilon floor so a
+/// zero vector maps to ~zero rather than NaN). Used by the B.6 contrastive
+/// inner-loss ablation to compare view *directions*.
+fn l2_normalize(v: &Tensor) -> Result<Tensor> {
+    let norm = v.sqr()?.sum_all()?.sqrt()?.affine(1.0, 1e-6)?;
+    v.broadcast_div(&norm)
 }
 
 impl OnlineGuards {
@@ -128,6 +144,14 @@ impl OnlineGuards {
     pub fn set_anchor_strength(&self, v: f32) {
         self.anchor_strength
             .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    /// Select the inner-loss form: `true` = normalized/contrastive multi-view,
+    /// `false` (default) = exact MSE reconstruction (byte-identical).
+    pub fn set_aux_loss_normalized(&self, on: bool) {
+        self.aux_loss_normalized.store(on, Ordering::Relaxed);
+    }
+    fn aux_normalized(&self) -> bool {
+        self.aux_loss_normalized.load(Ordering::Relaxed)
     }
     fn drift(&self) -> f32 {
         f32::from_bits(self.drift_reset_norm.load(Ordering::Relaxed))
@@ -244,6 +268,17 @@ impl NativeTTTBlock {
 
         // v_vec: [d_model]  (remove the leading batch-of-one dimension)
         let v_vec = v.squeeze(0)?;
+
+        // B.6 inner-loss ablation: when enabled, L2-normalize both views so the
+        // objective aligns *directions* (cosine / contrastive multi-view) instead
+        // of raw magnitudes (MSE reconstruction). Applied to both `pred` and
+        // `v_vec` so every downstream update path (ungated, scalar/learned gate)
+        // stays consistent. Default off ⇒ exact reconstruction (byte-identical).
+        let (pred, v_vec) = if self.guards.aux_normalized() {
+            (l2_normalize(&pred)?, l2_normalize(&v_vec)?)
+        } else {
+            (pred, v_vec)
+        };
 
         // error: [d_model]
         let error = pred.sub(&v_vec)?;
@@ -664,5 +699,38 @@ mod tests {
 
     fn device_cpu() -> Device {
         Device::Cpu
+    }
+
+    // ---- B.6: contrastive multi-view inner-loss ablation ------------------
+
+    #[test]
+    fn aux_loss_normalized_changes_dynamics_but_stays_finite() {
+        // Enabling the normalized (contrastive) inner loss must (a) keep the
+        // state finite and (b) produce a *different* trajectory than the default
+        // reconstruction loss — proving the ablation knob actually switches the
+        // objective rather than being a silent no-op.
+        let d = 16usize;
+        let (block, device, guards) = make_block_with_guards(d);
+        let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
+
+        let run = |normalized: bool| -> Vec<f32> {
+            guards.set_aux_loss_normalized(normalized);
+            let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+            for _ in 0..16 {
+                let _ = block.forward_native(&x, &mut state).unwrap();
+            }
+            state.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+
+        let recon = run(false);
+        let contrastive = run(true);
+        assert!(
+            contrastive.iter().all(|v| v.is_finite()),
+            "normalized inner loss must stay finite"
+        );
+        assert!(
+            recon != contrastive,
+            "normalized inner loss must change the update trajectory"
+        );
     }
 }
