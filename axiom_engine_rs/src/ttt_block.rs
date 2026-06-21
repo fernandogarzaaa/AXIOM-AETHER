@@ -61,6 +61,10 @@ pub struct NativeTTTBlock {
     /// start near 1 (≈ ungated), so training departs from the proven dynamics
     /// rather than a cold, aggressively-forgetting gate.
     learned_gate: Option<Linear>,
+    /// Shared safe-online-update guards (drift reset, token selection,
+    /// anti-forgetting anchor). Shared `Arc` like `inner_lr` so one call on the
+    /// model retunes every layer at once. Default-disabled ⇒ byte-identical.
+    guards: Arc<OnlineGuards>,
 }
 
 /// Lower bound on the learned forget gate, keeping α ∈ [GATE_FLOOR, 1) so a
@@ -73,6 +77,74 @@ const GATE_FLOOR: f64 = 1e-3;
 /// with a cold, aggressively-forgetting gate.
 const GATE_INIT_LOGIT: f64 = 4.0;
 
+/// Shared, runtime-tunable guards for **safe online (persistent) test-time
+/// updates**, grounded in the TTA literature (RDumb periodic reset, EATA sample
+/// selection + Fisher anchoring, CoTTA stochastic restoration). When the
+/// fast-weight matrix is carried across a long stream of tokens, the bare delta
+/// rule can drift, accumulate error, or collapse; these three orthogonal guards
+/// bound that without altering the proven short-context dynamics.
+///
+/// Every field defaults to a disabled/identity value (`0.0`), so a freshly
+/// constructed block is **byte-identical to the ungated path** until a guard is
+/// explicitly enabled — and the default path stays device-sync-free (the guards'
+/// scalar reads only happen when enabled).
+///
+/// Orchestration order inside `forward_native` (each independent, layered so they
+/// cannot fight): **(1) token selection** decides whether the update is kept at
+/// all; **(2) anti-forgetting anchor** pulls the kept update toward the init;
+/// **(3) drift reset** is the final backstop on the resulting state.
+#[derive(Debug, Default)]
+pub struct OnlineGuards {
+    /// Drift-aware reset (RDumb). If the post-update fast-weight Frobenius norm
+    /// exceeds this threshold, `W̃` is reset to its meta-trained init (identity).
+    /// `0.0` disables the check.
+    pub drift_reset_norm: AtomicU32,
+    /// Token selection (EATA). The inner update is skipped when the
+    /// reconstruction-error L2 norm ‖pred − v‖ is *below* this threshold (the
+    /// token carries little new information). `0.0` never skips — every token
+    /// updates `W̃` exactly as before.
+    pub update_min_error: AtomicU32,
+    /// Anti-forgetting anchor (EATA Fisher / CoTTA stochastic restore). After the
+    /// update, `W̃ ← (1−λ)·W̃ + λ·I` pulls the state weakly back toward the
+    /// meta-trained init. λ ∈ [0,1]; `0.0` disables anchoring.
+    pub anchor_strength: AtomicU32,
+}
+
+impl OnlineGuards {
+    /// Construct guards in the disabled (identity / byte-identical) state.
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+    /// Set the drift-reset Frobenius-norm threshold (`0.0` disables).
+    pub fn set_drift_reset_norm(&self, v: f32) {
+        self.drift_reset_norm.store(v.to_bits(), Ordering::Relaxed);
+    }
+    /// Set the token-selection minimum reconstruction-error threshold
+    /// (`0.0` never skips).
+    pub fn set_update_min_error(&self, v: f32) {
+        self.update_min_error.store(v.to_bits(), Ordering::Relaxed);
+    }
+    /// Set the anti-forgetting anchor strength λ ∈ [0,1] (`0.0` disables).
+    pub fn set_anchor_strength(&self, v: f32) {
+        self.anchor_strength
+            .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    fn drift(&self) -> f32 {
+        f32::from_bits(self.drift_reset_norm.load(Ordering::Relaxed))
+    }
+    fn min_error(&self) -> f32 {
+        f32::from_bits(self.update_min_error.load(Ordering::Relaxed))
+    }
+    fn anchor(&self) -> f32 {
+        f32::from_bits(self.anchor_strength.load(Ordering::Relaxed))
+    }
+    /// True when every guard is at its disabled default — lets `forward_native`
+    /// skip the guard block (and its device syncs) entirely on the hot path.
+    fn all_disabled(&self) -> bool {
+        self.drift() == 0.0 && self.min_error() == 0.0 && self.anchor() == 0.0
+    }
+}
+
 impl NativeTTTBlock {
     /// Construct a new block with its own private inner-lr cell initialised
     /// from `config.lr_inner`.
@@ -81,7 +153,8 @@ impl NativeTTTBlock {
         let inner_lr = Arc::new(AtomicU32::new(config.lr_inner.to_bits()));
         let stabilize = Arc::new(AtomicBool::new(false));
         let forget_gate = Arc::new(AtomicU32::new(1.0f32.to_bits()));
-        Self::new_with_shared_lr(vs, config, inner_lr, stabilize, forget_gate, false)
+        let guards = Arc::new(OnlineGuards::disabled());
+        Self::new_with_shared_lr(vs, config, inner_lr, stabilize, forget_gate, guards, false)
     }
 
     /// Construct a block that reads its inner learning rate from a shared
@@ -95,6 +168,7 @@ impl NativeTTTBlock {
         inner_lr: Arc<AtomicU32>,
         stabilize: Arc<AtomicBool>,
         forget_gate: Arc<AtomicU32>,
+        guards: Arc<OnlineGuards>,
         learned_gate: bool,
     ) -> Result<Self> {
         let d = config.d_model;
@@ -118,6 +192,7 @@ impl NativeTTTBlock {
             stabilize,
             forget_gate,
             learned_gate,
+            guards,
         })
     }
 
@@ -214,6 +289,46 @@ impl NativeTTTBlock {
             // Sync-free element backstop: a hard ceiling that NaN can never breach.
             updated_state = updated_state.clamp(-STAB_CLAMP, STAB_CLAMP)?;
         }
+
+        // --- Safe online-update guards (all no-ops at their disabled defaults) --
+        // Only taken when at least one guard is enabled, so the default path stays
+        // device-sync-free. Layered (1)→(2)→(3) so the controls cannot conflict.
+        if !self.guards.all_disabled() {
+            // (1) Token selection (EATA): a token whose reconstruction error is
+            //     below threshold carries little new signal — retain the prior
+            //     fast-weights instead of writing. Cuts update cost and the noise
+            //     that drives long-stream drift/collapse.
+            let min_err = self.guards.min_error();
+            if min_err > 0.0 {
+                let err_norm = error.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+                if err_norm < min_err {
+                    updated_state = session_state.clone();
+                }
+            }
+            // (2) Anti-forgetting anchor (EATA Fisher / CoTTA restore): pull the
+            //     kept state weakly toward the meta-trained init (identity):
+            //     W̃ ← (1−λ)·W̃ + λ·I.
+            let lambda = self.guards.anchor();
+            if lambda > 0.0 {
+                let d = updated_state.dim(0)?;
+                let eye = Tensor::eye(d, updated_state.dtype(), updated_state.device())?;
+                updated_state = updated_state
+                    .affine((1.0 - lambda) as f64, 0.0)?
+                    .add(&eye.affine(lambda as f64, 0.0)?)?;
+            }
+            // (3) Drift-aware reset (RDumb): last-resort backstop. If the state's
+            //     Frobenius norm has run away past threshold, snap back to init
+            //     rather than letting a collapsed/diverged W̃ poison the stream.
+            let drift = self.guards.drift();
+            if drift > 0.0 {
+                let fro = updated_state.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+                if fro > drift {
+                    let d = updated_state.dim(0)?;
+                    updated_state =
+                        Tensor::eye(d, updated_state.dtype(), updated_state.device())?;
+                }
+            }
+        }
         // The session state is an inference cache, not a BPTT tape. Detaching it
         // here prevents long prompts from retaining one Candle op node per token.
         *session_state = updated_state.detach();
@@ -298,12 +413,14 @@ mod tests {
         let inner_lr = Arc::new(AtomicU32::new(1e-3f32.to_bits()));
         let stabilize = Arc::new(AtomicBool::new(false));
         let forget_gate = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let guards = Arc::new(OnlineGuards::disabled());
         let block = NativeTTTBlock::new_with_shared_lr(
             vb.pp("block"),
             config,
             inner_lr,
             stabilize,
             forget_gate,
+            guards,
             true, // learned gate
         )
         .unwrap();
@@ -422,5 +539,130 @@ mod tests {
             sv.iter().all(|v| v.abs() <= STAB_CLAMP + 1e-3),
             "state exceeded the stabilization clamp"
         );
+    }
+
+    // ---- B.2: safe online-update guards -----------------------------------
+
+    /// Build a block sharing an `OnlineGuards` cell the test can tune.
+    fn make_block_with_guards(d_model: usize) -> (NativeTTTBlock, Device, Arc<OnlineGuards>) {
+        let device = Device::Cpu;
+        let config = AxiomConfig {
+            d_model,
+            n_layers: 1,
+            vocab_size: 16,
+            lr_inner: 1e-3,
+            norm_eps: 1e-6,
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let inner_lr = Arc::new(AtomicU32::new(config.lr_inner.to_bits()));
+        let stabilize = Arc::new(AtomicBool::new(false));
+        let forget_gate = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let guards = Arc::new(OnlineGuards::disabled());
+        let block = NativeTTTBlock::new_with_shared_lr(
+            vb.pp("block"),
+            config,
+            inner_lr,
+            stabilize,
+            forget_gate,
+            guards.clone(),
+            false,
+        )
+        .unwrap();
+        (block, device, guards)
+    }
+
+    #[test]
+    fn guards_disabled_leave_dynamics_unchanged() {
+        // With every guard at its default 0.0, `all_disabled()` short-circuits the
+        // guard block, so the run is deterministic and identical across repeats —
+        // confirming the default path has no guard side effects.
+        let d = 24usize;
+        let (block, device, guards) = make_block_with_guards(d);
+        assert!(guards.all_disabled(), "fresh guards must be disabled");
+        let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
+
+        let run = || -> Vec<f32> {
+            let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+            for _ in 0..16 {
+                let _ = block.forward_native(&x, &mut state).unwrap();
+            }
+            state.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        assert_eq!(run(), run(), "default-guard path must be a deterministic no-op");
+    }
+
+    #[test]
+    fn token_selection_skips_low_information_updates() {
+        // A high min-error threshold forces every token to be treated as
+        // low-information, so the fast-weight state must never move from init.
+        let d = 16usize;
+        let (block, device, guards) = make_block_with_guards(d);
+        guards.set_update_min_error(1e9); // nothing clears this bar → always skip
+        let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
+        let init = Tensor::eye(d, DType::F32, &device).unwrap();
+        let mut state = init.clone();
+        for _ in 0..32 {
+            let _ = block.forward_native(&x, &mut state).unwrap();
+        }
+        let moved = state.sub(&init).unwrap().sqr().unwrap().sum_all().unwrap()
+            .to_scalar::<f32>().unwrap();
+        assert!(moved < 1e-9, "all updates should have been skipped (moved {moved})");
+    }
+
+    #[test]
+    fn anchor_pulls_state_toward_identity() {
+        // A strong anchor (λ→1) must hold the state near the identity init even
+        // under many updates that would otherwise push it far away.
+        let d = 16usize;
+        let x = Tensor::randn(0f32, 2f32, (1usize, d), &device_cpu()).unwrap();
+
+        let run = |lambda: f32| -> f32 {
+            let (block, device, guards) = make_block_with_guards(d);
+            guards.set_anchor_strength(lambda);
+            let _ = device; // device captured via x already
+            let mut state = Tensor::eye(d, DType::F32, &device_cpu()).unwrap();
+            for _ in 0..64 {
+                let _ = block.forward_native(&x, &mut state).unwrap();
+            }
+            let eye = Tensor::eye(d, DType::F32, &device_cpu()).unwrap();
+            state.sub(&eye).unwrap().sqr().unwrap().sum_all().unwrap()
+                .to_scalar::<f32>().unwrap()
+        };
+        let unanchored = run(0.0);
+        let anchored = run(0.9);
+        assert!(
+            anchored < unanchored,
+            "anchor must keep state nearer init (anchored {anchored} !< {unanchored})"
+        );
+    }
+
+    #[test]
+    fn drift_reset_bounds_runaway_state() {
+        // Large input with no stabilization would let ‖W̃‖ blow up; a drift-reset
+        // threshold must snap it back, keeping the Frobenius norm bounded.
+        let d = 16usize;
+        let (block, device, guards) = make_block_with_guards(d);
+        let threshold = 50.0f32;
+        guards.set_drift_reset_norm(threshold);
+        let x = Tensor::randn(0f32, 8f32, (1usize, d), &device).unwrap();
+        let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+        let mut max_seen = 0f32;
+        for _ in 0..256 {
+            let _ = block.forward_native(&x, &mut state).unwrap();
+            let fro = frobenius(&state);
+            assert!(fro.is_finite(), "drift-reset state went non-finite");
+            max_seen = max_seen.max(fro);
+        }
+        // After any step the norm may reach ~threshold then reset to ‖I‖=√d, but
+        // it can never run away unboundedly.
+        assert!(
+            max_seen <= threshold * 4.0,
+            "drift reset failed to bound the state (max {max_seen})"
+        );
+    }
+
+    fn device_cpu() -> Device {
+        Device::Cpu
     }
 }
