@@ -25,7 +25,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -3175,7 +3175,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/immunity", get(get_immunity))
         .route("/v1/immunity/merge", post(post_immunity_merge))
         .route("/v1/patches", get(get_patches))
-        .route("/v1/patches/merge", post(post_patches_merge))
+        .route(
+            "/v1/patches/merge",
+            // Patch candidates carry full file contents, so a signed export of a
+            // real fix can exceed axum's 2 MB default body limit. Raise it for
+            // this route so larger-but-valid fixes can still gossip.
+            post(post_patches_merge).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -4374,6 +4380,61 @@ mod tests {
         // The store now records the candidate as verified by two nodes.
         let pm = crate::patch_memory::PatchMemory::load(&patch_path);
         assert_eq!(pm.candidates("fp1")[0].verified_count, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_patches_merge_accepts_bodies_over_2mb() {
+        // A patch candidate carries full file contents; a real fix can push the
+        // signed export past axum's 2 MB default body limit. The /v1/patches/merge
+        // route raises that limit, so a large-but-valid export must still merge.
+        let dir = std::env::temp_dir().join(format!("axiom_srv_bigpatch_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let heal_path = dir.join("axiom_heal_memory.json");
+        let patch_path = dir.join("axiom_patch_memory.json");
+        {
+            let big = "X".repeat(3 * 1024 * 1024); // ~3 MB > the 2 MB default
+            let mut pm = crate::patch_memory::PatchMemory::new();
+            pm.record_verified("fp-big", "src/big.rs", &big);
+            pm.save(&patch_path).unwrap();
+        }
+
+        let state = make_test_state().await.with_heal_memory_path(Some(heal_path));
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/patches")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let export = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(export.len() > 2 * 1024 * 1024, "export should exceed the default limit");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/patches/merge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(export.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Without the raised limit this would be 413 PAYLOAD_TOO_LARGE.
+        assert_eq!(resp.status(), StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(&dir);
         safe_drop(pipeline_arc).await;
