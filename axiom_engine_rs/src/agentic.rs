@@ -239,11 +239,65 @@ pub fn agentic_loop<P, V, C>(
     memory: &mut AttemptMemory,
     proposer: &mut P,
     mut verify: V,
-    mut capture: C,
+    capture: C,
 ) -> AgenticOutcome
 where
     P: Proposer,
     V: FnMut() -> bool,
+    C: FnMut() -> String,
+{
+    // Single-gate loop: a candidate is accepted iff `verify()` passes.
+    run_agentic(objective, max_attempts, memory, proposer, || verify(), capture)
+}
+
+/// **B.4 — held-out verification split (anti-overfitting).** Same verifier-gated
+/// loop as [`agentic_loop`], but a candidate is committed only when it passes the
+/// `verify_train` subset **and** the held-out `verify_holdout` subset. A patch
+/// that passes the train subset yet fails the held-out one is the classic
+/// test-overfit fix (green on the tests it was shaped against, wrong in general):
+/// it is rolled back and counted as a rejection like any other, so the loop keeps
+/// searching instead of trusting it.
+///
+/// `verify_holdout` is only run when `verify_train` already passed (cheap-first),
+/// so the held-out suite costs nothing on the common failing path.
+pub fn agentic_loop_with_holdout<P, Vt, Vh, C>(
+    objective: &str,
+    max_attempts: usize,
+    memory: &mut AttemptMemory,
+    proposer: &mut P,
+    mut verify_train: Vt,
+    mut verify_holdout: Vh,
+    capture: C,
+) -> AgenticOutcome
+where
+    P: Proposer,
+    Vt: FnMut() -> bool,
+    Vh: FnMut() -> bool,
+    C: FnMut() -> String,
+{
+    run_agentic(
+        objective,
+        max_attempts,
+        memory,
+        proposer,
+        || verify_train() && verify_holdout(),
+        capture,
+    )
+}
+
+/// Shared core for the agentic loop, generic over the accept predicate so the
+/// single-gate and held-out-split variants share one audited control flow.
+fn run_agentic<P, A, C>(
+    objective: &str,
+    max_attempts: usize,
+    memory: &mut AttemptMemory,
+    proposer: &mut P,
+    mut accept: A,
+    mut capture: C,
+) -> AgenticOutcome
+where
+    P: Proposer,
+    A: FnMut() -> bool,
     C: FnMut() -> String,
 {
     let mut last_failure = capture();
@@ -269,7 +323,7 @@ where
             rejected += 1;
             continue;
         };
-        if verify() {
+        if accept() {
             tx.commit();
             return AgenticOutcome {
                 solved: true,
@@ -448,6 +502,81 @@ mod tests {
             "ORIGINAL",
             "a never-verifying run leaves the source byte-for-byte intact"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn holdout_rejects_a_patch_that_overfits_the_train_subset() {
+        // The first proposal passes the train check (contains "TRAIN") but fails
+        // the held-out check (must also contain "HOLD"): a classic overfit fix.
+        // The split loop must reject it, roll back, and accept only the second
+        // proposal that satisfies both — never trusting the overfit patch.
+        let dir = tmp("holdout");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("prog.txt");
+        std::fs::write(&target, "BROKEN").unwrap();
+
+        let mut proposer = ScriptedProposer {
+            scripted: vec![
+                EditSet::new().with(target.clone(), "TRAIN"),        // passes train only
+                EditSet::new().with(target.clone(), "TRAIN HOLD"),   // passes both
+            ],
+            idx: 0,
+        };
+        let mut mem = AttemptMemory::new();
+        let t1 = target.clone();
+        let verify_train =
+            move || std::fs::read_to_string(&t1).map(|s| s.contains("TRAIN")).unwrap_or(false);
+        let t2 = target.clone();
+        let verify_holdout =
+            move || std::fs::read_to_string(&t2).map(|s| s.contains("HOLD")).unwrap_or(false);
+
+        let outcome = agentic_loop_with_holdout(
+            "fix it",
+            5,
+            &mut mem,
+            &mut proposer,
+            verify_train,
+            verify_holdout,
+            String::new,
+        );
+
+        assert!(outcome.solved);
+        assert_eq!(outcome.attempts, 2);
+        assert_eq!(
+            outcome.rejected, 1,
+            "the train-only (overfit) patch must be rejected by the held-out gate"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "TRAIN HOLD");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn holdout_leaves_source_intact_when_only_train_ever_passes() {
+        // A patch that forever passes train but never the held-out gate must never
+        // be committed; the source stays byte-for-byte original.
+        let dir = tmp("holdoutfail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("prog.txt");
+        std::fs::write(&target, "ORIGINAL").unwrap();
+
+        let mut proposer = ScriptedProposer {
+            scripted: vec![EditSet::new().with(target.clone(), "TRAIN")],
+            idx: 0,
+        };
+        let mut mem = AttemptMemory::new();
+        let outcome = agentic_loop_with_holdout(
+            "impossible",
+            3,
+            &mut mem,
+            &mut proposer,
+            || true,  // train always passes
+            || false, // held-out never passes
+            String::new,
+        );
+        assert!(!outcome.solved);
+        assert_eq!(outcome.rejected, 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "ORIGINAL");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
