@@ -10,6 +10,8 @@
 //! | POST   | `/v1/chat/completions`               | Chat completion (stateless or session)   |
 //! | POST   | `/v1/messages`                       | Anthropic Messages API (Claude clients)  |
 //! | POST   | `/v1/cluster/sync`                   | Delta state replication merge hook       |
+//! | GET    | `/v1/patches`                        | Signed verified-patch export (fleet)     |
+//! | POST   | `/v1/patches/merge`                  | Merge a peer's signed patch export       |
 //! | POST   | `/v1/sessions`                       | Create a new persistent TTT session      |
 //! | DELETE | `/v1/sessions/{id}`                  | Delete a session                         |
 //! | POST   | `/v1/adapt`                          | In-place TTT adaptation on a corpus      |
@@ -3172,6 +3174,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/verify", post(verify_grounding))
         .route("/v1/immunity", get(get_immunity))
         .route("/v1/immunity/merge", post(post_immunity_merge))
+        .route("/v1/patches", get(get_patches))
+        .route("/v1/patches/merge", post(post_patches_merge))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -3529,6 +3533,85 @@ async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Res
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// Locate this node's verified-patch store, co-located with the configured heal
+/// memory (`axiom_patch_memory.json`), matching `PatchMemory::default_path()`.
+fn patch_store_path(state: &AppState) -> Option<PathBuf> {
+    (*state.heal_memory_path)
+        .as_ref()
+        .map(|p| p.with_file_name("axiom_patch_memory.json"))
+}
+
+/// `GET /v1/patches` — this node's verified-patch store, provenance-signed
+/// (SHA-256 + optional HMAC via `AXIOM_FLEET_KEY`) so a peer can verify before
+/// trusting. The payload only carries candidates; a peer never applies them
+/// without re-verifying locally (see `POST /v1/patches/merge`).
+async fn get_patches(State(state): State<AppState>) -> Response {
+    let Some(path) = patch_store_path(&state) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "patch memory not configured on this node"})),
+        )
+            .into_response();
+    };
+    let memory = crate::patch_memory::PatchMemory::load(&path);
+    let signed = memory.export_signed(fleet_key().as_deref());
+    Json(signed).into_response()
+}
+
+/// `POST /v1/patches/merge` — fold a peer's signed patch export (its
+/// `GET /v1/patches` payload) into this node's store. Provenance is enforced:
+/// `merge_signed` verifies the signature/hash and recomputes content hashes, and
+/// a fleet key (if configured) is required. SAFETY: merging only *records*
+/// candidates — a peer's fix is never executed or written until the autonomous
+/// repair loop re-verifies it green locally, so an incorrect or malicious peer
+/// patch is inert.
+async fn post_patches_merge(State(state): State<AppState>, body: String) -> Response {
+    let Some(path) = patch_store_path(&state) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "patch memory not configured on this node"})),
+        )
+            .into_response();
+    };
+    let export: crate::provenance::SignedExport = match serde_json::from_str(&body) {
+        Ok(e) => e,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "expected a signed patch export (the GET /v1/patches payload)"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut memory = crate::patch_memory::PatchMemory::load(&path);
+    match memory.merge_signed(&export, fleet_key().as_deref()) {
+        Ok(report) => {
+            if let Err(e) = memory.save(&path) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("merge succeeded but save failed: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+            Json(serde_json::json!({
+                "merged": true,
+                "new_candidates": report.new_candidates,
+                "reinforced": report.reinforced,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": format!("provenance rejected: {e}")})),
         )
             .into_response(),
     }
@@ -4228,6 +4311,71 @@ mod tests {
             layer.sum_all().unwrap().to_scalar::<f32>().unwrap()
         };
         assert!(layer_sum > 0.0);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_patches_export_and_merge_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("axiom_srv_patches_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let heal_path = dir.join("axiom_heal_memory.json");
+        let patch_path = dir.join("axiom_patch_memory.json");
+
+        // Seed this node's verified-patch store with one candidate.
+        {
+            let mut pm = crate::patch_memory::PatchMemory::new();
+            pm.record_verified("fp1", "src/a.rs", "FIXED");
+            pm.save(&patch_path).unwrap();
+        }
+
+        let state = make_test_state().await.with_heal_memory_path(Some(heal_path));
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+
+        // GET /v1/patches → provenance-signed export of the store.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/patches")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let export = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        // POST it back to /v1/patches/merge → the identical candidate reinforces,
+        // exercising provenance verification + content-hash recompute over HTTP.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/patches/merge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(export.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["merged"], true);
+        assert_eq!(v["reinforced"], 1);
+        assert_eq!(v["new_candidates"], 0);
+
+        // The store now records the candidate as verified by two nodes.
+        let pm = crate::patch_memory::PatchMemory::load(&patch_path);
+        assert_eq!(pm.candidates("fp1")[0].verified_count, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
         safe_drop(pipeline_arc).await;
     }
 
