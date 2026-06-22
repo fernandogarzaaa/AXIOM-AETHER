@@ -20,6 +20,7 @@ pub mod hamiltonian;
 pub mod hallucination;
 pub mod hardware;
 pub mod heal_memory;
+pub mod hindsight;
 pub mod inference;
 pub mod jit_streamer;
 pub mod kernel;
