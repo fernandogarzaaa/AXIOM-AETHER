@@ -40,6 +40,11 @@ pub struct AxiomTTTLM {
     /// state); default 1.0 is the identity (ungated, existing checkpoints
     /// unchanged). Parameter-free, so no checkpoint-format change.
     forget_gate: Arc<AtomicU32>,
+    /// Shared safe-online-update guards (drift-aware reset, token selection,
+    /// anti-forgetting anchor) read by every `NativeTTTBlock`. All disabled by
+    /// default ⇒ byte-identical dynamics; enable to bound long-stream persistent
+    /// adaptation. Parameter-free, so no checkpoint-format change.
+    guards: Arc<crate::ttt_block::OnlineGuards>,
 }
 
 impl AxiomTTTLM {
@@ -68,6 +73,8 @@ impl AxiomTTTLM {
         let stabilize = Arc::new(AtomicBool::new(false));
         // Shared forget gate, default 1.0 (ungated → existing models unchanged).
         let forget_gate = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        // Shared safe-online-update guards, all disabled (byte-identical default).
+        let guards = Arc::new(crate::ttt_block::OnlineGuards::disabled());
 
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
@@ -77,6 +84,7 @@ impl AxiomTTTLM {
                 inner_lr.clone(),
                 stabilize.clone(),
                 forget_gate.clone(),
+                guards.clone(),
                 learned_gate,
             )?);
         }
@@ -94,7 +102,54 @@ impl AxiomTTTLM {
             inner_lr,
             stabilize,
             forget_gate,
+            guards,
         })
+    }
+
+    /// Configure the safe-online-update guards across every TTT layer in one
+    /// call (RDumb drift reset, EATA token selection, anti-forgetting anchor).
+    /// These bound *persistent* fast-weight adaptation over long token streams;
+    /// all default to disabled, so leaving them unset keeps the proven dynamics.
+    ///
+    /// * `drift_reset_norm` – reset `W̃` to init when its Frobenius norm exceeds
+    ///   this (`0.0` disables).
+    /// * `update_min_error` – skip the update when ‖pred − v‖ is below this
+    ///   (`0.0` updates on every token).
+    /// * `anchor_strength` – λ ∈ [0,1] pulling `W̃` toward init each step
+    ///   (`0.0` disables).
+    pub fn set_online_guards(
+        &self,
+        drift_reset_norm: f32,
+        update_min_error: f32,
+        anchor_strength: f32,
+    ) {
+        self.guards.set_drift_reset_norm(drift_reset_norm.max(0.0));
+        self.guards.set_update_min_error(update_min_error.max(0.0));
+        self.guards.set_anchor_strength(anchor_strength);
+    }
+
+    /// Select the inner self-supervised loss form across every TTT layer
+    /// (B.6 ablation): `true` = normalized/contrastive multi-view objective,
+    /// `false` (default) = exact MSE reconstruction (byte-identical dynamics).
+    pub fn set_aux_loss_normalized(&self, on: bool) {
+        self.guards.set_aux_loss_normalized(on);
+    }
+
+    /// Whether the contrastive multi-view inner loss is currently enabled.
+    pub fn aux_loss_normalized(&self) -> bool {
+        self.guards
+            .aux_loss_normalized
+            .load(Ordering::Relaxed)
+    }
+
+    /// Current safe-online-update guard settings as
+    /// `(drift_reset_norm, update_min_error, anchor_strength)`.
+    pub fn online_guards(&self) -> (f32, f32, f32) {
+        (
+            f32::from_bits(self.guards.drift_reset_norm.load(Ordering::Relaxed)),
+            f32::from_bits(self.guards.update_min_error.load(Ordering::Relaxed)),
+            f32::from_bits(self.guards.anchor_strength.load(Ordering::Relaxed)),
+        )
     }
 
     /// Enable/disable inner-loop stabilization (normalized keys + state clamp)

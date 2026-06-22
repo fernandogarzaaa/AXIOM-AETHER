@@ -149,10 +149,23 @@ impl PatchMemory {
         // the same way at record time), so even same-named files in different
         // directories never cross-apply.
         let original = std::fs::read_to_string(source_path).ok()?;
-        for c in candidates {
-            if c.rel_path != rel_path {
-                continue; // recorded for a different source file
-            }
+
+        // B.1 per-bug test-time adaptation: among the candidates recorded for this
+        // exact file, try them in self-consistency-reranked order (consensus
+        // across alpha-rename/whitespace-equivalent fixes first, weighted by
+        // verified_count) rather than raw verified_count order. This only changes
+        // *which candidate the verifier tries first* — the verify gate below is
+        // unchanged, so re-verify-before-trust is fully preserved.
+        let matching: Vec<&PatchCandidate> =
+            candidates.iter().filter(|c| c.rel_path == rel_path).collect();
+        let adapter_cands: Vec<crate::test_time_adapter::Candidate> = matching
+            .iter()
+            .map(|c| crate::test_time_adapter::Candidate::new(c.content.clone(), c.verified_count as f32))
+            .collect();
+        let order = crate::test_time_adapter::rerank_by_self_consistency(&adapter_cands);
+
+        for &i in &order {
+            let c = matching[i];
             if c.content == original {
                 continue; // already the current source
             }
@@ -169,6 +182,26 @@ impl PatchMemory {
             }
         }
         None
+    }
+
+    /// Candidate patches for `fingerprint` targeting `rel_path`, ordered by the
+    /// B.1 per-bug test-time adapter (self-consistency voting weighted by
+    /// `verified_count`) — the order [`try_candidates`] uses. Exposed for callers
+    /// that want the adapter's ranking without driving the verify loop.
+    pub fn candidates_reranked(&self, fingerprint: &str, rel_path: &str) -> Vec<PatchCandidate> {
+        let Some(list) = self.by_fingerprint.get(fingerprint) else {
+            return Vec::new();
+        };
+        let matching: Vec<&PatchCandidate> =
+            list.iter().filter(|c| c.rel_path == rel_path).collect();
+        let adapter_cands: Vec<crate::test_time_adapter::Candidate> = matching
+            .iter()
+            .map(|c| crate::test_time_adapter::Candidate::new(c.content.clone(), c.verified_count as f32))
+            .collect();
+        crate::test_time_adapter::rerank_by_self_consistency(&adapter_cands)
+            .into_iter()
+            .map(|i| matching[i].clone())
+            .collect()
     }
 
     fn to_json(&self) -> String {
