@@ -51,6 +51,60 @@ pub struct PatchMemory {
 pub struct PatchMergeReport {
     pub new_candidates: usize,
     pub reinforced: usize,
+    /// Candidates rejected by the [`FleetTrustPolicy`] (oversized content or
+    /// per-fingerprint flood cap). `0` under the permissive default policy.
+    pub byzantine_rejected: usize,
+}
+
+/// Byzantine-robustness policy for folding in a peer's patch export.
+///
+/// Provenance ([`crate::provenance`]) proves an export came from a key-holder and
+/// was not tampered in transit — but a *malicious key-holder* can still try to
+/// (a) inflate `verified_count` to force a bad-but-locally-verifiable patch to
+/// the top of the try-order, or (b) flood the store with junk candidates. The
+/// local re-verify gate ([`PatchMemory::try_candidates`]) already stops a wrong
+/// patch from ever being *applied*; this policy additionally bounds how much
+/// *trust and space* any single peer merge can consume, inspired by FLTrust-style
+/// bounded-contribution aggregation.
+#[derive(Debug, Clone, Copy)]
+pub struct FleetTrustPolicy {
+    /// Max `verified_count` a single merge may add to any one candidate. Counts
+    /// are meant to reflect *independent* confirmations, so one peer export
+    /// should move the needle by a bounded amount (robust default: `1`).
+    pub max_verified_bump_per_candidate: u32,
+    /// Max brand-new candidates a single merge may add per fingerprint (flood
+    /// cap). Excess new candidates are rejected.
+    pub max_new_candidates_per_fingerprint: usize,
+    /// Reject any candidate whose content exceeds this many bytes.
+    pub max_content_bytes: usize,
+}
+
+impl FleetTrustPolicy {
+    /// The recommended Byzantine-robust policy: one peer = at most +1 trust per
+    /// candidate, at most 8 new candidates per fingerprint per merge, 8 MiB cap.
+    pub fn robust() -> Self {
+        Self {
+            max_verified_bump_per_candidate: 1,
+            max_new_candidates_per_fingerprint: 8,
+            max_content_bytes: 8 * 1024 * 1024,
+        }
+    }
+
+    /// The legacy permissive policy (no bounds) — preserves the original
+    /// `merge_signed` behavior for callers that have their own trust model.
+    pub fn permissive() -> Self {
+        Self {
+            max_verified_bump_per_candidate: u32::MAX,
+            max_new_candidates_per_fingerprint: usize::MAX,
+            max_content_bytes: usize::MAX,
+        }
+    }
+}
+
+impl Default for FleetTrustPolicy {
+    fn default() -> Self {
+        Self::robust()
+    }
 }
 
 impl PatchMemory {
@@ -219,10 +273,29 @@ impl PatchMemory {
     /// Rejects the merge if provenance fails (bad hash / wrong key / unsigned
     /// when a key is required). NEVER applies anything — merging only stores
     /// candidates for later re-verified application.
+    ///
+    /// Uses the legacy [`FleetTrustPolicy::permissive`] (no contribution bounds)
+    /// for backward compatibility. Prefer [`Self::merge_signed_guarded`] with
+    /// [`FleetTrustPolicy::robust`] in fleets that may include Byzantine peers.
     pub fn merge_signed(
         &mut self,
         export: &SignedExport,
         fleet_key: Option<&[u8]>,
+    ) -> Result<PatchMergeReport, ProvenanceError> {
+        self.merge_signed_guarded(export, fleet_key, FleetTrustPolicy::permissive())
+    }
+
+    /// Byzantine-robust merge: verify provenance, then fold the peer's candidates
+    /// in subject to `policy` — bounding how much `verified_count` trust and how
+    /// many new candidates a single peer export can contribute, and dropping
+    /// oversized candidates. The local re-verify gate still decides what is ever
+    /// applied; this only bounds a malicious key-holder's influence on ranking
+    /// and store size.
+    pub fn merge_signed_guarded(
+        &mut self,
+        export: &SignedExport,
+        fleet_key: Option<&[u8]>,
+        policy: FleetTrustPolicy,
     ) -> Result<PatchMergeReport, ProvenanceError> {
         let payload = verify_export(export, fleet_key)?;
         let peer: PatchMemory = serde_json::from_str(payload)
@@ -230,21 +303,40 @@ impl PatchMemory {
         let mut report = PatchMergeReport {
             new_candidates: 0,
             reinforced: 0,
+            byzantine_rejected: 0,
         };
         for (fp, peer_list) in peer.by_fingerprint {
             let local = self.by_fingerprint.entry(fp).or_default();
+            let mut new_this_fp = 0usize;
             for mut pc in peer_list {
+                // Drop implausibly large candidates outright.
+                if pc.content.len() > policy.max_content_bytes {
+                    report.byzantine_rejected += 1;
+                    continue;
+                }
                 // Never trust the peer-supplied hash: the signature proves the
                 // bytes weren't changed in transit, not that sha256 identifies
                 // content. Recompute from content so dedup, ranking, and logged
                 // patch IDs always reflect the real bytes.
                 pc.sha256 = sha256_hex(pc.content.as_bytes());
                 if let Some(existing) = local.iter_mut().find(|c| c.sha256 == pc.sha256) {
-                    existing.verified_count =
-                        existing.verified_count.saturating_add(pc.verified_count);
+                    // Bound the trust a single peer can inject: one export should
+                    // count as at most a few independent confirmations.
+                    let bump = pc.verified_count.min(policy.max_verified_bump_per_candidate);
+                    existing.verified_count = existing.verified_count.saturating_add(bump);
                     report.reinforced += 1;
                 } else {
+                    // Flood cap: reject excess brand-new candidates per fingerprint.
+                    if new_this_fp >= policy.max_new_candidates_per_fingerprint {
+                        report.byzantine_rejected += 1;
+                        continue;
+                    }
+                    // Also clamp the incoming count of a brand-new candidate so a
+                    // peer cannot seed a fresh patch at the top of the ranking.
+                    pc.verified_count =
+                        pc.verified_count.min(policy.max_verified_bump_per_candidate);
                     local.push(pc);
+                    new_this_fp += 1;
                     report.new_candidates += 1;
                 }
             }
@@ -374,5 +466,114 @@ mod tests {
             "the wrong-target file must be left byte-for-byte intact"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn robust_merge_caps_verified_count_inflation_from_one_peer() {
+        // A Byzantine key-holder ships a candidate claiming a million confirmations
+        // to force it to the top of the try-order. The robust policy must cap the
+        // trust a single peer can inject to +1.
+        let key: &[u8] = b"fleet";
+        let mut peer = PatchMemory::new();
+        peer.by_fingerprint.insert(
+            "fp".into(),
+            vec![PatchCandidate {
+                rel_path: "a.rs".into(),
+                content: "FIX".into(),
+                sha256: sha256_hex(b"FIX"),
+                verified_count: 1_000_000,
+            }],
+        );
+        let export = peer.export_signed(Some(key));
+
+        let mut local = PatchMemory::new();
+        local.record_verified("fp", "a.rs", "FIX"); // local count = 1
+        let rep = local
+            .merge_signed_guarded(&export, Some(key), FleetTrustPolicy::robust())
+            .unwrap();
+        assert_eq!(rep.reinforced, 1);
+        assert_eq!(
+            local.candidates("fp")[0].verified_count,
+            2,
+            "one peer may add at most +1 (1 local + 1 capped bump)"
+        );
+    }
+
+    #[test]
+    fn robust_merge_caps_new_candidate_flood_per_fingerprint() {
+        let key: &[u8] = b"fleet";
+        let mut peer = PatchMemory::new();
+        let flood: Vec<PatchCandidate> = (0..20)
+            .map(|i| PatchCandidate {
+                rel_path: "a.rs".into(),
+                content: format!("C{i}"),
+                sha256: String::new(), // recomputed on merge
+                verified_count: 99,
+            })
+            .collect();
+        peer.by_fingerprint.insert("fp".into(), flood);
+        let export = peer.export_signed(Some(key));
+
+        let mut local = PatchMemory::new();
+        let rep = local
+            .merge_signed_guarded(&export, Some(key), FleetTrustPolicy::robust())
+            .unwrap();
+        assert_eq!(rep.new_candidates, 8, "flood capped to 8 new per fingerprint");
+        assert_eq!(rep.byzantine_rejected, 12);
+        assert_eq!(local.candidates("fp").len(), 8);
+        assert!(
+            local.candidates("fp").iter().all(|c| c.verified_count == 1),
+            "fresh peer candidates seeded at a bounded count, not their claimed 99"
+        );
+    }
+
+    #[test]
+    fn robust_merge_rejects_oversized_candidates() {
+        let key: &[u8] = b"fleet";
+        let mut peer = PatchMemory::new();
+        peer.by_fingerprint.insert(
+            "fp".into(),
+            vec![PatchCandidate {
+                rel_path: "a.rs".into(),
+                content: "TOOBIG".into(), // 6 bytes
+                sha256: String::new(),
+                verified_count: 1,
+            }],
+        );
+        let export = peer.export_signed(Some(key));
+
+        let policy = FleetTrustPolicy {
+            max_content_bytes: 4, // < 6
+            ..FleetTrustPolicy::robust()
+        };
+        let mut local = PatchMemory::new();
+        let rep = local.merge_signed_guarded(&export, Some(key), policy).unwrap();
+        assert_eq!(rep.new_candidates, 0);
+        assert_eq!(rep.byzantine_rejected, 1);
+        assert!(local.candidates("fp").is_empty());
+    }
+
+    #[test]
+    fn permissive_merge_preserves_legacy_summing_behavior() {
+        // merge_signed (permissive) must still sum counts unbounded, so existing
+        // fleet behavior is unchanged for callers with their own trust model.
+        let key: &[u8] = b"fleet";
+        let mut peer = PatchMemory::new();
+        peer.by_fingerprint.insert(
+            "fp".into(),
+            vec![PatchCandidate {
+                rel_path: "a.rs".into(),
+                content: "FIX".into(),
+                sha256: sha256_hex(b"FIX"),
+                verified_count: 50,
+            }],
+        );
+        let export = peer.export_signed(Some(key));
+        let mut local = PatchMemory::new();
+        local.record_verified("fp", "a.rs", "FIX"); // 1
+        let rep = local.merge_signed(&export, Some(key)).unwrap();
+        assert_eq!(rep.reinforced, 1);
+        assert_eq!(rep.byzantine_rejected, 0);
+        assert_eq!(local.candidates("fp")[0].verified_count, 51, "1 + 50 unbounded");
     }
 }

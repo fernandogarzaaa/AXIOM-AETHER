@@ -220,6 +220,18 @@ impl NativeTTTBlock {
         })
     }
 
+    /// Mean-squared reconstruction error ‖pred − v‖² for `x` under the current
+    /// fast-weight `state`, *without* mutating anything. This is the inner
+    /// self-supervised objective the per-token update minimizes; exposed so the
+    /// TTT-MLP measurement harness can compare expressivity across block types.
+    pub fn reconstruction_error(&self, x: &Tensor, state: &Tensor) -> Result<f32> {
+        let k = self.w_k.forward(x)?;
+        let v = self.w_v.forward(x)?.squeeze(0)?;
+        let k_col = k.t()?.contiguous()?;
+        let pred = state.matmul(&k_col)?.squeeze(D::Minus1)?;
+        pred.sub(&v)?.sqr()?.sum_all()?.to_scalar::<f32>()
+    }
+
     /// Autoregressive forward step for a single token.
     ///
     /// # Arguments

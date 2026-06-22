@@ -112,6 +112,19 @@ impl NativeTTTMlpBlock {
         MlpState::init(self.d_model, self.hidden, device)
     }
 
+    /// Mean-squared reconstruction error ‖pred − v‖² for `x` under the current
+    /// MLP `state`, without mutating anything (`pred = W₂·tanh(W₁·k)`). The
+    /// companion to `NativeTTTBlock::reconstruction_error` for the measurement
+    /// harness.
+    pub fn reconstruction_error(&self, x: &Tensor, state: &MlpState) -> Result<f32> {
+        let k = self.w_k.forward(x)?.squeeze(0)?;
+        let v = self.w_v.forward(x)?.squeeze(0)?;
+        let z = state.w1.matmul(&k.unsqueeze(1)?)?.squeeze(D::Minus1)?;
+        let a = z.tanh()?;
+        let pred = state.w2.matmul(&a.unsqueeze(1)?)?.squeeze(D::Minus1)?;
+        pred.sub(&v)?.sqr()?.sum_all()?.to_scalar::<f32>()
+    }
+
     /// Autoregressive forward step for a single token, updating the MLP state via
     /// one closed-form gradient step through both layers.
     ///
