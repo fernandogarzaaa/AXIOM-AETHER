@@ -3597,7 +3597,14 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
         }
     };
     let mut memory = crate::patch_memory::PatchMemory::load(&path);
-    match memory.merge_signed(&export, fleet_key().as_deref()) {
+    // Byzantine-robust: a peer holding the fleet key still cannot inflate trust
+    // or flood the store — the robust policy bounds per-peer contribution. Local
+    // re-verification still gates any application.
+    match memory.merge_signed_guarded(
+        &export,
+        fleet_key().as_deref(),
+        crate::patch_memory::FleetTrustPolicy::robust(),
+    ) {
         Ok(report) => {
             if let Err(e) = memory.save(&path) {
                 return (
@@ -3612,6 +3619,7 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
                 "merged": true,
                 "new_candidates": report.new_candidates,
                 "reinforced": report.reinforced,
+                "byzantine_rejected": report.byzantine_rejected,
             }))
             .into_response()
         }
