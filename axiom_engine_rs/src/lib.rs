@@ -54,6 +54,7 @@ pub mod swarm_router;
 pub mod test_time_adapter;
 pub mod train;
 pub mod ttt_block;
+pub mod ttt_mlp;
 pub mod vfs;
 pub mod vibe_memory;
 pub mod weight_merge;
