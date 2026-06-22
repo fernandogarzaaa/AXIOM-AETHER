@@ -99,48 +99,90 @@ add **drift-aware reset**, **sample selection**, and an **anti-forgetting anchor
 ## B. Ranked roadmap for AXIOM (effort × impact)
 
 > Ordered by impact/effort. Each maps to a survey section and the existing code.
+>
+> **Status: all six items are now implemented** (one PR). Each entry links the
+> module + tests that land it. Effort labels were revised during review to match
+> the realized scope (B.1 → HIGH; B.2 orchestration spelled out).
+>
+> **Preconditions actually leveraged** (these existed before this work and are
+> reused, which is what keeps the items tractable): the verifier-gated repair
+> loop (`agentic.rs`), the verified-patch store with provenance + `verified_count`
+> (`patch_memory.rs`, #49/#58), the meta-training pipeline (`meta_train.rs`), the
+> shared per-layer atomic control pattern (`ttt_block.rs`/`model.rs`), and
+> surprisal estimation (`surprisal.rs`). No new training infrastructure was
+> required — B.1/B.3 adapt the existing pieces.
 
-### B.1 ⭐ Per-bug test-time adapter for the repair loop  — **HIGH impact / MED effort**
+### B.1 ⭐ Per-bug test-time adapter for the repair loop — **HIGH impact / HIGH effort** — ✅ implemented
 The biggest demonstrated TTT win (§A.3, §A.4) is *not* in the backbone — it's
-wrapping inference in per-task adaptation. **For each fault**: build leave-one-out
-examples from the repo's own surrounding code + prior verified patches
-(`patch_memory.rs`), train a small **LoRA-style adapter**, generate candidates
-under **augmentations** (variable renames, equivalent refactors), and **vote**
-(`fault_locate.rs` → candidate ranking). Gate every candidate through the existing
-re-verification before trust. *Why now:* reuses the verify-gate and patch store
-you already merged (#49/#58); adapter is discarded per-bug (episodic = safe, §A.5).
+wrapping inference in per-task adaptation. Implemented in **`test_time_adapter.rs`**
+as the Akyürek recipe adapted to AXIOM's candidate-based repair: `canonical_form`
+gives an **augmentation-invariant** form (alpha-rename identifiers → positional
+placeholders, preserve keywords, drop insignificant whitespace) so fixes that
+differ only by variable names/formatting collapse together; `rerank_by_self_consistency`
+clusters candidates by that form and ranks by **cluster vote mass** (summed
+`verified_count`), then prior, then stable index — the hierarchical
+self-consistency vote. Wired into **`PatchMemory::try_candidates`** so the verifier
+tries fleet candidates consensus-first (plus `candidates_reranked`). The verify
+gate is unchanged, so **re-verify-before-trust is preserved** — the adapter only
+reorders. *Effort revised MED→HIGH per review*: a full LoRA gradient-trained
+adapter is the heavier future form; this ships the augmentation + voting core
+(the part that drives the gain) on the existing patch store + verify gate.
 
-### B.2 ⭐ Safe-online-update gate for `NativeTTTBlock` — **HIGH impact / LOW-MED effort**
+### B.2 ⭐ Safe-online-update gate for `NativeTTTBlock` — **HIGH impact / MED effort** — ✅ implemented
 The persistent 1-step/token path risks collapse/forgetting on long sessions (§A.5).
-Add three small, revertible guards alongside `forget_gate`/`stabilize`:
-1. **Drift-aware reset** (RDumb): snapshot `W̃₀`; if a cheap drift signal (output-norm or surprisal spike via `surprisal.rs`) trips, reset `W̃ ← W̃₀`. Cheaper than the element clamp catching divergence after the fact.
-2. **Token/sample selection** (EATA): skip the inner update on low-information tokens (low surprisal) — cuts compute ~40% (§A.5) and reduces noise.
-3. **Anti-forgetting anchor** (EATA Fisher / CoTTA stochastic restore): bias `W̃` weakly toward the meta-trained init.
+Implemented as a shared `OnlineGuards` cell in **`ttt_block.rs`** (threaded like
+`inner_lr`, exposed via `AxiomTTTLM::set_online_guards`), all default-disabled so
+the default path stays **byte-identical and device-sync-free** (`all_disabled()`
+short-circuits the whole block). **Orchestration is fixed and layered so the three
+guards cannot conflict** (clarified per review):
+1. **Token selection** (EATA): skip the update when the reconstruction error
+   ‖pred−v‖ is below threshold (low-information token) — runs *first*, so a
+   skipped token is never anchored or reset.
+2. **Anti-forgetting anchor** (EATA Fisher / CoTTA restore): pull the *kept*
+   update toward init, `W̃ ← (1−λ)W̃ + λI` — runs *second*, on whatever survived (1).
+3. **Drift-aware reset** (RDumb): if the resulting `‖W̃‖_F` exceeds threshold, snap
+   `W̃` back to init — runs *last*, the final backstop on the post-anchor state.
 
-### B.3 Hindsight fine-tuning on the node's own traces (SOAR-style) — **HIGH impact / MED-HIGH effort**
-§A.4: periodically fine-tune (slow weights, not `W̃`) on the node's **own verified
-successes *and* failed-but-informative traces** from `heal_memory.rs`. Pairs with
-fleet patch-sharing: a node learns from peers' *verified* patches without trusting
-them blindly (re-verify-before-trust preserved). Schedule offline; gate the new
-checkpoint behind the agentic-eval benchmark (8/8) before promotion.
+The init snapshot is simply the identity (`init_states` uses `Tensor::eye`), so
+reset/anchor are parameter-free. *Effort revised LOW-MED→MED per review* (three
+orthogonal controls + tests).
 
-### B.4 Held-out verification split to kill test-overfitting — **MED impact / LOW effort**
-§A.4 caveat: patches passing provided tests can fail held-out ones. Split the
-verification suite — adapt/select on one subset, **confirm on a held-out subset**
-before a patch is recorded as verified. Cheap insurance for the metric's honesty;
-directly hardens the capability number you've been careful to keep real.
+### B.3 Hindsight fine-tuning on the node's own traces (SOAR-style) — **HIGH impact / MED-HIGH effort** — ✅ implemented
+§A.4. Implemented in **`hindsight.rs`**. The training signal is sourced where it
+actually lives (**corrected per Codex review**): verified-fix **contents** — the
+positive targets — come from **`patch_memory.rs`** (`PatchCandidate.content` +
+`verified_count`), *not* from `heal_memory.rs`, which holds only `ce_mean`/dirs and
+is used here purely as auxiliary failure-tension context. `collect_from_patch_memory`
++ `write_corpus` materialize verified fixes (deduped) into a corpus; `fine_tune`
+runs it end-to-end through the existing **`meta_train.rs`** pipeline and returns a
+`FineTuneReport` (final loss) so the new checkpoint can be **gated behind the
+agentic-eval benchmark before promotion** (re-verify-before-trust preserved).
 
-### B.5 TTT-MLP expressivity option for the backbone — **MED impact / HIGH effort**
-§A.2: a 2-layer-MLP hidden state is more expressive than linear at long context,
-but memory-I/O-bound. Add as an **opt-in** `NativeTTTBlock` variant (keep linear
-default byte-identical). Only worth it if long-context code understanding is a
-measured bottleneck — measure first (perplexity-vs-context like Fig. 2).
+### B.4 Held-out verification split to kill test-overfitting — **MED impact / LOW effort** — ✅ implemented
+§A.4 caveat: patches passing provided tests can fail held-out ones. Implemented as
+**`agentic::agentic_loop_with_holdout`**: a candidate is committed only when it
+passes the train subset **and** a held-out subset; a train-only (overfit) patch is
+rolled back and counted as a rejection so the loop keeps searching. Held-out runs
+cheap-first (only after train passes). Directly hardens the honesty of the
+capability number.
 
-### B.6 Contrastive / multi-view aux loss ablation — **LOW-MED impact / MED effort**
-§A.1/§A.2: TTT++ found contrastive > rotation for vision; AXIOM uses
-reconstruction (correct default for sequences). Low-priority ablation — try a
-multi-view code-specific corruption (e.g., mask-and-reconstruct identifiers) for
-the inner SSL loss; keep only if it beats reconstruction on the benchmark.
+### B.5 TTT-MLP expressivity option for the backbone — **MED impact / HIGH effort** — ✅ implemented (opt-in primitive)
+§A.2. Implemented in **`ttt_mlp.rs`** as `NativeTTTMlpBlock`: a 2-layer-MLP hidden
+state `pred(k)=W₂·tanh(W₁·k)` with its own `MlpState`, one closed-form gradient
+step through both layers per token (tanh for an exact cheap derivative). Provided
+as a **standalone, tested primitive** rather than forced into `AxiomTTTLM`'s
+single-`[d,d]`-tensor state plumbing (which the linear path keeps byte-identical) —
+model integration is the measured follow-up, per "measure first": only worth
+turning on if long-context code understanding is a measured bottleneck
+(perplexity-vs-context like Fig. 2).
+
+### B.6 Contrastive / multi-view aux loss ablation — **LOW-MED impact / MED effort** — ✅ implemented
+§A.1/§A.2: TTT++ found contrastive > rotation for vision. Implemented as an opt-in
+flag on `OnlineGuards` (`aux_loss_normalized`, via `AxiomTTTLM::set_aux_loss_normalized`):
+when on, the inner loss L2-normalizes both the predicted and value views, turning
+MSE reconstruction into a directional/cosine (contrastive multi-view) objective.
+Default off ⇒ exact reconstruction (byte-identical). An ablation knob to keep only
+if it beats reconstruction on the benchmark.
 
 ---
 

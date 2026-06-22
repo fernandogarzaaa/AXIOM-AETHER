@@ -174,7 +174,7 @@ pub fn fine_tune(
         device,
         corpus_dir,
         checkpoint_path,
-        /* batch_size */ corpus_files.min(4).max(1),
+        /* batch_size */ corpus_files.clamp(1, 4),
         seq_len,
         /* max_files */ 4096,
         /* max_sequences */ 65536,

@@ -238,7 +238,7 @@ pub fn agentic_loop<P, V, C>(
     max_attempts: usize,
     memory: &mut AttemptMemory,
     proposer: &mut P,
-    mut verify: V,
+    verify: V,
     capture: C,
 ) -> AgenticOutcome
 where
@@ -247,7 +247,7 @@ where
     C: FnMut() -> String,
 {
     // Single-gate loop: a candidate is accepted iff `verify()` passes.
-    run_agentic(objective, max_attempts, memory, proposer, || verify(), capture)
+    run_agentic(objective, max_attempts, memory, proposer, verify, capture)
 }
 
 /// **B.4 — held-out verification split (anti-overfitting).** Same verifier-gated
