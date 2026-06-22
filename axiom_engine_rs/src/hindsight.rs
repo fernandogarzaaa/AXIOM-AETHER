@@ -117,6 +117,20 @@ pub fn collect_tension_context(hm: &HealMemory) -> Vec<TensionContext> {
 /// files written.
 pub fn write_corpus(examples: &[TrainingExample], dir: &Path) -> std::io::Result<usize> {
     std::fs::create_dir_all(dir)?;
+    // Prune stale generated files from prior runs so a re-run with fewer/different
+    // examples never trains on obsolete samples (and `corpus_files` reflects the
+    // real set). Only our own `hindsight_*.rs` files are touched.
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let is_generated = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("hindsight_") && n.ends_with(".rs"))
+            .unwrap_or(false);
+        if is_generated {
+            let _ = std::fs::remove_file(path);
+        }
+    }
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut written = 0usize;
     for (i, ex) in examples.iter().enumerate() {
@@ -132,8 +146,14 @@ pub fn write_corpus(examples: &[TrainingExample], dir: &Path) -> std::io::Result
     Ok(written)
 }
 
-/// Default on-disk location for the hindsight corpus, alongside the patch store.
+/// Default on-disk location for the hindsight corpus. Prefer an app-owned
+/// directory alongside the patch store (not world-readable shared temp) since
+/// corpus entries are full verified source contents; fall back to temp only
+/// when no patch-store path is configured.
 pub fn default_corpus_dir() -> PathBuf {
+    if let Some(pm_path) = PatchMemory::default_path() {
+        return pm_path.with_file_name("axiom_hindsight_corpus");
+    }
     std::env::temp_dir().join("axiom_hindsight_corpus")
 }
 
@@ -266,6 +286,27 @@ mod tests {
         assert_eq!(n, 2, "identical contents must be written once");
         let count = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(count, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_corpus_prunes_stale_generated_files() {
+        let dir = tmp("prune");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A stale file from a prior run + an unrelated file that must be kept.
+        std::fs::write(dir.join("hindsight_999999.rs"), "stale").unwrap();
+        std::fs::write(dir.join("keep.txt"), "unrelated").unwrap();
+
+        let examples = vec![TrainingExample {
+            fingerprint: "fp".into(),
+            rel_path: "a.rs".into(),
+            content: "fn a() {}".into(),
+            weight: 1,
+        }];
+        let n = write_corpus(&examples, &dir).unwrap();
+        assert_eq!(n, 1);
+        assert!(!dir.join("hindsight_999999.rs").exists(), "stale file must be pruned");
+        assert!(dir.join("keep.txt").exists(), "non-generated files must be left alone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -51,6 +51,9 @@ impl MlpState {
     /// state starts non-degenerate (a zero `W₁` would stop `W₂` from ever
     /// learning, since `dW₂ = e ⊗ φ(0) = 0`).
     pub fn init(d_model: usize, hidden: usize, device: &Device) -> Result<Self> {
+        if d_model == 0 || hidden == 0 {
+            candle_core::bail!("MlpState dimensions must be non-zero (d_model={d_model}, hidden={hidden})");
+        }
         let n = d_model.max(hidden);
         let eye = Tensor::eye(n, DType::F32, device)?;
         let w1 = eye.narrow(0, 0, hidden)?.narrow(1, 0, d_model)?.contiguous()?;
@@ -185,6 +188,13 @@ mod tests {
         let st = MlpState::init(8, 12, &Device::Cpu).unwrap();
         assert_eq!(st.w1.dims(), &[12, 8]);
         assert_eq!(st.w2.dims(), &[8, 12]);
+    }
+
+    #[test]
+    fn state_init_rejects_zero_dimensions() {
+        assert!(MlpState::init(0, 4, &Device::Cpu).is_err());
+        assert!(MlpState::init(4, 0, &Device::Cpu).is_err());
+        assert!(MlpState::init(4, 4, &Device::Cpu).is_ok());
     }
 
     #[test]
