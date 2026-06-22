@@ -50,6 +50,7 @@ mod skeleton;
 mod surprisal;
 mod swarm_route;
 mod swarm_router;
+mod test_time_adapter;
 mod train;
 mod ttt_block;
 mod vfs;
