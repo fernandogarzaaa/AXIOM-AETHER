@@ -115,6 +115,18 @@ used by the project scripts.
 The script builds the release binary if needed and uses a temporary state
 directory, so it does not mutate your normal Axiom memory.
 
+### Simulate a brand-new user (blank slate)
+
+```bash
+./scripts/new_user_simulation.sh
+```
+
+Stands up a pristine `HOME` with no `~/.axiom`, runs `axiom init` from scratch
+(offline checkpoint bootstrap included), then walks the real first-run journey —
+doctor → compression → self-healing runtime → learned immunity → the ChimeraLang
+DSL (run + offline certificate) → the reproducible capability score — printing
+PASS/FAIL per step. Useful as a first-run regression check.
+
 ## Release Assets
 
 The latest GitHub release publishes:
