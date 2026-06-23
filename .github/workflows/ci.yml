@@ -45,6 +45,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
 
+      - name: Lint (clippy, library)
+        working-directory: axiom_engine_rs
+        # Gate the library (the shipped product) at deny-warnings. Bin/test
+        # targets carry pre-existing lib+bin dead-code warnings and are excluded.
+        run: cargo clippy --lib --locked -- -D warnings
+
       - name: Build (release)
         working-directory: axiom_engine_rs
         run: cargo build --release --locked

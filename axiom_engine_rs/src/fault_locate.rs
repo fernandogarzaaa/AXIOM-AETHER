@@ -228,7 +228,7 @@ pub fn locate_sites(trace: &str) -> Vec<FaultSite> {
         })
         .collect();
     // Stable sort by hits desc keeps first-seen order for equal counts.
-    sites.sort_by(|a, b| b.hits.cmp(&a.hits));
+    sites.sort_by_key(|s| std::cmp::Reverse(s.hits));
     sites
 }
 

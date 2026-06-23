@@ -27,7 +27,8 @@ general answer-quality claims that are not proven by the repository.
 | Self-healing runner | Runs a command, detects supported environment failures, applies bounded heals, and records learned immunity. | `self_heal.rs`, `heal_memory.rs`, `main.rs` |
 | Autonomous solve loop | Uses the runner plus source repair attempts to drive a verifier command toward green. | `solve.rs`, `poly_jit.rs`, `sandbox.rs` |
 | Grounding verification | Checks whether response claims are supported by supplied evidence and can expand dropped symbols when a session digest is available. | `hallucination.rs`, `/v1/verify` in `server.rs` |
-| Swarm and provenance | Shares selected learned state through signed immunity export/merge and weighted belief logic. | `belief.rs`, `provenance.rs`, `weight_merge.rs` |
+| Swarm and provenance | Shares selected learned state through signed immunity export/merge and weighted belief logic. Patch gossip is Byzantine-robust (bounded per-peer trust). | `belief.rs`, `provenance.rs`, `weight_merge.rs`, `patch_memory.rs` |
+| ChimeraLang DSL | In-tree Rust implementation of the [ChimeraLang](https://github.com/fernandogarzaaa/ChimeraLang) AI-cognition language: `belief/inquire/resolve/guard/evolve` programs run on the same `BetaBelief` + provenance substrate, with tamper-evident run certificates. | `chimera.rs`, CLI `axiom chimera`, `/v1/chimera/run` |
 | Search ingestion node | Scrapes web pages, ingests text through local TTT, and emits an Axiom fingerprint for downstream use. | `src/bin/search_node.rs`, `search_scrape.rs`, `search_ingest.rs` |
 
 For a compact index of surfaces, see [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md).
@@ -113,6 +114,18 @@ used by the project scripts.
 
 The script builds the release binary if needed and uses a temporary state
 directory, so it does not mutate your normal Axiom memory.
+
+### Simulate a brand-new user (blank slate)
+
+```bash
+./scripts/new_user_simulation.sh
+```
+
+Stands up a pristine `HOME` with no `~/.axiom`, runs `axiom init` from scratch
+(offline checkpoint bootstrap included), then walks the real first-run journey —
+doctor → compression → self-healing runtime → learned immunity → the ChimeraLang
+DSL (run + offline certificate) → the reproducible capability score — printing
+PASS/FAIL per step. Useful as a first-run regression check.
 
 ## Release Assets
 

@@ -83,7 +83,7 @@ pub fn collect_from_patch_memory(pm: &PatchMemory, min_verified: u32) -> Vec<Tra
             }
         }
     }
-    out.sort_by(|a, b| b.weight.cmp(&a.weight));
+    out.sort_by_key(|e| std::cmp::Reverse(e.weight));
     out
 }
 
