@@ -3182,6 +3182,7 @@ pub fn create_router(state: AppState) -> Router {
             // this route so larger-but-valid fixes can still gossip.
             post(post_patches_merge).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
+        .route("/v1/chimera/run", post(post_chimera_run))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -3626,6 +3627,43 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
         Err(e) => (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": format!("provenance rejected: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /v1/chimera/run` — execute a ChimeraLang program with AXIOM's in-tree
+/// implementation ([`crate::chimera`]). Body: `{"source": "..."}`. Returns the
+/// emitted values, belief means, guard violations, and trace. Beliefs are
+/// answered by the default mock adapter here; grounding `inquire` in AXIOM's
+/// model is the Phase-2 follow-up (the `InquiryAdapter` seam already exists).
+async fn post_chimera_run(body: String) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let source = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => v
+            .get("source")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string()),
+        Err(_) => None,
+    };
+    let Some(source) = source else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "expected JSON body {\"source\": \"...\"}"})),
+        )
+            .into_response();
+    };
+    match crate::chimera::run_source(&source, None) {
+        Ok(res) => Json(serde_json::json!({
+            "emitted": res.emitted,
+            "beliefs": res.beliefs,
+            "guard_violations": res.guard_violations,
+            "trace": res.trace,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e})),
         )
             .into_response(),
     }
@@ -4325,6 +4363,34 @@ mod tests {
             layer.sum_all().unwrap().to_scalar::<f32>().unwrap()
         };
         assert!(layer_sum > 0.0);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn test_chimera_run_endpoint_executes_a_program() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+
+        let body = serde_json::json!({
+            "source": "val xs = [1, 2, 3]\nfor x in xs\n  emit x\nend"
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chimera/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["emitted"], serde_json::json!(["1", "2", "3"]));
         safe_drop(pipeline_arc).await;
     }
 
