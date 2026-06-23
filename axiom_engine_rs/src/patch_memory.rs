@@ -153,7 +153,7 @@ impl PatchMemory {
                 verified_count: 1,
             });
         }
-        list.sort_by(|a, b| b.verified_count.cmp(&a.verified_count));
+        list.sort_by_key(|c| std::cmp::Reverse(c.verified_count));
     }
 
     /// Candidate patches for a fingerprint, ranked most-verified first.
@@ -340,7 +340,7 @@ impl PatchMemory {
                     report.new_candidates += 1;
                 }
             }
-            local.sort_by(|a, b| b.verified_count.cmp(&a.verified_count));
+            local.sort_by_key(|c| std::cmp::Reverse(c.verified_count));
         }
         Ok(report)
     }
