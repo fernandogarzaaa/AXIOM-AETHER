@@ -4,6 +4,7 @@ mod agentic_eval;
 mod anthropic_forwarder;
 mod bench;
 mod belief;
+mod chimera;
 mod bootstrap;
 mod claude_backend;
 mod cli;
@@ -61,7 +62,7 @@ use std::env;
 use std::path::PathBuf;
 
 use candle_core::{bail, Device, Result};
-use cli::{AxiomCommand, DaemonCommand, ParsedCli, SwarmCommand};
+use cli::{AxiomCommand, ChimeraCommand, DaemonCommand, ParsedCli, SwarmCommand};
 use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use inference::{InferencePipeline, InferenceRuntimeOptions};
 use train::AxiomTrainer;
@@ -1092,6 +1093,65 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     println!("\n[axiom] heal memory: {}", path.display());
                 }
                 None => println!("[axiom] heal memory disabled (AXIOM_HEAL_MEMORY=0)."),
+            }
+        }
+        AxiomCommand::Chimera { command } => {
+            let read = |p: &std::path::Path| -> candle_core::Result<String> {
+                std::fs::read_to_string(p)
+                    .map_err(|e| candle_core::Error::Msg(format!("read {}: {e}", p.display())))
+            };
+            let fleet_key = std::env::var("AXIOM_FLEET_KEY").ok();
+            let key = fleet_key.as_deref().map(|s| s.as_bytes());
+            match command {
+                ChimeraCommand::Check { file } => {
+                    let src = read(&file)?;
+                    match chimera::check(&src) {
+                        Ok(()) => println!("[chimera] {} OK", file.display()),
+                        Err(e) => {
+                            return Err(candle_core::Error::Msg(format!("[chimera] check failed: {e}")));
+                        }
+                    }
+                }
+                ChimeraCommand::Run { file } => {
+                    let src = read(&file)?;
+                    let res = chimera::run_source(&src, None)
+                        .map_err(|e| candle_core::Error::Msg(format!("[chimera] run failed: {e}")))?;
+                    for line in &res.emitted {
+                        println!("{line}");
+                    }
+                    for v in &res.guard_violations {
+                        eprintln!("[chimera] guard violation: {v}");
+                    }
+                }
+                ChimeraCommand::Prove { file, out } => {
+                    let src = read(&file)?;
+                    let res = chimera::run_source(&src, None)
+                        .map_err(|e| candle_core::Error::Msg(format!("[chimera] run failed: {e}")))?;
+                    let cert = chimera::certify(&res, key);
+                    let json = serde_json::to_string_pretty(&cert)
+                        .map_err(|e| candle_core::Error::Msg(format!("serialize cert: {e}")))?;
+                    match out {
+                        Some(p) => {
+                            std::fs::write(&p, &json)
+                                .map_err(|e| candle_core::Error::Msg(format!("write cert: {e}")))?;
+                            println!("[chimera] certificate written to {}", p.display());
+                        }
+                        None => println!("{json}"),
+                    }
+                }
+                ChimeraCommand::Verify { cert } => {
+                    let json = read(&cert)?;
+                    let export: provenance::SignedExport = serde_json::from_str(&json)
+                        .map_err(|e| candle_core::Error::Msg(format!("parse cert: {e}")))?;
+                    match chimera::verify_certificate(&export, key) {
+                        Ok(_) => println!("[chimera] certificate VALID: {}", cert.display()),
+                        Err(e) => {
+                            return Err(candle_core::Error::Msg(format!(
+                                "[chimera] certificate INVALID: {e}"
+                            )));
+                        }
+                    }
+                }
             }
         }
         AxiomCommand::Swarm { command } => match command {

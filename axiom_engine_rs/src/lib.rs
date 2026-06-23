@@ -5,6 +5,7 @@ pub mod anthropic_forwarder;
 pub mod belief;
 pub mod bench;
 pub mod bootstrap;
+pub mod chimera;
 pub mod claude_backend;
 pub mod cluster;
 pub mod config;

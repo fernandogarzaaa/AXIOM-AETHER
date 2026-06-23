@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 const SOURCE_EXTS: &[&str] = &[
     "rs", "py", "pyi", "js", "jsx", "ts", "tsx", "mjs", "cjs", "go", "c", "h", "cc", "cpp", "cxx",
     "hpp", "hh", "java", "kt", "kts", "rb", "php", "cs", "swift", "scala", "sh", "bash", "lua",
-    "ml", "mli", "ex", "exs", "dart",
+    "ml", "mli", "ex", "exs", "dart", "chimera",
 ];
 
 /// A located source reference parsed from a tool's failure output.
@@ -49,6 +49,10 @@ pub enum Language {
     /// determines the verify command — running `mvn` in a Gradle-only repo fails.
     Gradle,
     Ruby,
+    /// A ChimeraLang project (a `chimera.toml` marker or any `*.chimera` source
+    /// at the root). Verified by AXIOM's own in-tree ChimeraLang implementation
+    /// ([`crate::chimera`]) rather than an external toolchain.
+    Chimera,
 }
 
 /// Detect the dominant project language from well-known marker files. Returns
@@ -81,7 +85,24 @@ pub fn detect_language(root: &Path) -> Option<Language> {
     if has("Gemfile") {
         return Some(Language::Ruby);
     }
+    if has("chimera.toml") || has_chimera_source(root) {
+        return Some(Language::Chimera);
+    }
     None
+}
+
+/// True if the project root directly contains a `*.chimera` source file.
+fn has_chimera_source(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .map(|x| x.eq_ignore_ascii_case("chimera"))
+            .unwrap_or(false)
+    })
 }
 
 /// A sensible default verify command for a language — the thing CI would run.
@@ -96,6 +117,9 @@ pub fn default_verify(language: Language) -> (String, Vec<String>) {
         Language::Java => ("mvn", &["-q", "test"]),
         Language::Gradle => ("gradle", &["test", "--quiet"]),
         Language::Ruby => ("rake", &["test"]),
+        // Verified in-process by AXIOM's ChimeraLang implementation; the CLI
+        // subcommand `axiom chimera check` is the command-line equivalent.
+        Language::Chimera => ("axiom", &["chimera", "check"]),
     };
     (prog.to_string(), args.iter().map(|s| s.to_string()).collect())
 }
@@ -492,6 +516,26 @@ src/a.rs:3:1: error";
         assert_eq!(prog, "go");
         assert_eq!(args, vec!["test", "./..."]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_language_recognizes_chimera_projects() {
+        // A bare *.chimera source at the root is enough to detect the language.
+        let dir = std::env::temp_dir().join(format!("axiom_floc_chimera_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.chimera"), "emit \"hi\"").unwrap();
+        assert_eq!(detect_language(&dir), Some(Language::Chimera));
+        let (prog, args) = default_verify(Language::Chimera);
+        assert_eq!(prog, "axiom");
+        assert_eq!(args, vec!["chimera", "check"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The explicit chimera.toml marker also works (no source file present).
+        let dir2 = std::env::temp_dir().join(format!("axiom_floc_chimtoml_{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("chimera.toml"), "name = \"x\"").unwrap();
+        assert_eq!(detect_language(&dir2), Some(Language::Chimera));
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

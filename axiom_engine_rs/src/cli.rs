@@ -117,6 +117,41 @@ pub enum AxiomCommand {
         #[arg(long)]
         prune: bool,
     },
+    /// Run AXIOM's in-tree ChimeraLang (AI-cognition DSL): check, run, prove
+    /// (emit a signed certificate), or verify a certificate. `.chimera` programs
+    /// execute on the same belief/provenance substrate as the engine itself.
+    Chimera {
+        #[command(subcommand)]
+        command: ChimeraCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ChimeraCommand {
+    /// Lex + parse a `.chimera` file, reporting syntax errors (the verify gate).
+    Check {
+        /// Path to the `.chimera` source file.
+        file: PathBuf,
+    },
+    /// Execute a `.chimera` file and print emitted values + any guard violations.
+    Run {
+        /// Path to the `.chimera` source file.
+        file: PathBuf,
+    },
+    /// Execute and emit a tamper-evident certificate of the run (SHA-256, plus
+    /// HMAC when `AXIOM_FLEET_KEY` is set), reusing AXIOM's provenance layer.
+    Prove {
+        /// Path to the `.chimera` source file.
+        file: PathBuf,
+        /// Where to write the certificate JSON (defaults to stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Verify a certificate produced by `prove`, offline.
+    Verify {
+        /// Path to the certificate JSON.
+        cert: PathBuf,
+    },
 }
 
 #[derive(Debug, Args, Default)]
