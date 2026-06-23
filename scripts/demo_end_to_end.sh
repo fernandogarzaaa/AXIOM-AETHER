@@ -84,6 +84,20 @@ else
     wait "$SRV" 2>/dev/null
 fi
 
+step "Pillar 4 — ChimeraLang DSL (in-tree port: run + prove/verify certificate)"
+cat > "$TMP/demo.chimera" <<'CHIM'
+val scores = [1, 2, 3]
+for s in scores
+  emit s
+end
+CHIM
+"$BIN" chimera run "$TMP/demo.chimera" 2>&1 | sed 's/^/    /'
+"$BIN" chimera run "$TMP/demo.chimera" 2>&1 | grep -q "3" \
+    && ok "chimera run executed a program" || bad "chimera run produced no output"
+"$BIN" chimera prove "$TMP/demo.chimera" --out "$TMP/chimera_cert.json" >/dev/null 2>&1
+"$BIN" chimera verify "$TMP/chimera_cert.json" 2>&1 | grep -qi "VALID" \
+    && ok "chimera certificate verifies offline" || bad "chimera cert did not verify"
+
 step "summary"
 printf '\n  %d passed, %d failed\n\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

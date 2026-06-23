@@ -282,7 +282,14 @@ mod tests {
         let recs = vec![
             rec("near", "personal", "near", vec![1.0, 0.0]),
             rec("far", "personal", "far", vec![0.0, 1.0]),
-            rec("mid", "personal", "mid", vec![0.7071, 0.7071]),
+            // Unit vector at 45° = (1/√2, 1/√2); use the exact constant so the
+            // clippy `approx_constant` correctness lint stays clean.
+            rec(
+                "mid",
+                "personal",
+                "mid",
+                vec![std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2],
+            ),
         ];
         let ranked = top_k(&[1.0, 0.0], &recs, 2);
         assert_eq!(ranked.len(), 2);
