@@ -3,6 +3,37 @@ name = "axiom_engine"
 version = "0.1.0"
 edition = "2021"
 description = "Axiom-TTT Inference Engine – Rust implementation using candle"
+license = "MIT"
+repository = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
+homepage = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
+readme = "README.md"
+authors = ["Fernando Garza <fernandogarzaaa@users.noreply.github.com>"]
+keywords = ["ttt", "inference", "llm", "self-healing", "cli"]
+categories = ["command-line-utilities", "science"]
+# `axiom` is the canonical entrypoint (so `cargo run` and maturin's bin wheel
+# select it rather than ambiguating over the many dev/bench binaries).
+default-run = "axiom"
+# Keep the published crate to source only — never ship checkpoints, models, or
+# build output (crates.io enforces a size limit these would blow past).
+exclude = [
+    "target/*",
+    "checkpoints/*",
+    "**/*.safetensors",
+    "**/*.gguf",
+    "tests/fixtures/*",
+]
+
+# Two names for the same entrypoint: `axiom_engine` keeps the existing Docker /
+# release / script references working, while `axiom` is the clean command that
+# `cargo install` and the pip wheel expose (matching what install.sh already
+# renames the release binary to).
+[[bin]]
+name = "axiom_engine"
+path = "src/main.rs"
+
+[[bin]]
+name = "axiom"
+path = "src/main.rs"
 
 [features]
 default = []
@@ -10,6 +41,61 @@ default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 # Enable Apple Metal GPU backend (macOS / Apple Silicon only).
 metal = ["candle-core/metal", "candle-nn/metal"]
+# Dev/training/eval binaries (src/bin/*). Off by default so `cargo install`,
+# the pip wheel, Docker, and release builds ship only the user-facing `axiom`
+# command — not the training toolchain. Build them with `--features tools`.
+tools = []
+
+# Dev/training/eval binaries, gated behind the `tools` feature (see above).
+[[bin]]
+name = "build_pairs"
+path = "src/bin/build_pairs.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "corpus_crawl"
+path = "src/bin/corpus_crawl.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "eval_model"
+path = "src/bin/eval_model.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "eval_recall"
+path = "src/bin/eval_recall.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "harvest"
+path = "src/bin/harvest.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "search_node"
+path = "src/bin/search_node.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "smoke_embed"
+path = "src/bin/smoke_embed.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "train_embedder"
+path = "src/bin/train_embedder.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "train_semantic"
+path = "src/bin/train_semantic.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "train_tokenizer"
+path = "src/bin/train_tokenizer.rs"
+required-features = ["tools"]
 
 [dependencies]
 candle-core = "0.10.2"
