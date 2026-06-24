@@ -6,7 +6,7 @@ tag. End users install with one of:
 ```bash
 pip install axiom-aether            # prebuilt binary wheel (no toolchain)
 cargo install axiom_engine          # build from source
-curl -fsSL …/scripts/install.sh | sh   # GitHub Release binary
+curl -fsSL https://raw.githubusercontent.com/fernandogarzaaa/AXIOM-AETHER/main/scripts/install.sh | bash   # GitHub Release binary
 ```
 
 ## What is published where

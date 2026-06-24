@@ -11,7 +11,7 @@ Installs the `axiom` command.
 ```bash
 cargo install axiom_engine          # builds from source (needs a Rust toolchain)
 pip install axiom-aether            # prebuilt binary, no toolchain (recommended)
-curl -fsSL https://raw.githubusercontent.com/fernandogarzaaa/AXIOM-AETHER/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/fernandogarzaaa/AXIOM-AETHER/main/scripts/install.sh | bash
 ```
 
 ## Quick start

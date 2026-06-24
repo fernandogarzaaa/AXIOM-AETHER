@@ -15,6 +15,11 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Least privilege by default; jobs widen only where strictly needed (the PyPI
+# job requests id-token for Trusted Publishing).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -22,8 +27,12 @@ jobs:
   crates-io:
     name: Publish crate (crates.io)
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux build dependencies
         run: |
@@ -38,6 +47,8 @@ jobs:
   wheels:
     name: Build wheel (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +64,8 @@ jobs:
             maturin-target: x64
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
@@ -72,10 +85,13 @@ jobs:
 
   pypi:
     name: Publish to PyPI
-    needs: wheels
+    # Gate on crates.io too: a single tag is a multi-channel release, so don't
+    # publish wheels to PyPI if the crate publish failed (avoids partial releases).
+    needs: [wheels, crates-io]
     runs-on: ubuntu-22.04
     environment: pypi
     permissions:
+      contents: read
       id-token: write # Trusted Publishing (OIDC) — no API token needed.
     steps:
       - uses: actions/download-artifact@v4
