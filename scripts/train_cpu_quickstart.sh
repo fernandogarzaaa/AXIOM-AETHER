@@ -35,7 +35,9 @@ export AXIOM_WARMUP_STEPS="${AXIOM_WARMUP_STEPS:-100}"
 export AXIOM_LOG_EVERY="${AXIOM_LOG_EVERY:-200}"
 
 echo "[quickstart] building trainer binaries..."
-cargo build --release --manifest-path axiom_engine_rs/Cargo.toml --bins >/dev/null
+# The trainer/eval binaries are gated behind the `tools` feature (kept out of
+# default builds + the pip/crates packages), so enable it here.
+cargo build --release --manifest-path axiom_engine_rs/Cargo.toml --features tools --bins >/dev/null
 
 # --- 1. Stage a corpus from the repo's own source + docs -------------------
 echo "[quickstart] staging corpus -> checkpoints/corpus/"

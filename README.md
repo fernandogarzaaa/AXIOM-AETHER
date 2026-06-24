@@ -68,7 +68,16 @@ round-trip behavior; answer-quality gains require separate upstream evaluation.
 
 ## Quick Start
 
-### Install from the release helper
+### Install
+
+All three install the `axiom` command:
+
+```bash
+pip install axiom-aether            # prebuilt binary, no Rust toolchain (recommended)
+cargo install axiom_engine          # build from source (needs a Rust toolchain)
+```
+
+Or the release helper (no package manager needed):
 
 Linux/macOS:
 
@@ -81,6 +90,10 @@ Windows PowerShell:
 ```powershell
 iwr https://raw.githubusercontent.com/fernandogarzaaa/AXIOM-AETHER/main/scripts/install.ps1 -UseB | iex
 ```
+
+> `pip install axiom-aether` ships the precompiled `axiom` engine binary — it is
+> **not** the same as the pure-Python `axiom-engine` reference package. Publishing
+> is automated on version tags; see [`docs/PUBLISHING.md`](docs/PUBLISHING.md).
 
 ### Build from source
 

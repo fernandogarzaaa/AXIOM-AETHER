@@ -1,0 +1,42 @@
+# pip packaging for the Rust `axiom` binary via maturin.
+#
+# `pip install axiom-aether` ships the *prebuilt* `axiom` command for the user's
+# platform — no Rust toolchain, no compilation. This is intentionally separate
+# from the repo-root pyproject.toml (the pure-Python `axiom-engine` reference
+# implementation); the two are distinct PyPI packages.
+#
+# Wheels are built per-platform in CI (release.yml) with `--bin axiom` so only
+# the one binary is shipped, not the crate's other dev/bench binaries.
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "axiom-aether"
+version = "0.1.0"
+description = "Axiom-TTT: online test-time-training inference engine and self-healing runtime (prebuilt `axiom` binary)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Fernando Garza" }]
+keywords = ["ttt", "inference", "llm", "ai", "cli", "self-healing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
+Repository = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
+
+[tool.maturin]
+# Package Rust binaries (not a Python extension): the wheel installs the `axiom`
+# command onto PATH. The crate's dev/training binaries are gated behind the
+# `tools` feature (off by default), so a default build — and therefore this
+# wheel — ships only the user-facing `axiom` (plus the `axiom_engine` alias).
+bindings = "bin"
+manifest-path = "Cargo.toml"

@@ -1,0 +1,88 @@
+name: Publish packages
+
+# Publish the `axiom` engine to crates.io (Rust) and PyPI (prebuilt wheels) when
+# a version tag is pushed. Mirrors the targets release.yml already builds, so the
+# same code that produces GitHub Release binaries produces the package-manager
+# artifacts.
+#
+# One-time setup required (see docs/PUBLISHING.md):
+#   * crates.io: add repo secret CARGO_REGISTRY_TOKEN.
+#   * PyPI: configure Trusted Publishing for this repo + workflow (OIDC), so no
+#     token is needed; the `pypi` job requests an id-token below.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crates-io:
+    name: Publish crate (crates.io)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
+      - name: cargo publish
+        working-directory: axiom_engine_rs
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+  wheels:
+    name: Build wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            maturin-target: x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            maturin-target: aarch64
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            maturin-target: x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build wheel (prebuilt `axiom` binary)
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: axiom_engine_rs
+          target: ${{ matrix.maturin-target }}
+          # Dev/training bins are gated behind the `tools` feature, so a default
+          # build ships only the user-facing `axiom` (+ `axiom_engine` alias).
+          args: --release --bindings bin --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.maturin-target }}
+          path: axiom_engine_rs/dist/*.whl
+
+  pypi:
+    name: Publish to PyPI
+    needs: wheels
+    runs-on: ubuntu-22.04
+    environment: pypi
+    permissions:
+      id-token: write # Trusted Publishing (OIDC) — no API token needed.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
