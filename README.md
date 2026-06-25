@@ -104,6 +104,23 @@ cargo build --release --locked
 cargo test --release --locked
 ```
 
+### Generation backends & models
+
+Axiom's own model handles compression/recall; **text generation is pluggable and
+optional** — a tiny model is bootstrapped offline by `axiom init`, and you can
+point axiom at a bigger brain when you want one:
+
+- **Local, zero-cost** — serve an open model (default **Qwen2.5-Coder-32B**) via
+  [OpenDrop](https://github.com/fernandogarzaaa/OpenDrop) and set
+  `AXIOM_BACKEND=openai` + `OPENAI_BASE_URL`.
+- **Cloud** — `AXIOM_BACKEND=openai|anthropic` with an API key.
+- **Your ChatGPT/Claude subscription** — drive axiom's tools from the app via MCP
+  (zero API cost).
+
+See [`docs/BACKENDS.md`](docs/BACKENDS.md) (backends + model recommendations) and
+[`docs/MCP-CLIENTS.md`](docs/MCP-CLIENTS.md) (use axiom from Claude/ChatGPT). The
+trained model is an enhancement, not a requirement.
+
 Run the local hardware check:
 
 ```bash
