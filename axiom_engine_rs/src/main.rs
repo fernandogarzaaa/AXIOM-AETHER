@@ -2,6 +2,7 @@ mod adaptive;
 mod agentic;
 mod agentic_eval;
 mod anthropic_forwarder;
+mod backend_router;
 mod bench;
 mod belief;
 mod chimera;
