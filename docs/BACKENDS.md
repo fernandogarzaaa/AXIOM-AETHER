@@ -11,6 +11,7 @@ trained model — the brain is pluggable and optional.
 | `AXIOM_BACKEND` | Brain | Cost | Notes |
 |---|---|---|---|
 | `bootstrap` (default) | Axiom's tiny local TTT model | free, offline | auto-trained by `axiom init`; weak at generation, fine for the cognition loops |
+| `opendrop` | Local OpenDrop server | free, local | defaults `OPENAI_BASE_URL` to `http://127.0.0.1:11434/v1` — just `opendrop run <model>` |
 | `openai` | Any OpenAI-compatible endpoint | depends | cloud OpenAI **or** a local server (OpenDrop, Ollama, vLLM) |
 | `anthropic` | Claude (Anthropic API) | metered | needs `ANTHROPIC_API_KEY` |
 
@@ -29,12 +30,13 @@ model behind an OpenAI-compatible API. Point axiom at it — **works today** wit
 the `openai` backend:
 
 ```bash
-opendrop run Qwen2.5-Coder-32B          # serves OpenAI-compatible API, e.g. :11434
-export AXIOM_BACKEND=openai
-export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-export OPENAI_API_KEY=sk-local-anything # most local servers ignore the value
-axiom --mode server                      # axiom now generates via local GLM/Qwen/etc.
+opendrop run Qwen2.5-Coder-32B          # serves OpenAI-compatible API on :11434
+export AXIOM_BACKEND=opendrop            # auto-targets http://127.0.0.1:11434/v1
+axiom --mode server                      # axiom now generates via the local model
 ```
+
+(Use `AXIOM_BACKEND=openai` + `OPENAI_BASE_URL` instead if your local server runs
+on a non-default host/port, e.g. Ollama or vLLM.)
 
 ### Recommended models (all GGUF / OpenDrop-ready)
 
