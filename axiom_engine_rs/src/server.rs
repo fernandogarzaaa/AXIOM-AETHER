@@ -43,6 +43,7 @@ use uuid::Uuid;
 use crate::anthropic_forwarder::{
     build_compressed_payload, partition_messages, AnthropicForwarder, ClientAuth, ForwarderError,
 };
+use crate::backend_router::{Router as BackendRouter, TaskKind};
 use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
@@ -228,6 +229,10 @@ pub struct AppState {
     /// Optional Anthropic Claude backend. When `Some`, generation is
     /// routed through Claude instead of the local Axiom-TTT pipeline.
     pub claude_backend: Arc<Option<ClaudeBackend>>,
+    /// Multi-provider router (`AXIOM_BACKEND=router`): when present, generation is
+    /// routed across GPT/Claude/local with failover/consensus. `None` ⇒ the
+    /// default single-backend path.
+    pub router: Arc<Option<BackendRouter>>,
     /// Active-compression session store: per-tenant adapted fast-weight
     /// tensors held in a lock-free DashMap. Distinct from `sessions`
     /// above (which serves the legacy `/v1/sessions` API); this store
@@ -284,6 +289,7 @@ impl AppState {
             sequence_versions: Arc::new(RwLock::new(HashMap::new())),
             model_id,
             claude_backend: Arc::new(None),
+            router: Arc::new(None),
             ttt_sessions: Arc::new(TttSessionStore::new()),
             anthropic_forwarder: Arc::new(None),
             openai_forwarder: Arc::new(None),
@@ -597,6 +603,13 @@ impl AppState {
     /// Install a Claude backend on this app state, replacing any existing one.
     pub fn with_claude_backend(mut self, backend: Option<ClaudeBackend>) -> Self {
         self.claude_backend = Arc::new(backend);
+        self
+    }
+
+    /// Install the multi-provider router (`AXIOM_BACKEND=router`). `None` keeps
+    /// the default single-backend generation path.
+    pub fn with_router(mut self, router: Option<BackendRouter>) -> Self {
+        self.router = Arc::new(router);
         self
     }
 
@@ -1758,6 +1771,16 @@ fn run_generation(
     max_tokens: usize,
     session_id: Option<&str>,
 ) -> Result<String, ApiError> {
+    // Router mode (AXIOM_BACKEND=router): GPT + Claude + local together, with
+    // failover. Generation is delegated to external providers, so session TTT
+    // state does not apply here.
+    if let Some(router) = state.router.as_ref() {
+        return router
+            .generate(TaskKind::General, prompt)
+            .map(|a| a.text)
+            .map_err(|e| ApiError::Internal(format!("router generation failed: {e}")));
+    }
+
     if let Some(backend) = state.claude_backend.as_ref() {
         return backend
             .generate(prompt, max_tokens)
@@ -3918,6 +3941,17 @@ pub async fn run_server(
         .with_compressor_config(compressor_config)
         .with_master_vibe(master_vibe)
         .with_heal_memory_path(heal_memory_path);
+    // AXIOM_BACKEND=router: assemble the multi-provider router from the live
+    // pipeline + Claude backend + OpenAI creds. None unless router mode is set.
+    let router = crate::backend_live::router_from_env(
+        state.pipeline.clone(),
+        state.claude_backend.clone(),
+        256,
+    );
+    if router.is_some() {
+        println!("[+] AXIOM_BACKEND=router — generation routed across GPT/Claude/local");
+    }
+    let state = state.with_router(router);
     if state.compression_active() {
         match state.hydrate_compression_cache().await {
             Ok(0) => println!(
@@ -4363,6 +4397,27 @@ mod tests {
             layer.sum_all().unwrap().to_scalar::<f32>().unwrap()
         };
         assert!(layer_sum > 0.0);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn router_mode_routes_generation_through_the_router() {
+        use crate::backend_router::{
+            BackendError, ChatBackend, Provider, RoutePolicy, Router as BR,
+        };
+        struct Mock;
+        impl ChatBackend for Mock {
+            fn complete(&self, _p: &str) -> Result<String, BackendError> {
+                Ok("routed-answer".into())
+            }
+        }
+        // General task routes to OpenAi by default; register the mock there.
+        let router = BR::new(RoutePolicy::default()).with(Provider::OpenAi, Box::new(Mock));
+        let state = make_test_state().await.with_router(Some(router));
+        let pipeline_arc = state.pipeline.clone();
+        // run_generation must short-circuit to the router, not the local pipeline.
+        let out = run_generation(&state, "hello", 8, None).unwrap();
+        assert_eq!(out, "routed-answer");
         safe_drop(pipeline_arc).await;
     }
 

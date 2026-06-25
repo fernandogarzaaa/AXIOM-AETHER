@@ -62,9 +62,10 @@ impl std::fmt::Display for BackendError {
     }
 }
 
-/// One generation backend. Implemented by the real OpenAI/Anthropic forwarders
-/// (wrapping their blocking HTTP client) and by mocks in tests.
-pub trait ChatBackend {
+/// One generation backend. Implemented by the real OpenAI/Anthropic/local
+/// adapters (wrapping their blocking client) and by mocks in tests. `Send + Sync`
+/// so a [`Router`] can be shared in the axum server state across requests.
+pub trait ChatBackend: Send + Sync {
     /// Generate a completion for `prompt`. Returns the text or a [`BackendError`].
     fn complete(&self, prompt: &str) -> Result<String, BackendError>;
 }

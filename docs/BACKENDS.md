@@ -14,14 +14,31 @@ trained model — the brain is pluggable and optional.
 | `opendrop` | Local OpenDrop server | free, local | defaults `OPENAI_BASE_URL` to `http://127.0.0.1:11434/v1` — just `opendrop run <model>` |
 | `openai` | Any OpenAI-compatible endpoint | depends | cloud OpenAI **or** a local server (OpenDrop, Ollama, vLLM) |
 | `anthropic` | Claude (Anthropic API) | metered | needs `ANTHROPIC_API_KEY` |
+| `router` | **GPT + Claude + local together** | metered | routes by task (code→Claude, else→GPT), with failover; opt-in consensus |
+
+### Router mode (`AXIOM_BACKEND=router`)
+
+Generation is routed across providers: code-repair → Claude, reasoning/general →
+GPT, with deterministic failover to the local pipeline if a provider errors. It
+registers whichever providers are configured:
+
+```bash
+export AXIOM_BACKEND=router
+export ANTHROPIC_API_KEY=sk-ant-...     # registers Claude
+export OPENAI_API_KEY=sk-...            # registers GPT (or set OPENAI_BASE_URL for a local server)
+export AXIOM_OPENAI_MODEL=gpt-4o        # optional, default gpt-4o
+axiom --mode server
+```
+
+The local TTT pipeline is always registered as the last-resort fallback, so the
+server still answers even if every cloud provider is down.
 
 Env knobs: `OPENAI_API_KEY`, `OPENAI_BASE_URL` (or `OPENAI_API_BASE`),
 `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`.
 
 > **Multi-provider router** (GPT + Claude together, with failover and belief
-> consensus) ships as a library (`backend_router.rs`, fully tested) and grounds
-> ChimeraLang `inquire`. Wiring it as a runtime `AXIOM_BACKEND=router` mode in the
-> server request path is the next step (see "Roadmap" below).
+> consensus) is live as `AXIOM_BACKEND=router` (see below) and also grounds
+> ChimeraLang `inquire`.
 
 ## Local models via OpenDrop (zero per-token cost)
 
@@ -69,7 +86,8 @@ ChimeraLang — runs on it. A bigger model (OpenDrop-served or cloud) only impro
 
 ## Roadmap (next backend work)
 
-1. **`AXIOM_BACKEND=router`** runtime mode — wire `backend_router` into the server
-   so GPT + Claude run together (routing/failover/consensus) on live requests.
-2. **Remote MCP transport (HTTP/SSE)** — so the **ChatGPT connector** and Claude
+1. **Remote MCP transport (HTTP/SSE)** — so the **ChatGPT connector** and Claude
    *remote* connectors can attach, not just local stdio (`MCP-CLIENTS.md`).
+2. **Consensus on the live router** — `AXIOM_BACKEND=router` runs single-provider
+   routing + failover today; surfacing the opt-in two-model consensus
+   (`RoutePolicy.consensus`) as a runtime toggle is a follow-up.
