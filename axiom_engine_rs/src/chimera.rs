@@ -813,6 +813,33 @@ impl InquiryAdapter for MockAdapter {
     }
 }
 
+/// Grounds `inquire` in Axiom's multi-provider [`crate::backend_router::Router`]
+/// — so a belief's evidence comes from a real model (GPT/Claude/local), and the
+/// router's consensus confidence flows straight into the belief's Beta update.
+/// Treated as a reasoning task. Falls back to a neutral, low-confidence response
+/// if every backend is unavailable (so programs still complete).
+pub struct RouterAdapter<'a> {
+    pub router: &'a crate::backend_router::Router,
+}
+
+impl InquiryAdapter for RouterAdapter<'_> {
+    fn inquire(&self, prompt: &str, _agents: &[String]) -> InquiryResponse {
+        match self
+            .router
+            .generate(crate::backend_router::TaskKind::Reasoning, prompt)
+        {
+            Ok(a) => InquiryResponse {
+                confidence: a.confidence,
+                answer: Some(a.text),
+            },
+            Err(_) => InquiryResponse {
+                confidence: 0.5,
+                answer: None,
+            },
+        }
+    }
+}
+
 /// Pseudocount strength used to convert an inquiry confidence into a Beta belief
 /// (higher ⇒ more evidence ⇒ lower variance).
 const INQUIRY_STRENGTH: f32 = 4.0;
@@ -1081,5 +1108,34 @@ mod tests {
     #[test]
     fn parse_error_is_reported() {
         assert!(parse("val = 3").is_err());
+    }
+
+    #[test]
+    fn router_adapter_grounds_belief_in_a_backend() {
+        use crate::backend_router::{BackendError, ChatBackend, Provider, RoutePolicy, Router};
+        struct Confident;
+        impl ChatBackend for Confident {
+            fn complete(&self, _p: &str) -> Result<String, BackendError> {
+                Ok("black holes form from stellar collapse".into())
+            }
+        }
+        // Reasoning routes to OpenAi by default; register a backend there.
+        let router = Router::new(RoutePolicy::default())
+            .with(Provider::OpenAi, Box::new(Confident));
+        let adapter = RouterAdapter { router: &router };
+
+        let src = r#"
+            belief cause := inquire { prompt: "why do black holes form?", agents: [gpt], ttl: 0 }
+            emit cause
+        "#;
+        let prog = parse(src).unwrap();
+        let res = run(&prog, &adapter).unwrap();
+        // The belief's emitted answer came from the backend, not the mock.
+        assert!(
+            res.emitted.iter().any(|e| e.contains("stellar collapse")),
+            "belief should carry the backend's answer, got {:?}",
+            res.emitted
+        );
+        assert!(res.beliefs.contains_key("cause"));
     }
 }
