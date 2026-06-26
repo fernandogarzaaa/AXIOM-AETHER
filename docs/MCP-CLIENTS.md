@@ -7,6 +7,12 @@ Axiom ships an MCP server that exposes its cognition tools — `axiom_compress_p
 sanctioned, zero-API-cost way to combine your ChatGPT/Claude *subscription* with
 axiom (you drive your own app; it calls axiom's tools).
 
+> **Want your AI agent to set this up for you?** See
+> [`AGENT-SETUP.md`](AGENT-SETUP.md) for copy-paste prompts that make **Codex**
+> (ChatGPT) or a **Claude** agent build, run, and connect Axiom end to end —
+> including the Windows-build and `404 /mcp` gotchas. This page below is the
+> transport reference.
+
 ## Claude Desktop / Claude Code — works today (stdio)
 
 Axiom's MCP server speaks JSON-RPC over **stdio**, the transport Claude Desktop

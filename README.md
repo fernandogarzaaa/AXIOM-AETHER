@@ -121,9 +121,11 @@ point axiom at a bigger brain when you want one:
   (zero API cost); works from Claude over stdio and from the ChatGPT connector
   over remote HTTP (`AXIOM_MCP_HTTP=1`).
 
-See [`docs/BACKENDS.md`](docs/BACKENDS.md) (backends + model recommendations) and
-[`docs/MCP-CLIENTS.md`](docs/MCP-CLIENTS.md) (use axiom from Claude/ChatGPT). The
-trained model is an enhancement, not a requirement.
+See [`docs/AGENT-SETUP.md`](docs/AGENT-SETUP.md) (**set up Axiom with your
+Codex/Claude agent** — copy-paste prompts + troubleshooting),
+[`docs/BACKENDS.md`](docs/BACKENDS.md) (backends + model recommendations) and
+[`docs/MCP-CLIENTS.md`](docs/MCP-CLIENTS.md) (MCP transport details). The trained
+model is an enhancement, not a requirement.
 
 Run the local hardware check:
 
