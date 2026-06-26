@@ -93,9 +93,10 @@ ChimeraLang — runs on it. A bigger model (OpenDrop-served or cloud) only impro
 
 ## Roadmap (next backend work)
 
-1. **ChatGPT standard-mode `search`/`fetch` aliases** — remote MCP over HTTP is
-   live (`AXIOM_MCP_HTTP=1`, see `MCP-CLIENTS.md`); adding `search`/`fetch` tool
-   aliases would make Axiom a standard ChatGPT connector (not just Developer Mode).
+1. ~~**ChatGPT standard-mode `search`/`fetch` aliases**~~ — **done**: Axiom now
+   exposes `search` and `fetch` tools (over its semantic memory) alongside its
+   native tools, so it works as a standard ChatGPT connector, not just Developer
+   Mode (see `MCP-CLIENTS.md`).
 2. **Consensus on the live router** — `AXIOM_BACKEND=router` runs single-provider
    routing + failover today; surfacing the opt-in two-model consensus
    (`RoutePolicy.consensus`) as a runtime toggle is a follow-up.

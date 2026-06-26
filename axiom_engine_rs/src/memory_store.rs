@@ -99,6 +99,40 @@ impl MemoryStore {
         latest.into_values().filter(|r| !r.tombstone).collect()
     }
 
+    /// List the scopes that have a store file on disk (the `<stem>.jsonl`
+    /// filenames, sans extension). Note these are the *sanitized* stems, which
+    /// equal the original scope for the common `personal` / `project_<name>`
+    /// cases. Used to resolve a record id back to its scope (e.g. the `fetch`
+    /// MCP alias, which receives only an id).
+    pub fn scopes(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    out.push(stem.to_string());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Find a live (non-tombstoned) record by id across all on-disk scopes.
+    /// Returns the first match (ids are unique per scope; collisions across
+    /// scopes are not expected for content-hash ids). `None` if not found.
+    pub fn get(&self, id: &str) -> Option<MemoryRecord> {
+        for scope in self.scopes() {
+            if let Some(rec) = self.load_scope(&scope).into_iter().find(|r| r.id == id) {
+                return Some(rec);
+            }
+        }
+        None
+    }
+
     /// Tombstone an id within a scope by appending a tombstone record.
     pub fn tombstone(&self, scope: &str, id: &str) -> std::io::Result<()> {
         let rec = MemoryRecord {
@@ -195,6 +229,32 @@ mod tests {
         let loaded = store.load_scope("personal");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "use 4-space indent");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scopes_lists_files_and_get_resolves_id_across_scopes() {
+        let root = temp_root("scopes_get");
+        let store = MemoryStore::open(&root).unwrap();
+        store
+            .append(&rec("p1", "personal", "personal note", vec![1.0, 0.0]))
+            .unwrap();
+        store
+            .append(&rec("x1", "project_acme", "acme note", vec![0.0, 1.0]))
+            .unwrap();
+
+        let mut scopes = store.scopes();
+        scopes.sort();
+        assert_eq!(scopes, vec!["personal", "project_acme"]);
+
+        // get() finds a record regardless of which scope it lives in.
+        assert_eq!(store.get("p1").unwrap().body, "personal note");
+        assert_eq!(store.get("x1").unwrap().body, "acme note");
+        assert!(store.get("missing").is_none());
+
+        // A tombstoned record is not returned by get().
+        store.tombstone("personal", "p1").unwrap();
+        assert!(store.get("p1").is_none());
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -378,6 +378,29 @@ fn tools_list() -> Value {
                         "command": { "type": "string", "description": "Optional case-insensitive command substring to filter by (e.g. 'cargo build'). Omit to list everything Axiom has learned." }
                     }
                 }
+            },
+            {
+                "name": "search",
+                "description": "Search Axiom's long-term memory and return a ranked list of matching records as {id, title, url}. This is the standard ChatGPT-connector `search` tool (paired with `fetch`): call `search` to find relevant memories, then `fetch` with a result id to read the full text. Internally an alias over Axiom's semantic memory recall.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "What to search Axiom's memory for." },
+                        "scope": { "type": "string", "description": "Optional project scope to include alongside 'personal'." }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "fetch",
+                "description": "Fetch the full text of a single Axiom memory record by its id (an id returned by `search`). Returns {id, title, text, url, metadata}. This is the standard ChatGPT-connector `fetch` tool that pairs with `search`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "The record id from a `search` result." }
+                    },
+                    "required": ["id"]
+                }
             }
         ]
     })
@@ -570,6 +593,40 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .await
             .unwrap_or_else(|e| format!("worker join error: {e}"));
             success_response(id, tool_text_result(&outcome, false))
+        }
+        "search" => {
+            let Some(query) = args.get("query").and_then(Value::as_str) else {
+                return error_response(id, -32602, "search requires string 'query'");
+            };
+            let query = query.to_string();
+            let scope = args
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            let ctx = ctx.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                search_blocking(&query, scope.as_deref(), &ctx)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            match outcome {
+                Ok(json_text) => success_response(id, tool_text_result(&json_text, false)),
+                Err(e) => success_response(id, tool_text_result(&format!("search failed: {e}"), true)),
+            }
+        }
+        "fetch" => {
+            let Some(doc_id) = args.get("id").and_then(Value::as_str) else {
+                return error_response(id, -32602, "fetch requires string 'id'");
+            };
+            let doc_id = doc_id.to_string();
+            let ctx = ctx.clone();
+            let outcome = tokio::task::spawn_blocking(move || fetch_blocking(&doc_id, &ctx))
+                .await
+                .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            match outcome {
+                Ok(json_text) => success_response(id, tool_text_result(&json_text, false)),
+                Err(e) => success_response(id, tool_text_result(&format!("fetch failed: {e}"), true)),
+            }
         }
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
     }
@@ -854,6 +911,76 @@ fn recall_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result
     Ok(out)
 }
 
+/// Opaque, stable locator for a memory record (shown as `url` in search/fetch
+/// results so ChatGPT can display/cite a source without exposing the filesystem).
+fn memory_url(scope: &str, id: &str) -> String {
+    format!("axiom-memory://{scope}/{id}")
+}
+
+/// A short single-line title from a record body (first non-empty line, truncated).
+fn title_for(body: &str) -> String {
+    let line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    const MAX: usize = 80;
+    if line.chars().count() > MAX {
+        let truncated: String = line.chars().take(MAX - 1).collect();
+        format!("{truncated}…")
+    } else if line.is_empty() {
+        "(untitled memory)".to_string()
+    } else {
+        line.to_string()
+    }
+}
+
+/// `search` worker (ChatGPT-connector alias over recall). Returns a JSON string
+/// `{"results":[{"id","title","url"}]}` — the shape the standard ChatGPT search
+/// tool expects. Empty `results` when nothing matches (not an error).
+fn search_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result<String, String> {
+    let q_emb = embed_query(query, ctx)?;
+    let mut scopes = vec!["personal".to_string()];
+    if let Some(s) = scope {
+        if s != "personal" {
+            scopes.push(s.to_string());
+        }
+    }
+    let store = ctx
+        .memory
+        .lock()
+        .map_err(|_| "memory lock poisoned".to_string())?;
+    let hits = recall(&store, &scopes, &q_emb, &RecallParams::default());
+    let results: Vec<Value> = hits
+        .iter()
+        .map(|h| {
+            json!({
+                "id": h.record.id,
+                "title": title_for(&h.record.body),
+                "url": memory_url(&h.record.scope, &h.record.id),
+            })
+        })
+        .collect();
+    serde_json::to_string(&json!({ "results": results }))
+        .map_err(|e| format!("serialize results: {e}"))
+}
+
+/// `fetch` worker (ChatGPT-connector alias). Resolves a record id to its full
+/// stored text, returning JSON `{"id","title","text","url","metadata"}`.
+fn fetch_blocking(doc_id: &str, ctx: &McpContext) -> Result<String, String> {
+    let store = ctx
+        .memory
+        .lock()
+        .map_err(|_| "memory lock poisoned".to_string())?;
+    let rec = store
+        .get(doc_id)
+        .ok_or_else(|| format!("no memory record with id={doc_id}"))?;
+    let doc = json!({
+        "id": rec.id,
+        "title": title_for(&rec.body),
+        "text": rec.body,
+        "url": memory_url(&rec.scope, &rec.id),
+        "metadata": { "scope": rec.scope, "ts": rec.ts },
+    });
+    serde_json::to_string(&doc).map_err(|e| format!("serialize document: {e}"))
+}
+
 /// `axiom_forget` worker. Tombstones an id in its scope.
 fn forget_blocking(mem_id: &str, scope: &str, ctx: &McpContext) -> Result<String, String> {
     let store = ctx
@@ -930,7 +1057,7 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 10);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
@@ -965,6 +1092,34 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"axiom_immunity"));
+    }
+
+    #[test]
+    fn tools_list_includes_chatgpt_search_fetch_aliases() {
+        // The standard ChatGPT connector requires tools literally named
+        // `search` and `fetch`; assert both are present with the right required
+        // params so a standard-mode connector can attach.
+        let list = tools_list();
+        let tools = list["tools"].as_array().unwrap();
+        let search = tools.iter().find(|t| t["name"] == "search").unwrap();
+        let fetch = tools.iter().find(|t| t["name"] == "fetch").unwrap();
+        assert_eq!(search["inputSchema"]["required"][0], "query");
+        assert_eq!(fetch["inputSchema"]["required"][0], "id");
+    }
+
+    #[test]
+    fn title_for_takes_first_nonempty_line_and_truncates() {
+        assert_eq!(title_for("\n\nhello world\nmore"), "hello world");
+        assert_eq!(title_for("   "), "(untitled memory)");
+        let long = "x".repeat(200);
+        let t = title_for(&long);
+        assert!(t.chars().count() <= 80, "title too long: {}", t.chars().count());
+        assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn memory_url_is_stable_and_opaque() {
+        assert_eq!(memory_url("personal", "abc123"), "axiom-memory://personal/abc123");
     }
 
     #[test]

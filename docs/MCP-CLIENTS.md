@@ -68,12 +68,21 @@ Then expose the endpoint to ChatGPT (publicly or via a tunnel like `cloudflared`
 / `ngrok`) and add it as a **custom connector** pointing at `https://<host>/mcp`,
 configuring the bearer token in the connector's auth settings.
 
-> **Caveats (verify against current ChatGPT docs):** ChatGPT's standard connector
-> mode expects `search`/`fetch` tools — Axiom exposes its own tool names, which
-> work under ChatGPT **Developer Mode** (arbitrary MCP tools). Adding
-> `search`/`fetch` aliases (mapping to compress/expand/recall) for standard-mode
-> compatibility is a tracked follow-up. Because connector behavior must be tested
-> against your live ChatGPT, treat first-time setup as needing a quick smoke test.
+Axiom also exposes the two tools ChatGPT's **standard** connector mode requires —
+`search` and `fetch` — as first-class aliases over its semantic memory:
+
+- `search(query)` → ranked memory hits as `{"results":[{"id","title","url"}]}`.
+- `fetch(id)` → the full record for a `search` result id as
+  `{"id","title","text","url","metadata"}`.
+
+So Axiom works as a standard ChatGPT connector (not only Developer Mode). Axiom's
+richer tools (`axiom_compress_path`, `axiom_evaluate_drift`, `axiom_expand`,
+`axiom_remember`, `axiom_recall`, `axiom_forget`, `axiom_verify`,
+`axiom_immunity`) remain available under **Developer Mode** (arbitrary MCP tools).
+
+> **Caveat (verify against current ChatGPT docs):** connector behavior must be
+> tested against your live ChatGPT, so treat first-time setup as needing a quick
+> smoke test — the `search`/`fetch` contract ChatGPT expects can change.
 
 ## What this is *not*
 
