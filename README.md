@@ -111,11 +111,15 @@ optional** — a tiny model is bootstrapped offline by `axiom init`, and you can
 point axiom at a bigger brain when you want one:
 
 - **Local, zero-cost** — serve an open model (default **Qwen2.5-Coder-32B**) via
-  [OpenDrop](https://github.com/fernandogarzaaa/OpenDrop) and set
-  `AXIOM_BACKEND=openai` + `OPENAI_BASE_URL`.
-- **Cloud** — `AXIOM_BACKEND=openai|anthropic` with an API key.
+  [OpenDrop](https://github.com/fernandogarzaaa/OpenDrop): `AXIOM_BACKEND=opendrop`
+  auto-targets the local server, or use `AXIOM_BACKEND=openai` + `OPENAI_BASE_URL`
+  for any other host/port (Ollama, vLLM).
+- **Cloud** — `AXIOM_BACKEND=openai` or `AXIOM_BACKEND=anthropic` with an API key.
+- **GPT + Claude together** — `AXIOM_BACKEND=router` routes by task
+  (code→Claude, else→GPT) with failover and opt-in consensus.
 - **Your ChatGPT/Claude subscription** — drive axiom's tools from the app via MCP
-  (zero API cost).
+  (zero API cost); works from Claude over stdio and from the ChatGPT connector
+  over remote HTTP (`AXIOM_MCP_HTTP=1`).
 
 See [`docs/BACKENDS.md`](docs/BACKENDS.md) (backends + model recommendations) and
 [`docs/MCP-CLIENTS.md`](docs/MCP-CLIENTS.md) (use axiom from Claude/ChatGPT). The

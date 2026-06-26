@@ -813,21 +813,49 @@ impl InquiryAdapter for MockAdapter {
     }
 }
 
+/// Default token budget for a belief `inquire` (kept modest — beliefs want a
+/// claim + brief justification, not an essay).
+const INQUIRE_MAX_TOKENS: usize = 256;
+
+/// Map a ChimeraLang agent identifier (e.g. `[claude]`, `[gpt]`, `[local]`) to a
+/// router [`Provider`](crate::backend_router::Provider). Returns `None` for
+/// unrecognized or empty hints so the router uses its default task routing.
+fn provider_for_agent(agent: &str) -> Option<crate::backend_router::Provider> {
+    use crate::backend_router::Provider;
+    match agent.trim().to_ascii_lowercase().as_str() {
+        "claude" | "anthropic" => Some(Provider::Anthropic),
+        "gpt" | "openai" | "chatgpt" => Some(Provider::OpenAi),
+        "local" | "opendrop" | "bootstrap" => Some(Provider::Local),
+        _ => None,
+    }
+}
+
+/// First recognized provider among the listed agents (so `agents: [claude]`
+/// pins Claude). `None` when the list is empty or names nothing routable.
+fn pinned_provider(agents: &[String]) -> Option<crate::backend_router::Provider> {
+    agents.iter().find_map(|a| provider_for_agent(a))
+}
+
 /// Grounds `inquire` in Axiom's multi-provider [`crate::backend_router::Router`]
 /// — so a belief's evidence comes from a real model (GPT/Claude/local), and the
 /// router's consensus confidence flows straight into the belief's Beta update.
-/// Treated as a reasoning task. Falls back to a neutral, low-confidence response
-/// if every backend is unavailable (so programs still complete).
+/// Treated as a reasoning task. The belief's `agents` list pins a provider when
+/// it names one (`[claude]`/`[gpt]`/`[local]`); otherwise default routing
+/// applies. Falls back to a neutral, low-confidence response if every backend is
+/// unavailable (so programs still complete).
 pub struct RouterAdapter<'a> {
     pub router: &'a crate::backend_router::Router,
 }
 
 impl InquiryAdapter for RouterAdapter<'_> {
-    fn inquire(&self, prompt: &str, _agents: &[String]) -> InquiryResponse {
-        match self
-            .router
-            .generate(crate::backend_router::TaskKind::Reasoning, prompt)
-        {
+    fn inquire(&self, prompt: &str, agents: &[String]) -> InquiryResponse {
+        let pinned = pinned_provider(agents);
+        match self.router.generate_to(
+            pinned,
+            crate::backend_router::TaskKind::Reasoning,
+            prompt,
+            INQUIRE_MAX_TOKENS,
+        ) {
             Ok(a) => InquiryResponse {
                 confidence: a.confidence,
                 answer: Some(a.text),
@@ -1115,7 +1143,7 @@ mod tests {
         use crate::backend_router::{BackendError, ChatBackend, Provider, RoutePolicy, Router};
         struct Confident;
         impl ChatBackend for Confident {
-            fn complete(&self, _p: &str) -> Result<String, BackendError> {
+            fn complete(&self, _p: &str, _max_tokens: usize) -> Result<String, BackendError> {
                 Ok("black holes form from stellar collapse".into())
             }
         }
@@ -1137,5 +1165,49 @@ mod tests {
             res.emitted
         );
         assert!(res.beliefs.contains_key("cause"));
+    }
+
+    #[test]
+    fn agent_hint_maps_to_provider() {
+        use crate::backend_router::Provider;
+        assert_eq!(provider_for_agent("claude"), Some(Provider::Anthropic));
+        assert_eq!(provider_for_agent("GPT"), Some(Provider::OpenAi));
+        assert_eq!(provider_for_agent("local"), Some(Provider::Local));
+        assert_eq!(provider_for_agent("opendrop"), Some(Provider::Local));
+        assert_eq!(provider_for_agent("nonsense"), None);
+        assert_eq!(
+            pinned_provider(&["x".into(), "claude".into()]),
+            Some(Provider::Anthropic),
+            "first recognized agent wins"
+        );
+        assert_eq!(pinned_provider(&[]), None);
+    }
+
+    #[test]
+    fn router_adapter_honors_agent_pin() {
+        use crate::backend_router::{BackendError, ChatBackend, Provider, RoutePolicy, Router};
+        struct Says(&'static str);
+        impl ChatBackend for Says {
+            fn complete(&self, _p: &str, _max_tokens: usize) -> Result<String, BackendError> {
+                Ok(self.0.to_string())
+            }
+        }
+        // Both providers present; `agents: [claude]` must pull Claude even though
+        // reasoning's default primary is OpenAi.
+        let router = Router::new(RoutePolicy::default())
+            .with(Provider::OpenAi, Box::new(Says("from-gpt")))
+            .with(Provider::Anthropic, Box::new(Says("from-claude")));
+        let adapter = RouterAdapter { router: &router };
+        let src = r#"
+            belief b := inquire { prompt: "q", agents: [claude], ttl: 0 }
+            emit b
+        "#;
+        let prog = parse(src).unwrap();
+        let res = run(&prog, &adapter).unwrap();
+        assert!(
+            res.emitted.iter().any(|e| e.contains("from-claude")),
+            "agent pin [claude] should route to Anthropic, got {:?}",
+            res.emitted
+        );
     }
 }

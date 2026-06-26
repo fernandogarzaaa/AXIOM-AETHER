@@ -11,10 +11,14 @@ trained model — the brain is pluggable and optional.
 | `AXIOM_BACKEND` | Brain | Cost | Notes |
 |---|---|---|---|
 | `bootstrap` (default) | Axiom's tiny local TTT model | free, offline | auto-trained by `axiom init`; weak at generation, fine for the cognition loops |
-| `opendrop` | Local OpenDrop server | free, local | defaults `OPENAI_BASE_URL` to `http://127.0.0.1:11434/v1` — just `opendrop run <model>` |
+| `opendrop` | Local OpenDrop server | free, local | auto-targets a local OpenDrop server at `http://127.0.0.1:11434` — just `opendrop run <model>` |
 | `openai` | Any OpenAI-compatible endpoint | depends | cloud OpenAI **or** a local server (OpenDrop, Ollama, vLLM) |
 | `anthropic` | Claude (Anthropic API) | metered | needs `ANTHROPIC_API_KEY` |
 | `router` | **GPT + Claude + local together** | metered | routes by task (code→Claude, else→GPT), with failover; opt-in consensus |
+
+`openai`, `opendrop`, and `router` all build the same internal multi-provider
+router (with the local TTT pipeline as a deterministic last-resort fallback);
+`openai`/`opendrop` simply pin every task to the one OpenAI-compatible endpoint.
 
 ### Router mode (`AXIOM_BACKEND=router`)
 
@@ -48,7 +52,7 @@ the `openai` backend:
 
 ```bash
 opendrop run Qwen2.5-Coder-32B          # serves OpenAI-compatible API on :11434
-export AXIOM_BACKEND=opendrop            # auto-targets http://127.0.0.1:11434/v1
+export AXIOM_BACKEND=opendrop            # auto-targets the local server at :11434
 axiom --mode server                      # axiom now generates via the local model
 ```
 
@@ -63,10 +67,13 @@ on a non-default host/port, e.g. Ollama or vLLM.)
 | Laptop | Qwen2.5-Coder-7B / 14B, Llama-3.1-8B, Phi-4 | 5–10 GB | Apache / Llama / MIT |
 | Reasoning (ChimeraLang beliefs) | DeepSeek-R1-Distill-Qwen-32B, QwQ-32B | ~20 GB | Apache |
 | GLM family, runnable | GLM-4.5-Air (106B MoE) | ~40–60 GB | MIT |
-| Frontier (multi-GPU) | DeepSeek-V3, GLM-4.5 (355B) | large | MIT |
+| Frontier (multi-GPU) | DeepSeek-V3, GLM-4.5 (355B), GLM-5.2 (744B MoE) | large | MIT |
 
-> GLM-5.2 (754B, ~1.5 TB BF16) is impractical for most hardware — prefer
-> Qwen2.5-Coder-32B as the default and GLM-4.5-Air as the high-end GLM option.
+> GLM-5.2 is a released MIT-licensed MoE (~744B total / ~40B active per token).
+> Even as a sparse MoE it needs multi-GPU / lots of RAM for the full weights, so
+> for most hardware prefer Qwen2.5-Coder-32B as the default and GLM-4.5-Air as a
+> runnable GLM option; reach for GLM-5.2 only when you have the capacity for a
+> frontier model.
 
 ## Using your ChatGPT / Claude **subscriptions** (not API)
 

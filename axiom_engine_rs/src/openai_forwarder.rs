@@ -16,7 +16,18 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 /// server (OpenAI-compatible). Used when `AXIOM_BACKEND=opendrop` and no explicit
 /// base URL is set, so `opendrop run <model>` + `AXIOM_BACKEND=opendrop` "just
 /// works" against a local model with zero per-token cost.
-const OPENDROP_DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+///
+/// This is a **bare host with no `/v1` suffix**: the forwarder appends the full
+/// `/v1/chat/completions` path itself (see [`chat_completions_url`]). Including
+/// `/v1` here would produce a doubled `/v1/v1/chat/completions`.
+const OPENDROP_DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
+
+/// Compose the upstream Chat Completions URL from a base. Centralized + pure so
+/// the `/v1` path is appended in exactly one place and is unit-testable (guards
+/// against the `/v1/v1` doubling regression).
+fn chat_completions_url(base: &str) -> String {
+    format!("{}/v1/chat/completions", base.trim_end_matches('/'))
+}
 
 /// Resolve the effective OpenAI-compatible base URL from env signals. An explicit
 /// `OPENAI_BASE_URL`/`OPENAI_API_BASE` always wins; otherwise `AXIOM_BACKEND=opendrop`
@@ -92,10 +103,7 @@ impl OpenAiForwarder {
         payload: &Value,
         auth: &OpenAiClientAuth,
     ) -> Result<OpenAiForwardedResponse, OpenAiForwarderError> {
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = chat_completions_url(&self.base_url);
         let mut request = self
             .client
             .post(&url)
@@ -175,7 +183,36 @@ impl std::error::Error for OpenAiForwarderError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{bearer_value, resolve_base_url, OPENDROP_DEFAULT_BASE_URL};
+    use super::{
+        bearer_value, chat_completions_url, resolve_base_url, OPENDROP_DEFAULT_BASE_URL,
+    };
+
+    #[test]
+    fn opendrop_default_base_has_no_v1_suffix() {
+        // The forwarder appends `/v1/chat/completions`; the base must NOT carry
+        // its own `/v1` or the final URL doubles it.
+        assert!(
+            !OPENDROP_DEFAULT_BASE_URL.ends_with("/v1"),
+            "opendrop base must be a bare host, got {OPENDROP_DEFAULT_BASE_URL}"
+        );
+        assert_eq!(
+            chat_completions_url(OPENDROP_DEFAULT_BASE_URL),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_appends_v1_path_once() {
+        assert_eq!(
+            chat_completions_url("https://api.openai.com"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // Trailing slash is trimmed (no double slash).
+        assert_eq!(
+            chat_completions_url("https://api.openai.com/"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
 
     #[test]
     fn bearer_value_does_not_double_prefix() {
