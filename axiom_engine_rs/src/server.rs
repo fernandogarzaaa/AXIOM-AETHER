@@ -43,6 +43,7 @@ use uuid::Uuid;
 use crate::anthropic_forwarder::{
     build_compressed_payload, partition_messages, AnthropicForwarder, ClientAuth, ForwarderError,
 };
+use crate::backend_router::{Router as BackendRouter, TaskKind};
 use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
@@ -228,6 +229,19 @@ pub struct AppState {
     /// Optional Anthropic Claude backend. When `Some`, generation is
     /// routed through Claude instead of the local Axiom-TTT pipeline.
     pub claude_backend: Arc<Option<ClaudeBackend>>,
+    /// Multi-provider router (`AXIOM_BACKEND=router`): when present, generation is
+    /// routed across GPT/Claude/local with failover/consensus. `None` ⇒ the
+    /// default single-backend path.
+    pub router: Arc<Option<BackendRouter>>,
+    /// Remote MCP context (`AXIOM_MCP_HTTP=1`): when present, the `/mcp` route
+    /// exposes Axiom's MCP tools over HTTP (for the ChatGPT connector / Claude
+    /// remote connectors), sharing the same dispatch as the stdio server.
+    pub mcp: Arc<Option<crate::mcp_stdio::McpContext>>,
+    /// Optional bearer token guarding the remote `/mcp` transport
+    /// (`AXIOM_MCP_TOKEN`). When `Some`, `/mcp` requests must present
+    /// `Authorization: Bearer <token>`; when `None`, `/mcp` is unauthenticated
+    /// (intended only for trusted/local networks).
+    pub mcp_token: Arc<Option<String>>,
     /// Active-compression session store: per-tenant adapted fast-weight
     /// tensors held in a lock-free DashMap. Distinct from `sessions`
     /// above (which serves the legacy `/v1/sessions` API); this store
@@ -284,6 +298,9 @@ impl AppState {
             sequence_versions: Arc::new(RwLock::new(HashMap::new())),
             model_id,
             claude_backend: Arc::new(None),
+            router: Arc::new(None),
+            mcp: Arc::new(None),
+            mcp_token: Arc::new(None),
             ttt_sessions: Arc::new(TttSessionStore::new()),
             anthropic_forwarder: Arc::new(None),
             openai_forwarder: Arc::new(None),
@@ -597,6 +614,25 @@ impl AppState {
     /// Install a Claude backend on this app state, replacing any existing one.
     pub fn with_claude_backend(mut self, backend: Option<ClaudeBackend>) -> Self {
         self.claude_backend = Arc::new(backend);
+        self
+    }
+
+    /// Install the multi-provider router (`AXIOM_BACKEND=router`). `None` keeps
+    /// the default single-backend generation path.
+    pub fn with_router(mut self, router: Option<BackendRouter>) -> Self {
+        self.router = Arc::new(router);
+        self
+    }
+
+    /// Install the remote MCP context, enabling the `/mcp` HTTP route.
+    pub fn with_mcp(mut self, mcp: Option<crate::mcp_stdio::McpContext>) -> Self {
+        self.mcp = Arc::new(mcp);
+        self
+    }
+
+    /// Set the optional bearer token guarding the `/mcp` route.
+    pub fn with_mcp_token(mut self, token: Option<String>) -> Self {
+        self.mcp_token = Arc::new(token);
         self
     }
 
@@ -1758,6 +1794,16 @@ fn run_generation(
     max_tokens: usize,
     session_id: Option<&str>,
 ) -> Result<String, ApiError> {
+    // Router mode (AXIOM_BACKEND=router): GPT + Claude + local together, with
+    // failover. Generation is delegated to external providers, so session TTT
+    // state does not apply here.
+    if let Some(router) = state.router.as_ref() {
+        return router
+            .generate(TaskKind::General, prompt, max_tokens)
+            .map(|a| a.text)
+            .map_err(|e| ApiError::Internal(format!("router generation failed: {e}")));
+    }
+
     if let Some(backend) = state.claude_backend.as_ref() {
         return backend
             .generate(prompt, max_tokens)
@@ -3183,6 +3229,7 @@ pub fn create_router(state: AppState) -> Router {
             post(post_patches_merge).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route("/v1/chimera/run", post(post_chimera_run))
+        .route("/mcp", get(mcp_http_sse).post(post_mcp))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -3634,10 +3681,15 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
 
 /// `POST /v1/chimera/run` — execute a ChimeraLang program with AXIOM's in-tree
 /// implementation ([`crate::chimera`]). Body: `{"source": "..."}`. Returns the
-/// emitted values, belief means, guard violations, and trace. Beliefs are
-/// answered by the default mock adapter here; grounding `inquire` in AXIOM's
-/// model is the Phase-2 follow-up (the `InquiryAdapter` seam already exists).
-async fn post_chimera_run(body: String) -> axum::response::Response {
+/// emitted values, belief means, guard violations, and trace. When a generation
+/// router is configured (`AXIOM_BACKEND=router/openai/opendrop`), `inquire`
+/// beliefs are grounded in it via [`crate::chimera::RouterAdapter`] (with agent
+/// pins like `[claude]`/`[gpt]` honored); otherwise the offline mock adapter is
+/// used so programs still run.
+async fn post_chimera_run(
+    State(state): State<AppState>,
+    body: String,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
     let source = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(v) => v
@@ -3653,7 +3705,24 @@ async fn post_chimera_run(body: String) -> axum::response::Response {
         )
             .into_response();
     };
-    match crate::chimera::run_source(&source, None) {
+    // Ground beliefs in the live router when available. The router's HTTP
+    // backends are blocking, so run on a blocking thread (cloning the Arc to keep
+    // the adapter's borrow `'static`).
+    let result = if state.router.is_some() {
+        let router_arc = state.router.clone();
+        let src = source.clone();
+        tokio::task::spawn_blocking(move || {
+            // Safe: router_arc.is_some() checked above and the Arc keeps it alive.
+            let router = router_arc.as_ref().as_ref().unwrap();
+            let adapter = crate::chimera::RouterAdapter { router };
+            crate::chimera::run_source(&src, Some(&adapter))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("chimera execution task panicked: {e}")))
+    } else {
+        crate::chimera::run_source(&source, None)
+    };
+    match result {
         Ok(res) => Json(serde_json::json!({
             "emitted": res.emitted,
             "beliefs": res.beliefs,
@@ -3667,6 +3736,92 @@ async fn post_chimera_run(body: String) -> axum::response::Response {
         )
             .into_response(),
     }
+}
+
+/// Check the `Authorization: Bearer <token>` header against the configured
+/// `AXIOM_MCP_TOKEN`. Returns `None` when access is allowed (no token configured,
+/// or the presented token matches) and `Some(401 response)` when it must be
+/// rejected. The token is a pre-shared secret carried over TLS, so a plain
+/// equality check (not constant-time) is acceptable here.
+fn mcp_unauthorized(state: &AppState, headers: &axum::http::HeaderMap) -> Option<Response> {
+    use axum::response::IntoResponse;
+    let expected = state.mcp_token.as_ref().as_ref()?; // None ⇒ open access
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .map(str::trim);
+    if presented == Some(expected.as_str()) {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "missing or invalid bearer token for /mcp (set Authorization: Bearer <AXIOM_MCP_TOKEN>)"
+                })),
+            )
+                .into_response(),
+        )
+    }
+}
+
+/// `POST /mcp` — remote MCP transport. Dispatches a JSON-RPC 2.0 request against
+/// Axiom's MCP tools (the same dispatch the stdio server uses) and returns the
+/// JSON-RPC response. Enables ChatGPT connectors and Claude remote connectors to
+/// drive Axiom over HTTP. Returns 503 unless started with `AXIOM_MCP_HTTP=1`,
+/// and 401 if `AXIOM_MCP_TOKEN` is set and the bearer token is missing/wrong.
+async fn post_mcp(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = mcp_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let ctx = match state.mcp.as_ref() {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "MCP HTTP transport disabled; start the server with AXIOM_MCP_HTTP=1"
+                })),
+            )
+                .into_response();
+        }
+    };
+    match crate::mcp_stdio::dispatch(&body, ctx).await {
+        // Request → JSON-RPC response.
+        Some(resp) => Json(resp).into_response(),
+        // Notification (no id) → accepted, no body.
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// `GET /mcp` — SSE stream for Streamable-HTTP MCP clients that open a stream for
+/// server-initiated messages. Axiom's tool calls are request/response (handled by
+/// `POST /mcp`), so this stream just stays open with keep-alive pings.
+async fn mcp_http_sse(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Some(resp) = mcp_unauthorized(&state, &headers) {
+        return resp;
+    }
+    if state.mcp.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MCP HTTP transport disabled; start the server with AXIOM_MCP_HTTP=1",
+        )
+            .into_response();
+    }
+    let keepalive = stream::pending::<Result<Event, std::convert::Infallible>>();
+    Sse::new(keepalive)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Map a friendly compression "level" to a per-message threshold (whitespace
@@ -3918,6 +4073,58 @@ pub async fn run_server(
         .with_compressor_config(compressor_config)
         .with_master_vibe(master_vibe)
         .with_heal_memory_path(heal_memory_path);
+    // AXIOM_BACKEND=router/openai/opendrop: assemble the multi-provider router
+    // from the live pipeline + Claude (ANTHROPIC_API_KEY) + OpenAI creds. None
+    // unless one of those modes is set. Built on a blocking thread because it
+    // constructs `reqwest::blocking` clients, which panic if created inside the
+    // Tokio runtime.
+    let pipeline_for_router = state.pipeline.clone();
+    let router = tokio::task::spawn_blocking(move || {
+        crate::backend_live::router_from_env(pipeline_for_router)
+    })
+    .await
+    .expect("router_from_env build task panicked");
+    if router.is_some() {
+        println!(
+            "[+] AXIOM_BACKEND router mode — generation routed across configured providers \
+             (GPT/Claude/local), with failover"
+        );
+    }
+    let state = state.with_router(router);
+
+    // Remote MCP transport (AXIOM_MCP_HTTP=1): expose Axiom's MCP tools over HTTP
+    // at /mcp so the ChatGPT connector and Claude remote connectors can attach.
+    // Builds a dedicated MCP context (own pipeline/vibe/memory) like the stdio
+    // server; a build failure disables /mcp rather than taking the server down.
+    let mcp_token = std::env::var("AXIOM_MCP_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    let mcp = if std::env::var("AXIOM_MCP_HTTP").map(|v| v == "1").unwrap_or(false) {
+        match crate::mcp_stdio::build_context(config.clone(), device.clone(), checkpoint_path.to_string())
+            .await
+        {
+            Ok(c) => {
+                println!("[+] AXIOM_MCP_HTTP=1 — MCP tools served at POST /mcp (remote connectors)");
+                if mcp_token.is_some() {
+                    println!("[+] /mcp requires a bearer token (AXIOM_MCP_TOKEN set)");
+                } else {
+                    eprintln!(
+                        "[axiom] WARNING: /mcp is UNAUTHENTICATED. Anyone who can reach this \
+                         endpoint can drive Axiom's tools. Set AXIOM_MCP_TOKEN before exposing \
+                         it publicly (e.g. through a tunnel)."
+                    );
+                }
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("[axiom] /mcp disabled: failed to build MCP context: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let state = state.with_mcp(mcp).with_mcp_token(mcp_token);
     if state.compression_active() {
         match state.hydrate_compression_cache().await {
             Ok(0) => println!(
@@ -4367,6 +4574,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_http_route_returns_503_when_disabled() {
+        // Without AXIOM_MCP_HTTP the context is None, so /mcp must refuse cleanly
+        // (not 404, not 500) so clients get an actionable error.
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("AXIOM_MCP_HTTP"));
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn router_mode_routes_generation_through_the_router() {
+        use crate::backend_router::{
+            BackendError, ChatBackend, Provider, RoutePolicy, Router as BR,
+        };
+        struct Mock;
+        impl ChatBackend for Mock {
+            fn complete(&self, _p: &str, _max_tokens: usize) -> Result<String, BackendError> {
+                Ok("routed-answer".into())
+            }
+        }
+        // General task routes to OpenAi by default; register the mock there.
+        let router = BR::new(RoutePolicy::default()).with(Provider::OpenAi, Box::new(Mock));
+        let state = make_test_state().await.with_router(Some(router));
+        let pipeline_arc = state.pipeline.clone();
+        // run_generation must short-circuit to the router, not the local pipeline.
+        let out = run_generation(&state, "hello", 8, None).unwrap();
+        assert_eq!(out, "routed-answer");
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
     async fn test_chimera_run_endpoint_executes_a_program() {
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
@@ -4391,6 +4646,66 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["emitted"], serde_json::json!(["1", "2", "3"]));
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_route_rejects_missing_token_when_configured() {
+        // With a token configured, an unauthenticated /mcp request is 401 — and
+        // the auth check runs *before* the 503 disabled check, so a missing token
+        // is rejected even when the MCP context itself is disabled.
+        let state = make_test_state()
+            .await
+            .with_mcp_token(Some("s3cret".into()));
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+
+        // No Authorization header → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong token → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer wrong")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct token passes the auth gate; MCP is disabled here so it falls
+        // through to 503 (proving auth succeeded, not 401).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer s3cret")
+                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         safe_drop(pipeline_arc).await;
     }
 

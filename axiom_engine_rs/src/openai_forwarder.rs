@@ -12,6 +12,40 @@ use reqwest::Client;
 use serde_json::Value;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+/// Default endpoint for a local [OpenDrop](https://github.com/fernandogarzaaa/OpenDrop)
+/// server (OpenAI-compatible). Used when `AXIOM_BACKEND=opendrop` and no explicit
+/// base URL is set, so `opendrop run <model>` + `AXIOM_BACKEND=opendrop` "just
+/// works" against a local model with zero per-token cost.
+///
+/// This is a **bare host with no `/v1` suffix**: the forwarder appends the full
+/// `/v1/chat/completions` path itself (see [`chat_completions_url`]). Including
+/// `/v1` here would produce a doubled `/v1/v1/chat/completions`.
+const OPENDROP_DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
+
+/// Compose the upstream Chat Completions URL from a base. Centralized + pure so
+/// the `/v1` path is appended in exactly one place and is unit-testable (guards
+/// against the `/v1/v1` doubling regression).
+fn chat_completions_url(base: &str) -> String {
+    format!("{}/v1/chat/completions", base.trim_end_matches('/'))
+}
+
+/// Resolve the effective OpenAI-compatible base URL from env signals. An explicit
+/// `OPENAI_BASE_URL`/`OPENAI_API_BASE` always wins; otherwise `AXIOM_BACKEND=opendrop`
+/// selects the local OpenDrop endpoint; otherwise `None` (caller falls back to the
+/// real OpenAI default). Pure so it is unit-testable without touching process env.
+fn resolve_base_url(
+    backend: Option<&str>,
+    openai_base_url: Option<String>,
+    openai_api_base: Option<String>,
+) -> Option<String> {
+    if let Some(explicit) = openai_base_url.or(openai_api_base) {
+        return Some(explicit);
+    }
+    if backend.map(|b| b.eq_ignore_ascii_case("opendrop")).unwrap_or(false) {
+        return Some(OPENDROP_DEFAULT_BASE_URL.to_string());
+    }
+    None
+}
 
 /// Auth / relay headers captured from the inbound OpenAI-compatible request.
 #[derive(Clone, Debug, Default)]
@@ -46,9 +80,11 @@ impl OpenAiForwarder {
         let api_key = std::env::var("OPENAI_API_KEY")
             .ok()
             .filter(|k| !k.trim().is_empty());
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .ok()
-            .or_else(|| std::env::var("OPENAI_API_BASE").ok());
+        let base_url = resolve_base_url(
+            std::env::var("AXIOM_BACKEND").ok().as_deref(),
+            std::env::var("OPENAI_BASE_URL").ok(),
+            std::env::var("OPENAI_API_BASE").ok(),
+        );
         Some(Self::new(api_key, base_url))
     }
 
@@ -67,10 +103,7 @@ impl OpenAiForwarder {
         payload: &Value,
         auth: &OpenAiClientAuth,
     ) -> Result<OpenAiForwardedResponse, OpenAiForwarderError> {
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = chat_completions_url(&self.base_url);
         let mut request = self
             .client
             .post(&url)
@@ -150,12 +183,72 @@ impl std::error::Error for OpenAiForwarderError {}
 
 #[cfg(test)]
 mod tests {
-    use super::bearer_value;
+    use super::{
+        bearer_value, chat_completions_url, resolve_base_url, OPENDROP_DEFAULT_BASE_URL,
+    };
+
+    #[test]
+    fn opendrop_default_base_has_no_v1_suffix() {
+        // The forwarder appends `/v1/chat/completions`; the base must NOT carry
+        // its own `/v1` or the final URL doubles it.
+        assert!(
+            !OPENDROP_DEFAULT_BASE_URL.ends_with("/v1"),
+            "opendrop base must be a bare host, got {OPENDROP_DEFAULT_BASE_URL}"
+        );
+        assert_eq!(
+            chat_completions_url(OPENDROP_DEFAULT_BASE_URL),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_appends_v1_path_once() {
+        assert_eq!(
+            chat_completions_url("https://api.openai.com"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        // Trailing slash is trimmed (no double slash).
+        assert_eq!(
+            chat_completions_url("https://api.openai.com/"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
 
     #[test]
     fn bearer_value_does_not_double_prefix() {
         assert_eq!(bearer_value("sk-test"), "Bearer sk-test");
         assert_eq!(bearer_value("Bearer sk-test"), "Bearer sk-test");
         assert_eq!(bearer_value("bearer sk-test"), "bearer sk-test");
+    }
+
+    #[test]
+    fn opendrop_backend_defaults_to_local_endpoint() {
+        assert_eq!(
+            resolve_base_url(Some("opendrop"), None, None).as_deref(),
+            Some(OPENDROP_DEFAULT_BASE_URL)
+        );
+        // Case-insensitive.
+        assert_eq!(
+            resolve_base_url(Some("OpenDrop"), None, None).as_deref(),
+            Some(OPENDROP_DEFAULT_BASE_URL)
+        );
+    }
+
+    #[test]
+    fn explicit_base_url_always_wins() {
+        assert_eq!(
+            resolve_base_url(Some("opendrop"), Some("http://x:1/v1".into()), None).as_deref(),
+            Some("http://x:1/v1")
+        );
+        assert_eq!(
+            resolve_base_url(None, None, Some("http://y:2/v1".into())).as_deref(),
+            Some("http://y:2/v1")
+        );
+    }
+
+    #[test]
+    fn no_signal_falls_back_to_default() {
+        assert_eq!(resolve_base_url(None, None, None), None);
+        assert_eq!(resolve_base_url(Some("openai"), None, None), None);
     }
 }
