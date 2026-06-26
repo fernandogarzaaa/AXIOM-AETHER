@@ -378,6 +378,58 @@ fn tools_list() -> Value {
                         "command": { "type": "string", "description": "Optional case-insensitive command substring to filter by (e.g. 'cargo build'). Omit to list everything Axiom has learned." }
                     }
                 }
+            },
+            {
+                "name": "search",
+                "description": "Search Axiom's long-term memory and return a ranked list of matching records as {id, title, url}. This is the standard ChatGPT-connector `search` tool (paired with `fetch`): call `search` to find relevant memories, then `fetch` with a result id to read the full text. Internally an alias over Axiom's semantic memory recall.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "What to search Axiom's memory for." },
+                        "scope": { "type": "string", "description": "Optional project scope to include alongside 'personal'." }
+                    },
+                    "required": ["query"]
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "results": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "title": { "type": "string" },
+                                    "url": { "type": "string" }
+                                },
+                                "required": ["id", "title", "url"]
+                            }
+                        }
+                    },
+                    "required": ["results"]
+                }
+            },
+            {
+                "name": "fetch",
+                "description": "Fetch the full text of a single Axiom memory record by its id (an id returned by `search`). Returns {id, title, text, url, metadata}. This is the standard ChatGPT-connector `fetch` tool that pairs with `search`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "The record id from a `search` result." }
+                    },
+                    "required": ["id"]
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "title": { "type": "string" },
+                        "text": { "type": "string" },
+                        "url": { "type": "string" },
+                        "metadata": { "type": ["object", "null"] }
+                    },
+                    "required": ["id", "title", "text", "url", "metadata"]
+                }
             }
         ]
     })
@@ -570,6 +622,40 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .await
             .unwrap_or_else(|e| format!("worker join error: {e}"));
             success_response(id, tool_text_result(&outcome, false))
+        }
+        "search" => {
+            let Some(query) = args.get("query").and_then(Value::as_str) else {
+                return error_response(id, -32602, "search requires string 'query'");
+            };
+            let query = query.to_string();
+            let scope = args
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            let ctx = ctx.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                search_blocking(&query, scope.as_deref(), &ctx)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            match outcome {
+                Ok(value) => success_response(id, tool_structured_result(value, false)),
+                Err(e) => success_response(id, tool_text_result(&format!("search failed: {e}"), true)),
+            }
+        }
+        "fetch" => {
+            let Some(doc_id) = args.get("id").and_then(Value::as_str) else {
+                return error_response(id, -32602, "fetch requires string 'id'");
+            };
+            let doc_id = doc_id.to_string();
+            let ctx = ctx.clone();
+            let outcome = tokio::task::spawn_blocking(move || fetch_blocking(&doc_id, &ctx))
+                .await
+                .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            match outcome {
+                Ok(value) => success_response(id, tool_structured_result(value, false)),
+                Err(e) => success_response(id, tool_text_result(&format!("fetch failed: {e}"), true)),
+            }
         }
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
     }
@@ -854,6 +940,140 @@ fn recall_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result
     Ok(out)
 }
 
+/// Percent-encode a URI segment: RFC 3986 unreserved characters pass through,
+/// everything else becomes `%XX`. Keeps memory locators/ids valid for scopes
+/// like `project:acme` (a raw `:` would otherwise be misread).
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Inverse of [`pct_encode`]. Invalid escapes are passed through literally so it
+/// never panics on malformed input.
+fn pct_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Connector-safe, stable opaque locator for a memory record (shown as `url` in
+/// search/fetch results so ChatGPT can display/cite a source without exposing
+/// the filesystem). Scope and id live in the percent-encoded *path*, never the
+/// authority, so values like `project:acme` cannot be misparsed as `host:port`.
+fn memory_url(scope: &str, id: &str) -> String {
+    format!(
+        "axiom-memory://memory/{}/{}",
+        pct_encode(scope),
+        pct_encode(id)
+    )
+}
+
+/// The scope-qualified id surfaced by `search` and consumed by `fetch`, so the
+/// round-trip resolves to exactly the record `search` returned regardless of how
+/// raw ids are allocated. Format `<pct-encoded-scope>:<raw-id>` — raw ids are
+/// hex, so the first `:` unambiguously separates the two parts.
+fn qualified_id(scope: &str, id: &str) -> String {
+    format!("{}:{}", pct_encode(scope), id)
+}
+
+/// Parse a [`qualified_id`] back into `(scope, raw_id)`. Returns `None` for a
+/// bare id (no `:`), letting `fetch` fall back to a scope-scan for legacy ids.
+fn parse_qualified_id(doc_id: &str) -> Option<(String, String)> {
+    doc_id
+        .split_once(':')
+        .map(|(s, i)| (pct_decode(s), i.to_string()))
+}
+
+/// A short single-line title from a record body (first non-empty line, truncated).
+fn title_for(body: &str) -> String {
+    let line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    const MAX: usize = 80;
+    if line.chars().count() > MAX {
+        let truncated: String = line.chars().take(MAX - 1).collect();
+        format!("{truncated}…")
+    } else if line.is_empty() {
+        "(untitled memory)".to_string()
+    } else {
+        line.to_string()
+    }
+}
+
+/// `search` worker (ChatGPT-connector alias over recall). Returns the JSON value
+/// `{"results":[{"id","title","url"}]}` — the shape the standard ChatGPT search
+/// tool expects. Empty `results` when nothing matches (not an error).
+fn search_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result<Value, String> {
+    let q_emb = embed_query(query, ctx)?;
+    let mut scopes = vec!["personal".to_string()];
+    if let Some(s) = scope {
+        if s != "personal" {
+            scopes.push(s.to_string());
+        }
+    }
+    let store = ctx
+        .memory
+        .lock()
+        .map_err(|_| "memory lock poisoned".to_string())?;
+    let hits = recall(&store, &scopes, &q_emb, &RecallParams::default());
+    let results: Vec<Value> = hits
+        .iter()
+        .map(|h| {
+            json!({
+                "id": qualified_id(&h.record.scope, &h.record.id),
+                "title": title_for(&h.record.body),
+                "url": memory_url(&h.record.scope, &h.record.id),
+            })
+        })
+        .collect();
+    Ok(json!({ "results": results }))
+}
+
+/// `fetch` worker (ChatGPT-connector alias). Resolves a `search` result id to its
+/// full stored text, returning JSON `{"id","title","text","url","metadata"}`.
+/// A scope-qualified id (the form `search` emits) resolves the exact scope/record
+/// deterministically; a bare legacy id falls back to a cross-scope lookup.
+fn fetch_blocking(doc_id: &str, ctx: &McpContext) -> Result<Value, String> {
+    let store = ctx
+        .memory
+        .lock()
+        .map_err(|_| "memory lock poisoned".to_string())?;
+    let rec = match parse_qualified_id(doc_id) {
+        Some((scope, raw_id)) => store
+            .load_scope(&scope)
+            .into_iter()
+            .find(|r| r.id == raw_id),
+        None => store.get(doc_id),
+    }
+    .ok_or_else(|| format!("no memory record with id={doc_id}"))?;
+    Ok(json!({
+        // Echo the qualified id so a follow-up fetch is still unambiguous.
+        "id": qualified_id(&rec.scope, &rec.id),
+        "title": title_for(&rec.body),
+        "text": rec.body,
+        "url": memory_url(&rec.scope, &rec.id),
+        "metadata": { "scope": rec.scope, "ts": rec.ts },
+    }))
+}
+
 /// `axiom_forget` worker. Tombstones an id in its scope.
 fn forget_blocking(mem_id: &str, scope: &str, ctx: &McpContext) -> Result<String, String> {
     let store = ctx
@@ -912,6 +1132,20 @@ fn tool_text_result(text: &str, is_error: bool) -> Value {
     })
 }
 
+/// Build an MCP tool-result payload that carries a structured object in
+/// `structuredContent` *and* a JSON-encoded text mirror in `content`. The MCP
+/// spec lets a tool return both; ChatGPT standard/company-knowledge connectors
+/// read `structuredContent` (validated against the tool's `outputSchema`), while
+/// the text mirror keeps plain text-only clients working.
+fn tool_structured_result(structured: Value, is_error: bool) -> Value {
+    let text = serde_json::to_string(&structured).unwrap_or_else(|_| "{}".to_string());
+    json!({
+        "content": [ { "type": "text", "text": text } ],
+        "structuredContent": structured,
+        "isError": is_error
+    })
+}
+
 /// Short stable id derived from a path, for session labelling.
 fn short_hash(s: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -930,7 +1164,7 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 10);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
@@ -968,6 +1202,61 @@ mod tests {
     }
 
     #[test]
+    fn tools_list_includes_chatgpt_search_fetch_aliases() {
+        // The standard ChatGPT connector requires tools literally named
+        // `search` and `fetch`; assert both are present with the right required
+        // params so a standard-mode connector can attach.
+        let list = tools_list();
+        let tools = list["tools"].as_array().unwrap();
+        let search = tools.iter().find(|t| t["name"] == "search").unwrap();
+        let fetch = tools.iter().find(|t| t["name"] == "fetch").unwrap();
+        assert_eq!(search["inputSchema"]["required"][0], "query");
+        assert_eq!(fetch["inputSchema"]["required"][0], "id");
+    }
+
+    #[test]
+    fn title_for_takes_first_nonempty_line_and_truncates() {
+        assert_eq!(title_for("\n\nhello world\nmore"), "hello world");
+        assert_eq!(title_for("   "), "(untitled memory)");
+        let long = "x".repeat(200);
+        let t = title_for(&long);
+        assert!(t.chars().count() <= 80, "title too long: {}", t.chars().count());
+        assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn memory_url_is_stable_and_encodes_special_scopes() {
+        assert_eq!(
+            memory_url("personal", "abc123"),
+            "axiom-memory://memory/personal/abc123"
+        );
+        // A scope with a colon must not land raw in the authority.
+        assert_eq!(
+            memory_url("project:acme", "abc123"),
+            "axiom-memory://memory/project%3Aacme/abc123"
+        );
+    }
+
+    #[test]
+    fn qualified_id_roundtrips_including_special_scopes() {
+        for (scope, id) in [("personal", "abc123"), ("project:acme", "deadbeef")] {
+            let q = qualified_id(scope, id);
+            let (s, i) = parse_qualified_id(&q).expect("qualified id should parse");
+            assert_eq!(s, scope);
+            assert_eq!(i, id);
+        }
+        // A bare (legacy) id has no ':' and parses as None → fetch falls back.
+        assert!(parse_qualified_id("abc123").is_none());
+    }
+
+    #[test]
+    fn pct_encode_decode_roundtrip() {
+        for s in ["personal", "project:acme", "a/b c", "weird%20"] {
+            assert_eq!(pct_decode(&pct_encode(s)), s);
+        }
+    }
+
+    #[test]
     fn initialize_advertises_tools_capability() {
         // Build the same result initialize returns and assert its shape.
         let result = json!({
@@ -997,5 +1286,34 @@ mod tests {
         assert_eq!(r["isError"], true);
         assert_eq!(r["content"][0]["type"], "text");
         assert_eq!(r["content"][0]["text"], "boom");
+    }
+
+    #[test]
+    fn structured_result_carries_object_and_text_mirror() {
+        let payload = json!({ "results": [ { "id": "a", "title": "t", "url": "u" } ] });
+        let r = tool_structured_result(payload.clone(), false);
+        assert_eq!(r["isError"], false);
+        // structuredContent holds the object (what ChatGPT validates/reads).
+        assert_eq!(r["structuredContent"], payload);
+        // content holds a JSON-encoded text mirror (text-only clients).
+        let text = r["content"][0]["text"].as_str().unwrap();
+        let reparsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(reparsed, payload);
+    }
+
+    #[test]
+    fn search_and_fetch_advertise_output_schemas() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().unwrap();
+        let search = tools.iter().find(|t| t["name"] == "search").unwrap();
+        let fetch = tools.iter().find(|t| t["name"] == "fetch").unwrap();
+        assert_eq!(search["outputSchema"]["required"][0], "results");
+        let fetch_req = fetch["outputSchema"]["required"].as_array().unwrap();
+        for k in ["id", "title", "text", "url"] {
+            assert!(
+                fetch_req.iter().any(|v| v == k),
+                "fetch outputSchema must require {k}"
+            );
+        }
     }
 }
