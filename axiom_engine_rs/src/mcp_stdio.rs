@@ -53,7 +53,7 @@ const DRIFT_MAX_TOKENS: usize = 512;
 
 /// Shared engine context handed to every tool invocation.
 #[derive(Clone)]
-struct McpContext {
+pub struct McpContext {
     pipeline: Arc<Mutex<InferencePipeline>>,
     vibe: Arc<Mutex<MasterVibe>>,
     /// Tier-2 lossless memory store (Phase 2.0): JSONL records per scope.
@@ -72,15 +72,15 @@ struct McpContext {
     max_bytes: usize,
 }
 
-/// Boot the MCP stdio server. Runs until stdin reaches EOF (host disconnect).
-pub async fn run_stdio_server(
+/// Assemble an [`McpContext`] (pipeline + vibe + memory + embedder) from config,
+/// device, and a checkpoint path. Shared by the stdio server and the HTTP/SSE
+/// transport ([`crate::server`]'s `/mcp` route) so both expose identical tools
+/// against identical engine internals.
+pub async fn build_context(
     config: AxiomConfig,
     device: Device,
     checkpoint_path: String,
-) -> Result<(), Box<dyn Error>> {
-    // All status output MUST go to stderr; stdout is reserved for JSON-RPC.
-    eprintln!("[mcp] booting Axiom MCP stdio server (protocol {MCP_PROTOCOL_VERSION})");
-
+) -> Result<McpContext, String> {
     // Build the pipeline on a blocking thread. It owns a `reqwest::blocking::Client`
     // which carries its own runtime; constructing/dropping that inside the async
     // context is unsafe, so we keep all of its lifecycle off the async runtime.
@@ -149,7 +149,7 @@ pub async fn run_stdio_server(
         }
     );
 
-    let ctx = McpContext {
+    Ok(McpContext {
         pipeline: Arc::new(Mutex::new(pipeline)),
         vibe: Arc::new(Mutex::new(vibe)),
         memory: Arc::new(Mutex::new(memory)),
@@ -159,12 +159,24 @@ pub async fn run_stdio_server(
         top_k,
         max_files,
         max_bytes,
-    };
+    })
+}
+
+/// Boot the MCP stdio server. Runs until stdin reaches EOF (host disconnect).
+pub async fn run_stdio_server(
+    config: AxiomConfig,
+    device: Device,
+    checkpoint_path: String,
+) -> Result<(), Box<dyn Error>> {
+    // All status output MUST go to stderr; stdout is reserved for JSON-RPC.
+    eprintln!("[mcp] booting Axiom MCP stdio server (protocol {MCP_PROTOCOL_VERSION})");
+
+    let ctx = build_context(config, device, checkpoint_path).await?;
 
     eprintln!(
         "[mcp] ready — tools: axiom_compress_path, axiom_evaluate_drift, axiom_expand, \
-         axiom_remember, axiom_recall, axiom_forget \
-         (prime={prime}, drift_threshold={drift_threshold})"
+         axiom_remember, axiom_recall, axiom_forget (prime={}, drift_threshold={})",
+        ctx.prime, ctx.drift_threshold
     );
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -191,6 +203,13 @@ pub async fn run_stdio_server(
     let McpContext { pipeline, .. } = ctx;
     let _ = tokio::task::spawn_blocking(move || drop(pipeline)).await;
     Ok(())
+}
+
+/// Dispatch one JSON-RPC line against an [`McpContext`] — shared by the stdio
+/// loop and the HTTP/SSE transport ([`crate::server`]'s `/mcp` route). Returns
+/// `Some(response)` for requests, `None` for notifications.
+pub async fn dispatch(line: &str, ctx: &McpContext) -> Option<Value> {
+    handle_message(line, ctx).await
 }
 
 /// Parse and route one JSON-RPC line. Returns `Some(response)` for requests,

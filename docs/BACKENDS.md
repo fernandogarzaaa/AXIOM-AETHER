@@ -86,8 +86,9 @@ ChimeraLang — runs on it. A bigger model (OpenDrop-served or cloud) only impro
 
 ## Roadmap (next backend work)
 
-1. **Remote MCP transport (HTTP/SSE)** — so the **ChatGPT connector** and Claude
-   *remote* connectors can attach, not just local stdio (`MCP-CLIENTS.md`).
+1. **ChatGPT standard-mode `search`/`fetch` aliases** — remote MCP over HTTP is
+   live (`AXIOM_MCP_HTTP=1`, see `MCP-CLIENTS.md`); adding `search`/`fetch` tool
+   aliases would make Axiom a standard ChatGPT connector (not just Developer Mode).
 2. **Consensus on the live router** — `AXIOM_BACKEND=router` runs single-provider
    routing + failover today; surfacing the opt-in two-model consensus
    (`RoutePolicy.consensus`) as a runtime toggle is a follow-up.

@@ -36,21 +36,33 @@ claude mcp add axiom -- axiom --mode mcp
 Then ask Claude to "compress this repo with axiom" or "check this code for drift"
 and it will call the tools.
 
-## ChatGPT connector — roadmap (remote HTTP/SSE)
+## ChatGPT connector / Claude remote — remote HTTP transport
 
-ChatGPT connectors require a **remote** MCP server over HTTP (Streamable
-HTTP / SSE), not local stdio. Axiom's HTTP transport is the next piece of work
-(tracked in [`BACKENDS.md`](BACKENDS.md) → Roadmap):
+ChatGPT connectors (and Claude *remote* connectors) need a **remote** MCP server
+over HTTP, not local stdio. Axiom exposes one — start the server with the
+transport enabled:
 
-- A `/mcp` endpoint on axiom's existing HTTP server that dispatches the same
-  JSON-RPC tools against the live pipeline (POST → JSON response, GET → SSE).
-- `search` / `fetch` tool aliases (mapping to axiom's compress/expand/recall) so
-  axiom appears as a standard ChatGPT connector; arbitrary tools also work in
-  ChatGPT **Developer Mode**.
+```bash
+AXIOM_MCP_HTTP=1 axiom --mode server --host 0.0.0.0 --port 8080
+```
 
-Once landed, the setup will be: run `axiom --mode server`, expose `/mcp`
-(directly or via a tunnel), and add it as a custom connector in ChatGPT. Until
-then, the Claude stdio path above is the supported route.
+This serves the **same MCP tools** as the stdio path at `/mcp`, sharing one
+dispatch against the live pipeline:
+
+- `POST /mcp` — a JSON-RPC 2.0 request (`initialize`, `tools/list`, `tools/call`)
+  returns the JSON-RPC response.
+- `GET /mcp` — an SSE stream (keep-alive) for Streamable-HTTP clients that open a
+  stream for server-initiated messages.
+
+Then expose the endpoint to ChatGPT (publicly or via a tunnel like `cloudflared`
+/ `ngrok`) and add it as a **custom connector** pointing at `https://<host>/mcp`.
+
+> **Caveats (verify against current ChatGPT docs):** ChatGPT's standard connector
+> mode expects `search`/`fetch` tools — Axiom exposes its own tool names, which
+> work under ChatGPT **Developer Mode** (arbitrary MCP tools). Adding
+> `search`/`fetch` aliases (mapping to compress/expand/recall) for standard-mode
+> compatibility is a tracked follow-up. Because connector behavior must be tested
+> against your live ChatGPT, treat first-time setup as needing a quick smoke test.
 
 ## What this is *not*
 

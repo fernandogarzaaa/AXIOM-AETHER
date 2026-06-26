@@ -233,6 +233,10 @@ pub struct AppState {
     /// routed across GPT/Claude/local with failover/consensus. `None` ⇒ the
     /// default single-backend path.
     pub router: Arc<Option<BackendRouter>>,
+    /// Remote MCP context (`AXIOM_MCP_HTTP=1`): when present, the `/mcp` route
+    /// exposes Axiom's MCP tools over HTTP (for the ChatGPT connector / Claude
+    /// remote connectors), sharing the same dispatch as the stdio server.
+    pub mcp: Arc<Option<crate::mcp_stdio::McpContext>>,
     /// Active-compression session store: per-tenant adapted fast-weight
     /// tensors held in a lock-free DashMap. Distinct from `sessions`
     /// above (which serves the legacy `/v1/sessions` API); this store
@@ -290,6 +294,7 @@ impl AppState {
             model_id,
             claude_backend: Arc::new(None),
             router: Arc::new(None),
+            mcp: Arc::new(None),
             ttt_sessions: Arc::new(TttSessionStore::new()),
             anthropic_forwarder: Arc::new(None),
             openai_forwarder: Arc::new(None),
@@ -610,6 +615,12 @@ impl AppState {
     /// the default single-backend generation path.
     pub fn with_router(mut self, router: Option<BackendRouter>) -> Self {
         self.router = Arc::new(router);
+        self
+    }
+
+    /// Install the remote MCP context, enabling the `/mcp` HTTP route.
+    pub fn with_mcp(mut self, mcp: Option<crate::mcp_stdio::McpContext>) -> Self {
+        self.mcp = Arc::new(mcp);
         self
     }
 
@@ -3206,6 +3217,7 @@ pub fn create_router(state: AppState) -> Router {
             post(post_patches_merge).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route("/v1/chimera/run", post(post_chimera_run))
+        .route("/mcp", get(mcp_http_sse).post(post_mcp))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -3692,6 +3704,50 @@ async fn post_chimera_run(body: String) -> axum::response::Response {
     }
 }
 
+/// `POST /mcp` — remote MCP transport. Dispatches a JSON-RPC 2.0 request against
+/// Axiom's MCP tools (the same dispatch the stdio server uses) and returns the
+/// JSON-RPC response. Enables ChatGPT connectors and Claude remote connectors to
+/// drive Axiom over HTTP. Returns 503 unless started with `AXIOM_MCP_HTTP=1`.
+async fn post_mcp(State(state): State<AppState>, body: String) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let ctx = match state.mcp.as_ref() {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "MCP HTTP transport disabled; start the server with AXIOM_MCP_HTTP=1"
+                })),
+            )
+                .into_response();
+        }
+    };
+    match crate::mcp_stdio::dispatch(&body, ctx).await {
+        // Request → JSON-RPC response.
+        Some(resp) => Json(resp).into_response(),
+        // Notification (no id) → accepted, no body.
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// `GET /mcp` — SSE stream for Streamable-HTTP MCP clients that open a stream for
+/// server-initiated messages. Axiom's tool calls are request/response (handled by
+/// `POST /mcp`), so this stream just stays open with keep-alive pings.
+async fn mcp_http_sse(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if state.mcp.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MCP HTTP transport disabled; start the server with AXIOM_MCP_HTTP=1",
+        )
+            .into_response();
+    }
+    let keepalive = stream::pending::<Result<Event, std::convert::Infallible>>();
+    Sse::new(keepalive)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 /// Map a friendly compression "level" to a per-message threshold (whitespace
 /// words). Higher compression = lower threshold (more messages qualify).
 fn level_to_threshold(level: &str) -> Option<usize> {
@@ -3952,6 +4008,28 @@ pub async fn run_server(
         println!("[+] AXIOM_BACKEND=router — generation routed across GPT/Claude/local");
     }
     let state = state.with_router(router);
+
+    // Remote MCP transport (AXIOM_MCP_HTTP=1): expose Axiom's MCP tools over HTTP
+    // at /mcp so the ChatGPT connector and Claude remote connectors can attach.
+    // Builds a dedicated MCP context (own pipeline/vibe/memory) like the stdio
+    // server; a build failure disables /mcp rather than taking the server down.
+    let mcp = if std::env::var("AXIOM_MCP_HTTP").map(|v| v == "1").unwrap_or(false) {
+        match crate::mcp_stdio::build_context(config.clone(), device.clone(), checkpoint_path.to_string())
+            .await
+        {
+            Ok(c) => {
+                println!("[+] AXIOM_MCP_HTTP=1 — MCP tools served at POST /mcp (remote connectors)");
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("[axiom] /mcp disabled: failed to build MCP context: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let state = state.with_mcp(mcp);
     if state.compression_active() {
         match state.hydrate_compression_cache().await {
             Ok(0) => println!(
@@ -4397,6 +4475,33 @@ mod tests {
             layer.sum_all().unwrap().to_scalar::<f32>().unwrap()
         };
         assert!(layer_sum > 0.0);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_http_route_returns_503_when_disabled() {
+        // Without AXIOM_MCP_HTTP the context is None, so /mcp must refuse cleanly
+        // (not 404, not 500) so clients get an actionable error.
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("AXIOM_MCP_HTTP"));
         safe_drop(pipeline_arc).await;
     }
 
