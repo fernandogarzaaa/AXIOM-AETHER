@@ -33,8 +33,20 @@ tools are recent. **An older release binary will return `404` for `/mcp`.** Buil
 git clone https://github.com/fernandogarzaaa/AXIOM-AETHER
 cd AXIOM-AETHER/axiom_engine_rs
 cargo build --release --locked
-# binary: target/release/axiom_engine   (aka `axiom`)
+# binary: target/release/axiom_engine
+
+# Put the freshly built binary on PATH so `axiom` resolves to IT, not an older
+# installed release (the 404 case). Either install it:
+cargo install --path .            # installs into ~/.cargo/bin (usually on PATH)
+# …or invoke the built binary directly everywhere this guide says `axiom`:
+#   ./target/release/axiom_engine --mode ...
 ```
+
+> **Throughout this guide, `axiom` means the binary you just built.** If it isn't
+> on your PATH, either `cargo install --path .` or replace `axiom` with the full
+> path `target/release/axiom_engine`. A bare `axiom` may otherwise run an older
+> installed release that returns `404` for `/mcp` and lacks `search`/`fetch` —
+> verify with `axiom --version` / the [`tools/list` smoke test](#verify-always-do-this-first).
 
 > **Windows toolchain:** building can fail on missing linkers —
 > `link.exe` (MSVC target) or `dlltool.exe` (GNU target). Fix by installing the
@@ -120,9 +132,13 @@ verify.
 > Do this, reporting each step and stopping to ask me only if a step needs a
 > secret or a decision I must make:
 > 1. **Use current `main`.** Older binaries return **404 on `/mcp`** — confirm the
->    binary supports `/mcp` (build `cargo build --release --locked` if unsure). On
->    Windows, if the build fails on `link.exe`/`dlltool.exe`, install the MSVC C++
->    build tools and `rustup default stable-x86_64-pc-windows-msvc`, then rebuild.
+>    binary supports `/mcp` (build `cargo build --release --locked` if unsure).
+>    After building, **run the freshly built binary**
+>    (`target/release/axiom_engine`) or `cargo install --path .` first — do not
+>    assume a bare `axiom` on PATH is the new build, or you may start an old
+>    installed release (the 404 case). On Windows, if the build fails on
+>    `link.exe`/`dlltool.exe`, install the MSVC C++ build tools and
+>    `rustup default stable-x86_64-pc-windows-msvc`, then rebuild.
 > 2. **Generate a secret token** and set `AXIOM_MCP_TOKEN` to it; never print the
 >    full token back to me in plaintext beyond what I need to paste into ChatGPT.
 > 3. **Start the server:** `AXIOM_MCP_HTTP=1 axiom --mode server --host 0.0.0.0
