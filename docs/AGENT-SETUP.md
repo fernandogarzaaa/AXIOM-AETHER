@@ -83,7 +83,7 @@ AXIOM_MCP_HTTP=1 axiom --mode server --host 0.0.0.0 --port 8080
 #   add --checkpoint <path> for a trained model
 
 # 3. Expose it over HTTPS (ChatGPT needs a public URL):
-cloudflared tunnel --url http://localhost:8080      # or: ngrok http 8080
+ngrok http 8080      # or: cloudflared tunnel --url http://localhost:8080
 ```
 
 In ChatGPT → **Settings → Connectors → Add custom connector**:
@@ -92,6 +92,32 @@ In ChatGPT → **Settings → Connectors → Add custom connector**:
 
 `GET/POST /mcp` share one dispatch; the connector sees the same tools as stdio,
 plus the standard `search`/`fetch` aliases for ChatGPT's standard connector mode.
+
+> **Pick a stable, free public endpoint.** A reusable URL matters because you
+> paste it into ChatGPT once:
+> - **ngrok's free assigned dev domain** (`https://<assigned>.ngrok-free.dev`) —
+>   the recommended free option: ngrok gives each free account **one persistent
+>   dev domain, auto-assigned** (you can't choose or reserve the name on the free
+>   plan). Find yours in the ngrok dashboard, then bind to it:
+>   `ngrok http 8080 --url=<assigned>.ngrok-free.dev` (the `--url` flag replaces
+>   the deprecated `--domain`).
+> - **Cloudflare quick tunnel** (`cloudflared tunnel --url …`) — free but the URL
+>   is **ephemeral** (changes every run), so you'd re-paste it into ChatGPT each
+>   time.
+> - **Cloudflare *named* tunnel** — stable, but requires a Cloudflare-managed
+>   **domain/zone** on your account; without one it can't be routed publicly.
+>
+> Whatever you choose, gate it: only `/mcp` requests carrying the correct
+> `Authorization: Bearer <AXIOM_MCP_TOKEN>` should return `200`; unauthenticated
+> and wrong-token requests must return `401`. The native server enforces this; a
+> custom bridge must check the header itself.
+
+> **Windows native build works** — install the **MSVC** toolchain ("Desktop
+> development with C++" via Visual Studio Build Tools) and
+> `rustup default stable-x86_64-pc-windows-msvc`, then
+> `cargo build --release --locked`. The resulting `axiom_engine.exe` serves native
+> HTTP `/mcp` directly, so the [bridge fallback](#fallback-stdio--http-bridge-for-chatgpt)
+> is only needed when you genuinely can't build.
 
 ### Fallback: stdio → HTTP bridge (for ChatGPT)
 
@@ -143,8 +169,13 @@ verify.
 >    full token back to me in plaintext beyond what I need to paste into ChatGPT.
 > 3. **Start the server:** `AXIOM_MCP_HTTP=1 axiom --mode server --host 0.0.0.0
 >    --port 8080` (use `--checkpoint` if a trained checkpoint exists).
-> 4. **Expose it** over HTTPS with a tunnel (`cloudflared tunnel --url
->    http://localhost:8080` or `ngrok`). Capture the public URL.
+> 4. **Expose it** over HTTPS with a tunnel and capture the public URL. Prefer a
+>    **stable, free** endpoint so I only paste it into ChatGPT once — an
+>    your **ngrok free assigned dev domain** (auto-assigned and persistent — read
+>    it from the ngrok dashboard, then `ngrok http 8080
+>    --url=<assigned>.ngrok-free.dev`) is ideal; a Cloudflare *quick* tunnel works
+>    but its URL is ephemeral, and a Cloudflare *named* tunnel needs a domain/zone
+>    on the account.
 > 5. **Smoke test** a `tools/list` JSON-RPC call against `https://<host>/mcp` with
 >    the `Authorization: Bearer <token>` header, both locally and through the
 >    tunnel. Show me the tool names returned; I expect to see `search` and `fetch`
