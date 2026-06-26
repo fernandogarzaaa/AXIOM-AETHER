@@ -428,7 +428,7 @@ fn tools_list() -> Value {
                         "url": { "type": "string" },
                         "metadata": { "type": ["object", "null"] }
                     },
-                    "required": ["id", "title", "text", "url"]
+                    "required": ["id", "title", "text", "url", "metadata"]
                 }
             }
         ]
@@ -940,10 +940,68 @@ fn recall_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result
     Ok(out)
 }
 
-/// Opaque, stable locator for a memory record (shown as `url` in search/fetch
-/// results so ChatGPT can display/cite a source without exposing the filesystem).
+/// Percent-encode a URI segment: RFC 3986 unreserved characters pass through,
+/// everything else becomes `%XX`. Keeps memory locators/ids valid for scopes
+/// like `project:acme` (a raw `:` would otherwise be misread).
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Inverse of [`pct_encode`]. Invalid escapes are passed through literally so it
+/// never panics on malformed input.
+fn pct_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Connector-safe, stable opaque locator for a memory record (shown as `url` in
+/// search/fetch results so ChatGPT can display/cite a source without exposing
+/// the filesystem). Scope and id live in the percent-encoded *path*, never the
+/// authority, so values like `project:acme` cannot be misparsed as `host:port`.
 fn memory_url(scope: &str, id: &str) -> String {
-    format!("axiom-memory://{scope}/{id}")
+    format!(
+        "axiom-memory://memory/{}/{}",
+        pct_encode(scope),
+        pct_encode(id)
+    )
+}
+
+/// The scope-qualified id surfaced by `search` and consumed by `fetch`, so the
+/// round-trip resolves to exactly the record `search` returned regardless of how
+/// raw ids are allocated. Format `<pct-encoded-scope>:<raw-id>` — raw ids are
+/// hex, so the first `:` unambiguously separates the two parts.
+fn qualified_id(scope: &str, id: &str) -> String {
+    format!("{}:{}", pct_encode(scope), id)
+}
+
+/// Parse a [`qualified_id`] back into `(scope, raw_id)`. Returns `None` for a
+/// bare id (no `:`), letting `fetch` fall back to a scope-scan for legacy ids.
+fn parse_qualified_id(doc_id: &str) -> Option<(String, String)> {
+    doc_id
+        .split_once(':')
+        .map(|(s, i)| (pct_decode(s), i.to_string()))
 }
 
 /// A short single-line title from a record body (first non-empty line, truncated).
@@ -980,7 +1038,7 @@ fn search_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result
         .iter()
         .map(|h| {
             json!({
-                "id": h.record.id,
+                "id": qualified_id(&h.record.scope, &h.record.id),
                 "title": title_for(&h.record.body),
                 "url": memory_url(&h.record.scope, &h.record.id),
             })
@@ -989,18 +1047,26 @@ fn search_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result
     Ok(json!({ "results": results }))
 }
 
-/// `fetch` worker (ChatGPT-connector alias). Resolves a record id to its full
-/// stored text, returning JSON `{"id","title","text","url","metadata"}`.
+/// `fetch` worker (ChatGPT-connector alias). Resolves a `search` result id to its
+/// full stored text, returning JSON `{"id","title","text","url","metadata"}`.
+/// A scope-qualified id (the form `search` emits) resolves the exact scope/record
+/// deterministically; a bare legacy id falls back to a cross-scope lookup.
 fn fetch_blocking(doc_id: &str, ctx: &McpContext) -> Result<Value, String> {
     let store = ctx
         .memory
         .lock()
         .map_err(|_| "memory lock poisoned".to_string())?;
-    let rec = store
-        .get(doc_id)
-        .ok_or_else(|| format!("no memory record with id={doc_id}"))?;
+    let rec = match parse_qualified_id(doc_id) {
+        Some((scope, raw_id)) => store
+            .load_scope(&scope)
+            .into_iter()
+            .find(|r| r.id == raw_id),
+        None => store.get(doc_id),
+    }
+    .ok_or_else(|| format!("no memory record with id={doc_id}"))?;
     Ok(json!({
-        "id": rec.id,
+        // Echo the qualified id so a follow-up fetch is still unambiguous.
+        "id": qualified_id(&rec.scope, &rec.id),
         "title": title_for(&rec.body),
         "text": rec.body,
         "url": memory_url(&rec.scope, &rec.id),
@@ -1159,8 +1225,35 @@ mod tests {
     }
 
     #[test]
-    fn memory_url_is_stable_and_opaque() {
-        assert_eq!(memory_url("personal", "abc123"), "axiom-memory://personal/abc123");
+    fn memory_url_is_stable_and_encodes_special_scopes() {
+        assert_eq!(
+            memory_url("personal", "abc123"),
+            "axiom-memory://memory/personal/abc123"
+        );
+        // A scope with a colon must not land raw in the authority.
+        assert_eq!(
+            memory_url("project:acme", "abc123"),
+            "axiom-memory://memory/project%3Aacme/abc123"
+        );
+    }
+
+    #[test]
+    fn qualified_id_roundtrips_including_special_scopes() {
+        for (scope, id) in [("personal", "abc123"), ("project:acme", "deadbeef")] {
+            let q = qualified_id(scope, id);
+            let (s, i) = parse_qualified_id(&q).expect("qualified id should parse");
+            assert_eq!(s, scope);
+            assert_eq!(i, id);
+        }
+        // A bare (legacy) id has no ':' and parses as None → fetch falls back.
+        assert!(parse_qualified_id("abc123").is_none());
+    }
+
+    #[test]
+    fn pct_encode_decode_roundtrip() {
+        for s in ["personal", "project:acme", "a/b c", "weird%20"] {
+            assert_eq!(pct_decode(&pct_encode(s)), s);
+        }
     }
 
     #[test]

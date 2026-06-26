@@ -121,9 +121,13 @@ impl MemoryStore {
         out
     }
 
-    /// Find a live (non-tombstoned) record by id across all on-disk scopes.
-    /// Returns the first match (ids are unique per scope; collisions across
-    /// scopes are not expected for content-hash ids). `None` if not found.
+    /// Best-effort lookup of a live (non-tombstoned) record by a *bare* id,
+    /// scanning scopes in sorted order and returning the first match. Ids embed
+    /// their scope (plus timestamp + text) in the hash, so a cross-scope
+    /// collision would require identical inputs and is not expected; still,
+    /// prefer the scope-qualified path (e.g. the `fetch` MCP alias) when the
+    /// scope is known, and treat this as a fallback for legacy bare ids.
+    /// `None` if not found.
     pub fn get(&self, id: &str) -> Option<MemoryRecord> {
         for scope in self.scopes() {
             if let Some(rec) = self.load_scope(&scope).into_iter().find(|r| r.id == id) {

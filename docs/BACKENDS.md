@@ -81,8 +81,9 @@ A ChatGPT Pro / Claude Pro subscription is **not** API access — axiom can't ca
 those chat endpoints (no official API; doing so violates ToS). The sanctioned,
 zero-cost way to combine a subscription with axiom is the **MCP** path: let your
 subscription app call axiom's tools (see [`MCP-CLIENTS.md`](MCP-CLIENTS.md)).
-Today that works with Claude Desktop / Claude Code over stdio; a remote HTTP
-transport for the ChatGPT connector is on the roadmap below.
+This works with Claude Desktop / Claude Code over stdio **and** with the ChatGPT
+connector over the remote HTTP transport (`AXIOM_MCP_HTTP=1`), which now also
+exposes the standard `search`/`fetch` tools — see [`MCP-CLIENTS.md`](MCP-CLIENTS.md).
 
 ## Is a trained model required?
 
