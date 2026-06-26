@@ -75,6 +75,11 @@ Axiom also exposes the two tools ChatGPT's **standard** connector mode requires 
 - `fetch(id)` → the full record for a `search` result id as
   `{"id","title","text","url","metadata"}`.
 
+Both tools advertise an `outputSchema` and return their payload in the MCP
+result's `structuredContent` (with a JSON text mirror in `content`), so standard
+ChatGPT / company-knowledge connectors can validate and read the structured
+result, not just the text.
+
 So Axiom works as a standard ChatGPT connector (not only Developer Mode). Axiom's
 richer tools (`axiom_compress_path`, `axiom_evaluate_drift`, `axiom_expand`,
 `axiom_remember`, `axiom_recall`, `axiom_forget`, `axiom_verify`,

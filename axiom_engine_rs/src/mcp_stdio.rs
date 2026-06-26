@@ -389,6 +389,24 @@ fn tools_list() -> Value {
                         "scope": { "type": "string", "description": "Optional project scope to include alongside 'personal'." }
                     },
                     "required": ["query"]
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "results": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "title": { "type": "string" },
+                                    "url": { "type": "string" }
+                                },
+                                "required": ["id", "title", "url"]
+                            }
+                        }
+                    },
+                    "required": ["results"]
                 }
             },
             {
@@ -400,6 +418,17 @@ fn tools_list() -> Value {
                         "id": { "type": "string", "description": "The record id from a `search` result." }
                     },
                     "required": ["id"]
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "title": { "type": "string" },
+                        "text": { "type": "string" },
+                        "url": { "type": "string" },
+                        "metadata": { "type": ["object", "null"] }
+                    },
+                    "required": ["id", "title", "text", "url"]
                 }
             }
         ]
@@ -610,7 +639,7 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .await
             .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok(json_text) => success_response(id, tool_text_result(&json_text, false)),
+                Ok(value) => success_response(id, tool_structured_result(value, false)),
                 Err(e) => success_response(id, tool_text_result(&format!("search failed: {e}"), true)),
             }
         }
@@ -624,7 +653,7 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .await
                 .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok(json_text) => success_response(id, tool_text_result(&json_text, false)),
+                Ok(value) => success_response(id, tool_structured_result(value, false)),
                 Err(e) => success_response(id, tool_text_result(&format!("fetch failed: {e}"), true)),
             }
         }
@@ -931,10 +960,10 @@ fn title_for(body: &str) -> String {
     }
 }
 
-/// `search` worker (ChatGPT-connector alias over recall). Returns a JSON string
+/// `search` worker (ChatGPT-connector alias over recall). Returns the JSON value
 /// `{"results":[{"id","title","url"}]}` — the shape the standard ChatGPT search
 /// tool expects. Empty `results` when nothing matches (not an error).
-fn search_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result<String, String> {
+fn search_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result<Value, String> {
     let q_emb = embed_query(query, ctx)?;
     let mut scopes = vec!["personal".to_string()];
     if let Some(s) = scope {
@@ -957,13 +986,12 @@ fn search_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result
             })
         })
         .collect();
-    serde_json::to_string(&json!({ "results": results }))
-        .map_err(|e| format!("serialize results: {e}"))
+    Ok(json!({ "results": results }))
 }
 
 /// `fetch` worker (ChatGPT-connector alias). Resolves a record id to its full
 /// stored text, returning JSON `{"id","title","text","url","metadata"}`.
-fn fetch_blocking(doc_id: &str, ctx: &McpContext) -> Result<String, String> {
+fn fetch_blocking(doc_id: &str, ctx: &McpContext) -> Result<Value, String> {
     let store = ctx
         .memory
         .lock()
@@ -971,14 +999,13 @@ fn fetch_blocking(doc_id: &str, ctx: &McpContext) -> Result<String, String> {
     let rec = store
         .get(doc_id)
         .ok_or_else(|| format!("no memory record with id={doc_id}"))?;
-    let doc = json!({
+    Ok(json!({
         "id": rec.id,
         "title": title_for(&rec.body),
         "text": rec.body,
         "url": memory_url(&rec.scope, &rec.id),
         "metadata": { "scope": rec.scope, "ts": rec.ts },
-    });
-    serde_json::to_string(&doc).map_err(|e| format!("serialize document: {e}"))
+    }))
 }
 
 /// `axiom_forget` worker. Tombstones an id in its scope.
@@ -1035,6 +1062,20 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
 fn tool_text_result(text: &str, is_error: bool) -> Value {
     json!({
         "content": [ { "type": "text", "text": text } ],
+        "isError": is_error
+    })
+}
+
+/// Build an MCP tool-result payload that carries a structured object in
+/// `structuredContent` *and* a JSON-encoded text mirror in `content`. The MCP
+/// spec lets a tool return both; ChatGPT standard/company-knowledge connectors
+/// read `structuredContent` (validated against the tool's `outputSchema`), while
+/// the text mirror keeps plain text-only clients working.
+fn tool_structured_result(structured: Value, is_error: bool) -> Value {
+    let text = serde_json::to_string(&structured).unwrap_or_else(|_| "{}".to_string());
+    json!({
+        "content": [ { "type": "text", "text": text } ],
+        "structuredContent": structured,
         "isError": is_error
     })
 }
@@ -1152,5 +1193,34 @@ mod tests {
         assert_eq!(r["isError"], true);
         assert_eq!(r["content"][0]["type"], "text");
         assert_eq!(r["content"][0]["text"], "boom");
+    }
+
+    #[test]
+    fn structured_result_carries_object_and_text_mirror() {
+        let payload = json!({ "results": [ { "id": "a", "title": "t", "url": "u" } ] });
+        let r = tool_structured_result(payload.clone(), false);
+        assert_eq!(r["isError"], false);
+        // structuredContent holds the object (what ChatGPT validates/reads).
+        assert_eq!(r["structuredContent"], payload);
+        // content holds a JSON-encoded text mirror (text-only clients).
+        let text = r["content"][0]["text"].as_str().unwrap();
+        let reparsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(reparsed, payload);
+    }
+
+    #[test]
+    fn search_and_fetch_advertise_output_schemas() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().unwrap();
+        let search = tools.iter().find(|t| t["name"] == "search").unwrap();
+        let fetch = tools.iter().find(|t| t["name"] == "fetch").unwrap();
+        assert_eq!(search["outputSchema"]["required"][0], "results");
+        let fetch_req = fetch["outputSchema"]["required"].as_array().unwrap();
+        for k in ["id", "title", "text", "url"] {
+            assert!(
+                fetch_req.iter().any(|v| v == k),
+                "fetch outputSchema must require {k}"
+            );
+        }
     }
 }
