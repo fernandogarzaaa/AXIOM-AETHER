@@ -168,9 +168,18 @@ pub fn router_from_env(pipeline: Arc<Mutex<InferencePipeline>>) -> Option<Router
     let backend = std::env::var("AXIOM_BACKEND").unwrap_or_default();
     let mode = router_mode_from(&backend)?;
 
+    let consensus = std::env::var("AXIOM_ROUTER_CONSENSUS")
+        .ok()
+        .map(|v| !matches!(v.trim(), "0" | "false" | "off" | ""))
+        .unwrap_or(false);
+
     match mode {
         RouterMode::Router => {
-            let mut router = Router::new(RoutePolicy::default()).with(
+            let policy = RoutePolicy {
+                consensus,
+                ..RoutePolicy::default()
+            };
+            let mut router = Router::new(policy).with(
                 Provider::Local,
                 Box::new(LocalPipelineBackend { pipeline }),
             );
@@ -211,7 +220,7 @@ pub fn router_from_env(pipeline: Arc<Mutex<InferencePipeline>>) -> Option<Router
                 reasoning: Provider::OpenAi,
                 general: Provider::OpenAi,
                 failover: vec![Provider::OpenAi, Provider::Local],
-                consensus: false,
+                consensus,
             };
             let openai_key = std::env::var("OPENAI_API_KEY")
                 .ok()
@@ -248,6 +257,20 @@ mod tests {
         assert_eq!(router_mode_from("opendrop"), Some(RouterMode::OpenDrop));
         assert_eq!(router_mode_from("bootstrap"), None);
         assert_eq!(router_mode_from("claude"), None);
+    }
+
+    #[test]
+    fn consensus_env_var_parsing() {
+        let truthy = ["1", "true", "yes", "on"];
+        let falsy = ["0", "false", "off", ""];
+        for v in truthy {
+            let enabled = !matches!(v.trim(), "0" | "false" | "off" | "");
+            assert!(enabled, "expected {v:?} to enable consensus");
+        }
+        for v in falsy {
+            let enabled = !matches!(v.trim(), "0" | "false" | "off" | "");
+            assert!(!enabled, "expected {v:?} to disable consensus");
+        }
     }
 
     #[test]

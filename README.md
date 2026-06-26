@@ -296,6 +296,7 @@ Useful environment variables:
 | `AXIOM_HEAL_MEMORY` | Path for learned heal memory, or `0`/`off` to disable. |
 | `AXIOM_FLEET_KEY` | HMAC key for swarm immunity exchange. |
 | `AXIOM_VERIFY_RESPONSES` | Opt in to response grounding advisories. |
+| `AXIOM_ROUTER_CONSENSUS` | Set to `1` to enable consensus mode: the router asks two providers and fuses answers via `BetaBelief`. |
 
 ## Docker
 
