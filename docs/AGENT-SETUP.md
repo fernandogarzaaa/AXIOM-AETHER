@@ -95,9 +95,12 @@ plus the standard `search`/`fetch` aliases for ChatGPT's standard connector mode
 
 > **Pick a stable, free public endpoint.** A reusable URL matters because you
 > paste it into ChatGPT once:
-> - **ngrok with a free static domain** (`https://<name>.ngrok-free.dev`) — the
->   recommended free option: the domain persists across restarts. Claim it in the
->   ngrok dashboard, then `ngrok http --domain=<name>.ngrok-free.dev 8080`.
+> - **ngrok's free assigned dev domain** (`https://<assigned>.ngrok-free.dev`) —
+>   the recommended free option: ngrok gives each free account **one persistent
+>   dev domain, auto-assigned** (you can't choose or reserve the name on the free
+>   plan). Find yours in the ngrok dashboard, then bind to it:
+>   `ngrok http 8080 --url=<assigned>.ngrok-free.dev` (the `--url` flag replaces
+>   the deprecated `--domain`).
 > - **Cloudflare quick tunnel** (`cloudflared tunnel --url …`) — free but the URL
 >   is **ephemeral** (changes every run), so you'd re-paste it into ChatGPT each
 >   time.
@@ -168,9 +171,11 @@ verify.
 >    --port 8080` (use `--checkpoint` if a trained checkpoint exists).
 > 4. **Expose it** over HTTPS with a tunnel and capture the public URL. Prefer a
 >    **stable, free** endpoint so I only paste it into ChatGPT once — an
->    **ngrok free static domain** (`ngrok http --domain=<name>.ngrok-free.dev
->    8080`) is ideal; a Cloudflare *quick* tunnel works but its URL is ephemeral,
->    and a Cloudflare *named* tunnel needs a domain/zone on the account.
+>    your **ngrok free assigned dev domain** (auto-assigned and persistent — read
+>    it from the ngrok dashboard, then `ngrok http 8080
+>    --url=<assigned>.ngrok-free.dev`) is ideal; a Cloudflare *quick* tunnel works
+>    but its URL is ephemeral, and a Cloudflare *named* tunnel needs a domain/zone
+>    on the account.
 > 5. **Smoke test** a `tools/list` JSON-RPC call against `https://<host>/mcp` with
 >    the `Authorization: Bearer <token>` header, both locally and through the
 >    tunnel. Show me the tool names returned; I expect to see `search` and `fetch`
