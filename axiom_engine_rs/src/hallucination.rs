@@ -88,6 +88,106 @@ const SUPPORT_HIGH: f32 = 0.60;
 /// Below this → unsupported; between the two → unverified.
 const SUPPORT_LOW: f32 = 0.30;
 
+/// Default δ for conformal coverage (0.10 → 90% coverage of genuinely supported claims).
+const DEFAULT_CONFORMAL_DELTA: f32 = 0.10;
+
+/// Conformal factuality gate: calibrated support threshold replacing the
+/// hardcoded `SUPPORT_HIGH`/`SUPPORT_LOW` constants.
+///
+/// Calibrate with `calibrate_conformal_threshold` from a
+/// `(score, truly_supported)` sample; the result is a coverage-guaranteed
+/// threshold τ such that at least (1-δ) of genuinely supported claims score ≥ τ.
+///
+/// **Env-var control**
+/// - `AXIOM_CONFORMAL_THRESHOLD` — use this value directly as τ (no calibration
+///   data required).
+/// - `AXIOM_CONFORMAL_DELTA` — set δ (default 0.10 → 90% coverage); paired with
+///   `AXIOM_CONFORMAL_THRESHOLD` it records the coverage intent.
+///
+/// When neither is set the hardcoded constants remain in effect.
+#[derive(Debug, Clone, Copy)]
+pub struct ConformalGate {
+    /// Threshold τ: support ≥ threshold → Supported.
+    pub threshold: f32,
+    /// Coverage tolerance δ used to derive the threshold (informational).
+    pub delta: f32,
+}
+
+impl ConformalGate {
+    /// Derive τ from a calibration set at the δ-missed-coverage level.
+    ///
+    /// `calibration` is a slice of `(score, truly_supported)` pairs. The
+    /// threshold is the δ-quantile of the positive scores: at most δ of
+    /// genuinely supported claims will score below τ, so at least (1-δ) are
+    /// captured. Falls back to `SUPPORT_HIGH` when there are no positives.
+    pub fn calibrate(calibration: &[(f32, bool)], delta: f32) -> Self {
+        let mut positives: Vec<f32> = calibration
+            .iter()
+            .filter_map(|(s, y)| if *y { Some(*s) } else { None })
+            .collect();
+        let threshold = if positives.is_empty() {
+            SUPPORT_HIGH
+        } else {
+            positives.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // δ-quantile (truncating floor): allow at most δ·n positives below τ.
+            let idx = ((positives.len() as f32 * delta.clamp(0.0, 1.0)) as usize)
+                .min(positives.len() - 1);
+            positives[idx].clamp(0.0, 1.0)
+        };
+        Self {
+            threshold,
+            delta: delta.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Load from environment variables, returning `None` when neither is set.
+    pub fn from_env() -> Option<Self> {
+        let delta = std::env::var("AXIOM_CONFORMAL_DELTA")
+            .ok()
+            .and_then(|d| d.trim().parse::<f32>().ok())
+            .map(|d| d.clamp(0.0, 1.0));
+
+        if let Ok(t) = std::env::var("AXIOM_CONFORMAL_THRESHOLD") {
+            if let Ok(v) = t.trim().parse::<f32>() {
+                return Some(Self {
+                    threshold: v.clamp(0.0, 1.0),
+                    delta: delta.unwrap_or(DEFAULT_CONFORMAL_DELTA),
+                });
+            }
+        }
+
+        delta.map(|d| Self {
+            threshold: SUPPORT_HIGH,
+            delta: d,
+        })
+    }
+
+    /// Verdict for a support score under this gate.
+    ///
+    /// The "unsupported" boundary is half the threshold, preserving the same
+    /// ratio as the default constants (0.30 / 0.60 = 0.5).
+    pub fn verdict(&self, support: f32) -> Verdict {
+        let low = self.threshold * 0.5;
+        if support >= self.threshold {
+            Verdict::Supported
+        } else if support < low {
+            Verdict::Unsupported
+        } else {
+            Verdict::Unverified
+        }
+    }
+}
+
+/// Compute a conformal support threshold from calibration data at coverage (1-δ).
+///
+/// `calibration` is `(score, truly_supported)` pairs collected from a held-out
+/// set. The returned threshold τ guarantees that at least (1-δ) of genuinely
+/// supported claims will score ≥ τ under `best_support`. Pass the result as
+/// `AXIOM_CONFORMAL_THRESHOLD` to activate the calibrated gate at runtime.
+pub fn calibrate_conformal_threshold(calibration: &[(f32, bool)], delta: f32) -> f32 {
+    ConformalGate::calibrate(calibration, delta).threshold
+}
+
 const STOPWORDS: &[&str] = &[
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "to", "of", "in", "on",
     "at", "for", "and", "or", "but", "if", "then", "that", "this", "these", "those", "it", "its",
@@ -199,6 +299,10 @@ fn tally(claims: Vec<ClaimVerdict>) -> GroundingReport {
 }
 
 /// Verify a response's claims against `evidence`, returning a grounding report.
+///
+/// When `AXIOM_CONFORMAL_THRESHOLD` or `AXIOM_CONFORMAL_DELTA` is set the
+/// verdict boundaries are taken from the conformal gate instead of the
+/// hardcoded `SUPPORT_HIGH`/`SUPPORT_LOW` constants.
 pub fn verify(response: &str, evidence: &str) -> GroundingReport {
     let evidence_spans: Vec<Vec<String>> = sentences(evidence)
         .iter()
@@ -206,11 +310,15 @@ pub fn verify(response: &str, evidence: &str) -> GroundingReport {
         .filter(|t| !t.is_empty())
         .collect();
 
+    let gate = ConformalGate::from_env();
+
     let mut claims = Vec::new();
     for claim in extract_claims(response) {
         let toks = content_tokens(&claim);
         let support = best_support(&toks, &evidence_spans);
-        let verdict = if support >= SUPPORT_HIGH {
+        let verdict = if let Some(ref g) = gate {
+            g.verdict(support)
+        } else if support >= SUPPORT_HIGH {
             Verdict::Supported
         } else if support < SUPPORT_LOW {
             Verdict::Unsupported
@@ -521,5 +629,71 @@ mod tests {
         assert!(report.expanded_symbols.is_empty());
         assert_eq!(report.expansion_bytes, 0, "no tokens spent when already grounded");
         assert_eq!(resolver_calls, 0, "resolver not consulted for supported claims");
+    }
+
+    // ── Conformal gate ────────────────────────────────────────────────────────
+
+    #[test]
+    fn conformal_calibration_coverage_guarantee() {
+        // 10 positives at evenly spaced scores 0.1, 0.2, …, 1.0.
+        let cal: Vec<(f32, bool)> = (1..=10).map(|i| (i as f32 * 0.1, true)).collect();
+        let threshold = calibrate_conformal_threshold(&cal, 0.10);
+        // δ=0.10 ⇒ allow at most 1 positive below τ: positives[floor(10*0.10)] = s[1] = 0.2.
+        assert!((threshold - 0.2).abs() < 1e-5, "threshold={threshold}");
+        // Coverage: 9 of 10 positives score ≥ 0.2 → 90%.
+        let positives: Vec<f32> = cal.iter().filter(|(_, y)| *y).map(|(s, _)| *s).collect();
+        let covered = positives.iter().filter(|&&s| s >= threshold).count();
+        assert!(
+            covered as f32 / positives.len() as f32 >= 0.90,
+            "coverage guarantee violated: {covered}/{} < 90%",
+            positives.len()
+        );
+    }
+
+    #[test]
+    fn conformal_calibration_delta_zero_captures_all() {
+        // δ=0 → threshold must be the minimum positive score (100% coverage).
+        let cal = vec![(0.2f32, true), (0.5, true), (0.8, true)];
+        let threshold = calibrate_conformal_threshold(&cal, 0.0);
+        assert!((threshold - 0.2).abs() < 1e-5, "threshold={threshold}");
+        let covered = cal.iter().filter(|(s, y)| *y && *s >= threshold).count();
+        assert_eq!(covered, 3, "all positives must score >= threshold at delta=0");
+    }
+
+    #[test]
+    fn conformal_calibration_no_positives_falls_back_to_support_high() {
+        let cal = vec![(0.2f32, false), (0.4, false)];
+        let threshold = calibrate_conformal_threshold(&cal, 0.10);
+        assert!((threshold - SUPPORT_HIGH).abs() < 1e-5);
+    }
+
+    #[test]
+    fn conformal_gate_verdict_boundaries() {
+        let gate = ConformalGate {
+            threshold: 0.50,
+            delta: 0.10,
+        };
+        // Above threshold → Supported.
+        assert_eq!(gate.verdict(0.60), Verdict::Supported);
+        assert_eq!(gate.verdict(0.50), Verdict::Supported);
+        // Between low (0.25) and threshold → Unverified.
+        assert_eq!(gate.verdict(0.30), Verdict::Unverified);
+        // Below low → Unsupported.
+        assert_eq!(gate.verdict(0.10), Verdict::Unsupported);
+        assert_eq!(gate.verdict(0.0), Verdict::Unsupported);
+    }
+
+    #[test]
+    fn conformal_gate_from_env_returns_none_without_vars() {
+        // As long as the conformal env vars are unset (typical test env), from_env
+        // returns None and verify uses the hardcoded thresholds.
+        if std::env::var("AXIOM_CONFORMAL_THRESHOLD").is_err()
+            && std::env::var("AXIOM_CONFORMAL_DELTA").is_err()
+        {
+            assert!(ConformalGate::from_env().is_none());
+            // verify should behave exactly as before.
+            let r = verify("Axiom uses online test-time training.", EVIDENCE);
+            assert_eq!(r.claims[0].verdict, Verdict::Supported);
+        }
     }
 }

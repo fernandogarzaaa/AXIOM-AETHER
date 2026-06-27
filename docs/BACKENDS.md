@@ -40,6 +40,21 @@ server still answers even if every cloud provider is down.
 Env knobs: `OPENAI_API_KEY`, `OPENAI_BASE_URL` (or `OPENAI_API_BASE`),
 `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`.
 
+#### Consensus mode
+
+Set `AXIOM_ROUTER_CONSENSUS=1` to ask two providers for every generation and
+fuse their answers via `BetaBelief` instead of returning the first success:
+
+```bash
+export AXIOM_BACKEND=router
+export AXIOM_ROUTER_CONSENSUS=1
+export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-...
+axiom --mode server
+```
+
+Any value other than `0`, `false`, or `off` enables consensus. Off by default.
+
 > **Multi-provider router** (GPT + Claude together, with failover and belief
 > consensus) is live as `AXIOM_BACKEND=router` (see below) and also grounds
 > ChimeraLang `inquire`.
@@ -98,6 +113,5 @@ ChimeraLang — runs on it. A bigger model (OpenDrop-served or cloud) only impro
    exposes `search` and `fetch` tools (over its semantic memory) alongside its
    native tools, so it works as a standard ChatGPT connector, not just Developer
    Mode (see `MCP-CLIENTS.md`).
-2. **Consensus on the live router** — `AXIOM_BACKEND=router` runs single-provider
-   routing + failover today; surfacing the opt-in two-model consensus
-   (`RoutePolicy.consensus`) as a runtime toggle is a follow-up.
+2. ~~**Consensus on the live router**~~ — **done**: set `AXIOM_ROUTER_CONSENSUS=1`
+   to enable two-model consensus with `BetaBelief` fusion (see above).
