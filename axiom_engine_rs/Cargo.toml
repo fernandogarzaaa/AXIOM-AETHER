@@ -1,6 +1,6 @@
 [package]
 name = "axiom_engine"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Axiom-TTT Inference Engine – Rust implementation using candle"
 license = "MIT"
