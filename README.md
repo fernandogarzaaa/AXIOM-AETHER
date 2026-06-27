@@ -297,6 +297,8 @@ Useful environment variables:
 | `AXIOM_FLEET_KEY` | HMAC key for swarm immunity exchange. |
 | `AXIOM_VERIFY_RESPONSES` | Opt in to response grounding advisories. |
 | `AXIOM_ROUTER_CONSENSUS` | Set to `1` to enable consensus mode: the router asks two providers and fuses answers via `BetaBelief`. |
+| `AXIOM_CONFORMAL_THRESHOLD` | Pre-calibrated support threshold τ for the conformal factuality gate; replaces the hardcoded 0.60 cutoff. |
+| `AXIOM_CONFORMAL_DELTA` | Coverage tolerance δ (default 0.10 → 90% coverage); pair with `AXIOM_CONFORMAL_THRESHOLD` or calibrate via `calibrate_conformal_threshold`. |
 
 ## Docker
 

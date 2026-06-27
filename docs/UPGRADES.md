@@ -31,9 +31,15 @@ engine, and a citation. Status: ✅ implemented · 🚧 scaffolded · ⬜ planne
 
 ## P1 — medium effort, strong payoff
 
-- ⬜ **Conformal factuality gate** — calibrate detector scores into a keep/drop
+- ✅ **Conformal factuality gate** — calibrate detector scores into a keep/drop
   threshold with a distribution-free guarantee that ≥(1−δ) of retained claims are
   correct (Mohri & Hashimoto, arXiv:2402.10978). Runtime = one quantile.
+  `ConformalGate::calibrate(calibration, delta)` derives τ as the δ-quantile of
+  positive-example scores; `calibrate_conformal_threshold` exposes it as a
+  standalone function. Set `AXIOM_CONFORMAL_THRESHOLD` to use a pre-calibrated τ
+  directly, or `AXIOM_CONFORMAL_DELTA` to record δ intent. When neither is set
+  the hardcoded `SUPPORT_HIGH`/`SUPPORT_LOW` thresholds remain in effect (backward
+  compatible). Wired into `verify()` in `hallucination.rs`.
 - ⬜ **LLMLingua-2 second-stage squeeze** (encoder-only, candle-portable,
   arXiv:2403.12968) + **query-aware expansion ranking** (LongLLMLingua,
   arXiv:2310.06839; "Beyond RAG", arXiv:2503.04973) on the compression path.
