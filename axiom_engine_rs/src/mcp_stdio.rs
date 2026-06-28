@@ -73,6 +73,8 @@ pub struct McpContext {
     /// Base URL of the running Axiom HTTP proxy (for awareness endpoint calls).
     /// Override with `AXIOM_PROXY_URL` (default `http://127.0.0.1:3000`).
     pub proxy_url: String,
+    /// Inter-agent task board. Loaded once from AXIOM_TASK_DIR.
+    task_board: Arc<crate::task_board::TaskBoard>,
 }
 
 /// Assemble an [`McpContext`] (pipeline + vibe + memory + embedder) from config,
@@ -164,6 +166,15 @@ pub async fn build_context(
         max_bytes,
         proxy_url: std::env::var("AXIOM_PROXY_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
+        task_board: Arc::new(
+            if std::env::var("AXIOM_TASK_DIR").is_ok() {
+                crate::task_board::TaskBoard::from_env()
+                    .map_err(|e| format!("AXIOM_TASK_DIR open failed: {e}"))?
+            } else {
+                crate::task_board::TaskBoard::open("checkpoints/tasks")
+                    .map_err(|e| format!("task board init failed: {e}"))?
+            }
+        ),
     })
 }
 
@@ -448,6 +459,59 @@ fn tools_list() -> Value {
                         }
                     }
                 }
+            },
+            {
+                "name": "axiom_post_task",
+                "description": "Post a task to a named channel so another agent (Claude, Codex, or a script) can claim and execute it. Attach an Axiom context digest so the claimer can reconstruct your context without re-reading it.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": { "type": "string", "description": "Work-queue channel name (e.g. 'code-review', 'codex-tasks')." },
+                        "description": { "type": "string", "description": "What needs to be done." },
+                        "context_digest": { "type": "string", "description": "Optional Axiom fingerprint from axiom_compress_path. The claimer can call axiom_expand to retrieve dropped symbols." },
+                        "budget_snapshot": { "type": "integer", "description": "Optional remaining token count to help the claimer size its work." },
+                        "priority": { "type": "integer", "description": "0 = normal, 1 = high. High-priority tasks are claimed first." },
+                        "posted_by": { "type": "string", "description": "Optional agent identifier for the poster." }
+                    },
+                    "required": ["channel", "description"]
+                }
+            },
+            {
+                "name": "axiom_claim_task",
+                "description": "Claim the next available task from a channel. Returns the highest-priority oldest pending task and marks it as in-progress. Call axiom_task_result when done.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": { "type": "string", "description": "Channel to claim from." },
+                        "agent_id": { "type": "string", "description": "Optional identifier of the claiming agent." }
+                    },
+                    "required": ["channel"]
+                }
+            },
+            {
+                "name": "axiom_task_result",
+                "description": "Report the result of a claimed task. Marks it done or failed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": { "type": "string", "description": "Task ID returned by axiom_claim_task." },
+                        "result": { "type": "string", "description": "Result text, summary, or error message." },
+                        "success": { "type": "boolean", "description": "true = Done, false = Failed." }
+                    },
+                    "required": ["task_id", "result", "success"]
+                }
+            },
+            {
+                "name": "axiom_list_tasks",
+                "description": "List tasks in a channel, optionally filtered by status (pending, claimed, done, failed). Returns all tasks if no filter given.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "channel": { "type": "string", "description": "Channel to inspect." },
+                        "status": { "type": "string", "description": "Optional filter: pending | claimed | done | failed." }
+                    },
+                    "required": ["channel"]
+                }
             }
         ]
     })
@@ -694,6 +758,127 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     tool_text_result(&format!("status unavailable: {e}"), true),
                 ),
             }
+        }
+        "axiom_post_task" => {
+            let Some(channel) = args.get("channel").and_then(Value::as_str) else {
+                return error_response(id, -32602, "axiom_post_task requires string 'channel'");
+            };
+            let Some(description) = args.get("description").and_then(Value::as_str) else {
+                return error_response(id, -32602, "axiom_post_task requires string 'description'");
+            };
+            let channel = channel.to_string();
+            let description = description.to_string();
+            let context_digest = args.get("context_digest").and_then(Value::as_str).map(str::to_string);
+            let budget_snapshot = args.get("budget_snapshot").and_then(Value::as_u64).map(|n| n as usize);
+            let priority = args.get("priority").and_then(Value::as_u64).unwrap_or(0) as u8;
+            let posted_by = args.get("posted_by").and_then(Value::as_str).map(str::to_string);
+            let board = ctx.task_board.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                board.post_task(&channel, description, context_digest, budget_snapshot, priority, posted_by)
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
+            match outcome {
+                Ok(task) => {
+                    let text = format!(
+                        "Task posted.\ntask_id : {}\nchannel : {}\nstatus  : pending\ndescription: {}",
+                        task.task_id, task.channel, task.description
+                    );
+                    success_response(id, tool_text_result(&text, false))
+                }
+                Err(e) => success_response(id, tool_text_result(&format!("post_task failed: {e}"), true)),
+            }
+        }
+        "axiom_claim_task" => {
+            let Some(channel) = args.get("channel").and_then(Value::as_str) else {
+                return error_response(id, -32602, "axiom_claim_task requires string 'channel'");
+            };
+            let channel = channel.to_string();
+            let agent_id = args.get("agent_id").and_then(Value::as_str).map(str::to_string);
+            let board = ctx.task_board.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                board.claim_task(&channel, agent_id)
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
+            match outcome {
+                Ok(None) => success_response(
+                    id,
+                    tool_text_result("No pending tasks in this channel.", false),
+                ),
+                Ok(Some(task)) => {
+                    let digest_line = task.context_digest
+                        .as_deref()
+                        .map(|d| format!("\ncontext_digest:\n{d}"))
+                        .unwrap_or_default();
+                    let budget_line = task.budget_snapshot
+                        .map(|b| format!("\nbudget_snapshot: {b} tokens"))
+                        .unwrap_or_default();
+                    let text = format!(
+                        "Task claimed.\ntask_id    : {}\nchannel    : {}\ndescription: {}\nposted_by  : {}\npriority   : {}{}{}",
+                        task.task_id, task.channel, task.description,
+                        task.posted_by.as_deref().unwrap_or("unknown"),
+                        task.priority, budget_line, digest_line
+                    );
+                    success_response(id, tool_text_result(&text, false))
+                }
+                Err(e) => success_response(id, tool_text_result(&format!("claim_task failed: {e}"), true)),
+            }
+        }
+        "axiom_task_result" => {
+            let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+                return error_response(id, -32602, "axiom_task_result requires string 'task_id'");
+            };
+            let Some(result) = args.get("result").and_then(Value::as_str) else {
+                return error_response(id, -32602, "axiom_task_result requires string 'result'");
+            };
+            let success = args.get("success").and_then(Value::as_bool).unwrap_or(true);
+            let task_id = task_id.to_string();
+            let result = result.to_string();
+            let board = ctx.task_board.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                board.task_result(&task_id, result, success)
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
+            match outcome {
+                Ok(true) => success_response(
+                    id,
+                    tool_text_result(&format!("Task marked {}.", if success { "done" } else { "failed" }), false),
+                ),
+                Ok(false) => success_response(
+                    id,
+                    tool_text_result("task_id not found.", true),
+                ),
+                Err(e) => success_response(id, tool_text_result(&format!("task_result failed: {e}"), true)),
+            }
+        }
+        "axiom_list_tasks" => {
+            let Some(channel) = args.get("channel").and_then(Value::as_str) else {
+                return error_response(id, -32602, "axiom_list_tasks requires string 'channel'");
+            };
+            let channel = channel.to_string();
+            let status_filter = args.get("status").and_then(Value::as_str).map(str::to_string);
+            let board = ctx.task_board.clone();
+            let tasks = tokio::task::spawn_blocking(move || {
+                board.list_tasks(&channel, status_filter.as_deref())
+            })
+            .await
+            .unwrap_or_default();
+            if tasks.is_empty() {
+                return success_response(id, tool_text_result("No tasks found.", false));
+            }
+            let lines: Vec<String> = tasks.iter().map(|t| {
+                format!(
+                    "[{}] {} | {} | {}{}",
+                    t.status,
+                    t.task_id.get(..8).unwrap_or(&t.task_id),
+                    t.description,
+                    t.posted_by.as_deref().unwrap_or("?"),
+                    t.result.as_deref().map(|r| format!(" → {}", r.lines().next().unwrap_or(r))).unwrap_or_default()
+                )
+            }).collect();
+            success_response(id, tool_text_result(&lines.join("\n"), false))
         }
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
     }
@@ -1253,12 +1438,16 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 15);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
         assert!(names.contains(&"axiom_expand"));
         assert!(names.contains(&"axiom_status"));
+        assert!(names.contains(&"axiom_post_task"));
+        assert!(names.contains(&"axiom_claim_task"));
+        assert!(names.contains(&"axiom_task_result"));
+        assert!(names.contains(&"axiom_list_tasks"));
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object");
             // `required` is optional in MCP (axiom_immunity has only optional

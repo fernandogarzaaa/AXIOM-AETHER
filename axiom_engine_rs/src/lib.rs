@@ -55,6 +55,7 @@ pub mod skeleton;
 pub mod surprisal;
 pub mod swarm_route;
 pub mod swarm_router;
+pub mod task_board;
 pub mod test_time_adapter;
 pub mod train;
 pub mod ttt_block;

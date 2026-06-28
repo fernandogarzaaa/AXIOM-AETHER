@@ -52,6 +52,7 @@ mod solve;
 mod server;
 mod skeleton;
 mod surprisal;
+mod task_board;
 mod swarm_route;
 mod swarm_router;
 mod test_time_adapter;
