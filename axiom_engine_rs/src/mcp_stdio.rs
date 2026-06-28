@@ -167,8 +167,13 @@ pub async fn build_context(
         proxy_url: std::env::var("AXIOM_PROXY_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
         task_board: Arc::new(
-            crate::task_board::TaskBoard::from_env()
-                .unwrap_or_else(|_| crate::task_board::TaskBoard::open("checkpoints/tasks").unwrap()),
+            if std::env::var("AXIOM_TASK_DIR").is_ok() {
+                crate::task_board::TaskBoard::from_env()
+                    .map_err(|e| format!("AXIOM_TASK_DIR open failed: {e}"))?
+            } else {
+                crate::task_board::TaskBoard::open("checkpoints/tasks")
+                    .map_err(|e| format!("task board init failed: {e}"))?
+            }
         ),
     })
 }

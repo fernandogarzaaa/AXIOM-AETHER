@@ -114,13 +114,15 @@ impl TaskBoard {
     }
 
     fn channel_path(&self, channel: &str) -> PathBuf {
+        // Percent-encode everything outside [A-Za-z0-9_-] so distinct channel
+        // names always map to distinct filenames (no silent collision).
         let stem: String = channel
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
+            .bytes()
+            .flat_map(|b| {
+                if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+                    vec![b as char]
                 } else {
-                    '_'
+                    format!("%{b:02X}").chars().collect::<Vec<_>>()
                 }
             })
             .collect();
