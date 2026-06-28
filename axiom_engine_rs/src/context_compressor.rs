@@ -457,6 +457,11 @@ pub struct CompressionControls {
     /// retried upstream with the original uncompressed payload (graceful
     /// degradation — a compression-side fault never costs the client a turn).
     degraded_fallbacks: std::sync::atomic::AtomicU64,
+    /// Agent-reported token budget target for compression sizing.
+    /// Zero when not set.
+    budget_target_tokens: std::sync::atomic::AtomicUsize,
+    /// True once the agent has set a budget target.
+    budget_target_set: std::sync::atomic::AtomicBool,
 }
 
 impl CompressionControls {
@@ -470,6 +475,8 @@ impl CompressionControls {
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
             degraded_fallbacks: AtomicU64::new(0),
+            budget_target_tokens: AtomicUsize::new(0),
+            budget_target_set: AtomicBool::new(false),
         }
     }
 
@@ -509,6 +516,24 @@ impl CompressionControls {
     pub fn degraded_fallbacks(&self) -> u64 {
         self.degraded_fallbacks
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set a budget-derived compression target (60 % of agent's remaining tokens).
+    pub fn set_budget_target(&self, tokens: usize) {
+        self.budget_target_tokens.store(tokens, std::sync::atomic::Ordering::Relaxed);
+        self.budget_target_set.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Effective threshold: min(configured threshold, budget target) when a
+    /// budget has been set; otherwise just the configured threshold.
+    pub fn effective_threshold(&self) -> usize {
+        let base = self.threshold();
+        if self.budget_target_set.load(std::sync::atomic::Ordering::Relaxed) {
+            let budget_t = self.budget_target_tokens.load(std::sync::atomic::Ordering::Relaxed);
+            base.min(budget_t)
+        } else {
+            base
+        }
     }
 
     /// (requests, messages_compressed, bytes_in, bytes_out)

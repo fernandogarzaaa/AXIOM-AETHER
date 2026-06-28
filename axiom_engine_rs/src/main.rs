@@ -46,6 +46,7 @@ mod provenance;
 mod q_manifold;
 mod quantization;
 mod sandbox;
+mod session_awareness;
 mod self_heal;
 mod solve;
 mod server;

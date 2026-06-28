@@ -60,6 +60,7 @@ use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarder
 use crate::poly_jit::{PolyJitEngine, PolyJitRunRequest, PolyJitReport, PolyJitStatus};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
 use crate::sandbox::{SandboxController, SandboxDiagnostic};
+use crate::session_awareness::AwarenessStore;
 use crate::surprisal::{ExactAttentionResidualCache, ExactResidualTelemetry};
 use crate::swarm_route::{LocalSwarmRouteMatrix, SwarmMatrixState};
 use crate::swarm_router::{SwarmChatResult, SwarmRouter};
@@ -286,6 +287,10 @@ pub struct AppState {
     /// Path to the persistent heal memory served/merged by the swarm-immunity
     /// endpoints (`/v1/immunity`). `None` disables those routes.
     pub heal_memory_path: Arc<Option<std::path::PathBuf>>,
+    /// Per-session token-awareness and self-awareness state. Tracks budget,
+    /// token costs of Axiom responses, and compression metrics so Axiom can
+    /// adapt autonomously. Populated via `POST /v1/budget`.
+    pub awareness: AwarenessStore,
 }
 
 impl AppState {
@@ -318,6 +323,7 @@ impl AppState {
             dwe_bus: Arc::new(DweBus::from_env()),
             swarm_matrix: Arc::new(LocalSwarmRouteMatrix::new()),
             heal_memory_path: Arc::new(None),
+            awareness: AwarenessStore::new(),
         }
     }
 
@@ -1180,6 +1186,17 @@ struct HypervisorJitRunRequest {
     /// the run and restored if the repair does not ultimately pass.
     #[serde(default)]
     source_path: Option<String>,
+}
+
+/// `POST /v1/budget` request: agent reports remaining token budget.
+#[derive(Debug, Deserialize)]
+struct BudgetRequest {
+    /// Remaining tokens in the agent's context window.
+    remaining_tokens: usize,
+    /// Optional model identifier, e.g. "claude-sonnet-4-6".
+    model: Option<String>,
+    /// Optional session ID to scope the budget (defaults to "global").
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3230,6 +3247,8 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/v1/chimera/run", post(post_chimera_run))
         .route("/mcp", get(mcp_http_sse).post(post_mcp))
+        .route("/v1/budget", post(post_budget))
+        .route("/v1/awareness/:id", get(get_awareness))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -3843,6 +3862,72 @@ fn threshold_to_level(t: usize) -> &'static str {
         "medium"
     } else {
         "low"
+    }
+}
+
+/// `POST /v1/budget` — agent reports remaining token budget.
+///
+/// Stores the budget in the awareness store. When a budget is set, the
+/// compression threshold is automatically capped to 60 % of remaining
+/// tokens so Axiom doesn't overshoot the context window.
+async fn post_budget(
+    State(state): State<AppState>,
+    Json(body): Json<BudgetRequest>,
+) -> impl IntoResponse {
+    let id = body.session_id.as_deref().unwrap_or("global");
+    let awareness = state.awareness.get_or_create(id);
+    awareness.set_budget(body.remaining_tokens, body.model.clone());
+
+    // Auto-tune compression threshold: cap at 60 % of remaining budget.
+    if let Some(target) = awareness.compression_target_tokens() {
+        let current = state.controls.threshold();
+        if target < current {
+            state.controls.set_threshold(target);
+        }
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "session_id": id,
+        "remaining_tokens": body.remaining_tokens,
+        "compression_threshold_tokens": state.controls.threshold(),
+        "model": body.model,
+    }))
+}
+
+/// `GET /v1/awareness/{id}` — return the current awareness state for a session.
+async fn get_awareness(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.awareness.get(&id) {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no awareness state for session", "id": id })),
+        )
+            .into_response(),
+        Some(a) => {
+            let (requests, msgs, bytes_in, bytes_out) = state.controls.counters();
+            Json(serde_json::json!({
+                "session_id": id,
+                "budget_remaining": a.budget(),
+                "target_model": a.target_model.lock().ok().and_then(|g| g.clone()),
+                "tokens_spent_on_axiom": a.tokens_spent.load(std::sync::atomic::Ordering::Relaxed),
+                "tool_calls_total": a.tool_calls_total.load(std::sync::atomic::Ordering::Relaxed),
+                "expansion_calls": a.expansion_calls.load(std::sync::atomic::Ordering::Relaxed),
+                "compression_ratio": a.compression_ratio(),
+                "compression_target_tokens": a.compression_target_tokens(),
+                "is_tight": a.is_tight(),
+                "recommendation": a.recommendation(),
+                "global_counters": {
+                    "requests": requests,
+                    "messages_compressed": msgs,
+                    "bytes_in": bytes_in,
+                    "bytes_out": bytes_out,
+                },
+            }))
+            .into_response()
+        }
     }
 }
 

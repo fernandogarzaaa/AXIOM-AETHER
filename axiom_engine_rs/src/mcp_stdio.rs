@@ -70,6 +70,9 @@ pub struct McpContext {
     /// Max files / bytes ingested by `axiom_compress_path`.
     max_files: usize,
     max_bytes: usize,
+    /// Base URL of the running Axiom HTTP proxy (for awareness endpoint calls).
+    /// Override with `AXIOM_PROXY_URL` (default `http://127.0.0.1:3000`).
+    pub proxy_url: String,
 }
 
 /// Assemble an [`McpContext`] (pipeline + vibe + memory + embedder) from config,
@@ -159,6 +162,8 @@ pub async fn build_context(
         top_k,
         max_files,
         max_bytes,
+        proxy_url: std::env::var("AXIOM_PROXY_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
     })
 }
 
@@ -430,6 +435,19 @@ fn tools_list() -> Value {
                     },
                     "required": ["id", "title", "text", "url", "metadata"]
                 }
+            },
+            {
+                "name": "axiom_status",
+                "description": "Report the current session awareness state: token budget, tokens spent on Axiom responses, compression ratio, expansion-miss count, and a recommendation. Call this to understand how much context budget remains and whether Axiom's compression settings need tuning.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session ID to query (default: 'mcp')."
+                        }
+                    }
+                }
             }
         ]
     })
@@ -657,8 +675,79 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 Err(e) => success_response(id, tool_text_result(&format!("fetch failed: {e}"), true)),
             }
         }
+        "axiom_status" => {
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_string();
+            let proxy_url = ctx.proxy_url.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                status_blocking(&session_id, &proxy_url)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            match outcome {
+                Ok(report) => success_response(id, tool_text_result(&report, false)),
+                Err(e) => success_response(
+                    id,
+                    tool_text_result(&format!("status unavailable: {e}"), true),
+                ),
+            }
+        }
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
     }
+}
+
+/// `axiom_status` worker — calls `GET /v1/awareness/{session_id}` on the running
+/// proxy and formats the JSON as a human-readable status block.
+fn status_blocking(session_id: &str, proxy_url: &str) -> Result<String, String> {
+    let url = format!(
+        "{}/v1/awareness/{}",
+        proxy_url.trim_end_matches('/'),
+        urlencoding::encode(session_id)
+    );
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("could not reach Axiom proxy at {url}: {e}"))?;
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Ok(format!(
+            "No awareness state for session '{session_id}' yet.              Call POST /v1/budget to report your token budget."
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!("proxy returned HTTP {status}"));
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("bad JSON from proxy: {e}"))?;
+    // Format as a readable block.
+    let budget = v["budget_remaining"]
+        .as_u64()
+        .map(|n| format!("{n} tokens"))
+        .unwrap_or_else(|| "not set".to_string());
+    let spent = v["tokens_spent_on_axiom"].as_u64().unwrap_or(0);
+    let tool_calls = v["tool_calls_total"].as_u64().unwrap_or(0);
+    let expansions = v["expansion_calls"].as_u64().unwrap_or(0);
+    let ratio = v["compression_ratio"]
+        .as_f64()
+        .map(|r| format!("{:.1}%", r * 100.0))
+        .unwrap_or_else(|| "no data".to_string());
+    let tight = v["is_tight"].as_bool().unwrap_or(false);
+    let model = v["target_model"].as_str().unwrap_or("unknown");
+    let rec = v["recommendation"].as_str().unwrap_or("—");
+    Ok(format!(
+        "=== Axiom Session Awareness: {session_id} ===
+         model            : {model}
+         budget remaining : {budget}{tight_flag}
+         spent on Axiom   : {spent} tokens across {tool_calls} tool calls
+         compression ratio: {ratio} (expand misses: {expansions})
+         recommendation   : {rec}",
+        tight_flag = if tight { " ⚠ TIGHT" } else { "" }
+    ))
 }
 
 /// `axiom_expand` worker — HTTP-calls the running proxy's `POST /v1/expand` to
