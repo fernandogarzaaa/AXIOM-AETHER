@@ -116,11 +116,7 @@ impl AwarenessState {
     pub fn recommendation(&self) -> Option<String> {
         let budget = self.budget()?;
         let spent = self.tokens_spent.load(Ordering::Relaxed);
-        let pct = if budget + spent > 0 {
-            spent * 100 / (budget + spent)
-        } else {
-            0
-        };
+        let pct = (spent * 100).checked_div(budget + spent).unwrap_or(0);
         let expansions = self.expansion_calls.load(Ordering::Relaxed);
         let mut msgs = Vec::new();
         if budget < 20_000 {
