@@ -1253,11 +1253,12 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
         assert!(names.contains(&"axiom_expand"));
+        assert!(names.contains(&"axiom_status"));
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object");
             // `required` is optional in MCP (axiom_immunity has only optional
