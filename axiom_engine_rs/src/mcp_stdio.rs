@@ -38,6 +38,7 @@ use crate::embedder::{embed_text, EmbeddingModel};
 use crate::inference::InferencePipeline;
 use crate::memory_recall::{recall, RecallParams};
 use crate::memory_store::{now_secs, MemoryKind, MemoryRecord, MemoryStore};
+use crate::session_awareness::AwarenessStore;
 use crate::vibe_memory::MasterVibe;
 
 /// MCP protocol revision we advertise in the `initialize` handshake.
@@ -75,6 +76,9 @@ pub struct McpContext {
     pub proxy_url: String,
     /// Inter-agent task board. Loaded once from AXIOM_TASK_DIR.
     task_board: Arc<crate::task_board::TaskBoard>,
+    /// Per-session token-awareness store (PR #72). Used to record tool response
+    /// costs and conditionally annotate responses with a meta cost line.
+    awareness: Arc<AwarenessStore>,
 }
 
 /// Assemble an [`McpContext`] (pipeline + vibe + memory + embedder) from config,
@@ -175,6 +179,7 @@ pub async fn build_context(
                     .map_err(|e| format!("task board init failed: {e}"))?
             }
         ),
+        awareness: Arc::new(AwarenessStore::new()),
     })
 }
 
@@ -512,6 +517,16 @@ fn tools_list() -> Value {
                     },
                     "required": ["channel"]
                 }
+            },
+            {
+                "name": "axiom_channels",
+                "description": "List all task-board channels that have at least one task.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string", "description": "Optional session identifier." }
+                    }
+                }
             }
         ]
     })
@@ -534,19 +549,27 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             let Some(path) = args.get("path").and_then(Value::as_str) else {
                 return error_response(id, -32602, "axiom_compress_path requires string 'path'");
             };
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
             let path = path.to_string();
+            let awareness = ctx.awareness.clone();
             let ctx = ctx.clone();
             let outcome = tokio::task::spawn_blocking(move || compress_path_blocking(&path, &ctx))
                 .await
                 .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok(block) => success_response(id, tool_text_result(&block, false)),
+                Ok(block) => {
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_compress_path", &block);
+                    success_response(id, tool_text_result(&text, false))
+                }
                 Err(e) => {
                     eprintln!("[mcp] axiom_compress_path failed: {e}");
-                    success_response(
-                        id,
-                        tool_text_result(&format!("compression failed: {e}"), true),
-                    )
+                    let msg = format!("compression failed: {e}");
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_compress_path", &msg);
+                    success_response(id, tool_text_result(&text, true))
                 }
             }
         }
@@ -558,19 +581,27 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     "axiom_evaluate_drift requires string 'code_content'",
                 );
             };
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
             let code = code.to_string();
+            let awareness = ctx.awareness.clone();
             let ctx = ctx.clone();
             let outcome = tokio::task::spawn_blocking(move || evaluate_drift_blocking(&code, &ctx))
                 .await
                 .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok((report, is_drift)) => success_response(id, tool_text_result(&report, is_drift)),
+                Ok((report, is_drift)) => {
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_evaluate_drift", &report);
+                    success_response(id, tool_text_result(&text, is_drift))
+                }
                 Err(e) => {
                     eprintln!("[mcp] axiom_evaluate_drift failed: {e}");
-                    success_response(
-                        id,
-                        tool_text_result(&format!("evaluation failed: {e}"), true),
-                    )
+                    let msg = format!("evaluation failed: {e}");
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_evaluate_drift", &msg);
+                    success_response(id, tool_text_result(&text, true))
                 }
             }
         }
@@ -583,16 +614,27 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .and_then(Value::as_str)
                 .unwrap_or("axiom-dev-session")
                 .to_string();
+            let awareness_session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
             let symbol = symbol.to_string();
+            let awareness = ctx.awareness.clone();
             let outcome =
                 tokio::task::spawn_blocking(move || expand_symbol_blocking(&session_id, &symbol))
                     .await
                     .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok((text, is_err)) => success_response(id, tool_text_result(&text, is_err)),
+                Ok((text, is_err)) => {
+                    let text = record_and_annotate(&awareness, &awareness_session_id, "axiom_expand", &text);
+                    success_response(id, tool_text_result(&text, is_err))
+                }
                 Err(e) => {
                     eprintln!("[mcp] axiom_expand failed: {e}");
-                    success_response(id, tool_text_result(&format!("expand failed: {e}"), true))
+                    let msg = format!("expand failed: {e}");
+                    let text = record_and_annotate(&awareness, &awareness_session_id, "axiom_expand", &msg);
+                    success_response(id, tool_text_result(&text, true))
                 }
             }
         }
@@ -611,15 +653,26 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .and_then(Value::as_str)
                 .unwrap_or("personal")
                 .to_string();
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let awareness = ctx.awareness.clone();
             let ctx = ctx.clone();
             let outcome =
                 tokio::task::spawn_blocking(move || remember_blocking(&text, &kind, &scope, &ctx))
                     .await
                     .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok(msg) => success_response(id, tool_text_result(&msg, false)),
+                Ok(msg) => {
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_remember", &msg);
+                    success_response(id, tool_text_result(&text, false))
+                }
                 Err(e) => {
-                    success_response(id, tool_text_result(&format!("remember failed: {e}"), true))
+                    let msg = format!("remember failed: {e}");
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_remember", &msg);
+                    success_response(id, tool_text_result(&text, true))
                 }
             }
         }
@@ -632,6 +685,12 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .get("scope")
                 .and_then(Value::as_str)
                 .map(|s| s.to_string());
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let awareness = ctx.awareness.clone();
             let ctx = ctx.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 recall_blocking(&query, scope.as_deref(), &ctx)
@@ -639,9 +698,14 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .await
             .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok(report) => success_response(id, tool_text_result(&report, false)),
+                Ok(report) => {
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_recall", &report);
+                    success_response(id, tool_text_result(&text, false))
+                }
                 Err(e) => {
-                    success_response(id, tool_text_result(&format!("recall failed: {e}"), true))
+                    let msg = format!("recall failed: {e}");
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_recall", &msg);
+                    success_response(id, tool_text_result(&text, true))
                 }
             }
         }
@@ -655,15 +719,26 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .and_then(Value::as_str)
                 .unwrap_or("personal")
                 .to_string();
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let awareness = ctx.awareness.clone();
             let ctx = ctx.clone();
             let outcome =
                 tokio::task::spawn_blocking(move || forget_blocking(&mem_id, &scope, &ctx))
                     .await
                     .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok(msg) => success_response(id, tool_text_result(&msg, false)),
+                Ok(msg) => {
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_forget", &msg);
+                    success_response(id, tool_text_result(&text, false))
+                }
                 Err(e) => {
-                    success_response(id, tool_text_result(&format!("forget failed: {e}"), true))
+                    let msg = format!("forget failed: {e}");
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_forget", &msg);
+                    success_response(id, tool_text_result(&text, true))
                 }
             }
         }
@@ -673,6 +748,11 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             if response.trim().is_empty() {
                 return error_response(id, -32602, "axiom_verify requires non-empty 'response'");
             }
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
             let report = crate::hallucination::verify(response, evidence);
             let mut text = format!(
                 "Grounding: {}/{} claims supported ({:.0}% grounded).",
@@ -689,20 +769,29 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     text.push_str(&format!("\n  - {}", c.claim));
                 }
             }
+            let is_error = report.unsupported > 0;
             // isError=true when anything is unsupported, so the agent notices.
-            success_response(id, tool_text_result(&text, report.unsupported > 0))
+            let text = record_and_annotate(&ctx.awareness, &session_id, "axiom_verify", &text);
+            success_response(id, tool_text_result(&text, is_error))
         }
         "axiom_immunity" => {
             let query = args
                 .get("command")
                 .and_then(Value::as_str)
                 .map(|s| s.to_string());
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let awareness = ctx.awareness.clone();
             let outcome = tokio::task::spawn_blocking(move || match crate::heal_memory::HealMemory::default_path() {
                 Some(path) => crate::heal_memory::HealMemory::load(&path).report_text(query.as_deref()),
                 None => "Axiom heal memory is disabled (AXIOM_HEAL_MEMORY=0).".to_string(),
             })
             .await
             .unwrap_or_else(|e| format!("worker join error: {e}"));
+            let outcome = record_and_annotate(&awareness, &session_id, "axiom_immunity", &outcome);
             success_response(id, tool_text_result(&outcome, false))
         }
         "search" => {
@@ -714,6 +803,12 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .get("scope")
                 .and_then(Value::as_str)
                 .map(|s| s.to_string());
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let awareness = ctx.awareness.clone();
             let ctx = ctx.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 search_blocking(&query, scope.as_deref(), &ctx)
@@ -721,8 +816,17 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .await
             .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok(value) => success_response(id, tool_structured_result(value, false)),
-                Err(e) => success_response(id, tool_text_result(&format!("search failed: {e}"), true)),
+                Ok(value) => {
+                    // Record cost based on the JSON text representation.
+                    let text_repr = serde_json::to_string(&value).unwrap_or_default();
+                    record_and_annotate(&awareness, &session_id, "search", &text_repr);
+                    success_response(id, tool_structured_result(value, false))
+                }
+                Err(e) => {
+                    let msg = format!("search failed: {e}");
+                    let text = record_and_annotate(&awareness, &session_id, "search", &msg);
+                    success_response(id, tool_text_result(&text, true))
+                }
             }
         }
         "fetch" => {
@@ -730,13 +834,27 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 return error_response(id, -32602, "fetch requires string 'id'");
             };
             let doc_id = doc_id.to_string();
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let awareness = ctx.awareness.clone();
             let ctx = ctx.clone();
             let outcome = tokio::task::spawn_blocking(move || fetch_blocking(&doc_id, &ctx))
                 .await
                 .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok(value) => success_response(id, tool_structured_result(value, false)),
-                Err(e) => success_response(id, tool_text_result(&format!("fetch failed: {e}"), true)),
+                Ok(value) => {
+                    let text_repr = serde_json::to_string(&value).unwrap_or_default();
+                    record_and_annotate(&awareness, &session_id, "fetch", &text_repr);
+                    success_response(id, tool_structured_result(value, false))
+                }
+                Err(e) => {
+                    let msg = format!("fetch failed: {e}");
+                    let text = record_and_annotate(&awareness, &session_id, "fetch", &msg);
+                    success_response(id, tool_text_result(&text, true))
+                }
             }
         }
         "axiom_status" => {
@@ -746,17 +864,23 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .unwrap_or("mcp")
                 .to_string();
             let proxy_url = ctx.proxy_url.clone();
+            let awareness = ctx.awareness.clone();
+            let awareness_session_id = session_id.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 status_blocking(&session_id, &proxy_url)
             })
             .await
             .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
-                Ok(report) => success_response(id, tool_text_result(&report, false)),
-                Err(e) => success_response(
-                    id,
-                    tool_text_result(&format!("status unavailable: {e}"), true),
-                ),
+                Ok(report) => {
+                    let text = record_and_annotate(&awareness, &awareness_session_id, "axiom_status", &report);
+                    success_response(id, tool_text_result(&text, false))
+                }
+                Err(e) => {
+                    let msg = format!("status unavailable: {e}");
+                    let text = record_and_annotate(&awareness, &awareness_session_id, "axiom_status", &msg);
+                    success_response(id, tool_text_result(&text, true))
+                }
             }
         }
         "axiom_post_task" => {
@@ -772,6 +896,12 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             let budget_snapshot = args.get("budget_snapshot").and_then(Value::as_u64).map(|n| n as usize);
             let priority = args.get("priority").and_then(Value::as_u64).unwrap_or(0) as u8;
             let posted_by = args.get("posted_by").and_then(Value::as_str).map(str::to_string);
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let awareness = ctx.awareness.clone();
             let board = ctx.task_board.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 board.post_task(&channel, description, context_digest, budget_snapshot, priority, posted_by)
@@ -780,13 +910,18 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
             match outcome {
                 Ok(task) => {
-                    let text = format!(
+                    let msg = format!(
                         "Task posted.\ntask_id : {}\nchannel : {}\nstatus  : pending\ndescription: {}",
                         task.task_id, task.channel, task.description
                     );
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_post_task", &msg);
                     success_response(id, tool_text_result(&text, false))
                 }
-                Err(e) => success_response(id, tool_text_result(&format!("post_task failed: {e}"), true)),
+                Err(e) => {
+                    let msg = format!("post_task failed: {e}");
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_post_task", &msg);
+                    success_response(id, tool_text_result(&text, true))
+                }
             }
         }
         "axiom_claim_task" => {
@@ -795,6 +930,12 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             };
             let channel = channel.to_string();
             let agent_id = args.get("agent_id").and_then(Value::as_str).map(str::to_string);
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let awareness = ctx.awareness.clone();
             let board = ctx.task_board.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 board.claim_task(&channel, agent_id)
@@ -802,10 +943,11 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
             match outcome {
-                Ok(None) => success_response(
-                    id,
-                    tool_text_result("No pending tasks in this channel.", false),
-                ),
+                Ok(None) => {
+                    let msg = "No pending tasks in this channel.";
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_claim_task", msg);
+                    success_response(id, tool_text_result(&text, false))
+                }
                 Ok(Some(task)) => {
                     let digest_line = task.context_digest
                         .as_deref()
@@ -814,15 +956,20 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     let budget_line = task.budget_snapshot
                         .map(|b| format!("\nbudget_snapshot: {b} tokens"))
                         .unwrap_or_default();
-                    let text = format!(
+                    let msg = format!(
                         "Task claimed.\ntask_id    : {}\nchannel    : {}\ndescription: {}\nposted_by  : {}\npriority   : {}{}{}",
                         task.task_id, task.channel, task.description,
                         task.posted_by.as_deref().unwrap_or("unknown"),
                         task.priority, budget_line, digest_line
                     );
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_claim_task", &msg);
                     success_response(id, tool_text_result(&text, false))
                 }
-                Err(e) => success_response(id, tool_text_result(&format!("claim_task failed: {e}"), true)),
+                Err(e) => {
+                    let msg = format!("claim_task failed: {e}");
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_claim_task", &msg);
+                    success_response(id, tool_text_result(&text, true))
+                }
             }
         }
         "axiom_task_result" => {
@@ -835,6 +982,12 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             let success = args.get("success").and_then(Value::as_bool).unwrap_or(true);
             let task_id = task_id.to_string();
             let result = result.to_string();
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let awareness = ctx.awareness.clone();
             let board = ctx.task_board.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 board.task_result(&task_id, result, success)
@@ -842,15 +995,21 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
             match outcome {
-                Ok(true) => success_response(
-                    id,
-                    tool_text_result(&format!("Task marked {}.", if success { "done" } else { "failed" }), false),
-                ),
-                Ok(false) => success_response(
-                    id,
-                    tool_text_result("task_id not found.", true),
-                ),
-                Err(e) => success_response(id, tool_text_result(&format!("task_result failed: {e}"), true)),
+                Ok(true) => {
+                    let msg = format!("Task marked {}.", if success { "done" } else { "failed" });
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_task_result", &msg);
+                    success_response(id, tool_text_result(&text, false))
+                }
+                Ok(false) => {
+                    let msg = "task_id not found.";
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_task_result", msg);
+                    success_response(id, tool_text_result(&text, true))
+                }
+                Err(e) => {
+                    let msg = format!("task_result failed: {e}");
+                    let text = record_and_annotate(&awareness, &session_id, "axiom_task_result", &msg);
+                    success_response(id, tool_text_result(&text, true))
+                }
             }
         }
         "axiom_list_tasks" => {
@@ -859,6 +1018,12 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             };
             let channel = channel.to_string();
             let status_filter = args.get("status").and_then(Value::as_str).map(str::to_string);
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let awareness = ctx.awareness.clone();
             let board = ctx.task_board.clone();
             let tasks = tokio::task::spawn_blocking(move || {
                 board.list_tasks(&channel, status_filter.as_deref())
@@ -866,7 +1031,8 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .await
             .unwrap_or_default();
             if tasks.is_empty() {
-                return success_response(id, tool_text_result("No tasks found.", false));
+                let text = record_and_annotate(&awareness, &session_id, "axiom_list_tasks", "No tasks found.");
+                return success_response(id, tool_text_result(&text, false));
             }
             let lines: Vec<String> = tasks.iter().map(|t| {
                 format!(
@@ -878,7 +1044,27 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     t.result.as_deref().map(|r| format!(" → {}", r.lines().next().unwrap_or(r))).unwrap_or_default()
                 )
             }).collect();
-            success_response(id, tool_text_result(&lines.join("\n"), false))
+            let msg = lines.join("\n");
+            let text = record_and_annotate(&awareness, &session_id, "axiom_list_tasks", &msg);
+            success_response(id, tool_text_result(&text, false))
+        }
+        "axiom_channels" => {
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
+            let board = ctx.task_board.clone();
+            let channels = tokio::task::spawn_blocking(move || board.channels())
+                .await
+                .unwrap_or_default();
+            let text = if channels.is_empty() {
+                "No task channels found.".to_string()
+            } else {
+                format!("Channels ({}): {}", channels.len(), channels.join(", "))
+            };
+            let text = record_and_annotate(&ctx.awareness, &session_id, "axiom_channels", &text);
+            success_response(id, tool_text_result(&text, false))
         }
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
     }
@@ -1387,6 +1573,38 @@ fn drift_score(pipeline: &InferencePipeline, text: &str) -> Result<f32, String> 
 }
 
 // ---------------------------------------------------------------------------
+// Per-response token-cost tracking
+// ---------------------------------------------------------------------------
+
+/// Estimate token cost, record it against the awareness store, and optionally
+/// append a compact `_meta: token_cost=N` line to the response text.
+///
+/// The meta line is only appended when a budget has already been set for the
+/// session (i.e. `awareness.get(session_id).is_some()`), keeping responses
+/// clean until the agent opts in via `POST /v1/budget`.
+fn record_and_annotate(
+    awareness: &AwarenessStore,
+    session_id: &str,
+    tool_name: &str,
+    response_text: &str,
+) -> String {
+    let token_cost = (response_text.len() / 4).max(1);
+    // Always record in the store (creates the entry if it already exists).
+    // We only record if the session has been opted in (budget set).
+    let annotate = if let Some(state) = awareness.get(session_id) {
+        state.record_tool_response(tool_name, token_cost);
+        true
+    } else {
+        false
+    };
+    if annotate {
+        format!("{response_text}\n\n_meta: token_cost={token_cost}")
+    } else {
+        response_text.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // JSON-RPC helpers
 // ---------------------------------------------------------------------------
 
@@ -1438,7 +1656,7 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
@@ -1448,6 +1666,7 @@ mod tests {
         assert!(names.contains(&"axiom_claim_task"));
         assert!(names.contains(&"axiom_task_result"));
         assert!(names.contains(&"axiom_list_tasks"));
+        assert!(names.contains(&"axiom_channels"));
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object");
             // `required` is optional in MCP (axiom_immunity has only optional
