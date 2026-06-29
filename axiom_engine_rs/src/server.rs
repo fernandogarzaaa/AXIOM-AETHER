@@ -2777,6 +2777,26 @@ async fn compressed_openai_chat_path(
         }
     }
 
+    // Automatic epistemic monitoring (opt-in, AXIOM_EPISTEMIC_AUTO=1): mirror the
+    // Anthropic forwarder path for OpenAI-compatible responses. Handles both a
+    // single JSON completion and a streamed SSE body. Fire-and-forget; no-op
+    // unless a judge is configured; never blocks or mutates the response. The
+    // enabled-check gates body parsing so the hot path does no work when off.
+    if upstream.status < 300 && crate::epistemic_drift::automatic_validation_enabled() {
+        let answer = openai_assistant_answer(&upstream.body);
+        if !answer.is_empty() {
+            crate::epistemic_drift::spawn_automatic_validation(
+                user_query_text.clone(),
+                answer,
+                heavy_combined.clone(),
+                body.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("openai-upstream")
+                    .to_string(),
+            );
+        }
+    }
+
     let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = upstream.content_type {
@@ -2787,6 +2807,43 @@ async fn compressed_openai_chat_path(
     builder
         .body(axum::body::Body::from(upstream.body))
         .map_err(|e| ApiError::Internal(format!("response build failed: {e}")))
+}
+
+/// Extract the assistant answer text from an OpenAI-compatible chat-completion
+/// response body, handling both a single JSON object (non-streamed:
+/// `choices[0].message.content`) and a streamed SSE body (concatenating
+/// `choices[].delta.content` across `data:` frames, ignoring the `[DONE]`
+/// sentinel). Returns an empty string when no answer can be recovered.
+fn openai_assistant_answer(body: &str) -> String {
+    // Non-streamed: the whole body is one JSON completion object.
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if let Some(text) = value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+        {
+            return text.to_string();
+        }
+    }
+    // Streamed (SSE): concatenate the incremental delta content from each frame.
+    let mut answer = String::new();
+    for line in body.lines() {
+        let Some(payload) = line.trim_start().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(chunk) = serde_json::from_str::<Value>(payload) {
+            if let Some(piece) = chunk
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+            {
+                answer.push_str(piece);
+            }
+        }
+    }
+    answer
 }
 
 fn local_openai_chat_response(
@@ -4353,6 +4410,29 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use candle_core::{DType, Device};
     use tower::ServiceExt;
+
+    #[test]
+    fn openai_assistant_answer_reads_non_streamed_completion() {
+        let body = serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": "hello world" } }]
+        })
+        .to_string();
+        assert_eq!(openai_assistant_answer(&body), "hello world");
+    }
+
+    #[test]
+    fn openai_assistant_answer_concatenates_sse_stream() {
+        let body = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\
+                    data: [DONE]\n";
+        assert_eq!(openai_assistant_answer(body), "hello");
+    }
+
+    #[test]
+    fn openai_assistant_answer_empty_when_unparseable() {
+        assert_eq!(openai_assistant_answer("not json, not sse"), "");
+    }
 
     #[test]
     fn grounding_advisory_only_when_claims_flagged() {

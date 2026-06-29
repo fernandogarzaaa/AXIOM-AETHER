@@ -330,6 +330,13 @@ pub async fn evaluate_with_judge(
     })
 }
 
+/// Whether opt-in automatic epistemic validation is enabled
+/// (`AXIOM_EPISTEMIC_AUTO=1`). Exposed so forwarder paths can gate any response
+/// parsing before doing work that would otherwise be discarded.
+pub fn automatic_validation_enabled() -> bool {
+    std::env::var("AXIOM_EPISTEMIC_AUTO").as_deref() == Ok("1")
+}
+
 /// Schedule semantic validation after generation without delaying the primary
 /// response. Returns `true` only when automatic validation was enabled and a
 /// judge task was scheduled.
@@ -339,7 +346,7 @@ pub fn spawn_automatic_validation(
     evidence: String,
     target_model: String,
 ) -> bool {
-    if std::env::var("AXIOM_EPISTEMIC_AUTO").as_deref() != Ok("1") {
+    if !automatic_validation_enabled() {
         return false;
     }
     let sem = AUTO_VALIDATION_SEMAPHORE
