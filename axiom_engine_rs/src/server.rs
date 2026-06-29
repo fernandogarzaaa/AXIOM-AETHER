@@ -2339,6 +2339,20 @@ async fn compressed_messages_path(
         }
     }
 
+    // Automatic epistemic monitoring (opt-in, AXIOM_EPISTEMIC_AUTO=1): fire a
+    // fire-and-forget semantic-judge validation of the answer against the
+    // absorbed context. No-op unless explicitly configured; never blocks or
+    // mutates the response.
+    crate::epistemic_drift::spawn_automatic_validation(
+        user_query_text,
+        assistant_text(&forwarded),
+        heavy_combined.clone(),
+        body.get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("anthropic-upstream")
+            .to_string(),
+    );
+
     // Auto grounding-verification (opt-in): annotate the response in place with
     // any claims not grounded in the context we just absorbed — hallucination
     // flagging with nobody asking. Never alters the answer text itself; appends
@@ -3235,6 +3249,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/swarm/matrix_state", get(swarm_matrix_state))
         .route("/v1/expand", post(expand_symbol_handler))
         .route("/v1/verify", post(verify_grounding))
+        .route("/v1/epistemic/validate", post(validate_epistemic_drift))
         .route("/v1/immunity", get(get_immunity))
         .route("/v1/immunity/merge", post(post_immunity_merge))
         .route("/v1/patches", get(get_patches))
@@ -3517,6 +3532,75 @@ async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>
         "note": "grounding verification against supplied evidence; lexical tier does not catch vocabulary-sharing contradictions",
     }))
     .into_response()
+}
+
+/// `POST /v1/epistemic/validate` — combine grounding verification with an
+/// explicitly configured semantic LLM judge and append local JSONL telemetry.
+async fn validate_epistemic_drift(Json(body): Json<Value>) -> Response {
+    let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("");
+    let response = body.get("response").and_then(Value::as_str).unwrap_or("");
+    let evidence = body.get("evidence").and_then(Value::as_str).unwrap_or("");
+    if prompt.trim().is_empty() || response.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "prompt and response are required"})),
+        )
+            .into_response();
+    }
+    let config = match crate::epistemic_drift::EpistemicJudgeConfig::from_env() {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "epistemic judge is not configured"})),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let judge = match crate::epistemic_drift::OpenAiSemanticJudge::new(config) {
+        Ok(judge) => judge,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let request_id = body
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let target_model = body
+        .get("target_model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    match crate::epistemic_drift::evaluate_with_judge(
+        &judge,
+        request_id,
+        prompt,
+        response,
+        evidence,
+        target_model,
+    )
+    .await
+    {
+        Ok(evaluation) => Json(evaluation).into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /v1/immunity` — export this node's heal memory for swarm peers.

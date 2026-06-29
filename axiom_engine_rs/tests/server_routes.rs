@@ -192,3 +192,39 @@ async fn verify_grounding_gated_expansion_spends_tokens_only_where_needed() {
     );
     assert!(v["expansion_bytes"].as_u64().unwrap() > 0);
 }
+
+#[tokio::test]
+async fn epistemic_validation_is_fail_visible_when_judge_is_unconfigured() {
+    // Remove judge env vars so the handler always returns 503 regardless of the
+    // environment this test runs in. SAFETY: tests that set these vars must not
+    // run concurrently with this test.
+    // SAFETY: single-threaded test environment; no parallel test touches these vars.
+    unsafe {
+        std::env::remove_var("AXIOM_EPISTEMIC_JUDGE_URL");
+        std::env::remove_var("AXIOM_EPISTEMIC_JUDGE_MODEL");
+        std::env::remove_var("AXIOM_EPISTEMIC_JUDGE_API_KEY");
+    }
+    let app = test_app().await;
+    let body = serde_json::json!({
+        "prompt": "Explain the quartz oscillator mechanically.",
+        "response": "The crystal resonates at a stable frequency.",
+        "evidence": "A quartz crystal mechanically deforms under voltage.",
+        "target_model": "test-model"
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/epistemic/validate")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["error"], "epistemic judge is not configured");
+}
