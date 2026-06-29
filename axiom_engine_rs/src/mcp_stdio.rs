@@ -836,7 +836,7 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             {
                 Ok(evaluation) => {
                     let is_error = evaluation.report.decision
-                        == crate::epistemic_drift::EpistemicDecision::Block;
+                        != crate::epistemic_drift::EpistemicDecision::Allow;
                     let text = serde_json::to_string_pretty(&evaluation)
                         .unwrap_or_else(|error| format!("evaluation serialization failed: {error}"));
                     success_response(id, tool_text_result(&text, is_error))

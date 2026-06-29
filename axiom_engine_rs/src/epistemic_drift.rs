@@ -7,10 +7,11 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,7 +24,9 @@ const MAX_TRIGGER_PHRASES: usize = 32;
 const MAX_TRIGGER_BYTES: usize = 512;
 const MAX_JUDGE_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_EVALUATED_TEXT_BYTES: usize = 512 * 1024;
+const MAX_AUTO_VALIDATION_CONCURRENCY: usize = 8;
 static TELEMETRY_APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static AUTO_VALIDATION_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 pub const JUDGE_SYSTEM_PROMPT: &str = r#"You are an adversarial telemetry validator specializing in epistemic drift detection. Compare the assistant response with the original prompt and any supplied evidence. Detect the exact point where the response abandons the epistemic mode requested by the prompt or introduces unsupported interpretive, philosophical, metaphorical, anthropomorphic, or teleological framing.
 
@@ -40,6 +43,7 @@ Do not treat abstract or philosophical language as drift when the original promp
 Use null for drift_onset_index and [] for primary_trigger_phrases when drift_detected is false. empirical_score and confidence must be numbers from 0.0 to 1.0."#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DriftValidation {
     pub schema_version: u32,
     pub empirical_score: f32,
@@ -243,19 +247,23 @@ impl OpenAiSemanticJudge {
             .await
             .map_err(|e| format!("epistemic judge request failed: {e}"))?;
         let status = upstream.status();
-        let bytes = upstream
-            .bytes()
-            .await
-            .map_err(|e| format!("epistemic judge response read failed: {e}"))?;
+        // Stream body incrementally so the cap is enforced before the full
+        // response is buffered, preventing OOM from a runaway upstream.
+        let mut stream = upstream.bytes_stream();
+        let mut buf = Vec::with_capacity(4096);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("epistemic judge body read failed: {e}"))?;
+            if buf.len() + chunk.len() > MAX_JUDGE_RESPONSE_BYTES {
+                return Err(format!(
+                    "epistemic judge response exceeds {MAX_JUDGE_RESPONSE_BYTES} bytes"
+                ));
+            }
+            buf.extend_from_slice(&chunk);
+        }
         if !status.is_success() {
             return Err(format!("epistemic judge returned HTTP {}", status.as_u16()));
         }
-        if bytes.len() > MAX_JUDGE_RESPONSE_BYTES {
-            return Err(format!(
-                "epistemic judge response exceeds {MAX_JUDGE_RESPONSE_BYTES} bytes"
-            ));
-        }
-        let envelope: Value = serde_json::from_slice(&bytes)
+        let envelope: Value = serde_json::from_slice(&buf)
             .map_err(|e| format!("epistemic judge envelope is invalid JSON: {e}"))?;
         let content = envelope
             .pointer("/choices/0/message/content")
@@ -334,7 +342,17 @@ pub fn spawn_automatic_validation(
     if std::env::var("AXIOM_EPISTEMIC_AUTO").as_deref() != Ok("1") {
         return false;
     }
+    let sem = AUTO_VALIDATION_SEMAPHORE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_AUTO_VALIDATION_CONCURRENCY)));
+    let Ok(permit) = Arc::clone(sem).try_acquire_owned() else {
+        eprintln!(
+            "[epistemic] automatic validation skipped: concurrency limit \
+             ({MAX_AUTO_VALIDATION_CONCURRENCY}) reached"
+        );
+        return false;
+    };
     tokio::spawn(async move {
+        let _permit = permit;
         let config = match EpistemicJudgeConfig::from_env() {
             Ok(Some(config)) => config,
             Ok(None) => {
@@ -558,6 +576,10 @@ impl EpistemicTelemetryRecord {
     }
 }
 
+/// Content fingerprint for telemetry deduplication. Raw text is never stored
+/// unless `AXIOM_EPISTEMIC_CAPTURE_TEXT=1` is explicitly set; when that flag is
+/// off, this hash is the only record of what was evaluated. HMAC/keyed hashing
+/// would require secret key management infrastructure that is out of scope here.
 pub fn sha256_text(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -588,8 +610,12 @@ impl JsonlTelemetrySink {
             .lock()
             .map_err(|_| "telemetry append lock poisoned".to_string())?;
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("telemetry directory creation failed: {e}"))?;
+            // `parent()` returns `Some("")` for a bare filename with no directory
+            // component; `create_dir_all("")` is an error, so skip it.
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("telemetry directory creation failed: {e}"))?;
+            }
         }
         let mut file = OpenOptions::new()
             .create(true)

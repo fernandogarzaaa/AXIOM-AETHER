@@ -58,15 +58,16 @@ configured and `502` when a configured judge fails or returns invalid output.
 
 `axiom_validate_epistemic` exposes the same operation to MCP clients. It
 requires `prompt` and `response`; `evidence`, `target_model`, and `request_id`
-are optional. A `block` decision sets the MCP result's `isError` flag so the
-calling agent cannot silently overlook detected drift.
+are optional. Both `review` and `block` decisions set the MCP result's `isError`
+flag so the calling agent cannot silently overlook drift or uncertain grounding.
 
 ## Automatic Monitoring
 
-With `AXIOM_EPISTEMIC_AUTO=1`, successful Anthropic and OpenAI-compatible
-responses that pass through Axiom's compression proxy are evaluated in a
-background task. Judge or telemetry failures are written to server diagnostics
-and never fail or mutate the primary inference response.
+With `AXIOM_EPISTEMIC_AUTO=1`, successful Anthropic responses that pass through
+Axiom's compression proxy are evaluated in a background task. Judge or telemetry
+failures are written to server diagnostics and never fail or mutate the primary
+inference response. Automatic monitoring of OpenAI-compatible upstream paths is
+not yet implemented.
 
 The judge prompt is versioned as `epistemic-drift-v1`. It treats abstract or
 philosophical language as drift only when that language departs from the mode
