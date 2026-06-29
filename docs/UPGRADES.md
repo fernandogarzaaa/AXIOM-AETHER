@@ -46,6 +46,8 @@ engine, and a citation. Status: ✅ implemented · 🚧 scaffolded · ⬜ planne
 - ⬜ **FLTrust root-of-trust + centered-clipping w/ momentum** Byzantine gate —
   survives 40–60% malicious peers and provably resists ALIE/IPM
   (arXiv:2012.13995; PMLR v139 karimireddy21a).
+  Current `FleetTrustPolicy::robust()` provides fixed-cap defense (~40% covered);
+  this item tracks the remaining root-of-trust + centered-clipping work.
 
 ## P2 — bigger / offline / research
 
