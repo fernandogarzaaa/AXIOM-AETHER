@@ -391,6 +391,21 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "axiom_validate_epistemic",
+                "description": "Detect soft hallucinations by combining evidence grounding with a configured semantic LLM judge. Appends local JSONL telemetry using hashes by default; raw text capture requires AXIOM_EPISTEMIC_CAPTURE_TEXT=1.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": { "type": "string", "description": "The original task or user prompt." },
+                        "response": { "type": "string", "description": "The model response to validate." },
+                        "evidence": { "type": "string", "description": "Optional source evidence used by grounding verification." },
+                        "target_model": { "type": "string", "description": "Optional target model identifier for telemetry." },
+                        "request_id": { "type": "string", "description": "Optional caller-provided trace id." }
+                    },
+                    "required": ["prompt", "response"]
+                }
+            },
+            {
                 "name": "axiom_immunity",
                 "description": "Report what Axiom has learned about program failures from supervised `axiom run` executions: the heals it now applies prophylactically (e.g. directories it pre-creates) and each program's failure-tension history. Use when debugging a command that fails in the user's environment — Axiom may already know the fix.",
                 "inputSchema": {
@@ -773,6 +788,61 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             // isError=true when anything is unsupported, so the agent notices.
             let text = record_and_annotate(&ctx.awareness, &session_id, "axiom_verify", &text);
             success_response(id, tool_text_result(&text, is_error))
+        }
+        "axiom_validate_epistemic" => {
+            let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("");
+            let response = args.get("response").and_then(Value::as_str).unwrap_or("");
+            let evidence = args.get("evidence").and_then(Value::as_str).unwrap_or("");
+            if prompt.trim().is_empty() || response.trim().is_empty() {
+                return error_response(
+                    id,
+                    -32602,
+                    "axiom_validate_epistemic requires non-empty 'prompt' and 'response'",
+                );
+            }
+            let config = match crate::epistemic_drift::EpistemicJudgeConfig::from_env() {
+                Ok(Some(config)) => config,
+                Ok(None) => {
+                    return success_response(
+                        id,
+                        tool_text_result("epistemic judge is not configured", true),
+                    )
+                }
+                Err(error) => return success_response(id, tool_text_result(&error, true)),
+            };
+            let judge = match crate::epistemic_drift::OpenAiSemanticJudge::new(config) {
+                Ok(judge) => judge,
+                Err(error) => return success_response(id, tool_text_result(&error, true)),
+            };
+            let request_id = args
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let target_model = args
+                .get("target_model")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            match crate::epistemic_drift::evaluate_with_judge(
+                &judge,
+                request_id,
+                prompt,
+                response,
+                evidence,
+                target_model,
+            )
+            .await
+            {
+                Ok(evaluation) => {
+                    let is_error = evaluation.report.decision
+                        == crate::epistemic_drift::EpistemicDecision::Block;
+                    let text = serde_json::to_string_pretty(&evaluation)
+                        .unwrap_or_else(|error| format!("evaluation serialization failed: {error}"));
+                    success_response(id, tool_text_result(&text, is_error))
+                }
+                Err(error) => success_response(id, tool_text_result(&error, true)),
+            }
         }
         "axiom_immunity" => {
             let query = args
@@ -1656,7 +1726,7 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
@@ -1697,6 +1767,7 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"axiom_immunity"));
+        assert!(names.contains(&"axiom_validate_epistemic"));
     }
 
     #[test]

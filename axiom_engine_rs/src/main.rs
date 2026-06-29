@@ -20,6 +20,7 @@ mod data_gen;
 mod dwe;
 mod embedder;
 mod encoder;
+mod epistemic_drift;
 mod fault_locate;
 mod hamiltonian;
 mod hallucination;
