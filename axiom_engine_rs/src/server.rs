@@ -8,6 +8,7 @@
 //! | GET    | `/v1/models`                         | List available models                    |
 //! | POST   | `/v1/completions`                    | Text completion (stateless or session)   |
 //! | POST   | `/v1/chat/completions`               | Chat completion (stateless or session)   |
+//! | POST   | `/v1/responses`                      | Native OpenAI Responses API passthrough  |
 //! | POST   | `/v1/messages`                       | Anthropic Messages API (Claude clients)  |
 //! | POST   | `/v1/cluster/sync`                   | Delta state replication merge hook       |
 //! | GET    | `/v1/patches`                        | Signed verified-patch export (fleet)     |
@@ -26,7 +27,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -1368,6 +1369,47 @@ async fn create_chat_completion(
         state.trigger_lru_vram_budget();
         json.into_response()
     }
+}
+
+/// `POST /v1/responses` - lossless passthrough to the configured OpenAI API.
+///
+/// Responses requests deliberately stay on their native wire protocol so
+/// function calls, reasoning items, and streaming event semantics survive.
+async fn create_response(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(forwarder) = state.openai_forwarder.as_ref().as_ref() else {
+        return ApiError::Upstream {
+            status: StatusCode::BAD_GATEWAY.as_u16(),
+            message: "OpenAI Responses forwarder is not configured".into(),
+        }
+        .into_response();
+    };
+    let client_auth = OpenAiClientAuth {
+        authorization: headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+    };
+    let upstream = match forwarder.forward_responses(&body, &client_auth).await {
+        Ok(response) => response,
+        Err(error) => return map_openai_forwarder_error(error).into_response(),
+    };
+    let status = upstream.status();
+    let content_type = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(axum::body::Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|error| {
+            ApiError::Internal(format!("response build failed: {error}")).into_response()
+        })
 }
 
 // -- non-streaming JSON path ------------------------------------------------
@@ -3283,6 +3325,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/completions", post(create_completion))
         .route("/v1/chat/completions", post(create_chat_completion))
+        .route("/v1/responses", post(create_response))
         .route("/v1/messages", post(create_message))
         .route("/v1/cluster/sync", post(cluster_sync))
         .route("/v1/cluster/merge", post(cluster_merge))
@@ -4188,11 +4231,9 @@ pub async fn run_server(
     } else {
         None
     };
-    let openai_forwarder = if compressor_config.enabled {
-        OpenAiForwarder::from_env()
-    } else {
-        None
-    };
+    // Responses passthrough is useful independently of context compression.
+    // `from_env` supports client-auth passthrough and holds no key by default.
+    let openai_forwarder = OpenAiForwarder::from_env();
     let swarm_router = if compressor_config.enabled {
         SwarmRouter::from_env()
     } else {
@@ -4375,6 +4416,7 @@ pub async fn run_server(
     println!("      GET  /v1/models");
     println!("      POST /v1/completions");
     println!("      POST /v1/chat/completions         (stream:true for SSE)");
+    println!("      POST /v1/responses                (native OpenAI passthrough)");
     println!("      POST /v1/messages                 (Anthropic Messages API)");
     println!("      POST /v1/cluster/sync            (distributed delta merge)");
     println!("      POST /v1/sessions                 (create TTT session)");

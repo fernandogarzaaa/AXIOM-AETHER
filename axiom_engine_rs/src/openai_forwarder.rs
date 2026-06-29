@@ -29,6 +29,10 @@ fn chat_completions_url(base: &str) -> String {
     format!("{}/v1/chat/completions", base.trim_end_matches('/'))
 }
 
+fn responses_url(base: &str) -> String {
+    format!("{}/v1/responses", base.trim_end_matches('/'))
+}
+
 /// Resolve the effective OpenAI-compatible base URL from env signals. An explicit
 /// `OPENAI_BASE_URL`/`OPENAI_API_BASE` always wins; otherwise `AXIOM_BACKEND=opendrop`
 /// selects the local OpenDrop endpoint; otherwise `None` (caller falls back to the
@@ -104,24 +108,28 @@ impl OpenAiForwarder {
         auth: &OpenAiClientAuth,
     ) -> Result<OpenAiForwardedResponse, OpenAiForwarderError> {
         let url = chat_completions_url(&self.base_url);
-        let mut request = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json");
+        self.forward_json_text(url, payload, auth).await
+    }
 
-        if let Some(authz) = auth.authorization.as_deref() {
-            request = request.header("authorization", authz);
-        } else if let Some(key) = self.api_key.as_deref() {
-            request = request.header("authorization", bearer_value(key));
-        } else {
-            return Err(OpenAiForwarderError::MissingAuth);
-        }
+    /// POST to `/v1/responses` without translating the request or response.
+    /// Native passthrough preserves function calls, reasoning items, and SSE
+    /// event types that do not have lossless Chat Completions equivalents.
+    pub async fn forward_responses(
+        &self,
+        payload: &Value,
+        auth: &OpenAiClientAuth,
+    ) -> Result<reqwest::Response, OpenAiForwarderError> {
+        let url = responses_url(&self.base_url);
+        self.send_json(url, payload, auth).await
+    }
 
-        let response = request
-            .json(payload)
-            .send()
-            .await
-            .map_err(|e| OpenAiForwarderError::Network(e.to_string()))?;
+    async fn forward_json_text(
+        &self,
+        url: String,
+        payload: &Value,
+        auth: &OpenAiClientAuth,
+    ) -> Result<OpenAiForwardedResponse, OpenAiForwarderError> {
+        let response = self.send_json(url, payload, auth).await?;
 
         let status = response.status().as_u16();
         let content_type = response
@@ -139,6 +147,32 @@ impl OpenAiForwarder {
             content_type,
             body,
         })
+    }
+
+    async fn send_json(
+        &self,
+        url: String,
+        payload: &Value,
+        auth: &OpenAiClientAuth,
+    ) -> Result<reqwest::Response, OpenAiForwarderError> {
+        let mut request = self
+            .client
+            .post(url)
+            .header("content-type", "application/json");
+
+        if let Some(authz) = auth.authorization.as_deref() {
+            request = request.header("authorization", authz);
+        } else if let Some(key) = self.api_key.as_deref() {
+            request = request.header("authorization", bearer_value(key));
+        } else {
+            return Err(OpenAiForwarderError::MissingAuth);
+        }
+
+        request
+            .json(payload)
+            .send()
+            .await
+            .map_err(|e| OpenAiForwarderError::Network(e.to_string()))
     }
 }
 
@@ -184,7 +218,8 @@ impl std::error::Error for OpenAiForwarderError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value, chat_completions_url, resolve_base_url, OPENDROP_DEFAULT_BASE_URL,
+        bearer_value, chat_completions_url, resolve_base_url, responses_url,
+        OPENDROP_DEFAULT_BASE_URL,
     };
 
     #[test]
@@ -211,6 +246,14 @@ mod tests {
         assert_eq!(
             chat_completions_url("https://api.openai.com/"),
             "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn responses_url_appends_v1_path_once() {
+        assert_eq!(
+            responses_url("https://api.openai.com/"),
+            "https://api.openai.com/v1/responses"
         );
     }
 
