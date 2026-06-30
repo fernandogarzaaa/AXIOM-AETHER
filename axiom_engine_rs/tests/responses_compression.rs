@@ -64,7 +64,8 @@ fn string_input_and_tool_only_input_are_not_compressed() {
     assert!(plan_compression(&json!({"input":[
         {"type":"function_call_output", "call_id":"c1", "output":"large"},
         {"role":"user", "content":"continue"}
-    ]})).is_none());
+    ]}))
+    .is_none());
 }
 
 #[test]

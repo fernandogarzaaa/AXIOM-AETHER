@@ -60,6 +60,7 @@ use crate::metrics;
 use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarderError};
 use crate::poly_jit::{PolyJitEngine, PolyJitRunRequest, PolyJitReport, PolyJitStatus};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
+use crate::responses_compressor::{apply_plan, plan_compression};
 use crate::sandbox::{SandboxController, SandboxDiagnostic};
 use crate::session_awareness::AwarenessStore;
 use crate::surprisal::{ExactAttentionResidualCache, ExactResidualTelemetry};
@@ -1371,10 +1372,93 @@ async fn create_chat_completion(
     }
 }
 
-/// `POST /v1/responses` - lossless passthrough to the configured OpenAI API.
+fn responses_compression_enabled() -> bool {
+    std::env::var("AXIOM_RESPONSES_COMPRESS")
+        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+async fn compressed_responses_payload(
+    state: &AppState,
+    body: &Value,
+    session_override: Option<&str>,
+) -> Result<Option<Value>, ApiError> {
+    if !state.controls.enabled() || !responses_compression_enabled() {
+        return Ok(None);
+    }
+    let Some(plan) = plan_compression(body) else {
+        return Ok(None);
+    };
+    let threshold = state.controls.threshold();
+    let context_tokens = state
+        .pipeline
+        .lock()
+        .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?
+        .token_count(&plan.context);
+    if context_tokens < threshold {
+        return Ok(None);
+    }
+
+    let session_id = session_override
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("responses-{}", Uuid::new_v4()));
+    let pipeline_arc = state.pipeline.clone();
+    let store = state.ttt_sessions.clone();
+    let context = plan.context.clone();
+    let query = plan.query.clone();
+    let top_k = state.compressor_config.recall_top_k;
+    let session_for_task = session_id.clone();
+    let started = Instant::now();
+    let fingerprint = spawn_blocking(move || -> Result<_, ApiError> {
+        let pipeline = pipeline_arc
+            .lock()
+            .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+        let session = store
+            .get_or_create(&session_for_task, &pipeline)
+            .map_err(|error| ApiError::Internal(format!("session allocation failed: {error}")))?;
+        let mut states = session.blocking_lock();
+        let context_ids = pipeline.encode_text(&context);
+        adapt_session_blocking(&pipeline, &mut states, &context_ids)
+            .map_err(|error| ApiError::Internal(format!("TTT adapt failed: {error}")))?;
+        let query_ids = pipeline.encode_text(&query);
+        extract_memory_vector_blocking(
+            &pipeline,
+            &mut states,
+            &query_ids,
+            &session_for_task,
+            context_ids.len(),
+            started,
+            top_k,
+        )
+        .map_err(|error| ApiError::Internal(format!("memory extraction failed: {error}")))
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("blocking task join failed: {error}")))??;
+
+    let compressed = apply_plan(body, &plan, &fingerprint.to_prompt_block())
+        .ok_or_else(|| ApiError::Internal("Responses compression transform failed".into()))?;
+    let bytes_in = serde_json::to_vec(body).map(|value| value.len()).unwrap_or(0) as u64;
+    let bytes_out = serde_json::to_vec(&compressed)
+        .map(|value| value.len())
+        .unwrap_or(0) as u64;
+    state
+        .controls
+        .record(plan.item_indices.len() as u64, bytes_in, bytes_out);
+    eprintln!(
+        "[axiom-ttt] responses compressed session={} assistant_items={} tokens={} bytes={}=>{}",
+        session_id,
+        plan.item_indices.len(),
+        context_tokens,
+        bytes_in,
+        bytes_out
+    );
+    Ok(Some(compressed))
+}
+
+/// `POST /v1/responses` - native passthrough with optional semantic compression.
 ///
-/// Responses requests deliberately stay on their native wire protocol so
-/// function calls, reasoning items, and streaming event semantics survive.
+/// Structural items stay on their native wire protocol. When explicitly
+/// enabled, only safe historical assistant text is replaced by a fingerprint.
 async fn create_response(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1393,10 +1477,42 @@ async fn create_response(
             .and_then(|value| value.to_str().ok())
             .map(str::to_string),
     };
-    let upstream = match forwarder.forward_responses(&body, &client_auth).await {
+    let session_override = headers
+        .get("x-axiom-session-id")
+        .and_then(|value| value.to_str().ok());
+    let compressed = match compressed_responses_payload(&state, &body, session_override).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("[axiom-ttt] Responses compression skipped after local failure: {error:?}");
+            state.controls.record_degraded_fallback();
+            None
+        }
+    };
+    let outbound = compressed.as_ref().unwrap_or(&body);
+    let mut upstream = match forwarder.forward_responses(outbound, &client_auth).await {
         Ok(response) => response,
+        Err(OpenAiForwarderError::Network(error)) if compressed.is_some() => {
+            eprintln!("[axiom-ttt] compressed Responses network failure ({error}); retrying original payload");
+            state.controls.record_degraded_fallback();
+            match forwarder.forward_responses(&body, &client_auth).await {
+                Ok(response) => response,
+                Err(error) => return map_openai_forwarder_error(error).into_response(),
+            }
+        }
         Err(error) => return map_openai_forwarder_error(error).into_response(),
     };
+    if compressed.is_some()
+        && (upstream.status() == StatusCode::BAD_REQUEST || upstream.status().is_server_error())
+    {
+        eprintln!(
+            "[axiom-ttt] compressed Responses returned {}; retrying original payload",
+            upstream.status()
+        );
+        state.controls.record_degraded_fallback();
+        if let Ok(response) = forwarder.forward_responses(&body, &client_auth).await {
+            upstream = response;
+        }
+    }
     let status = upstream.status();
     let content_type = upstream
         .headers()

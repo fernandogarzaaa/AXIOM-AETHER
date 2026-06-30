@@ -46,6 +46,7 @@ mod prime;
 mod provenance;
 mod q_manifold;
 mod quantization;
+mod responses_compressor;
 mod sandbox;
 mod session_awareness;
 mod self_heal;
