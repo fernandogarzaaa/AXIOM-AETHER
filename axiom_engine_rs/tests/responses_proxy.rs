@@ -174,3 +174,37 @@ async fn responses_stream_relays_semantic_sse_events_unchanged() {
     assert_eq!(capture.requests.lock().unwrap().len(), 1);
     task.abort();
 }
+
+#[tokio::test]
+async fn responses_get_returns_json_diagnostic_instead_of_405() {
+    let (upstream, _capture, task) = start_mock_responses_upstream(false).await;
+    let app = proxy_app(upstream).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/responses")
+                .header(header::UPGRADE, "websocket")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let response_json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        response_json["error"]["code"],
+        "responses_requires_http_post"
+    );
+    assert!(response_json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not ws://127.0.0.1:3000"));
+    task.abort();
+}

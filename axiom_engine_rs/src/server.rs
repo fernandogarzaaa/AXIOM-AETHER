@@ -1412,6 +1412,26 @@ async fn create_response(
         })
 }
 
+/// `GET /v1/responses` - friendly diagnostic for clients that accidentally
+/// configure the OpenAI Responses base URL as a WebSocket endpoint.
+///
+/// The Responses API is HTTP POST (SSE is still delivered over HTTP when
+/// `stream: true`). Returning a structured 426 avoids Axum's generic 405 HTML
+/// response, which some local Codex clients then try to parse as JSON.
+async fn responses_method_diagnostic() -> Response {
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(serde_json::json!({
+            "error": {
+                "message": "Axiom's /v1/responses endpoint expects HTTP POST JSON. Configure Codex/OpenAI clients with http://127.0.0.1:3000 (not ws://127.0.0.1:3000); streaming Responses use SSE over HTTP.",
+                "type": "invalid_request_error",
+                "code": "responses_requires_http_post"
+            }
+        })),
+    )
+        .into_response()
+}
+
 // -- non-streaming JSON path ------------------------------------------------
 
 fn chat_completion_json(
@@ -3325,7 +3345,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/completions", post(create_completion))
         .route("/v1/chat/completions", post(create_chat_completion))
-        .route("/v1/responses", post(create_response))
+        .route(
+            "/v1/responses",
+            post(create_response).get(responses_method_diagnostic),
+        )
         .route("/v1/messages", post(create_message))
         .route("/v1/cluster/sync", post(cluster_sync))
         .route("/v1/cluster/merge", post(cluster_merge))
