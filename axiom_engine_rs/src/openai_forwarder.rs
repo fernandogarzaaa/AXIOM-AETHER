@@ -17,16 +17,20 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 /// base URL is set, so `opendrop run <model>` + `AXIOM_BACKEND=opendrop` "just
 /// works" against a local model with zero per-token cost.
 ///
-/// This is a **bare host with no `/v1` suffix**: the forwarder appends the full
-/// `/v1/chat/completions` path itself (see [`chat_completions_url`]). Including
-/// `/v1` here would produce a doubled `/v1/v1/chat/completions`.
+/// This remains a bare host for consistency with the default OpenAI base.
 const OPENDROP_DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
 
-/// Compose the upstream Chat Completions URL from a base. Centralized + pure so
-/// the `/v1` path is appended in exactly one place and is unit-testable (guards
-/// against the `/v1/v1` doubling regression).
+fn api_root(base: &str) -> &str {
+    let base = base.trim_end_matches('/');
+    base.strip_suffix("/v1").unwrap_or(base)
+}
+
 fn chat_completions_url(base: &str) -> String {
-    format!("{}/v1/chat/completions", base.trim_end_matches('/'))
+    format!("{}/v1/chat/completions", api_root(base))
+}
+
+fn responses_url(base: &str) -> String {
+    format!("{}/v1/responses", api_root(base))
 }
 
 /// Resolve the effective OpenAI-compatible base URL from env signals. An explicit
@@ -59,6 +63,7 @@ pub struct OpenAiForwarder {
     api_key: Option<String>,
     base_url: String,
     client: Client,
+    streaming_client: Client,
 }
 
 impl OpenAiForwarder {
@@ -67,10 +72,17 @@ impl OpenAiForwarder {
             .timeout(Duration::from_secs(120))
             .build()
             .expect("reqwest async client should construct");
+        // Streaming agent runs can legitimately exceed two minutes. This
+        // client has no total timeout; disconnects and upstream errors still
+        // terminate its response stream.
+        let streaming_client = Client::builder()
+            .build()
+            .expect("reqwest streaming client should construct");
         Self {
             api_key,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             client,
+            streaming_client,
         }
     }
 
@@ -104,24 +116,35 @@ impl OpenAiForwarder {
         auth: &OpenAiClientAuth,
     ) -> Result<OpenAiForwardedResponse, OpenAiForwarderError> {
         let url = chat_completions_url(&self.base_url);
-        let mut request = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json");
+        self.forward_json_text(url, payload, auth).await
+    }
 
-        if let Some(authz) = auth.authorization.as_deref() {
-            request = request.header("authorization", authz);
-        } else if let Some(key) = self.api_key.as_deref() {
-            request = request.header("authorization", bearer_value(key));
+    /// POST to `/v1/responses` without translating the request or response.
+    /// Native passthrough preserves function calls, reasoning items, and SSE
+    /// event types that do not have lossless Chat Completions equivalents.
+    pub async fn forward_responses(
+        &self,
+        payload: &Value,
+        auth: &OpenAiClientAuth,
+    ) -> Result<reqwest::Response, OpenAiForwarderError> {
+        let url = responses_url(&self.base_url);
+        let client = if payload.get("stream").and_then(Value::as_bool) == Some(true) {
+            &self.streaming_client
         } else {
-            return Err(OpenAiForwarderError::MissingAuth);
-        }
+            &self.client
+        };
+        self.send_json_with(client, url, payload, auth).await
+    }
 
-        let response = request
-            .json(payload)
-            .send()
-            .await
-            .map_err(|e| OpenAiForwarderError::Network(e.to_string()))?;
+    async fn forward_json_text(
+        &self,
+        url: String,
+        payload: &Value,
+        auth: &OpenAiClientAuth,
+    ) -> Result<OpenAiForwardedResponse, OpenAiForwarderError> {
+        let response = self
+            .send_json_with(&self.client, url, payload, auth)
+            .await?;
 
         let status = response.status().as_u16();
         let content_type = response
@@ -139,6 +162,30 @@ impl OpenAiForwarder {
             content_type,
             body,
         })
+    }
+
+    async fn send_json_with(
+        &self,
+        client: &Client,
+        url: String,
+        payload: &Value,
+        auth: &OpenAiClientAuth,
+    ) -> Result<reqwest::Response, OpenAiForwarderError> {
+        let mut request = client.post(url).header("content-type", "application/json");
+
+        if let Some(authz) = auth.authorization.as_deref() {
+            request = request.header("authorization", authz);
+        } else if let Some(key) = self.api_key.as_deref() {
+            request = request.header("authorization", bearer_value(key));
+        } else {
+            return Err(OpenAiForwarderError::MissingAuth);
+        }
+
+        request
+            .json(payload)
+            .send()
+            .await
+            .map_err(|e| OpenAiForwarderError::Network(e.to_string()))
     }
 }
 
@@ -184,7 +231,8 @@ impl std::error::Error for OpenAiForwarderError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value, chat_completions_url, resolve_base_url, OPENDROP_DEFAULT_BASE_URL,
+        bearer_value, chat_completions_url, resolve_base_url, responses_url,
+        OPENDROP_DEFAULT_BASE_URL,
     };
 
     #[test]
@@ -211,6 +259,22 @@ mod tests {
         assert_eq!(
             chat_completions_url("https://api.openai.com/"),
             "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn responses_url_appends_v1_path_once() {
+        assert_eq!(
+            responses_url("https://api.openai.com/"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            responses_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/responses"
         );
     }
 
