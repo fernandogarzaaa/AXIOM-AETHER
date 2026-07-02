@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 axiom_engine_rs/target/
+# Isolated test target dir (avoids relink contention with the running proxy/MCP binary)
+axiom_engine_rs/target-test/
 
 # Model checkpoints are generated artifacts, never committed. `axiom init` /
 # eval bootstrap a local checkpoint into the CWD when no model can be fetched,
@@ -18,3 +20,6 @@ logs/*.json
 # Persistent vibe memory + its backups (runtime artifacts; reset via scripts/axiom-wipe.sh)
 axiom_master_vibe.bin
 .vibe_backups/
+
+# Deployed release tag recorded by scripts/update_axiom.ps1 (runtime state)
+.axiom_release_version
