@@ -1408,12 +1408,52 @@ async fn compressed_responses_payload(
     let session_id = session_override
         .map(str::to_string)
         .unwrap_or_else(|| format!("responses-{}", Uuid::new_v4()));
+
+    // One fingerprint per contiguous run, each adapted in its own sub-session
+    // so a run's recall vector reflects only that run's context.
+    let mut fingerprints = Vec::with_capacity(plan.runs.len());
+    for (ordinal, run) in plan.runs.iter().enumerate() {
+        let run_session = format!("{session_id}#r{ordinal}");
+        let fp = responses_run_fingerprint(state, &run_session, &run.context, &plan.query).await?;
+        fingerprints.push(fp);
+    }
+
+    let compressed = apply_plan(body, &plan, &fingerprints)
+        .ok_or_else(|| ApiError::Internal("Responses compression transform failed".into()))?;
+    let bytes_in = serde_json::to_vec(body).map(|value| value.len()).unwrap_or(0) as u64;
+    let bytes_out = serde_json::to_vec(&compressed)
+        .map(|value| value.len())
+        .unwrap_or(0) as u64;
+    state
+        .controls
+        .record(plan.item_indices().len() as u64, bytes_in, bytes_out);
+    eprintln!(
+        "[axiom-ttt] responses compressed session={} runs={} assistant_items={} tokens={} bytes={}=>{}",
+        session_id,
+        plan.runs.len(),
+        plan.item_indices().len(),
+        context_tokens,
+        bytes_in,
+        bytes_out
+    );
+    Ok(Some(compressed))
+}
+
+/// Adapt one run's context into a fresh TTT sub-session and return the recall
+/// fingerprint block. Extracted from the former inline body of
+/// `compressed_responses_payload` so each run gets its own adaptation.
+async fn responses_run_fingerprint(
+    state: &AppState,
+    session_id: &str,
+    context: &str,
+    query: &str,
+) -> Result<String, ApiError> {
     let pipeline_arc = state.pipeline.clone();
     let store = state.ttt_sessions.clone();
-    let context = plan.total_context();
-    let query = plan.query.clone();
+    let context = context.to_string();
+    let query = query.to_string();
     let top_k = state.compressor_config.recall_top_k;
-    let session_for_task = session_id.clone();
+    let session_for_task = session_id.to_string();
     let started = Instant::now();
     let fingerprint = spawn_blocking(move || -> Result<_, ApiError> {
         let pipeline = pipeline_arc
@@ -1440,25 +1480,7 @@ async fn compressed_responses_payload(
     })
     .await
     .map_err(|error| ApiError::Internal(format!("blocking task join failed: {error}")))??;
-
-    let compressed = apply_plan(body, &plan, &fingerprint.to_prompt_block())
-        .ok_or_else(|| ApiError::Internal("Responses compression transform failed".into()))?;
-    let bytes_in = serde_json::to_vec(body).map(|value| value.len()).unwrap_or(0) as u64;
-    let bytes_out = serde_json::to_vec(&compressed)
-        .map(|value| value.len())
-        .unwrap_or(0) as u64;
-    state
-        .controls
-        .record(plan.item_indices().len() as u64, bytes_in, bytes_out);
-    eprintln!(
-        "[axiom-ttt] responses compressed session={} assistant_items={} tokens={} bytes={}=>{}",
-        session_id,
-        plan.item_indices().len(),
-        context_tokens,
-        bytes_in,
-        bytes_out
-    );
-    Ok(Some(compressed))
+    Ok(fingerprint.to_prompt_block())
 }
 
 /// Client headers relayed verbatim to the Responses upstream, selected by
