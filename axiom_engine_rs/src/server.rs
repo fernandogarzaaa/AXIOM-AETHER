@@ -1495,6 +1495,135 @@ fn relayable_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Upstream WebSocket URL for the Responses passthrough, mirroring the HTTP
+/// upstream selection: explicit env override, ChatGPT backend when the client
+/// is a ChatGPT-subscription Codex (chatgpt-account-id header), else platform.
+fn responses_ws_upstream(headers: &HeaderMap) -> String {
+    if let Ok(explicit) = std::env::var("AXIOM_OPENAI_RESPONSES_WS_UPSTREAM") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if headers.contains_key("chatgpt-account-id") {
+        "wss://chatgpt.com/backend-api/codex/responses".to_string()
+    } else {
+        "wss://api.openai.com/v1/responses".to_string()
+    }
+}
+
+/// `GET /v1/responses` (WebSocket upgrade) — transparent frame relay to the
+/// upstream Responses WebSocket. Codex prefers this transport and previously
+/// burned five 405-retries (~10s) before falling back to HTTPS. The proxy
+/// does not interpret the protocol: client auth and relay headers are
+/// forwarded on the CONNECT, then frames are pumped verbatim both ways until
+/// either side closes. Compression does not apply on this path.
+async fn responses_websocket(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    headers: HeaderMap,
+) -> Response {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let upstream_url = responses_ws_upstream(&headers);
+    let mut request = match upstream_url.as_str().into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            return ApiError::Internal(format!("invalid upstream ws url: {e}")).into_response()
+        }
+    };
+    // Relay client auth + the same header set as the HTTP path. Skip
+    // WebSocket handshake headers — tungstenite generates its own.
+    const WS_HANDSHAKE: &[&str] = &[
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-extensions",
+        "sec-websocket-protocol",
+        "upgrade",
+        "connection",
+    ];
+    if let Some(auth) = headers.get(header::AUTHORIZATION) {
+        request
+            .headers_mut()
+            .insert(header::AUTHORIZATION, auth.clone());
+    }
+    for (name, value) in relayable_response_headers(&headers) {
+        if WS_HANDSHAKE.contains(&name.as_str()) {
+            continue;
+        }
+        if let (Ok(n), Ok(v)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&value),
+        ) {
+            request.headers_mut().insert(n, v);
+        }
+    }
+
+    ws.on_upgrade(move |client_socket| async move {
+        use axum::extract::ws::Message as AxMsg;
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as TgMsg;
+
+        let upstream = match tokio_tungstenite::connect_async(request).await {
+            Ok((socket, _resp)) => socket,
+            Err(e) => {
+                eprintln!("[responses-ws] upstream connect failed ({upstream_url}): {e}");
+                let mut client = client_socket;
+                let _ = client
+                    .send(AxMsg::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1011,
+                        reason: format!("upstream connect failed: {e}").into(),
+                    })))
+                    .await;
+                return;
+            }
+        };
+
+        let (mut up_tx, mut up_rx) = upstream.split();
+        let (mut cl_tx, mut cl_rx) = client_socket.split();
+
+        // Client → upstream.
+        let c2u = async {
+            while let Some(Ok(msg)) = cl_rx.next().await {
+                let out = match msg {
+                    AxMsg::Text(t) => TgMsg::Text(t),
+                    AxMsg::Binary(b) => TgMsg::Binary(b),
+                    AxMsg::Ping(p) => TgMsg::Ping(p),
+                    AxMsg::Pong(p) => TgMsg::Pong(p),
+                    AxMsg::Close(_) => break,
+                };
+                if up_tx.send(out).await.is_err() {
+                    break;
+                }
+            }
+            let _ = up_tx.send(TgMsg::Close(None)).await;
+        };
+
+        // Upstream → client.
+        let u2c = async {
+            while let Some(Ok(msg)) = up_rx.next().await {
+                let out = match msg {
+                    TgMsg::Text(t) => AxMsg::Text(t),
+                    TgMsg::Binary(b) => AxMsg::Binary(b),
+                    TgMsg::Ping(p) => AxMsg::Ping(p),
+                    TgMsg::Pong(p) => AxMsg::Pong(p),
+                    TgMsg::Close(_) => break,
+                    TgMsg::Frame(_) => continue, // raw frames never surface from read
+                };
+                if cl_tx.send(out).await.is_err() {
+                    break;
+                }
+            }
+            let _ = cl_tx.send(AxMsg::Close(None)).await;
+        };
+
+        // Run both pumps; when one side closes, the other unwinds.
+        tokio::select! {
+            _ = c2u => {}
+            _ = u2c => {}
+        }
+    })
+}
+
 /// `POST /v1/responses` - native passthrough with optional semantic compression.
 ///
 /// Structural items stay on their native wire protocol. When explicitly
@@ -3525,7 +3654,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/completions", post(create_completion))
         .route("/v1/chat/completions", post(create_chat_completion))
-        .route("/v1/responses", post(create_response))
+        .route(
+            "/v1/responses",
+            post(create_response).get(responses_websocket),
+        )
         .route("/v1/messages", post(create_message))
         .route("/v1/cluster/sync", post(cluster_sync))
         .route("/v1/cluster/merge", post(cluster_merge))
