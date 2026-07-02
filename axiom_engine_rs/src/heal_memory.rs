@@ -84,6 +84,22 @@ const FADED_VARIANCE: f32 = 0.07;
 /// treated as fabricated certainty (byzantine) and rejected from a merge.
 const MAX_PEER_EVIDENCE: f32 = 1.0e4;
 
+/// Trust applied to peer-reported beliefs before Dempster-Shafer fusion.
+/// 1.0 = full trust (plain combine_ds); lower values shrink peer evidence
+/// toward the uniform prior, bounding how hard a single gossiping peer can
+/// move local belief. Overridable via `AXIOM_PEER_RELIABILITY`.
+const PEER_RELIABILITY: f32 = 0.8;
+
+/// Effective peer reliability: `AXIOM_PEER_RELIABILITY` env (clamped to
+/// [0, 1]) or the `PEER_RELIABILITY` default.
+fn peer_reliability() -> f32 {
+    std::env::var("AXIOM_PEER_RELIABILITY")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .map(|v| v.clamp(0.0, 1.0))
+        .unwrap_or(PEER_RELIABILITY)
+}
+
 impl ProgramRecord {
     /// The stored Beta belief, migrating a legacy scalar-confidence record into
     /// a Beta on first access (evidence ≈ the immunization count).
@@ -615,6 +631,7 @@ impl HealMemory {
         let peer: MemoryFile =
             serde_json::from_str(peer_json).map_err(|e| format!("invalid peer memory: {e}"))?;
         let mut report = MergeReport::default();
+        let reliability = peer_reliability();
         for (fp, theirs) in peer.programs {
             // Byzantine gate: a peer cannot inject malformed/fabricated beliefs.
             if let Some(pb) = theirs.belief {
@@ -644,20 +661,23 @@ impl HealMemory {
                             / total as f32;
                         ours.ce_count = total;
                     }
-                    // Dempster-Shafer belief combination with conflict detection.
-                    match ours.base_belief().combine_ds(&theirs.base_belief()) {
-                        Ok(combined) => {
-                            ours.confidence = combined.mean();
-                            ours.belief = Some(combined);
-                            ours.immunizations += theirs.immunizations;
-                            ours.last_reinforced =
-                                ours.last_reinforced.max(theirs.last_reinforced);
-                        }
-                        Err(_conflict) => {
-                            // Irreconcilable: keep our belief, reject theirs.
-                            report.belief_conflicts += 1;
-                        }
+                    // Reliability-discounted Dempster-Shafer combination.
+                    // Peers are trusted at PEER_RELIABILITY (their evidence is
+                    // shrunk toward the uniform prior before fusing); when the
+                    // discounted beliefs still irreconcilably conflict, fall
+                    // back to Murphy averaging instead of discarding the peer
+                    // outright — dissent lowers confidence rather than being
+                    // silently dropped.
+                    let (combined, conflict) = ours
+                        .base_belief()
+                        .combine_ds_conflict_aware(&theirs.base_belief(), reliability);
+                    if conflict.is_some() {
+                        report.belief_conflicts += 1;
                     }
+                    ours.confidence = combined.mean();
+                    ours.belief = Some(combined);
+                    ours.immunizations += theirs.immunizations;
+                    ours.last_reinforced = ours.last_reinforced.max(theirs.last_reinforced);
                 }
             }
         }
@@ -768,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_flags_dempster_shafer_conflict_and_keeps_local() {
+    fn merge_flags_dempster_shafer_conflict_and_murphy_averages() {
         let fp = fingerprint("prog", &[]);
         let now = 1_000_000_000u64;
         // Ours: strongly-established belief (many successes).
@@ -788,8 +808,21 @@ mod tests {
 
         let report = ours.merge_json(&theirs.to_json()).unwrap();
         assert_eq!(report.belief_conflicts, 1, "irreconcilable beliefs flagged");
-        // Local belief kept (not averaged into the peer's low value).
-        assert!((ours.record(&fp).unwrap().belief_now(now + 12).mean() - our_mean).abs() < 1e-3);
+        // Conflict-aware fusion: the dissenting peer is Murphy-averaged in
+        // (reliability-discounted), so confidence drops below our prior mean
+        // instead of the peer being silently rejected — dissent is evidence.
+        let fused_mean = ours.record(&fp).unwrap().belief_now(now + 12).mean();
+        assert!(
+            fused_mean < our_mean,
+            "dissent must lower confidence: fused {fused_mean} vs local {our_mean}"
+        );
+        // But the discounted average must not capitulate to the peer's
+        // strongly-negative view either — it stays above the peer's mean.
+        let peer_mean = crate::belief::BetaBelief { alpha: 1.0, beta: 11.0 }.mean();
+        assert!(
+            fused_mean > peer_mean,
+            "fusion must not adopt the peer outright: fused {fused_mean} vs peer {peer_mean}"
+        );
     }
 
     #[test]

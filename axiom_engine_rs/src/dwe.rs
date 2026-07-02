@@ -76,6 +76,12 @@ impl DweBus {
         Self::new(peers)
     }
 
+    /// Shared telemetry handle for wiring an inbound listener
+    /// (`start_dwe_listener`) to the same counters the bus reports.
+    pub fn telemetry_handle(&self) -> Arc<Mutex<DweTelemetry>> {
+        self.telemetry.clone()
+    }
+
     pub fn telemetry(&self) -> DweTelemetry {
         let mut telemetry = self.telemetry.lock().map(|t| t.clone()).unwrap_or_default();
         telemetry.queued_fragments = self.tx.max_capacity().saturating_sub(self.tx.capacity());
