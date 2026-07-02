@@ -1488,6 +1488,30 @@ async fn responses_run_fingerprint(
     Ok(fingerprint.to_prompt_block())
 }
 
+/// Fire-and-forget session recording (AXIOM_SESSION_RECORD=1). `response` is
+/// the full JSON body when available, else `{"streamed":true,"status":N}`.
+/// File I/O runs on the blocking pool; failures never block the request path.
+fn record_proxy_exchange(
+    endpoint: &str,
+    session_id: &str,
+    request: &Value,
+    response: Value,
+    compressed: bool,
+) {
+    if !crate::session_recorder::recording_enabled() {
+        return;
+    }
+    let record = crate::session_recorder::ExchangeRecord {
+        ts: unix_now(),
+        endpoint: endpoint.to_string(),
+        session_id: session_id.to_string(),
+        request: request.clone(),
+        response,
+        compressed,
+    };
+    tokio::task::spawn_blocking(move || crate::session_recorder::record_exchange(record));
+}
+
 /// Client headers relayed verbatim to the Responses upstream, selected by
 /// allowlist (review hardening: a denylist silently forwards anything a
 /// client invents — cookies, x-forwarded-*, internal headers). The list
@@ -1719,6 +1743,15 @@ async fn create_response(
         }
     }
     let status = upstream.status();
+    // The Responses body always streams through untouched, so the record
+    // carries the request plus a streamed marker rather than a buffered body.
+    record_proxy_exchange(
+        "/v1/responses",
+        session_override.unwrap_or("anonymous"),
+        &body,
+        serde_json::json!({"streamed": true, "status": status.as_u16()}),
+        compressed.is_some(),
+    );
     let content_type = upstream
         .headers()
         .get(header::CONTENT_TYPE)
@@ -2730,6 +2763,13 @@ async fn compressed_messages_path(
     // flagging with nobody asking. Never alters the answer text itself; appends
     // a clearly-marked advisory only when claims are flagged.
     annotate_response_grounding(&mut forwarded, &heavy_combined);
+    record_proxy_exchange(
+        "/v1/messages",
+        &session_id,
+        body,
+        forwarded.clone(),
+        log_heavy_count > 0,
+    );
     Ok(forwarded)
 }
 
@@ -3170,6 +3210,17 @@ async fn compressed_openai_chat_path(
     }
 
     let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    // The forwarder buffers this body in full, so record it verbatim (JSON
+    // when parseable, else as a raw-string wrapper for SSE bodies).
+    let recorded_body = serde_json::from_str::<Value>(&upstream.body)
+        .unwrap_or_else(|_| serde_json::json!({"raw": upstream.body, "status": upstream.status}));
+    record_proxy_exchange(
+        "/v1/chat/completions",
+        &session_id,
+        body,
+        recorded_body,
+        log_heavy_count > 0,
+    );
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = upstream.content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);

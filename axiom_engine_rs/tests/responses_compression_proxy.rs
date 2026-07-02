@@ -98,3 +98,66 @@ async fn compressed_bad_request_retries_original_and_preserves_structural_items(
     task.abort();
     std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
 }
+
+#[tokio::test]
+async fn recording_persists_scrubbed_exchange_when_enabled() {
+    let rec_dir = std::env::temp_dir().join(format!(
+        "axiom_recproxy_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::env::set_var("AXIOM_SESSION_RECORD", "1");
+    std::env::set_var("AXIOM_SESSIONS_DIR", &rec_dir);
+
+    async fn upstream(Json(_body): Json<Value>) -> (StatusCode, Json<Value>) {
+        (StatusCode::OK, Json(json!({"id":"resp_rec","object":"response"})))
+    }
+    let upstream_app = Router::new().route("/v1/responses", post(upstream));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+
+    let test_pipeline = tokio::task::spawn_blocking(pipeline).await.unwrap();
+    let state = AppState::new(test_pipeline, "test".into())
+        .with_openai_forwarder(Some(OpenAiForwarder::new(None, Some(base))));
+    let app = create_router(state);
+    let response = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-secret-abcdefghijklmnop")
+                .header("x-axiom-session-id", "rectest")
+                .body(Body::from(
+                    json!({"model":"gpt-5.5","input":"hello"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The append happens on the blocking pool; give it a moment.
+    let file = rec_dir.join("rectest.jsonl");
+    let mut records = Vec::new();
+    for _ in 0..50 {
+        if file.exists() {
+            records = axiom_engine::session_recorder::read_session(&file).unwrap();
+            if !records.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    std::env::remove_var("AXIOM_SESSION_RECORD");
+    std::env::remove_var("AXIOM_SESSIONS_DIR");
+    let _ = std::fs::remove_dir_all(&rec_dir);
+    task.abort();
+
+    assert_eq!(records.len(), 1, "one exchange must be recorded");
+    assert_eq!(records[0].endpoint, "/v1/responses");
+    assert_eq!(records[0].session_id, "rectest");
+    assert_eq!(records[0].response["streamed"], true);
+    assert_eq!(records[0].response["status"], 200);
+}
