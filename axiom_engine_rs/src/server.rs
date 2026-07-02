@@ -1378,10 +1378,15 @@ async fn create_chat_completion(
     }
 }
 
+/// Responses compression is ON by default (opt-out). It still requires general
+/// compression (`state.controls.enabled()` / AXIOM_TTT_COMPRESS) to be active;
+/// this gate only lets an operator disable the Responses path specifically via
+/// AXIOM_RESPONSES_COMPRESS in {0,false,no,off}.
 fn responses_compression_enabled() -> bool {
-    std::env::var("AXIOM_RESPONSES_COMPRESS")
-        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    match std::env::var("AXIOM_RESPONSES_COMPRESS") {
+        Ok(value) => !matches!(value.to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
 }
 
 async fn compressed_responses_payload(
@@ -4943,6 +4948,21 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use candle_core::{DType, Device};
     use tower::ServiceExt;
+
+    #[test]
+    fn responses_compression_defaults_on_and_opts_out() {
+        std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
+        assert!(responses_compression_enabled(), "on by default when unset");
+
+        std::env::set_var("AXIOM_RESPONSES_COMPRESS", "0");
+        assert!(!responses_compression_enabled(), "explicit 0 disables");
+        std::env::set_var("AXIOM_RESPONSES_COMPRESS", "off");
+        assert!(!responses_compression_enabled(), "explicit off disables");
+
+        std::env::set_var("AXIOM_RESPONSES_COMPRESS", "1");
+        assert!(responses_compression_enabled(), "explicit 1 enables");
+        std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
+    }
 
     #[test]
     fn relayable_response_headers_skips_hop_by_hop_and_managed() {
