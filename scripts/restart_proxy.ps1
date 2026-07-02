@@ -16,7 +16,7 @@ Write-Host "  axiom_engine=$alive  watchdog=$wd"
 Write-Host '== launching one clean proxy (CPU) =='
 $bash = 'C:\Program Files\Git\bin\bash.exe'
 Start-Process -FilePath $bash `
-    -ArgumentList '-lc', 'cd /c/Users/garza/AXIOM-AETHER && AXIOM_DEVICE=cpu AXIOM_VIBE=0 ./start_axiom.sh' `
+    -ArgumentList '-lc', 'cd /d/AXIOM-AETHER && AXIOM_DEVICE=cpu AXIOM_VIBE=0 ./start_axiom.sh' `
     -WindowStyle Hidden
 
 Write-Host '== waiting for port 3000 =='

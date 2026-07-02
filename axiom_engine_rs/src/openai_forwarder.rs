@@ -20,6 +20,11 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 /// This remains a bare host for consistency with the default OpenAI base.
 const OPENDROP_DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
 
+/// Responses endpoint on the ChatGPT backend. Codex authenticated with a
+/// ChatGPT subscription (OAuth) can only call this backend — its token has no
+/// `api.responses.write` scope on the platform API (api.openai.com).
+const CHATGPT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+
 fn api_root(base: &str) -> &str {
     let base = base.trim_end_matches('/');
     base.strip_suffix("/v1").unwrap_or(base)
@@ -31,6 +36,30 @@ fn chat_completions_url(base: &str) -> String {
 
 fn responses_url(base: &str) -> String {
     format!("{}/v1/responses", api_root(base))
+}
+
+/// Pick the Responses upstream for a specific request.
+///
+/// Precedence:
+/// 1. `AXIOM_OPENAI_RESPONSES_UPSTREAM` env var — full URL, used verbatim.
+/// 2. Client sent `chatgpt-account-id` (Codex in ChatGPT-subscription mode)
+///    — route to the ChatGPT backend, the only upstream its token works on.
+/// 3. Default platform API: `{base}/v1/responses`.
+fn responses_upstream_url(base: &str, auth: &OpenAiClientAuth) -> String {
+    if let Ok(explicit) = std::env::var("AXIOM_OPENAI_RESPONSES_UPSTREAM") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let has_chatgpt_account = auth
+        .extra_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"));
+    if has_chatgpt_account {
+        return CHATGPT_CODEX_RESPONSES_URL.to_string();
+    }
+    responses_url(base)
 }
 
 /// Resolve the effective OpenAI-compatible base URL from env signals. An explicit
@@ -55,6 +84,11 @@ fn resolve_base_url(
 #[derive(Clone, Debug, Default)]
 pub struct OpenAiClientAuth {
     pub authorization: Option<String>,
+    /// Additional client headers relayed verbatim upstream (lowercase names).
+    /// Codex in ChatGPT-subscription mode needs `chatgpt-account-id`,
+    /// `openai-beta`, `session_id`, and `originator` to reach the ChatGPT
+    /// backend; hop-by-hop and body-encoding headers must never be included.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// Active outbound bridge. Cheap to clone (`reqwest::Client` is Arc-backed).
@@ -127,7 +161,7 @@ impl OpenAiForwarder {
         payload: &Value,
         auth: &OpenAiClientAuth,
     ) -> Result<reqwest::Response, OpenAiForwarderError> {
-        let url = responses_url(&self.base_url);
+        let url = responses_upstream_url(&self.base_url, auth);
         let client = if payload.get("stream").and_then(Value::as_bool) == Some(true) {
             &self.streaming_client
         } else {
@@ -179,6 +213,13 @@ impl OpenAiForwarder {
             request = request.header("authorization", bearer_value(key));
         } else {
             return Err(OpenAiForwarderError::MissingAuth);
+        }
+
+        for (name, value) in &auth.extra_headers {
+            if name.eq_ignore_ascii_case("authorization") {
+                continue; // handled above
+            }
+            request = request.header(name.as_str(), value.as_str());
         }
 
         request
@@ -263,6 +304,38 @@ mod tests {
         assert_eq!(
             chat_completions_url("https://api.openai.com/v1/"),
             "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chatgpt_account_header_routes_to_chatgpt_backend() {
+        use super::{responses_upstream_url, OpenAiClientAuth, CHATGPT_CODEX_RESPONSES_URL};
+        let auth = OpenAiClientAuth {
+            authorization: Some("Bearer tok".into()),
+            extra_headers: vec![("chatgpt-account-id".into(), "acct-123".into())],
+        };
+        assert_eq!(
+            responses_upstream_url("https://api.openai.com", &auth),
+            CHATGPT_CODEX_RESPONSES_URL
+        );
+        // Case-insensitive header match.
+        let auth_upper = OpenAiClientAuth {
+            authorization: None,
+            extra_headers: vec![("ChatGPT-Account-Id".into(), "acct-123".into())],
+        };
+        assert_eq!(
+            responses_upstream_url("https://api.openai.com", &auth_upper),
+            CHATGPT_CODEX_RESPONSES_URL
+        );
+    }
+
+    #[test]
+    fn no_chatgpt_header_uses_platform_default() {
+        use super::{responses_upstream_url, OpenAiClientAuth};
+        let auth = OpenAiClientAuth::default();
+        assert_eq!(
+            responses_upstream_url("https://api.openai.com", &auth),
+            "https://api.openai.com/v1/responses"
         );
     }
 
