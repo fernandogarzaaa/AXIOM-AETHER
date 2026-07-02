@@ -279,6 +279,10 @@ pub struct AppState {
     pub controls: Arc<CompressionControls>,
     /// Safe user-mode VFS loopback that feeds file reads into TTT prefill.
     pub neural_vfs: Arc<NeuralVfs>,
+    /// Per-session compression savings ledger: session_id → (bytes_in,
+    /// bytes_forwarded). Fed at each compression record site; drained into a
+    /// one-line receipt when the session drops; summed for /metrics.
+    pub savings: Arc<Mutex<HashMap<String, (u64, u64)>>>,
     /// User-mode polymorphic runtime status and execution wrapper.
     pub poly_jit: Arc<PolyJitEngine>,
     /// SR-TTT exact residual path for high-surprisal identifiers.
@@ -321,6 +325,7 @@ impl AppState {
                 &CompressorConfig::default(),
             )),
             neural_vfs: Arc::new(NeuralVfs::new()),
+            savings: Arc::new(Mutex::new(HashMap::new())),
             poly_jit: Arc::new(PolyJitEngine::default()),
             exact_residual_cache: Arc::new(ExactAttentionResidualCache::default()),
             dwe_bus: Arc::new(DweBus::from_env()),
@@ -1291,12 +1296,33 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     state.refresh_session_metrics()?;
+    let mut rendered = metrics::render_metrics();
+    // Compression savings (per-session ledger summed to lifetime totals).
+    let (bytes_in, bytes_out) = state
+        .savings
+        .lock()
+        .map(|ledger| {
+            ledger
+                .values()
+                .fold((0u64, 0u64), |acc, (i, o)| (acc.0 + i, acc.1 + o))
+        })
+        .unwrap_or((0, 0));
+    let ratio = if bytes_in > 0 && bytes_out < bytes_in {
+        (bytes_in - bytes_out) as f64 / bytes_in as f64
+    } else {
+        0.0
+    };
+    rendered.push_str(&format!(
+        "# TYPE axiom_savings_bytes_in_total counter\naxiom_savings_bytes_in_total {bytes_in}\n\
+         # TYPE axiom_savings_bytes_forwarded_total counter\naxiom_savings_bytes_forwarded_total {bytes_out}\n\
+         # TYPE axiom_savings_ratio gauge\naxiom_savings_ratio {ratio:.4}\n"
+    ));
     Ok((
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        metrics::render_metrics(),
+        rendered,
     )
         .into_response())
 }
@@ -1432,6 +1458,7 @@ async fn compressed_responses_payload(
     state
         .controls
         .record(plan.item_indices().len() as u64, bytes_in, bytes_out);
+    record_savings(state, &session_id, bytes_in, bytes_out);
     eprintln!(
         "[axiom-ttt] responses compressed session={} runs={} assistant_items={} tokens={} bytes={}=>{}",
         session_id,
@@ -1486,6 +1513,47 @@ async fn responses_run_fingerprint(
     .await
     .map_err(|error| ApiError::Internal(format!("blocking task join failed: {error}")))??;
     Ok(fingerprint.to_prompt_block())
+}
+
+/// One-line human receipt: thousands of bytes with one decimal + saved ratio.
+fn savings_receipt(bytes_in: u64, bytes_out: u64) -> String {
+    let saved_pct = if bytes_in > 0 && bytes_out < bytes_in {
+        ((bytes_in - bytes_out) * 100 / bytes_in) as u32
+    } else {
+        0
+    };
+    format!(
+        "{:.1}k in, {:.1}k forwarded, {}% saved",
+        bytes_in as f64 / 1000.0,
+        bytes_out as f64 / 1000.0,
+        saved_pct
+    )
+}
+
+/// Accumulate a compression event into the per-session savings ledger.
+fn record_savings(state: &AppState, session_id: &str, bytes_in: u64, bytes_out: u64) {
+    if let Ok(mut ledger) = state.savings.lock() {
+        let entry = ledger.entry(session_id.to_string()).or_insert((0, 0));
+        entry.0 += bytes_in;
+        entry.1 += bytes_out;
+    }
+}
+
+/// Drop a session's ledger entry, printing its receipt when non-trivial.
+fn emit_savings_receipt(state: &AppState, session_id: &str) {
+    let entry = state
+        .savings
+        .lock()
+        .ok()
+        .and_then(|mut ledger| ledger.remove(session_id));
+    if let Some((bytes_in, bytes_out)) = entry {
+        if bytes_in > 0 {
+            eprintln!(
+                "[receipt] session {session_id}: {}",
+                savings_receipt(bytes_in, bytes_out)
+            );
+        }
+    }
 }
 
 /// Fire-and-forget session recording (AXIOM_SESSION_RECORD=1). `response` is
@@ -1923,6 +1991,7 @@ async fn delete_session(
     drop(sessions);
     if deleted {
         metrics::remove_session(&session_id);
+        emit_savings_receipt(&state, &session_id);
         let mut sequence_versions = state
             .sequence_versions
             .write()
@@ -2675,6 +2744,7 @@ async fn compressed_messages_path(
     state
         .controls
         .record(log_heavy_count as u64, bytes_in, bytes_out);
+    record_savings(state, &session_id, bytes_in, bytes_out);
 
     if let Some(router) = state.swarm_router.as_ref().as_ref() {
         match router.route_chat_payload(&outbound).await {
@@ -3118,6 +3188,7 @@ async fn compressed_openai_chat_path(
     state
         .controls
         .record(log_heavy_count as u64, bytes_in, bytes_out);
+    record_savings(state, &session_id, bytes_in, bytes_out);
 
     if let Some(router) = state.swarm_router.as_ref().as_ref() {
         match router.route_chat_payload(&outbound).await {
@@ -3440,6 +3511,7 @@ async fn ttt_session_drop(
         }
         None => false,
     };
+    emit_savings_receipt(&state, &id);
     Json(serde_json::json!({ "session_id": id, "removed": removed }))
 }
 
@@ -5003,6 +5075,14 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use candle_core::{DType, Device};
     use tower::ServiceExt;
+
+    #[test]
+    fn savings_receipt_formats_bytes_and_ratio() {
+        assert_eq!(savings_receipt(41_200, 17_300), "41.2k in, 17.3k forwarded, 58% saved");
+        assert_eq!(savings_receipt(0, 0), "0.0k in, 0.0k forwarded, 0% saved");
+        // Never negative even if out > in (fingerprint overhead on tiny bodies).
+        assert_eq!(savings_receipt(100, 250), "0.1k in, 0.2k forwarded, 0% saved");
+    }
 
     #[test]
     fn responses_compression_defaults_on_and_opts_out() {
