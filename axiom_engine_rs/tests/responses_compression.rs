@@ -15,8 +15,8 @@ fn selects_only_old_text_assistant_messages() {
         "tools": [{"type":"function", "name":"lookup", "parameters":{"type":"object"}}]
     });
     let plan = plan_compression(&body).expect("one old assistant message is eligible");
-    assert_eq!(plan.item_indices, vec![1]);
-    assert_eq!(plan.context, "long old answer");
+    assert_eq!(plan.item_indices(), vec![1]);
+    assert_eq!(plan.total_context(), "long old answer");
     assert_eq!(plan.query, "current question");
 }
 
@@ -31,7 +31,7 @@ fn structural_item_protects_itself_and_everything_after_it() {
         {"role":"user", "content":"continue"}
     ]});
     let plan = plan_compression(&body).unwrap();
-    assert_eq!(plan.item_indices, vec![0]);
+    assert_eq!(plan.item_indices(), vec![0]);
 }
 
 #[test]
@@ -75,9 +75,10 @@ fn selected_source_hashes_are_stable_and_do_not_expose_text() {
         {"role":"user", "content":"next"}
     ]});
     let plan = plan_compression(&body).unwrap();
-    assert_eq!(plan.source_hashes.len(), 1);
-    assert_eq!(plan.source_hashes[0].len(), 64);
-    assert!(!plan.source_hashes[0].contains("sensitive"));
+    assert_eq!(plan.runs.len(), 1);
+    assert_eq!(plan.runs[0].source_hashes.len(), 1);
+    assert_eq!(plan.runs[0].source_hashes[0].len(), 64);
+    assert!(!plan.runs[0].source_hashes[0].contains("sensitive"));
 }
 
 fn _assert_value(_: Value) {}

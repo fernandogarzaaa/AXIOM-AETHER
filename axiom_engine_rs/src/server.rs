@@ -1400,7 +1400,7 @@ async fn compressed_responses_payload(
         .pipeline
         .lock()
         .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?
-        .token_count(&plan.context);
+        .token_count(&plan.total_context());
     if context_tokens < threshold {
         return Ok(None);
     }
@@ -1410,7 +1410,7 @@ async fn compressed_responses_payload(
         .unwrap_or_else(|| format!("responses-{}", Uuid::new_v4()));
     let pipeline_arc = state.pipeline.clone();
     let store = state.ttt_sessions.clone();
-    let context = plan.context.clone();
+    let context = plan.total_context();
     let query = plan.query.clone();
     let top_k = state.compressor_config.recall_top_k;
     let session_for_task = session_id.clone();
@@ -1449,11 +1449,11 @@ async fn compressed_responses_payload(
         .unwrap_or(0) as u64;
     state
         .controls
-        .record(plan.item_indices.len() as u64, bytes_in, bytes_out);
+        .record(plan.item_indices().len() as u64, bytes_in, bytes_out);
     eprintln!(
         "[axiom-ttt] responses compressed session={} assistant_items={} tokens={} bytes={}=>{}",
         session_id,
-        plan.item_indices.len(),
+        plan.item_indices().len(),
         context_tokens,
         bytes_in,
         bytes_out
