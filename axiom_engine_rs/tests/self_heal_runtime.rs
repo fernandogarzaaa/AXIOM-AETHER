@@ -69,6 +69,15 @@ fn supervise_full(
     )
 }
 
+/// Render a path for embedding in `sh -c` scripts or command args: sh eats
+/// unquoted backslashes, so Windows `\` separators would silently mangle the
+/// path (the redirect succeeds to a wrong-but-writable filename and the
+/// fail→heal→retry choreography never happens). Forward slashes work on all
+/// platforms; on Unix this is the identity.
+fn sh_path(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 fn supervise_opts(
     pipeline: InferencePipeline,
     cmd: String,
@@ -87,7 +96,7 @@ fn supervise_opts(
 fn heals_missing_directory_and_completes() {
     let base = unique_tmp("heal");
     let target = base.join("out").join("result.txt");
-    let script = format!("echo healed-run-output > {}", target.display());
+    let script = format!("echo healed-run-output > {}", sh_path(&target));
 
     let report = supervise(
         tiny_pipeline(),
@@ -141,7 +150,7 @@ fn never_fabricates_missing_file_content() {
     let report = supervise(
         tiny_pipeline(),
         "cat".into(),
-        vec![target.display().to_string()],
+        vec![sh_path(&target)],
         3,
     );
 
@@ -210,7 +219,7 @@ fn learned_immunity_pre_heals_a_fresh_environment() {
     let out_dir = base.join("out");
     let target = out_dir.join("result.txt");
     let memory = unique_tmp("immunity_mem").with_extension("json");
-    let script = format!("echo run-output > {}", target.display());
+    let script = format!("echo run-output > {}", sh_path(&target));
     let args = vec!["-c".to_string(), script];
 
     // Run 1: fails on the missing dir, heals reactively, succeeds, learns.
@@ -500,7 +509,7 @@ fn novel_healed_failure_is_written_to_recall_memory() {
     let base = unique_tmp("remember_env");
     let target = base.join("out").join("r.txt");
     let mem_root = unique_tmp("recall_store");
-    let script = format!("echo x > {}", target.display());
+    let script = format!("echo x > {}", sh_path(&target));
 
     let report = supervise_opts(
         tiny_pipeline(),
@@ -522,7 +531,7 @@ fn novel_healed_failure_is_written_to_recall_memory() {
     assert!(matches!(rec.kind, MemoryKind::Fix));
     assert!(rec.body.contains("self-healed"));
     assert!(
-        rec.body.contains(&base.join("out").display().to_string()),
+        rec.body.contains(&sh_path(&base.join("out"))),
         "memory body must name the directory heal"
     );
     assert!(!rec.embedding.is_empty(), "memory must be embedded for recall");

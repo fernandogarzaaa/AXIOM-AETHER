@@ -906,7 +906,20 @@ fn run_cir(program: &Program, adapter: &dyn InquiryAdapter) -> Result<RunResult,
                     let b = BetaBelief::from_confidence(r.confidence, INQUIRY_STRENGTH);
                     fused = Some(match fused {
                         None => b,
-                        Some(prev) => prev.combine_ds(&b).unwrap_or(prev),
+                        // Conflict-aware fusion: an irreconcilable dissenting
+                        // agent no longer gets silently dropped — the fused
+                        // belief falls back to a Murphy average, so dissent
+                        // shows up as lowered confidence in the trace.
+                        Some(prev) => {
+                            let (combined, conflict) = prev.combine_ds_conflict_aware(&b, 1.0);
+                            if let Some(c) = conflict {
+                                res.trace.push(format!(
+                                    "belief {name}: agent {ag} conflicts (k={:.3}); murphy-averaged",
+                                    c.conflict_mass
+                                ));
+                            }
+                            combined
+                        }
                     });
                 }
                 let mut belief = fused.unwrap_or_else(BetaBelief::uniform);

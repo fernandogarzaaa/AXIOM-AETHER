@@ -13,7 +13,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::agentic::{agentic_loop, AttemptMemory, EditSet, ProposeContext, Proposer};
+use crate::agentic::{
+    agentic_loop, agentic_loop_with_holdout, AttemptMemory, EditSet, ProposeContext, Proposer,
+};
 use crate::inference::InferencePipeline;
 use crate::solve::{run_verify, run_verify_capture, solve, SolveOptions};
 
@@ -34,6 +36,13 @@ pub struct EvalCase {
     /// where no single-file repair passes the verifier, so the single-file
     /// `solve` path cannot solve them — only a coordinated multi-file edit can.
     pub agentic_fix: Vec<(String, String)>,
+    /// Optional held-out verifier (program, args). When set on an agentic
+    /// case, a candidate edit-set is committed only if it passes BOTH the
+    /// train `command` and this held-out command
+    /// ([`crate::agentic::agentic_loop_with_holdout`]) — the anti-overfitting
+    /// split: a fix shaped against the train verifier that fails held-out
+    /// checks is rolled back instead of trusted.
+    pub holdout: Option<(String, Vec<String>)>,
 }
 
 impl EvalCase {
@@ -44,7 +53,15 @@ impl EvalCase {
             command: command.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             agentic_fix: Vec::new(),
+            holdout: None,
         }
+    }
+
+    /// Attach a held-out verifier: commits require passing both the train
+    /// command and this one. Meaningful only on agentic cases.
+    fn with_holdout(mut self, command: &str, args: &[&str]) -> Self {
+        self.holdout = Some((command.to_string(), args.iter().map(|s| s.to_string()).collect()));
+        self
     }
 
     /// A case solved via the agentic multi-file transaction path: `fix` is the
@@ -224,6 +241,26 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 ("b.sh", "#!/bin/sh\nexit 0\n"),
             ],
         ),
+        // 9. Held-out verification split: the fix must pass the train verifier
+        //    (a.sh) AND the held-out verifier (b.sh) before it is committed.
+        //    A train-only fix (patching a.sh alone) would be the classic
+        //    test-overfit patch — the holdout gate rejects it; the scripted
+        //    fix repairs both, so the case solves only through the
+        //    agentic_loop_with_holdout path.
+        EvalCase::new_agentic(
+            "agentic-holdout-split",
+            &[
+                ("a.sh", "#!/bin/sh\nexit 1\n"),
+                ("b.sh", "#!/bin/sh\nexit 1\n"),
+            ],
+            "sh",
+            &["-c", "sh a.sh"],
+            &[
+                ("a.sh", "#!/bin/sh\nexit 0\n"),
+                ("b.sh", "#!/bin/sh\nexit 0\n"),
+            ],
+        )
+        .with_holdout("sh", &["-c", "sh b.sh"]),
     ]
 }
 
@@ -300,14 +337,27 @@ fn solve_agentic_case(case: &EvalCase, root: &Path) -> bool {
     let mut proposer = ScriptedProposer { once: Some(edits) };
     let mut memory = AttemptMemory::new();
     let working_dir = Some(root);
-    let outcome = agentic_loop(
-        &format!("eval:{}", case.name),
-        3,
-        &mut memory,
-        &mut proposer,
-        || run_verify(&case.command, &case.args, working_dir),
-        || run_verify_capture(&case.command, &case.args, working_dir).1,
-    );
+    let outcome = match &case.holdout {
+        // Held-out split: commit only when the candidate passes both the
+        // train verifier and the held-out verifier (anti-overfitting gate).
+        Some((holdout_cmd, holdout_args)) => agentic_loop_with_holdout(
+            &format!("eval:{}", case.name),
+            3,
+            &mut memory,
+            &mut proposer,
+            || run_verify(&case.command, &case.args, working_dir),
+            || run_verify(holdout_cmd, holdout_args, working_dir),
+            || run_verify_capture(&case.command, &case.args, working_dir).1,
+        ),
+        None => agentic_loop(
+            &format!("eval:{}", case.name),
+            3,
+            &mut memory,
+            &mut proposer,
+            || run_verify(&case.command, &case.args, working_dir),
+            || run_verify_capture(&case.command, &case.args, working_dir).1,
+        ),
+    };
     outcome.solved
 }
 
@@ -317,10 +367,17 @@ fn solve_agentic_case(case: &EvalCase, root: &Path) -> bool {
 /// both are public and a committed transaction writes the latter to disk.
 fn is_safe_rel(rel: &str) -> bool {
     let p = Path::new(rel);
+    // `has_root()` catches rooted-but-not-absolute forms Windows treats as
+    // relative (`/etc/passwd`, `\x`); prefix components catch drive/UNC paths
+    // (`C:x` is drive-relative yet neither absolute nor rooted on Windows).
     !p.is_absolute()
-        && !p
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && !p.has_root()
+        && !p.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
 }
 
 fn unique_root(name: &str) -> PathBuf {

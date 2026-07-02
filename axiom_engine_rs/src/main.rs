@@ -1,67 +1,12 @@
-mod adaptive;
-mod agentic;
-mod agentic_eval;
-mod anthropic_forwarder;
-mod backend_live;
-mod backend_router;
-mod bench;
-mod belief;
-mod chimera;
-mod bootstrap;
-mod claude_backend;
-mod cli;
-mod cluster;
-mod config;
-mod context_compressor;
-mod contrastive;
-mod corpus;
-mod daemon;
-mod data_gen;
-mod dwe;
-mod embedder;
-mod encoder;
-mod epistemic_drift;
-mod fault_locate;
-mod hamiltonian;
-mod hallucination;
-mod hardware;
-mod heal_memory;
-mod inference;
-mod jit_streamer;
-mod kernel;
-mod lsp;
-mod mcp_stdio;
-mod memory_pool;
-mod memory_recall;
-mod memory_store;
-mod meta_train;
-mod metrics;
-mod model;
-mod model_meta;
-mod openai_forwarder;
-mod pairs;
-mod patch_memory;
-mod poly_jit;
-mod prime;
-mod provenance;
-mod q_manifold;
-mod quantization;
-mod sandbox;
-mod session_awareness;
-mod self_heal;
-mod solve;
-mod server;
-mod skeleton;
-mod surprisal;
-mod task_board;
-mod swarm_route;
-mod swarm_router;
-mod test_time_adapter;
-mod train;
-mod ttt_block;
-mod vfs;
-mod vibe_memory;
-mod weight_merge;
+// The binary consumes the `axiom_engine` library crate instead of re-declaring
+// its module tree. Re-declaring compiled every module twice and produced a
+// wall of false-positive dead-code warnings for lib API the binary happens
+// not to call (test- and tool-binary helpers).
+use axiom_engine::{
+    agentic, agentic_eval, bench, bootstrap, chimera, claude_backend, cli, config, daemon,
+    fault_locate, hardware, heal_memory, inference, lsp, mcp_stdio, meta_train, patch_memory,
+    prime, provenance, self_heal, server, solve, train, vibe_memory,
+};
 
 use std::env;
 use std::path::PathBuf;

@@ -39,6 +39,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::task::spawn_blocking;
 use tower_http::cors::CorsLayer;
+use tower_http::decompression::RequestDecompressionLayer;
 use uuid::Uuid;
 
 use crate::anthropic_forwarder::{
@@ -60,6 +61,7 @@ use crate::metrics;
 use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarderError};
 use crate::poly_jit::{PolyJitEngine, PolyJitRunRequest, PolyJitReport, PolyJitStatus};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
+use crate::responses_compressor::{apply_plan, plan_compression};
 use crate::sandbox::{SandboxController, SandboxDiagnostic};
 use crate::session_awareness::AwarenessStore;
 use crate::surprisal::{ExactAttentionResidualCache, ExactResidualTelemetry};
@@ -67,7 +69,7 @@ use crate::swarm_route::{LocalSwarmRouteMatrix, SwarmMatrixState};
 use crate::swarm_router::{SwarmChatResult, SwarmRouter};
 use crate::vfs::{NeuralVfs, VfsMountReport, VfsReadReport, VfsStats};
 use crate::vibe_memory::MasterVibe;
-use crate::weight_merge::{fleet_dare_ties, merge_checkpoint_files_with, MergeSummary};
+use crate::weight_merge::{fleet_dare_ties, merge_checkpoint_files_with, MergeMethod, MergeSummary};
 
 const MAX_ACTIVE_VRAM_SESSIONS: usize = 32;
 
@@ -1142,6 +1144,10 @@ struct ClusterMergeRequest {
     output: String,
     #[serde(default)]
     alpha: Option<f32>,
+    /// Merge strategy: "dare_ties" (default; sign-elected, sparsified) or
+    /// "alpha_blend" (uniform task-vector interpolation).
+    #[serde(default)]
+    method: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1343,6 +1349,7 @@ async fn create_chat_completion(
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
+            extra_headers: Vec::new(),
         };
         match compressed_openai_chat_path(&state, &body, session_override.as_deref(), &client_auth)
             .await
@@ -1371,10 +1378,264 @@ async fn create_chat_completion(
     }
 }
 
-/// `POST /v1/responses` - lossless passthrough to the configured OpenAI API.
+fn responses_compression_enabled() -> bool {
+    std::env::var("AXIOM_RESPONSES_COMPRESS")
+        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+async fn compressed_responses_payload(
+    state: &AppState,
+    body: &Value,
+    session_override: Option<&str>,
+) -> Result<Option<Value>, ApiError> {
+    if !state.controls.enabled() || !responses_compression_enabled() {
+        return Ok(None);
+    }
+    let Some(plan) = plan_compression(body) else {
+        return Ok(None);
+    };
+    let threshold = state.controls.threshold();
+    let context_tokens = state
+        .pipeline
+        .lock()
+        .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?
+        .token_count(&plan.context);
+    if context_tokens < threshold {
+        return Ok(None);
+    }
+
+    let session_id = session_override
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("responses-{}", Uuid::new_v4()));
+    let pipeline_arc = state.pipeline.clone();
+    let store = state.ttt_sessions.clone();
+    let context = plan.context.clone();
+    let query = plan.query.clone();
+    let top_k = state.compressor_config.recall_top_k;
+    let session_for_task = session_id.clone();
+    let started = Instant::now();
+    let fingerprint = spawn_blocking(move || -> Result<_, ApiError> {
+        let pipeline = pipeline_arc
+            .lock()
+            .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+        let session = store
+            .get_or_create(&session_for_task, &pipeline)
+            .map_err(|error| ApiError::Internal(format!("session allocation failed: {error}")))?;
+        let mut states = session.blocking_lock();
+        let context_ids = pipeline.encode_text(&context);
+        adapt_session_blocking(&pipeline, &mut states, &context_ids)
+            .map_err(|error| ApiError::Internal(format!("TTT adapt failed: {error}")))?;
+        let query_ids = pipeline.encode_text(&query);
+        extract_memory_vector_blocking(
+            &pipeline,
+            &mut states,
+            &query_ids,
+            &session_for_task,
+            context_ids.len(),
+            started,
+            top_k,
+        )
+        .map_err(|error| ApiError::Internal(format!("memory extraction failed: {error}")))
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("blocking task join failed: {error}")))??;
+
+    let compressed = apply_plan(body, &plan, &fingerprint.to_prompt_block())
+        .ok_or_else(|| ApiError::Internal("Responses compression transform failed".into()))?;
+    let bytes_in = serde_json::to_vec(body).map(|value| value.len()).unwrap_or(0) as u64;
+    let bytes_out = serde_json::to_vec(&compressed)
+        .map(|value| value.len())
+        .unwrap_or(0) as u64;
+    state
+        .controls
+        .record(plan.item_indices.len() as u64, bytes_in, bytes_out);
+    eprintln!(
+        "[axiom-ttt] responses compressed session={} assistant_items={} tokens={} bytes={}=>{}",
+        session_id,
+        plan.item_indices.len(),
+        context_tokens,
+        bytes_in,
+        bytes_out
+    );
+    Ok(Some(compressed))
+}
+
+/// Client headers relayed verbatim to the Responses upstream, selected by
+/// allowlist (review hardening: a denylist silently forwards anything a
+/// client invents — cookies, x-forwarded-*, internal headers). The list
+/// covers what Codex and OpenAI SDKs actually send; extend via
+/// `AXIOM_RESPONSES_RELAY_EXTRA` (comma-separated lowercase names).
+fn relayable_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    const ALLOW: &[&str] = &[
+        "accept",
+        "accept-language",
+        "user-agent",
+        "chatgpt-account-id",
+        "openai-beta",
+        "openai-organization",
+        "openai-project",
+        "session_id",
+        "conversation_id",
+        "originator",
+        "x-request-id",
+        "idempotency-key",
+    ];
+    let extra = std::env::var("AXIOM_RESPONSES_RELAY_EXTRA").unwrap_or_default();
+    let extra: Vec<String> = extra
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str().to_ascii_lowercase();
+            let allowed = ALLOW.contains(&name.as_str())
+                || name.starts_with("openai-")
+                || name.starts_with("x-stainless-") // official SDK telemetry headers
+                || extra.iter().any(|e| e == &name);
+            if !allowed {
+                return None;
+            }
+            value.to_str().ok().map(|v| (name, v.to_string()))
+        })
+        .collect()
+}
+
+/// Upstream WebSocket URL for the Responses passthrough, mirroring the HTTP
+/// upstream selection: explicit env override, ChatGPT backend when the client
+/// is a ChatGPT-subscription Codex (chatgpt-account-id header), else platform.
+fn responses_ws_upstream(headers: &HeaderMap) -> String {
+    if let Ok(explicit) = std::env::var("AXIOM_OPENAI_RESPONSES_WS_UPSTREAM") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if headers.contains_key("chatgpt-account-id") {
+        "wss://chatgpt.com/backend-api/codex/responses".to_string()
+    } else {
+        "wss://api.openai.com/v1/responses".to_string()
+    }
+}
+
+/// `GET /v1/responses` (WebSocket upgrade) — transparent frame relay to the
+/// upstream Responses WebSocket. Codex prefers this transport and previously
+/// burned five 405-retries (~10s) before falling back to HTTPS. The proxy
+/// does not interpret the protocol: client auth and relay headers are
+/// forwarded on the CONNECT, then frames are pumped verbatim both ways until
+/// either side closes. Compression does not apply on this path.
+async fn responses_websocket(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    headers: HeaderMap,
+) -> Response {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let upstream_url = responses_ws_upstream(&headers);
+    let mut request = match upstream_url.as_str().into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            return ApiError::Internal(format!("invalid upstream ws url: {e}")).into_response()
+        }
+    };
+    // Relay client auth + the same header set as the HTTP path. Skip
+    // WebSocket handshake headers — tungstenite generates its own.
+    const WS_HANDSHAKE: &[&str] = &[
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-extensions",
+        "sec-websocket-protocol",
+        "upgrade",
+        "connection",
+    ];
+    if let Some(auth) = headers.get(header::AUTHORIZATION) {
+        request
+            .headers_mut()
+            .insert(header::AUTHORIZATION, auth.clone());
+    }
+    for (name, value) in relayable_response_headers(&headers) {
+        if WS_HANDSHAKE.contains(&name.as_str()) {
+            continue;
+        }
+        if let (Ok(n), Ok(v)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&value),
+        ) {
+            request.headers_mut().insert(n, v);
+        }
+    }
+
+    ws.on_upgrade(move |client_socket| async move {
+        use axum::extract::ws::Message as AxMsg;
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as TgMsg;
+
+        let upstream = match tokio_tungstenite::connect_async(request).await {
+            Ok((socket, _resp)) => socket,
+            Err(e) => {
+                eprintln!("[responses-ws] upstream connect failed ({upstream_url}): {e}");
+                let mut client = client_socket;
+                let _ = client
+                    .send(AxMsg::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 1011,
+                        reason: format!("upstream connect failed: {e}").into(),
+                    })))
+                    .await;
+                return;
+            }
+        };
+
+        let (mut up_tx, mut up_rx) = upstream.split();
+        let (mut cl_tx, mut cl_rx) = client_socket.split();
+
+        // Client → upstream.
+        let c2u = async {
+            while let Some(Ok(msg)) = cl_rx.next().await {
+                let out = match msg {
+                    AxMsg::Text(t) => TgMsg::Text(t),
+                    AxMsg::Binary(b) => TgMsg::Binary(b),
+                    AxMsg::Ping(p) => TgMsg::Ping(p),
+                    AxMsg::Pong(p) => TgMsg::Pong(p),
+                    AxMsg::Close(_) => break,
+                };
+                if up_tx.send(out).await.is_err() {
+                    break;
+                }
+            }
+            let _ = up_tx.send(TgMsg::Close(None)).await;
+        };
+
+        // Upstream → client.
+        let u2c = async {
+            while let Some(Ok(msg)) = up_rx.next().await {
+                let out = match msg {
+                    TgMsg::Text(t) => AxMsg::Text(t),
+                    TgMsg::Binary(b) => AxMsg::Binary(b),
+                    TgMsg::Ping(p) => AxMsg::Ping(p),
+                    TgMsg::Pong(p) => AxMsg::Pong(p),
+                    TgMsg::Close(_) => break,
+                    TgMsg::Frame(_) => continue, // raw frames never surface from read
+                };
+                if cl_tx.send(out).await.is_err() {
+                    break;
+                }
+            }
+            let _ = cl_tx.send(AxMsg::Close(None)).await;
+        };
+
+        // Run both pumps; when one side closes, the other unwinds.
+        tokio::select! {
+            _ = c2u => {}
+            _ = u2c => {}
+        }
+    })
+}
+
+/// `POST /v1/responses` - native passthrough with optional semantic compression.
 ///
-/// Responses requests deliberately stay on their native wire protocol so
-/// function calls, reasoning items, and streaming event semantics survive.
+/// Structural items stay on their native wire protocol. When explicitly
+/// enabled, only safe historical assistant text is replaced by a fingerprint.
 async fn create_response(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1392,11 +1653,44 @@ async fn create_response(
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string),
+        extra_headers: relayable_response_headers(&headers),
     };
-    let upstream = match forwarder.forward_responses(&body, &client_auth).await {
+    let session_override = headers
+        .get("x-axiom-session-id")
+        .and_then(|value| value.to_str().ok());
+    let compressed = match compressed_responses_payload(&state, &body, session_override).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("[axiom-ttt] Responses compression skipped after local failure: {error:?}");
+            state.controls.record_degraded_fallback();
+            None
+        }
+    };
+    let outbound = compressed.as_ref().unwrap_or(&body);
+    let mut upstream = match forwarder.forward_responses(outbound, &client_auth).await {
         Ok(response) => response,
+        Err(OpenAiForwarderError::Network(error)) if compressed.is_some() => {
+            eprintln!("[axiom-ttt] compressed Responses network failure ({error}); retrying original payload");
+            state.controls.record_degraded_fallback();
+            match forwarder.forward_responses(&body, &client_auth).await {
+                Ok(response) => response,
+                Err(error) => return map_openai_forwarder_error(error).into_response(),
+            }
+        }
         Err(error) => return map_openai_forwarder_error(error).into_response(),
     };
+    if compressed.is_some()
+        && (upstream.status() == StatusCode::BAD_REQUEST || upstream.status().is_server_error())
+    {
+        eprintln!(
+            "[axiom-ttt] compressed Responses returned {}; retrying original payload",
+            upstream.status()
+        );
+        state.controls.record_degraded_fallback();
+        if let Ok(response) = forwarder.forward_responses(&body, &client_auth).await {
+            upstream = response;
+        }
+    }
     let status = upstream.status();
     let content_type = upstream
         .headers()
@@ -1788,9 +2082,18 @@ async fn cluster_merge(
         .map(PathBuf::from)
         .collect::<Vec<_>>();
     let output = PathBuf::from(req.output);
-    // Fleet merges use DARE-TIES (sign-elected, sparsified) rather than a uniform
-    // alpha-blend, so agreeing peers compound and conflicting deltas don't cancel.
-    let method = fleet_dare_ties(alpha);
+    // Fleet merges default to DARE-TIES (sign-elected, sparsified) so agreeing
+    // peers compound and conflicting deltas don't cancel; "alpha_blend" selects
+    // the uniform task-vector interpolation instead.
+    let method = match req.method.as_deref().map(str::trim) {
+        Some("alpha_blend") => MergeMethod::AlphaBlend { alpha },
+        Some("dare_ties") | None => fleet_dare_ties(alpha),
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown merge method '{other}' (expected \"dare_ties\" or \"alpha_blend\")"
+            )))
+        }
+    };
     let summary = spawn_blocking(move || merge_checkpoint_files_with(&inputs, &output, method))
         .await
         .map_err(|e| ApiError::Internal(format!("merge task join failed: {e}")))?
@@ -3160,6 +3463,40 @@ async fn hypervisor_read(
     }))
 }
 
+/// `POST /v1/hypervisor/list` — readdir over the mounted VFS. Body:
+/// `{"path": "relative/or/absolute"}` (default `.` = the mount root).
+/// Paths are canonicalized and confined to the mounted root.
+async fn hypervisor_list(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let path = body.get("path").and_then(Value::as_str).unwrap_or(".");
+    let entries = state
+        .neural_vfs
+        .readdir(path)
+        .map_err(ApiError::BadRequest)?;
+    Ok(Json(serde_json::json!({
+        "entries": entries,
+        "vfs": state.neural_vfs.status(),
+    })))
+}
+
+/// `POST /v1/hypervisor/stat` — getattr over the mounted VFS. Body:
+/// `{"path": "relative/or/absolute"}`. Same root confinement as `list`.
+async fn hypervisor_stat(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(path) = body.get("path").and_then(Value::as_str) else {
+        return Err(ApiError::BadRequest("path is required".into()));
+    };
+    let attr = state.neural_vfs.getattr(path).map_err(ApiError::BadRequest)?;
+    Ok(Json(serde_json::json!({
+        "attr": attr,
+        "vfs": state.neural_vfs.status(),
+    })))
+}
+
 /// `POST /v1/hypervisor/jit_run` — drive the Poly JIT closed loop: run a
 /// command; on failure feed the fault trace into the session's W̃ (TTT) and
 /// apply a bounded, deterministic source patch (Q-TTT-ranked candidates), then
@@ -3325,7 +3662,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/completions", post(create_completion))
         .route("/v1/chat/completions", post(create_chat_completion))
-        .route("/v1/responses", post(create_response))
+        .route(
+            "/v1/responses",
+            post(create_response).get(responses_websocket),
+        )
         .route("/v1/messages", post(create_message))
         .route("/v1/cluster/sync", post(cluster_sync))
         .route("/v1/cluster/merge", post(cluster_merge))
@@ -3340,6 +3680,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/ttt/feedback", post(ttt_feedback))
         .route("/v1/hypervisor/mount", post(hypervisor_mount))
         .route("/v1/hypervisor/read", post(hypervisor_read))
+        .route("/v1/hypervisor/list", post(hypervisor_list))
+        .route("/v1/hypervisor/stat", post(hypervisor_stat))
         .route("/v1/hypervisor/jit_run", post(hypervisor_jit_run))
         .route("/v1/hypervisor/jit_status", get(hypervisor_jit_status))
         .route(
@@ -3366,6 +3708,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/awareness/:id", get(get_awareness))
         .route("/v1/config", get(get_config).post(post_config))
         .layer(CorsLayer::permissive())
+        // Codex CLI compresses HTTP request bodies (gzip/zstd); decompress
+        // before the Json extractors so /v1/responses accepts them.
+        .layer(RequestDecompressionLayer::new())
         .with_state(state)
 }
 
@@ -3526,6 +3871,63 @@ fn neural_lifts(
 /// flagged (unsupported) claims — flags hallucinations *relative to the
 /// supplied evidence*, not universal fact-checking.
 async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    // Conformal calibration mode: `{"calibrate": [[score, truly_supported],
+    // ...], "delta": 0.1}` computes a coverage-guaranteed threshold τ from a
+    // held-out sample. Export the result as AXIOM_CONFORMAL_THRESHOLD to gate
+    // future verdicts at (1-δ) coverage of genuinely supported claims.
+    // Checked before `response` validation — calibration needs no response.
+    if let Some(cal) = body.get("calibrate").and_then(Value::as_array) {
+        // Strict parsing: a malformed sample silently dropped would shift the
+        // computed quantile — reject the request instead.
+        let mut pairs: Vec<(f32, bool)> = Vec::with_capacity(cal.len());
+        for (i, entry) in cal.iter().enumerate() {
+            let parsed = entry.as_array().and_then(|pair| {
+                let score = pair.first()?.as_f64()? as f32;
+                let supported = pair.get(1)?.as_bool()?;
+                (pair.len() == 2 && score.is_finite()).then_some((score, supported))
+            });
+            match parsed {
+                Some(p) => pairs.push(p),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "calibrate[{i}] is not a [finite_score, truly_supported_bool] pair"
+                            ),
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        if pairs.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "calibrate must be a non-empty array of [score, truly_supported] pairs",
+                })),
+            )
+                .into_response();
+        }
+        let delta = body
+            .get("delta")
+            .and_then(Value::as_f64)
+            .map(|d| d as f32)
+            .unwrap_or(0.10)
+            .clamp(0.0, 1.0);
+        let threshold = crate::hallucination::calibrate_conformal_threshold(&pairs, delta);
+        return Json(serde_json::json!({
+            "mode": "conformal_calibration",
+            "threshold": threshold,
+            "delta": delta,
+            "samples": pairs.len(),
+            "positives": pairs.iter().filter(|(_, y)| *y).count(),
+            "note": "set AXIOM_CONFORMAL_THRESHOLD to this value (and optionally AXIOM_CONFORMAL_DELTA) to activate the calibrated gate for all future /v1/verify verdicts",
+        }))
+        .into_response();
+    }
+
     let response = body.get("response").and_then(Value::as_str).unwrap_or("");
     let evidence = body.get("evidence").and_then(Value::as_str).unwrap_or("");
     if response.trim().is_empty() {
@@ -4405,6 +4807,73 @@ pub async fn run_server(
             Err(e) => eprintln!("[!] Compression cache hydration skipped: {e}"),
         }
     }
+    // Differential Weight Exchange inbound listener: when AXIOM_DWE_LISTEN is
+    // set (host:port), accept peer fragments over TCP and merge their layer
+    // deltas into the named session — the network mirror of /v1/cluster/sync.
+    if let Ok(listen_addr) = std::env::var("AXIOM_DWE_LISTEN") {
+        let listen_addr = listen_addr.trim().to_string();
+        if !listen_addr.is_empty() {
+            let telemetry = state.dwe_bus.telemetry_handle();
+            let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<crate::dwe::DweFragment>(64);
+            let apply_state = state.clone();
+            tokio::spawn(async move {
+                while let Some(fragment) = in_rx.recv().await {
+                    let Ok(mut sessions) = apply_state.sessions.write() else {
+                        continue;
+                    };
+                    let Some(session) = sessions.get_mut(&fragment.session_id) else {
+                        eprintln!(
+                            "[dwe] fragment for unknown session '{}' dropped",
+                            fragment.session_id
+                        );
+                        continue;
+                    };
+                    for layer in &fragment.layers {
+                        let total: usize = layer.shape.iter().product();
+                        if total != layer.values.len() {
+                            eprintln!("[dwe] layer {} shape/value mismatch", layer.layer_index);
+                            continue;
+                        }
+                        let delta = Tensor::from_vec(
+                            layer.values.clone(),
+                            (total,),
+                            &apply_state.device,
+                        )
+                        .and_then(|t| t.reshape(layer.shape.as_slice()));
+                        match delta {
+                            Ok(delta) => {
+                                if let Err(e) = session.merge_delta(
+                                    layer.layer_index,
+                                    &delta,
+                                    &apply_state.device,
+                                ) {
+                                    eprintln!(
+                                        "[dwe] merge failed for session '{}' layer {}: {e}",
+                                        fragment.session_id, layer.layer_index
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "[dwe] fragment tensor rebuild failed (layer {}): {e}",
+                                layer.layer_index
+                            ),
+                        }
+                    }
+                    session.last_used = unix_now();
+                }
+            });
+            let listener_addr = listen_addr.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::dwe::start_dwe_listener(&listener_addr, in_tx, telemetry).await
+                {
+                    eprintln!("[dwe] listener on {listener_addr} exited: {e}");
+                }
+            });
+            println!("[+] DWE inbound listener ON — accepting peer weight deltas at {listen_addr}");
+        }
+    }
+
     // Keep a handle for the graceful-shutdown flush (AppState is cheaply Clone).
     let shutdown_state = state.clone();
     let app = create_router(state);
@@ -4452,6 +4921,45 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use candle_core::{DType, Device};
     use tower::ServiceExt;
+
+    #[test]
+    fn relayable_response_headers_skips_hop_by_hop_and_managed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer tok".parse().unwrap());
+        headers.insert("host", "127.0.0.1:3000".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        headers.insert("accept-encoding", "gzip, br".parse().unwrap());
+        headers.insert("x-axiom-session-id", "sess".parse().unwrap());
+        headers.insert("chatgpt-account-id", "acct-123".parse().unwrap());
+        headers.insert("openai-beta", "responses=experimental".parse().unwrap());
+        headers.insert("session_id", "abc".parse().unwrap());
+        headers.insert("originator", "codex_cli_rs".parse().unwrap());
+        headers.insert("accept", "text/event-stream".parse().unwrap());
+
+        let relayed = relayable_response_headers(&headers);
+        let names: Vec<&str> = relayed.iter().map(|(n, _)| n.as_str()).collect();
+
+        for skipped in [
+            "authorization",
+            "host",
+            "content-type",
+            "content-encoding",
+            "accept-encoding",
+            "x-axiom-session-id",
+        ] {
+            assert!(!names.contains(&skipped), "{skipped} must not be relayed");
+        }
+        for kept in [
+            "chatgpt-account-id",
+            "openai-beta",
+            "session_id",
+            "originator",
+            "accept",
+        ] {
+            assert!(names.contains(&kept), "{kept} must be relayed");
+        }
+    }
 
     #[test]
     fn openai_assistant_answer_reads_non_streamed_completion() {

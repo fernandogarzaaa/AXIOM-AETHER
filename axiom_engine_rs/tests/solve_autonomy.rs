@@ -35,6 +35,13 @@ fn run_solve(cmd: String, args: Vec<String>, opts: SolveOptions) -> axiom_engine
         .unwrap()
 }
 
+/// Render a path for embedding in `sh -c` scripts or command args: sh eats
+/// unquoted backslashes, so Windows `\` separators would silently mangle the
+/// path. Forward slashes work on all platforms; on Unix this is the identity.
+fn sh_path(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 #[test]
 fn solve_via_environment_heal_only() {
     // Missing directory → Pillar-2 environment heal alone drives it green.
@@ -43,7 +50,7 @@ fn solve_via_environment_heal_only() {
     let target = base.join("out").join("r.txt");
     let report = run_solve(
         "sh".into(),
-        vec!["-c".into(), format!("echo ok > {}", target.display())],
+        vec!["-c".into(), format!("echo ok > {}", sh_path(&target))],
         SolveOptions {
             max_rounds: 2,
             max_restarts: 3,
@@ -135,7 +142,7 @@ fn solve_tries_multiple_localized_candidates_until_one_repairs() {
         "sh".into(),
         vec![
             "-c".into(),
-            format!("sh {}; sh {}", first.display(), second.display()),
+            format!("sh {}; sh {}", sh_path(&first), sh_path(&second)),
         ],
         SolveOptions {
             max_rounds: 2,
