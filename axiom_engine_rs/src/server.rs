@@ -1297,16 +1297,10 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     state.refresh_session_metrics()?;
     let mut rendered = metrics::render_metrics();
-    // Compression savings (per-session ledger summed to lifetime totals).
-    let (bytes_in, bytes_out) = state
-        .savings
-        .lock()
-        .map(|ledger| {
-            ledger
-                .values()
-                .fold((0u64, 0u64), |acc, (i, o)| (acc.0 + i, acc.1 + o))
-        })
-        .unwrap_or((0, 0));
+    // Compression savings: lifetime monotone counters (session drops remove
+    // ledger entries for receipts, so the ledger alone would undercount).
+    let bytes_in = LIFETIME_SAVINGS_IN.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes_out = LIFETIME_SAVINGS_OUT.load(std::sync::atomic::Ordering::Relaxed);
     let ratio = if bytes_in > 0 && bytes_out < bytes_in {
         (bytes_in - bytes_out) as f64 / bytes_in as f64
     } else {
@@ -1451,10 +1445,29 @@ async fn compressed_responses_payload(
 
     let compressed = apply_plan(body, &plan, &fingerprints)
         .ok_or_else(|| ApiError::Internal("Responses compression transform failed".into()))?;
+
+    // Transient sessions (no client x-axiom-session-id) must not leak their
+    // per-run adaptation sub-sessions — nothing will ever drop them.
+    if session_override.is_none() {
+        for ordinal in 0..plan.runs.len() {
+            let _ = state
+                .ttt_sessions
+                .take_session(&format!("{session_id}#r{ordinal}"));
+        }
+    }
+
     let bytes_in = serde_json::to_vec(body).map(|value| value.len()).unwrap_or(0) as u64;
     let bytes_out = serde_json::to_vec(&compressed)
         .map(|value| value.len())
         .unwrap_or(0) as u64;
+    // Fingerprint + manifest overhead can exceed the replaced text on short
+    // multi-run transcripts — compression must never expand the payload.
+    if bytes_out >= bytes_in {
+        eprintln!(
+            "[axiom-ttt] responses compression skipped (would expand {bytes_in}=>{bytes_out} bytes); forwarding original"
+        );
+        return Ok(None);
+    }
     state
         .controls
         .record(plan.item_indices().len() as u64, bytes_in, bytes_out);
@@ -1530,8 +1543,17 @@ fn savings_receipt(bytes_in: u64, bytes_out: u64) -> String {
     )
 }
 
-/// Accumulate a compression event into the per-session savings ledger.
+/// Lifetime savings counters: monotone across the process, independent of the
+/// per-session ledger (whose entries are removed when sessions drop).
+static LIFETIME_SAVINGS_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIFETIME_SAVINGS_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Accumulate a compression event into the per-session savings ledger and the
+/// lifetime totals.
 fn record_savings(state: &AppState, session_id: &str, bytes_in: u64, bytes_out: u64) {
+    use std::sync::atomic::Ordering;
+    LIFETIME_SAVINGS_IN.fetch_add(bytes_in, Ordering::Relaxed);
+    LIFETIME_SAVINGS_OUT.fetch_add(bytes_out, Ordering::Relaxed);
     if let Ok(mut ledger) = state.savings.lock() {
         let entry = ledger.entry(session_id.to_string()).or_insert((0, 0));
         entry.0 += bytes_in;

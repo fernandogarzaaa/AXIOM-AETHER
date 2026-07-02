@@ -67,8 +67,12 @@ async fn compressed_bad_request_retries_original_and_preserves_structural_items(
         });
     let app = create_router(state);
     let reasoning = json!({"type":"reasoning","id":"r1","encrypted_content":"opaque","summary":[]});
+    // Heavy enough that the fingerprint replacement actually SHRINKS the body —
+    // the expansion guard forwards tiny payloads untouched by design.
+    let heavy_history =
+        "historical assistant answer with useful context about the build system ".repeat(80);
     let original = json!({"model":"gpt-5.5","input":[
-        {"role":"assistant","content":"historical assistant answer with useful context"},
+        {"role":"assistant","content":heavy_history},
         reasoning,
         {"type":"function_call_output","call_id":"c1","output":"unchanged"},
         {"role":"user","content":"continue"}
