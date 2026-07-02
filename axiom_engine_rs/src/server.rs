@@ -4913,6 +4913,10 @@ pub async fn run_server(
     println!("      POST /v1/completions");
     println!("      POST /v1/chat/completions         (stream:true for SSE)");
     println!("      POST /v1/responses                (native OpenAI passthrough)");
+    println!(
+        "[+] Responses input compression: {} (opt out with AXIOM_RESPONSES_COMPRESS=0)",
+        if responses_compression_enabled() { "ON (default)" } else { "OFF" }
+    );
     println!("      POST /v1/messages                 (Anthropic Messages API)");
     println!("      POST /v1/cluster/sync            (distributed delta merge)");
     println!("      POST /v1/sessions                 (create TTT session)");
