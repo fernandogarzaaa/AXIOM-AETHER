@@ -46,7 +46,21 @@ fn responses_url(base: &str) -> String {
 ///    — route to the ChatGPT backend, the only upstream its token works on.
 /// 3. Default platform API: `{base}/v1/responses`.
 fn responses_upstream_url(base: &str, auth: &OpenAiClientAuth) -> String {
-    if let Ok(explicit) = std::env::var("AXIOM_OPENAI_RESPONSES_UPSTREAM") {
+    responses_upstream_url_with(
+        std::env::var("AXIOM_OPENAI_RESPONSES_UPSTREAM").ok().as_deref(),
+        base,
+        auth,
+    )
+}
+
+/// Pure core of [`responses_upstream_url`] — env override injected as a
+/// parameter so routing is unit-testable without process-global mutation.
+fn responses_upstream_url_with(
+    override_url: Option<&str>,
+    base: &str,
+    auth: &OpenAiClientAuth,
+) -> String {
+    if let Some(explicit) = override_url {
         let trimmed = explicit.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -309,13 +323,13 @@ mod tests {
 
     #[test]
     fn chatgpt_account_header_routes_to_chatgpt_backend() {
-        use super::{responses_upstream_url, OpenAiClientAuth, CHATGPT_CODEX_RESPONSES_URL};
+        use super::{responses_upstream_url_with, OpenAiClientAuth, CHATGPT_CODEX_RESPONSES_URL};
         let auth = OpenAiClientAuth {
             authorization: Some("Bearer tok".into()),
             extra_headers: vec![("chatgpt-account-id".into(), "acct-123".into())],
         };
         assert_eq!(
-            responses_upstream_url("https://api.openai.com", &auth),
+            responses_upstream_url_with(None, "https://api.openai.com", &auth),
             CHATGPT_CODEX_RESPONSES_URL
         );
         // Case-insensitive header match.
@@ -324,18 +338,36 @@ mod tests {
             extra_headers: vec![("ChatGPT-Account-Id".into(), "acct-123".into())],
         };
         assert_eq!(
-            responses_upstream_url("https://api.openai.com", &auth_upper),
+            responses_upstream_url_with(None, "https://api.openai.com", &auth_upper),
             CHATGPT_CODEX_RESPONSES_URL
         );
     }
 
     #[test]
     fn no_chatgpt_header_uses_platform_default() {
-        use super::{responses_upstream_url, OpenAiClientAuth};
+        use super::{responses_upstream_url_with, OpenAiClientAuth};
         let auth = OpenAiClientAuth::default();
         assert_eq!(
-            responses_upstream_url("https://api.openai.com", &auth),
+            responses_upstream_url_with(None, "https://api.openai.com", &auth),
             "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn explicit_override_beats_header_routing() {
+        use super::{responses_upstream_url_with, OpenAiClientAuth};
+        let auth = OpenAiClientAuth {
+            authorization: None,
+            extra_headers: vec![("chatgpt-account-id".into(), "acct-123".into())],
+        };
+        assert_eq!(
+            responses_upstream_url_with(Some("http://127.0.0.1:9999/x"), "https://api.openai.com", &auth),
+            "http://127.0.0.1:9999/x"
+        );
+        // Blank override falls through to header routing.
+        assert_eq!(
+            responses_upstream_url_with(Some("  "), "https://api.openai.com", &auth),
+            super::CHATGPT_CODEX_RESPONSES_URL
         );
     }
 

@@ -1461,33 +1461,41 @@ async fn compressed_responses_payload(
     Ok(Some(compressed))
 }
 
-/// Client headers relayed verbatim to the Responses upstream. Skips
-/// hop-by-hop, host, body-encoding, and proxy-internal headers; everything
-/// else (chatgpt-account-id, openai-beta, session_id, originator, accept,
-/// user-agent, ...) passes through so ChatGPT-subscription Codex works.
+/// Client headers relayed verbatim to the Responses upstream, selected by
+/// allowlist (review hardening: a denylist silently forwards anything a
+/// client invents — cookies, x-forwarded-*, internal headers). The list
+/// covers what Codex and OpenAI SDKs actually send; extend via
+/// `AXIOM_RESPONSES_RELAY_EXTRA` (comma-separated lowercase names).
 fn relayable_response_headers(headers: &HeaderMap) -> Vec<(String, String)> {
-    const SKIP: &[&str] = &[
-        "authorization", // relayed separately with key-injection fallback
-        "host",
-        "content-type", // forwarder sets its own; relaying duplicates it
-        "content-length",
-        "content-encoding",
-        "transfer-encoding",
-        "connection",
-        "keep-alive",
-        "accept-encoding", // reqwest negotiates its own
-        "te",
-        "trailer",
-        "upgrade",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "x-axiom-session-id", // proxy-internal
+    const ALLOW: &[&str] = &[
+        "accept",
+        "accept-language",
+        "user-agent",
+        "chatgpt-account-id",
+        "openai-beta",
+        "openai-organization",
+        "openai-project",
+        "session_id",
+        "conversation_id",
+        "originator",
+        "x-request-id",
+        "idempotency-key",
     ];
+    let extra = std::env::var("AXIOM_RESPONSES_RELAY_EXTRA").unwrap_or_default();
+    let extra: Vec<String> = extra
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
     headers
         .iter()
         .filter_map(|(name, value)| {
             let name = name.as_str().to_ascii_lowercase();
-            if SKIP.contains(&name.as_str()) {
+            let allowed = ALLOW.contains(&name.as_str())
+                || name.starts_with("openai-")
+                || name.starts_with("x-stainless-") // official SDK telemetry headers
+                || extra.iter().any(|e| e == &name);
+            if !allowed {
                 return None;
             }
             value.to_str().ok().map(|v| (name, v.to_string()))
@@ -3869,15 +3877,30 @@ async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>
     // future verdicts at (1-δ) coverage of genuinely supported claims.
     // Checked before `response` validation — calibration needs no response.
     if let Some(cal) = body.get("calibrate").and_then(Value::as_array) {
-        let pairs: Vec<(f32, bool)> = cal
-            .iter()
-            .filter_map(|entry| {
-                let pair = entry.as_array()?;
+        // Strict parsing: a malformed sample silently dropped would shift the
+        // computed quantile — reject the request instead.
+        let mut pairs: Vec<(f32, bool)> = Vec::with_capacity(cal.len());
+        for (i, entry) in cal.iter().enumerate() {
+            let parsed = entry.as_array().and_then(|pair| {
                 let score = pair.first()?.as_f64()? as f32;
                 let supported = pair.get(1)?.as_bool()?;
-                Some((score, supported))
-            })
-            .collect();
+                (pair.len() == 2 && score.is_finite()).then_some((score, supported))
+            });
+            match parsed {
+                Some(p) => pairs.push(p),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "calibrate[{i}] is not a [finite_score, truly_supported_bool] pair"
+                            ),
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }
         if pairs.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
