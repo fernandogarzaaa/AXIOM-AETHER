@@ -23,6 +23,7 @@ general answer-quality claims that are not proven by the repository.
 |---|---|---|
 | Online TTT engine | Updates per-session fast weights during inference and adaptation. | `axiom_engine_rs/src/ttt_block.rs`, `model.rs`, `inference.rs` |
 | Context compression proxy | Accepts Anthropic Messages and OpenAI Chat Completions style traffic, absorbs heavy context locally, and forwards a smaller readable payload. | `server.rs`, `context_compressor.rs`, `skeleton.rs`, `anthropic_forwarder.rs`, `openai_forwarder.rs` |
+| Responses input compression | **On by default.** Replaces old, text-only assistant turns in the safe prefix of `/v1/responses` transcripts with a dense recall fingerprint — each contiguous run collapses in place, so every user/tool/structural item keeps its position. Disable with `AXIOM_RESPONSES_COMPRESS=0`. | `responses_compressor.rs`, `server.rs` |
 | MCP server | Exposes Axiom as stdio JSON-RPC tools for compression, drift checks, expansion, memory, immunity, and grounding. | `mcp_stdio.rs` |
 | Self-healing runner | Runs a command, detects supported environment failures, applies bounded heals, and records learned immunity. | `self_heal.rs`, `heal_memory.rs`, `main.rs` |
 | Autonomous solve loop | Uses the runner plus source repair attempts to drive a verifier command toward green. | `solve.rs`, `poly_jit.rs`, `sandbox.rs` |

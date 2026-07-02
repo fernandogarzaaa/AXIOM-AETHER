@@ -54,6 +54,9 @@ export AXIOM_TTT_COMPRESS="${AXIOM_TTT_COMPRESS:-1}"
 # Raise back to 512+ (or set AXIOM_TTT_COMPRESS=0) to revert.
 export AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS="${AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS:-200}"
 export AXIOM_TTT_COMPRESS_TOP_K="${AXIOM_TTT_COMPRESS_TOP_K:-32}"
+# Responses (Codex/OpenAI) input compression is ON by default when compression
+# is enabled. Export AXIOM_RESPONSES_COMPRESS=0 before launching to opt the
+# Responses path out specifically.
 
 # --- Compute device: GPU-first, CPU fallback -------------------------------
 # Default to "auto": the engine selects CUDA when the `cuda` feature is compiled
