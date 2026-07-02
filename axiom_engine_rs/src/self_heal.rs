@@ -215,6 +215,33 @@ pub fn extract_missing_paths(trace: &str) -> Vec<PathBuf> {
                 }
             }
         }
+        // Windows drive-letter candidates (`I:/a/b`, `C:\a\b`): captured
+        // before the colon-split pass below, which would sever the drive
+        // prefix and leave a rooted-but-driveless remnant (`/a/b`) that later
+        // resolves against the anchor's drive — a wrong-drive heal.
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            let is_drive = bytes[i].is_ascii_alphabetic()
+                && bytes[i + 1] == b':'
+                && (bytes[i + 2] == b'/' || bytes[i + 2] == b'\\')
+                && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric());
+            if !is_drive {
+                i += 1;
+                continue;
+            }
+            let end = line[i..]
+                .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+                .map(|off| i + off)
+                .unwrap_or(line.len());
+            let candidate = line[i..end].trim_end_matches([',', ';', ':']);
+            if candidate.len() > 3 && seen.insert(candidate.to_string()) {
+                // Suppress the driveless remnant the colon-split would emit.
+                seen.insert(candidate[2..].to_string());
+                found.push(PathBuf::from(candidate));
+            }
+            i = end.max(i + 1);
+        }
         // Unquoted candidates: any whitespace- or colon-delimited word that
         // looks like a path. Covers `cat: /a/b: No such file or directory`,
         // `sh: 1: cannot create /a/b/out.txt: Directory nonexistent`, and bare
@@ -947,6 +974,27 @@ mod tests {
         let trace = "FileNotFoundError: [Errno 2] No such file or directory: '/tmp/ax/data.csv'";
         let paths = extract_missing_paths(trace);
         assert!(paths.contains(&PathBuf::from("/tmp/ax/data.csv")));
+    }
+
+    #[test]
+    fn extracts_windows_drive_path_with_full_drive_prefix() {
+        // The colon-split pass alone would sever `I:` and leave `/tmp/ax/out.txt`,
+        // which later resolves against the anchor's drive — the wrong-drive heal.
+        let trace = "sh: line 1: I:/tmp/ax/out/result.txt: No such file or directory";
+        let paths = extract_missing_paths(trace);
+        assert!(
+            paths.contains(&PathBuf::from("I:/tmp/ax/out/result.txt")),
+            "drive-letter path must be captured intact: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&PathBuf::from("/tmp/ax/out/result.txt")),
+            "the driveless remnant must be suppressed: {paths:?}"
+        );
+
+        // Backslash form (native Windows tools).
+        let trace = r"error: C:\ax\cache\stale.bin: No such file or directory";
+        let paths = extract_missing_paths(trace);
+        assert!(paths.contains(&PathBuf::from(r"C:\ax\cache\stale.bin")));
     }
 
     #[test]
