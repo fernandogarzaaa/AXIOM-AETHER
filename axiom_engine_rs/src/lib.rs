@@ -54,6 +54,7 @@ pub mod search_scrape;
 pub mod self_heal;
 pub mod solve;
 pub mod server;
+pub mod session_recorder;
 pub mod session_awareness;
 pub mod skeleton;
 pub mod surprisal;
