@@ -58,6 +58,7 @@ pub fn run_fleet() -> PillarResult {
             if ok { "pass" } else { "FAIL" }
         ),
         detail: json!({
+            "ok": ok,
             "pre_immunized": pre_immunized,
             "merge_ms": elapsed_ms,
             "unsigned_rejected": unsigned_rejected,

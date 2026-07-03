@@ -21,12 +21,20 @@ fn samples() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// A recovery is *exact* when the block `expand_symbol` returns reproduces the
+/// original single-declaration source verbatim (whitespace-normalized, so
+/// trailing-newline handling doesn't count as a mismatch) — not merely mentions
+/// the symbol name.
+fn is_exact_recovery(recovered: &str, original: &str) -> bool {
+    recovered.split_whitespace().eq(original.split_whitespace())
+}
+
 pub fn run_cognition() -> PillarResult {
     let mut recovered = 0usize;
     let total = samples().len();
     for (name, src) in samples() {
         if let Some(body) = axiom_engine::skeleton::expand_symbol(src, name) {
-            if body.contains(name) {
+            if is_exact_recovery(&body, src) {
                 recovered += 1;
             }
         }
