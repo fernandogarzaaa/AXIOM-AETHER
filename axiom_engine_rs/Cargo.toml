@@ -48,6 +48,11 @@ tools = []
 
 # Dev/training/eval binaries, gated behind the `tools` feature (see above).
 [[bin]]
+name = "axiombench"
+path = "src/bin/axiombench.rs"
+required-features = ["tools"]
+
+[[bin]]
 name = "build_pairs"
 path = "src/bin/build_pairs.rs"
 required-features = ["tools"]
