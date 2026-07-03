@@ -24,9 +24,13 @@ fn session_source(input: &str) -> PathBuf {
 
 fn looks_secret(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
+    let upper = s.to_ascii_uppercase();
     lower.starts_with("bearer ")
+        || lower.starts_with("-----begin")
+        || upper.starts_with("AKIA")
+        || s.starts_with("AIza")
         || s.len() >= 20
-            && ["sk-", "ghp_", "gho_", "xoxb-", "eyj"]
+            && ["sk-", "sk_live_", "sk_test_", "ghp_", "gho_", "xoxb-", "eyj"]
                 .iter()
                 .any(|prefix| lower.contains(prefix))
 }

@@ -82,6 +82,12 @@ fn parse_metrics(text: &str) -> SavingsMetrics {
     metrics
 }
 
+fn request_bytes(record: &ExchangeRecord) -> u64 {
+    serde_json::to_vec(&record.request)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0)
+}
+
 fn read_metrics(
     client: &reqwest::blocking::Client,
     base_url: &str,
@@ -210,8 +216,11 @@ pub fn run_cost_with(base_url: &str, dir: &Path) -> PillarResult {
                     if (200..300).contains(&off_status) && (200..300).contains(&on_status) =>
                 {
                     replayed += 1;
-                    bytes_in = bytes_in.saturating_add(delta.bytes_in);
-                    bytes_forwarded = bytes_forwarded.saturating_add(delta.bytes_forwarded);
+                    let original_bytes = request_bytes(&record);
+                    let saved = delta.bytes_in.saturating_sub(delta.bytes_forwarded);
+                    bytes_in = bytes_in.saturating_add(original_bytes);
+                    bytes_forwarded =
+                        bytes_forwarded.saturating_add(original_bytes.saturating_sub(saved));
                 }
                 (Ok((off_status, off_delta)), Ok((on_status, on_delta))) => {
                     errored += 1;
@@ -274,6 +283,7 @@ pub fn run_cost_with(base_url: &str, dir: &Path) -> PillarResult {
             "base_url": base_url,
             "corpus_dir": dir.display().to_string(),
             "corpus_hash": hash,
+            "precondition": "run against an idle proxy; /metrics savings counters are process-global",
             "sessions": sessions,
             "replayed": replayed,
             "paired_replays": replayed,

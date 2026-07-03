@@ -1403,9 +1403,13 @@ async fn create_chat_completion(
 /// compression (`state.controls.enabled()` / AXIOM_TTT_COMPRESS) to be active;
 /// this gate only lets an operator disable the Responses path specifically via
 /// AXIOM_RESPONSES_COMPRESS in {0,false,no,off}.
+fn is_falsy_flag(value: &str) -> bool {
+    matches!(value.to_lowercase().as_str(), "0" | "false" | "no" | "off")
+}
+
 fn responses_compression_enabled() -> bool {
     match std::env::var("AXIOM_RESPONSES_COMPRESS") {
-        Ok(value) => !matches!(value.to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Ok(value) => !is_falsy_flag(&value),
         Err(_) => true,
     }
 }
@@ -1414,7 +1418,7 @@ fn responses_compression_header_enabled(headers: &HeaderMap) -> bool {
     headers
         .get("x-axiom-responses-compress")
         .and_then(|value| value.to_str().ok())
-        .map(|value| !matches!(value.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|value| !is_falsy_flag(value))
         .unwrap_or(true)
 }
 
