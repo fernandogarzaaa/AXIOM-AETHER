@@ -6,6 +6,10 @@
 
 #[path = "axiombench_cognition.rs"]
 mod cognition;
+#[path = "axiombench_fleet.rs"]
+mod fleet;
+#[path = "axiombench_trust.rs"]
+mod trust;
 
 use cognition::PillarResult;
 
@@ -26,7 +30,11 @@ fn results_json(results: &[PillarResult]) -> serde_json::Value {
 }
 
 fn main() {
-    let results = vec![cognition::run_cognition()];
+    let results = vec![
+        cognition::run_cognition(),
+        trust::run_trust(),
+        fleet::run_fleet(),
+    ];
     println!("== AxiomBench ==");
     for r in &results {
         print_result(r);
