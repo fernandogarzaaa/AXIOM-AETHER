@@ -1410,6 +1410,14 @@ fn responses_compression_enabled() -> bool {
     }
 }
 
+fn responses_compression_header_enabled(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-axiom-responses-compress")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| !matches!(value.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
+}
+
 fn responses_run_concurrency(run_count: usize) -> usize {
     run_count.clamp(1, MAX_RESPONSES_RUN_CONCURRENCY)
 }
@@ -1434,8 +1442,9 @@ async fn compressed_responses_payload(
     state: &AppState,
     body: &Value,
     session_override: Option<&str>,
+    request_compression_enabled: bool,
 ) -> Result<Option<Value>, ApiError> {
-    if !state.controls.enabled() || !responses_compression_enabled() {
+    if !request_compression_enabled || !state.controls.enabled() || !responses_compression_enabled() {
         return Ok(None);
     }
     let Some(plan) = plan_compression(body) else {
@@ -1874,7 +1883,14 @@ async fn create_response(
     let session_override = headers
         .get("x-axiom-session-id")
         .and_then(|value| value.to_str().ok());
-    let compressed = match compressed_responses_payload(&state, &body, session_override).await {
+    let compressed = match compressed_responses_payload(
+        &state,
+        &body,
+        session_override,
+        responses_compression_header_enabled(&headers),
+    )
+    .await
+    {
         Ok(payload) => payload,
         Err(error) => {
             eprintln!("[axiom-ttt] Responses compression skipped after local failure: {error:?}");
@@ -5242,6 +5258,18 @@ mod tests {
     }
 
     #[test]
+    fn responses_compression_header_can_disable_one_request() {
+        let mut headers = HeaderMap::new();
+        assert!(responses_compression_header_enabled(&headers));
+
+        headers.insert("x-axiom-responses-compress", "0".parse().unwrap());
+        assert!(!responses_compression_header_enabled(&headers));
+
+        headers.insert("x-axiom-responses-compress", "1".parse().unwrap());
+        assert!(responses_compression_header_enabled(&headers));
+    }
+
+    #[test]
     fn relayable_response_headers_skips_hop_by_hop_and_managed() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer tok".parse().unwrap());
@@ -5250,6 +5278,7 @@ mod tests {
         headers.insert("content-encoding", "gzip".parse().unwrap());
         headers.insert("accept-encoding", "gzip, br".parse().unwrap());
         headers.insert("x-axiom-session-id", "sess".parse().unwrap());
+        headers.insert("x-axiom-responses-compress", "0".parse().unwrap());
         headers.insert("chatgpt-account-id", "acct-123".parse().unwrap());
         headers.insert("openai-beta", "responses=experimental".parse().unwrap());
         headers.insert("session_id", "abc".parse().unwrap());
@@ -5266,6 +5295,7 @@ mod tests {
             "content-encoding",
             "accept-encoding",
             "x-axiom-session-id",
+            "x-axiom-responses-compress",
         ] {
             assert!(!names.contains(&skipped), "{skipped} must not be relayed");
         }
