@@ -93,7 +93,16 @@ impl DweBus {
         telemetry
     }
 
-    pub fn broadcast(&self, fragment: DweFragment) {
+    pub fn broadcast(&self, mut fragment: DweFragment) {
+        // Sign every outbound fragment when a fleet key is configured so peers
+        // can authenticate it. Unsigned broadcast is only meaningful for a
+        // keyless (single-node / trusted-LAN) setup, where the listener also
+        // refuses to run — so in practice a peer only ever sees signed frames.
+        if let Ok(key) = std::env::var("AXIOM_FLEET_KEY") {
+            if !key.trim().is_empty() {
+                sign_fragment(&mut fragment, key.as_bytes());
+            }
+        }
         if let Err(err) = self.tx.try_send(fragment) {
             update_telemetry(&self.telemetry, |t| {
                 t.last_error = Some(format!("dwe queue full: {err}"));
