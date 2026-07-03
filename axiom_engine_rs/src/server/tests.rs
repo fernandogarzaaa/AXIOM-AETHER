@@ -7,7 +7,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use candle_core::{DType, Device};
+    use std::sync::Mutex;
     use tower::ServiceExt;
+
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
     fn savings_receipt_formats_bytes_and_ratio() {
@@ -25,6 +28,7 @@ mod tests {
 
     #[test]
     fn responses_compression_defaults_on_and_opts_out() {
+        let _guard = ENV_GUARD.lock().expect("env guard poisoned");
         std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
         assert!(responses_compression_enabled(), "on by default when unset");
 
@@ -252,6 +256,7 @@ mod tests {
 
     #[test]
     fn annotate_response_grounding_respects_env_flag() {
+        let _guard = ENV_GUARD.lock().expect("env guard poisoned");
         // Single test (sequential) to avoid racing on the process-global env var.
         let evidence = "Axiom uses online test-time training.";
         let make = || {

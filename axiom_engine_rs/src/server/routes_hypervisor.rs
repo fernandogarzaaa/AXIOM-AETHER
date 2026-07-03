@@ -240,9 +240,11 @@ async fn hypervisor_jit_run(
     let mut source_restored = false;
     if !report.passed {
         if let (Some(p), Some(b)) = (source_path.as_deref(), backup.as_ref()) {
-            if tokio::fs::write(p, b).await.is_ok() {
-                source_restored = true;
-            }
+            tokio::fs::write(p, b).await.map_err(|e| {
+                eprintln!("[poly-jit] failed to restore source_path '{p}': {e}");
+                ApiError::Internal(format!("failed to restore source_path '{p}': {e}"))
+            })?;
+            source_restored = true;
         }
     }
 

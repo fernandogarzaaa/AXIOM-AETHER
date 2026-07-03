@@ -314,7 +314,7 @@ pub async fn run_server(
         .with_graceful_shutdown(async move {
             // Wait for Ctrl-C / SIGTERM, then flush all live sessions into the
             // persistent master vibe so accumulated structure survives restart.
-            let _ = tokio::signal::ctrl_c().await;
+            wait_for_shutdown_signal().await;
             eprintln!("[+] shutdown signal received — flushing vibe memory");
             shutdown_state.flush_all_sessions_to_vibe().await;
         })
@@ -325,6 +325,27 @@ pub async fn run_server(
     // terminating, so exit the process directly and let the OS reclaim memory
     // rather than running destructors on the async runtime.
     std::process::exit(0);
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(e) => {
+            eprintln!("[!] failed to install SIGTERM handler: {e}; waiting for Ctrl-C only");
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 // ---------------------------------------------------------------------------

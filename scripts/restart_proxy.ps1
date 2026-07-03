@@ -1,4 +1,4 @@
-# restart_proxy.ps1 — definitively stop every Axiom proxy/watchdog instance and
+# restart_proxy.ps1 - definitively stop every Axiom proxy/watchdog instance and
 # start exactly one, pinned to CPU for stability. Idempotent and quote-safe.
 $ErrorActionPreference = 'SilentlyContinue'
 

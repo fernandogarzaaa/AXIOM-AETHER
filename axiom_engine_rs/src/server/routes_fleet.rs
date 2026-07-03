@@ -131,8 +131,9 @@ async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Res
     }
 }
 
-/// Locate this node's verified-patch store, co-located with the configured heal
-/// memory (`axiom_patch_memory.json`), matching `PatchMemory::default_path()`.
+/// Spawn the background task that consumes inbound DWE fragments, verifies
+/// HMAC with current/previous fleet-key rotation, enforces per-session sequence
+/// ordering, and merges accepted layer deltas into session state.
 pub fn start_dwe_apply_loop(
     apply_state: AppState,
     mut in_rx: tokio::sync::mpsc::Receiver<crate::dwe::DweFragment>,
