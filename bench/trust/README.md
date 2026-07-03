@@ -27,7 +27,7 @@ The corpus has 240 deterministic, synthetic, secret-free rows:
 3. `contradiction` - the claim reuses the evidence vocabulary but asserts the
    opposite; these are the hardest negatives for a lexical gate.
 
-Contradictions are at least one third of the dataset, and rows are interleaved
+Contradictions are at least one-third of the dataset, and rows are interleaved
 so the deterministic even/odd split includes every family on both sides.
 
 ## Use

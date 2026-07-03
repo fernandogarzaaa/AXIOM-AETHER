@@ -368,7 +368,7 @@ fn has_any_word(words: &[String], terms: &[&str]) -> bool {
 }
 
 fn has_negation(words: &[String]) -> bool {
-    has_any_word(words, &["not", "never", "without", "cannot", "cant", "no"])
+    has_any_word(words, &["not", "never", "without", "cannot", "no"])
 }
 
 fn number_tokens(words: &[String]) -> std::collections::BTreeSet<String> {
@@ -406,7 +406,8 @@ fn has_opposition(claim_words: &[String], evidence_words: &[String]) -> bool {
             &["expose", "exposes", "exposed"],
         ),
         (&["pass", "passes", "passed"], &["fail", "fails", "failed"]),
-        (&["before"], &["after"]),
+        (&["before"], &["after", "then"]),
+        (&["supported", "support"], &["unsupported", "unsupport"]),
         (&["true"], &["false"]),
     ];
 
@@ -443,19 +444,37 @@ pub fn deterministic_grounding_lift(claim: &str, evidence: &str) -> Option<f32> 
     if toks.len() < 3 {
         return None;
     }
-    let evidence_spans: Vec<Vec<String>> = sentences(evidence)
-        .iter()
-        .map(|s| content_tokens(s))
-        .filter(|t| !t.is_empty())
-        .collect();
-    let support = best_support(&toks, &evidence_spans);
-    if support < SUPPORT_HIGH {
+    let evidence_sentences = sentences(evidence);
+    let mut best_support = 0.0f32;
+    let mut best_sentence: Option<&str> = None;
+    for sentence in &evidence_sentences {
+        let span = content_tokens(sentence);
+        if span.is_empty() {
+            continue;
+        }
+        let matched = toks.iter().filter(|t| span.contains(t)).count();
+        let support = matched as f32 / toks.len() as f32;
+        if support > best_support {
+            best_support = support;
+            best_sentence = Some(sentence.as_str());
+        }
+    }
+    if best_support < SUPPORT_HIGH {
         return None;
     }
-    if has_contradiction_signature(claim, evidence) {
+    if has_contradiction_signature(claim, best_sentence.unwrap_or(evidence)) {
         Some(-1.2)
     } else {
         Some(1.0)
+    }
+}
+
+/// Apply the neural-surprisal demotion rule to a verdict produced by any gate.
+pub fn verdict_after_neural_lift(verdict: Verdict, lift: Option<f32>) -> Verdict {
+    if verdict == Verdict::Supported && lift.is_some_and(|l| l < -DEMOTE_MARGIN) {
+        Verdict::Unverified
+    } else {
+        verdict
     }
 }
 
@@ -476,9 +495,7 @@ where
         .map(|mut c| {
             if let Some(l) = lift(&c.claim) {
                 c.lift = Some(l);
-                if c.verdict == Verdict::Supported && l < -DEMOTE_MARGIN {
-                    c.verdict = Verdict::Unverified;
-                }
+                c.verdict = verdict_after_neural_lift(c.verdict, c.lift);
             }
             c
         })
@@ -753,6 +770,27 @@ mod tests {
             deterministic_grounding_lift(c, evidence)
         });
         assert_eq!(report.claims[0].verdict, Verdict::Unverified);
+    }
+
+    #[test]
+    fn deterministic_grounding_lift_handles_prefix_antonyms() {
+        let evidence = "The trust dataset marks contradictions as unsupported examples.";
+        let claim = "The trust dataset marks contradictions as supported.";
+        assert_eq!(deterministic_grounding_lift(claim, evidence), Some(-1.2));
+    }
+
+    #[test]
+    fn deterministic_grounding_lift_handles_order_inversions() {
+        let evidence = "AxiomBench reports cognition, trust, fleet, then cost.";
+        let claim = "AxiomBench runs cost before trust.";
+        assert_eq!(deterministic_grounding_lift(claim, evidence), Some(-1.2));
+    }
+
+    #[test]
+    fn deterministic_grounding_lift_uses_best_span_for_negation() {
+        let evidence = "The unrelated monitor is not enabled. Responses compression preserves pass-through fallback for unsafe payloads.";
+        let claim = "Responses compression preserves pass-through fallback for unsafe payloads.";
+        assert_eq!(deterministic_grounding_lift(claim, evidence), Some(1.0));
     }
 
     #[test]

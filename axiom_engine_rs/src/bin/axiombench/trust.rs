@@ -2,8 +2,8 @@
 
 use crate::cognition::PillarResult;
 use axiom_engine::hallucination::{
-    calibrate_conformal_threshold, deterministic_grounding_lift, verify, verify_with_signals,
-    ConformalGate, Verdict,
+    calibrate_conformal_threshold, deterministic_grounding_lift, verdict_after_neural_lift, verify,
+    verify_with_signals, ConformalGate, Verdict,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -58,13 +58,18 @@ fn lexical_supported(row: &Row, gate: &ConformalGate) -> bool {
     matches!(gate.verdict(score(row)), Verdict::Supported)
 }
 
-fn neural_supported(row: &Row) -> bool {
+fn neural_supported(row: &Row, gate: &ConformalGate) -> bool {
     verify_with_signals(&row.claim, &row.evidence, |claim| {
         deterministic_grounding_lift(claim, &row.evidence)
     })
     .claims
     .first()
-    .map(|c| matches!(c.verdict, Verdict::Supported))
+    .map(|c| {
+        matches!(
+            verdict_after_neural_lift(gate.verdict(c.support), c.lift),
+            Verdict::Supported
+        )
+    })
     .unwrap_or(false)
 }
 
@@ -88,15 +93,24 @@ pub fn run_trust() -> PillarResult {
     };
 
     let holdout: Vec<&Row> = rows.iter().skip(1).step_by(2).collect();
-    let pos: Vec<&&Row> = holdout.iter().filter(|r| r.supported).collect();
-    let neg: Vec<&&Row> = holdout.iter().filter(|r| !r.supported).collect();
+    let pos: Vec<&Row> = holdout.iter().copied().filter(|r| r.supported).collect();
+    let neg: Vec<&Row> = holdout.iter().copied().filter(|r| !r.supported).collect();
+    let unsupported: Vec<&Row> = holdout
+        .iter()
+        .copied()
+        .filter(|r| r.family == Family::Unsupported)
+        .collect();
     let covered = pos
         .iter()
         .filter(|r| matches!(gate.verdict(score(r)), Verdict::Supported))
         .count();
-    let false_pos = neg.iter().filter(|r| lexical_supported(r, &gate)).count();
-    let contradictions: Vec<&&Row> = holdout
+    let false_pos = unsupported
         .iter()
+        .filter(|r| lexical_supported(r, &gate))
+        .count();
+    let contradictions: Vec<&Row> = holdout
+        .iter()
+        .copied()
         .filter(|r| r.family == Family::Contradiction)
         .collect();
     let lexical_contradictions_caught = contradictions
@@ -105,10 +119,10 @@ pub fn run_trust() -> PillarResult {
         .count();
     let neural_contradictions_caught = contradictions
         .iter()
-        .filter(|r| !neural_supported(r))
+        .filter(|r| !neural_supported(r, &gate))
         .count();
     let coverage = covered as f64 / pos.len().max(1) as f64;
-    let fpr = false_pos as f64 / neg.len().max(1) as f64;
+    let fpr = false_pos as f64 / unsupported.len().max(1) as f64;
     let lexical_contradiction_catch_rate =
         lexical_contradictions_caught as f64 / contradictions.len().max(1) as f64;
     let neural_contradiction_catch_rate =
@@ -131,6 +145,7 @@ pub fn run_trust() -> PillarResult {
             "false_positive_rate": fpr,
             "positives": pos.len(),
             "negatives": neg.len(),
+            "unsupported": unsupported.len(),
             "contradictions": contradictions.len(),
             "lexical_contradiction_catch_rate": lexical_contradiction_catch_rate,
             "neural_contradiction_catch_rate": neural_contradiction_catch_rate,

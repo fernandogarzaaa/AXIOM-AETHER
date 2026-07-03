@@ -1,6 +1,6 @@
 use axiom_engine::hallucination::{
-    calibrate_conformal_threshold, deterministic_grounding_lift, verify, verify_with_signals,
-    ConformalGate, Verdict,
+    calibrate_conformal_threshold, deterministic_grounding_lift, verdict_after_neural_lift, verify,
+    verify_with_signals, ConformalGate, Verdict,
 };
 use serde::Deserialize;
 
@@ -44,13 +44,18 @@ fn lexical_supported(row: &Row, gate: &ConformalGate) -> bool {
     matches!(gate.verdict(support_score(row)), Verdict::Supported)
 }
 
-fn neural_supported(row: &Row) -> bool {
+fn neural_supported(row: &Row, gate: &ConformalGate) -> bool {
     verify_with_signals(&row.claim, &row.evidence, |claim| {
         deterministic_grounding_lift(claim, &row.evidence)
     })
     .claims
     .first()
-    .map(|c| matches!(c.verdict, Verdict::Supported))
+    .map(|c| {
+        matches!(
+            verdict_after_neural_lift(gate.verdict(c.support), c.lift),
+            Verdict::Supported
+        )
+    })
     .unwrap_or(false)
 }
 
@@ -76,7 +81,7 @@ fn calibrated_gate_meets_family_coverage_on_holdout() {
     );
     assert!(
         family_count(&rows, Family::Contradiction) * 3 >= rows.len(),
-        "contradictions must be at least one third of the dataset"
+        "contradictions must be at least one-third of the dataset"
     );
 
     // Deterministic split: even indices calibrate, odd indices are held out.
@@ -146,7 +151,7 @@ fn calibrated_gate_meets_family_coverage_on_holdout() {
         / contradictions.len() as f32;
     let neural_catch_rate = contradictions
         .iter()
-        .filter(|r| !neural_supported(r))
+        .filter(|r| !neural_supported(r, &gate))
         .count() as f32
         / contradictions.len() as f32;
     assert!(
