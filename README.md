@@ -306,7 +306,8 @@ Useful environment variables:
 | `AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS` | Compression threshold. |
 | `AXIOM_VIBE` / `AXIOM_VIBE_PRIME` | Persistent fast-weight memory controls. |
 | `AXIOM_HEAL_MEMORY` | Path for learned heal memory, or `0`/`off` to disable. |
-| `AXIOM_FLEET_KEY` | HMAC key for swarm immunity exchange. |
+| `AXIOM_FLEET_KEY` | Current HMAC key for swarm immunity exchange and DWE fragments. Required when `AXIOM_DWE_LISTEN` is set. |
+| `AXIOM_FLEET_KEY_PREV` | Optional previous fleet key accepted during graceful key rotation; remove after all peers use `AXIOM_FLEET_KEY`. |
 | `AXIOM_VERIFY_RESPONSES` | Opt in to response grounding advisories. |
 | `AXIOM_ROUTER_CONSENSUS` | Set to `1` to enable consensus mode: the router asks two providers and fuses answers via `BetaBelief`. |
 | `AXIOM_CONFORMAL_THRESHOLD` | Pre-calibrated support threshold τ for the conformal factuality gate; replaces the hardcoded 0.60 cutoff. |

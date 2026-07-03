@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -37,29 +37,31 @@ use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::task::{spawn_blocking, JoinSet};
+use tokio::task::{JoinSet, spawn_blocking};
 use tower_http::cors::CorsLayer;
 use tower_http::decompression::RequestDecompressionLayer;
 use uuid::Uuid;
 
 use crate::anthropic_forwarder::{
-    build_compressed_payload, partition_messages, AnthropicForwarder, ClientAuth, ForwarderError,
+    AnthropicForwarder, ClientAuth, ForwarderError, build_compressed_payload, partition_messages,
 };
 use crate::backend_router::{Router as BackendRouter, TaskKind};
 use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
 use crate::context_compressor::{
+    CompressionControls, CompressorConfig, MemoryFingerprint, SessionStates, TttSessionStore,
     adapt_session_blocking, extract_memory_vector_blocking, feedback_adaptation_text,
-    should_retry_uncompressed, CompressionControls, CompressorConfig, MemoryFingerprint,
-    SessionStates, TttSessionStore,
+    should_retry_uncompressed,
 };
-use crate::dwe::{extract_delta_fragment, DweBus, DweTelemetry};
+use crate::dwe::{
+    DweBus, DweTelemetry, extract_delta_fragment, record_applied_fragment, record_rejected_fragment,
+};
 use crate::hamiltonian::QuantumRuntimeStatus;
 use crate::inference::InferencePipeline;
 use crate::metrics;
 use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarderError};
-use crate::poly_jit::{PolyJitEngine, PolyJitRunRequest, PolyJitReport, PolyJitStatus};
+use crate::poly_jit::{PolyJitEngine, PolyJitReport, PolyJitRunRequest, PolyJitStatus};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
 use crate::responses_compressor::{apply_plan, plan_compression};
 use crate::sandbox::{SandboxController, SandboxDiagnostic};
@@ -69,7 +71,9 @@ use crate::swarm_route::{LocalSwarmRouteMatrix, SwarmMatrixState};
 use crate::swarm_router::{SwarmChatResult, SwarmRouter};
 use crate::vfs::{NeuralVfs, VfsMountReport, VfsReadReport, VfsStats};
 use crate::vibe_memory::MasterVibe;
-use crate::weight_merge::{fleet_dare_ties, merge_checkpoint_files_with, MergeMethod, MergeSummary};
+use crate::weight_merge::{
+    MergeMethod, MergeSummary, fleet_dare_ties, merge_checkpoint_files_with,
+};
 
 const MAX_ACTIVE_VRAM_SESSIONS: usize = 32;
 const MAX_RESPONSES_RUN_CONCURRENCY: usize = 4;
@@ -339,6 +343,11 @@ impl AppState {
     /// Enable the swarm-immunity endpoints against this heal-memory file.
     pub fn with_heal_memory_path(mut self, path: Option<std::path::PathBuf>) -> Self {
         self.heal_memory_path = Arc::new(path);
+        self
+    }
+
+    pub fn with_dwe_bus(mut self, bus: DweBus) -> Self {
+        self.dwe_bus = Arc::new(bus);
         self
     }
 
@@ -1238,6 +1247,15 @@ struct SwarmMatrixStateResponse {
     exact_residual: ExactResidualTelemetry,
 }
 
+#[derive(Debug, Serialize)]
+struct FleetStatusResponse {
+    dwe: DweTelemetry,
+    peers: Vec<String>,
+    listen: Option<String>,
+    key_configured: bool,
+    previous_key_configured: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Checkpoint helpers
 // ---------------------------------------------------------------------------
@@ -1298,6 +1316,22 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     state.refresh_session_metrics()?;
     let mut rendered = metrics::render_metrics();
+    let dwe = state.dwe_bus.telemetry();
+    rendered.push_str(&format!(
+        "# HELP axiom_dwe_sent Total DWE fragments sent to peers.\n\
+         # TYPE axiom_dwe_sent counter\n\
+         axiom_dwe_sent {}\n\
+         # HELP axiom_dwe_received Total DWE fragments received from peers.\n\
+         # TYPE axiom_dwe_received counter\n\
+         axiom_dwe_received {}\n\
+         # HELP axiom_dwe_applied Total DWE fragments applied to local sessions.\n\
+         # TYPE axiom_dwe_applied counter\n\
+         axiom_dwe_applied {}\n\
+         # HELP axiom_dwe_rejected Total DWE fragments rejected before apply.\n\
+         # TYPE axiom_dwe_rejected counter\n\
+         axiom_dwe_rejected {}\n",
+        dwe.sent_fragments, dwe.received_fragments, dwe.applied_fragments, dwe.rejected_fragments
+    ));
     // Compression savings: lifetime monotone counters (session drops remove
     // ledger entries for receipts, so the ledger alone would undercount).
     let bytes_in = LIFETIME_SAVINGS_IN.load(std::sync::atomic::Ordering::Relaxed);
@@ -1320,6 +1354,16 @@ async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiEr
         rendered,
     )
         .into_response())
+}
+
+async fn fleet_status(State(state): State<AppState>) -> Json<FleetStatusResponse> {
+    Json(FleetStatusResponse {
+        dwe: state.dwe_bus.telemetry(),
+        peers: configured_dwe_peers(),
+        listen: nonempty_env("AXIOM_DWE_LISTEN"),
+        key_configured: fleet_key().is_some(),
+        previous_key_configured: fleet_key_prev().is_some(),
+    })
 }
 
 /// `POST /v1/completions` — text completion (stateless or session-aware).
@@ -1384,7 +1428,7 @@ async fn create_chat_completion(
         Ok(r) => r,
         Err(e) => {
             return ApiError::BadRequest(format!("invalid /v1/chat/completions body: {e}"))
-                .into_response()
+                .into_response();
         }
     };
 
@@ -1448,7 +1492,8 @@ async fn compressed_responses_payload(
     session_override: Option<&str>,
     request_compression_enabled: bool,
 ) -> Result<Option<Value>, ApiError> {
-    if !request_compression_enabled || !state.controls.enabled() || !responses_compression_enabled() {
+    if !request_compression_enabled || !state.controls.enabled() || !responses_compression_enabled()
+    {
         return Ok(None);
     }
     let Some(plan) = plan_compression(body) else {
@@ -1537,14 +1582,11 @@ async fn compressed_responses_payload(
             ));
         }
     };
-    cleanup_responses_run_subsessions(
-        state,
-        &session_id,
-        plan.runs.len(),
-        is_transient_session,
-    );
+    cleanup_responses_run_subsessions(state, &session_id, plan.runs.len(), is_transient_session);
 
-    let bytes_in = serde_json::to_vec(body).map(|value| value.len()).unwrap_or(0) as u64;
+    let bytes_in = serde_json::to_vec(body)
+        .map(|value| value.len())
+        .unwrap_or(0) as u64;
     let bytes_out = serde_json::to_vec(&compressed)
         .map(|value| value.len())
         .unwrap_or(0) as u64;
@@ -1765,7 +1807,7 @@ async fn responses_websocket(
     let mut request = match upstream_url.as_str().into_client_request() {
         Ok(r) => r,
         Err(e) => {
-            return ApiError::Internal(format!("invalid upstream ws url: {e}")).into_response()
+            return ApiError::Internal(format!("invalid upstream ws url: {e}")).into_response();
         }
     };
     // Relay client auth + the same header set as the HTTP path. Skip
@@ -1906,7 +1948,9 @@ async fn create_response(
     let mut upstream = match forwarder.forward_responses(outbound, &client_auth).await {
         Ok(response) => response,
         Err(OpenAiForwarderError::Network(error)) if compressed.is_some() => {
-            eprintln!("[axiom-ttt] compressed Responses network failure ({error}); retrying original payload");
+            eprintln!(
+                "[axiom-ttt] compressed Responses network failure ({error}); retrying original payload"
+            );
             state.controls.record_degraded_fallback();
             match forwarder.forward_responses(&body, &client_auth).await {
                 Ok(response) => response,
@@ -2281,10 +2325,7 @@ async fn cluster_sync(
         if payload.sequence_version <= existing.version {
             return Err(ApiError::Conflict(format!(
                 "stale delta rejected: incoming sequence_version={} current={} timestamp={} current_timestamp={}",
-                payload.sequence_version,
-                existing.version,
-                payload.timestamp,
-                existing.timestamp
+                payload.sequence_version, existing.version, payload.timestamp, existing.timestamp
             )));
         }
     }
@@ -2337,7 +2378,7 @@ async fn cluster_merge(
         Some(other) => {
             return Err(ApiError::BadRequest(format!(
                 "unknown merge method '{other}' (expected \"dare_ties\" or \"alpha_blend\")"
-            )))
+            )));
         }
     };
     let summary = spawn_blocking(move || merge_checkpoint_files_with(&inputs, &output, method))
@@ -2581,7 +2622,7 @@ async fn create_message(
     let req: AnthropicMessagesRequest = match serde_json::from_value(body) {
         Ok(r) => r,
         Err(e) => {
-            return ApiError::BadRequest(format!("invalid /v1/messages body: {e}")).into_response()
+            return ApiError::BadRequest(format!("invalid /v1/messages body: {e}")).into_response();
         }
     };
     local_messages_path(state, req).map_or_else(|e| e.into_response(), |json| json.into_response())
@@ -2923,9 +2964,14 @@ async fn compressed_messages_path(
     // revision. Moves from *flagging* hallucinations to *reducing* them. Costs
     // one extra upstream call only when claims are actually flagged.
     if std::env::var("AXIOM_GROUND_CORRECT").as_deref() == Ok("1") {
-        if let Some(revised) =
-            ground_correct_round(&forwarder, client_auth, &outbound, &forwarded, &heavy_combined)
-                .await
+        if let Some(revised) = ground_correct_round(
+            &forwarder,
+            client_auth,
+            &outbound,
+            &forwarded,
+            &heavy_combined,
+        )
+        .await
         {
             forwarded = revised;
         }
@@ -3757,7 +3803,10 @@ async fn hypervisor_stat(
     let Some(path) = body.get("path").and_then(Value::as_str) else {
         return Err(ApiError::BadRequest("path is required".into()));
     };
-    let attr = state.neural_vfs.getattr(path).map_err(ApiError::BadRequest)?;
+    let attr = state
+        .neural_vfs
+        .getattr(path)
+        .map_err(ApiError::BadRequest)?;
     Ok(Json(serde_json::json!({
         "attr": attr,
         "vfs": state.neural_vfs.status(),
@@ -3910,7 +3959,9 @@ async fn readyz(State(state): State<AppState>) -> Response {
             .into_response(),
         Err(std::sync::TryLockError::Poisoned(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "status": "unavailable", "reason": "pipeline lock poisoned" })),
+            Json(
+                serde_json::json!({ "status": "unavailable", "reason": "pipeline lock poisoned" }),
+            ),
         )
             .into_response(),
     }
@@ -3926,6 +3977,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(export_metrics))
+        .route("/v1/fleet/status", get(fleet_status))
         .route("/v1/models", get(list_models))
         .route("/v1/completions", post(create_completion))
         .route("/v1/chat/completions", post(create_chat_completion))
@@ -4057,7 +4109,9 @@ fn inject_immunity_advisory(
     if advisories.is_empty() && hints.is_empty() {
         return;
     }
-    let mut block = String::from("<axiom_immunity>\nAxiom has prior self-healing experience with commands referenced here:\n");
+    let mut block = String::from(
+        "<axiom_immunity>\nAxiom has prior self-healing experience with commands referenced here:\n",
+    );
     for a in &advisories {
         block.push_str("- ");
         block.push_str(a);
@@ -4079,18 +4133,27 @@ fn inject_immunity_advisory(
 
 /// Mean next-token cross-entropy of `ids` through a clone of `states` (the
 /// states are not mutated). Mirrors `eval_model`/`self_heal` CE scoring.
-fn claim_ce(pipeline: &InferencePipeline, states: &[candle_core::Tensor], ids: &[u32]) -> Option<f32> {
+fn claim_ce(
+    pipeline: &InferencePipeline,
+    states: &[candle_core::Tensor],
+    ids: &[u32],
+) -> Option<f32> {
     if ids.len() < 2 {
         return None;
     }
     let dev = pipeline.device();
     let mut probe = states.to_vec();
-    let input = candle_core::Tensor::from_vec(ids[..ids.len() - 1].to_vec(), (1, ids.len() - 1), dev).ok()?;
+    let input =
+        candle_core::Tensor::from_vec(ids[..ids.len() - 1].to_vec(), (1, ids.len() - 1), dev)
+            .ok()?;
     let logits = pipeline.model().forward_lm(&input, &mut probe).ok()?;
     let (_, t, v) = logits.dims3().ok()?;
     let l2d = logits.squeeze(0).ok()?.reshape((t, v)).ok()?;
     let tgt = candle_core::Tensor::from_vec(ids[1..].to_vec(), (ids.len() - 1,), dev).ok()?;
-    candle_nn::loss::cross_entropy(&l2d, &tgt).ok()?.to_scalar::<f32>().ok()
+    candle_nn::loss::cross_entropy(&l2d, &tgt)
+        .ok()?
+        .to_scalar::<f32>()
+        .ok()
 }
 
 /// Mean next-token cross-entropy of `text` under a fresh (unadapted) model —
@@ -4123,9 +4186,10 @@ fn neural_lifts(
     }
     for claim in claims {
         let ids = pipeline.encode_text(claim);
-        if let (Some(ce_base), Some(ce_ctx)) =
-            (claim_ce(pipeline, &base, &ids), claim_ce(pipeline, &ctx, &ids))
-        {
+        if let (Some(ce_base), Some(ce_ctx)) = (
+            claim_ce(pipeline, &base, &ids),
+            claim_ce(pipeline, &ctx, &ids),
+        ) {
             out.insert(claim.clone(), ce_base - ce_ctx);
         }
     }
@@ -4164,7 +4228,7 @@ async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>
                             ),
                         })),
                     )
-                        .into_response()
+                        .into_response();
                 }
             }
         }
@@ -4238,11 +4302,9 @@ async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>
             )
                 .into_response();
         };
-        let report = crate::hallucination::verify_with_gated_expansion(
-            response,
-            evidence,
-            |sym| crate::skeleton::expand_symbol(&source, sym),
-        );
+        let report = crate::hallucination::verify_with_gated_expansion(response, evidence, |sym| {
+            crate::skeleton::expand_symbol(&source, sym)
+        });
         return Json(serde_json::json!({
             "mode": "grounding_gated_expansion",
             "grounded_fraction_before": report.before.grounded_fraction,
@@ -4323,14 +4385,14 @@ async fn validate_epistemic_drift(Json(body): Json<Value>) -> Response {
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "epistemic judge is not configured"})),
             )
-                .into_response()
+                .into_response();
         }
         Err(error) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": error})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let judge = match crate::epistemic_drift::OpenAiSemanticJudge::new(config) {
@@ -4340,7 +4402,7 @@ async fn validate_epistemic_drift(Json(body): Json<Value>) -> Response {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": error})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let request_id = body
@@ -4392,10 +4454,32 @@ async fn get_immunity(State(state): State<AppState>) -> Response {
 /// The shared fleet secret for swarm-immunity authentication, from
 /// `AXIOM_FLEET_KEY`. `None` → exports are hashed but not signed.
 fn fleet_key() -> Option<Vec<u8>> {
-    std::env::var("AXIOM_FLEET_KEY")
+    nonempty_env("AXIOM_FLEET_KEY").map(String::into_bytes)
+}
+
+fn fleet_key_prev() -> Option<Vec<u8>> {
+    nonempty_env("AXIOM_FLEET_KEY_PREV").map(String::into_bytes)
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
-        .filter(|k| !k.is_empty())
-        .map(|k| k.into_bytes())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn configured_dwe_peers() -> Vec<String> {
+    std::env::var("AXIOM_DWE_PEERS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|peer| !peer.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `POST /v1/immunity/merge` — fold a peer's exported heal memory into this
@@ -4558,10 +4642,7 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
 /// beliefs are grounded in it via [`crate::chimera::RouterAdapter`] (with agent
 /// pins like `[claude]`/`[gpt]` honored); otherwise the offline mock adapter is
 /// used so programs still run.
-async fn post_chimera_run(
-    State(state): State<AppState>,
-    body: String,
-) -> axum::response::Response {
+async fn post_chimera_run(State(state): State<AppState>, body: String) -> axum::response::Response {
     use axum::response::IntoResponse;
     let source = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(v) => v
@@ -4621,7 +4702,10 @@ fn mcp_unauthorized(state: &AppState, headers: &axum::http::HeaderMap) -> Option
     let presented = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
         .map(str::trim);
     if presented == Some(expected.as_str()) {
         None
@@ -4749,10 +4833,7 @@ async fn post_budget(
 }
 
 /// `GET /v1/awareness/{id}` — return the current awareness state for a session.
-async fn get_awareness(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn get_awareness(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match state.awareness.get(&id) {
         None => (
             StatusCode::NOT_FOUND,
@@ -4842,6 +4923,113 @@ async fn post_config(State(state): State<AppState>, Json(body): Json<Value>) -> 
         "compression_active": state.compression_active(),
         "openai_compression_active": state.openai_compression_active(),
     }))
+}
+
+pub fn start_dwe_apply_loop(
+    apply_state: AppState,
+    mut in_rx: tokio::sync::mpsc::Receiver<crate::dwe::DweFragment>,
+    verify_secret: Vec<u8>,
+    previous_secret: Option<Vec<u8>>,
+    telemetry: Arc<Mutex<DweTelemetry>>,
+) {
+    tokio::spawn(async move {
+        while let Some(fragment) = in_rx.recv().await {
+            if let Err(e) = crate::dwe::verify_fragment_with_rotation(
+                &fragment,
+                &verify_secret,
+                previous_secret.as_deref(),
+            ) {
+                eprintln!("[dwe] rejected fragment for '{}': {e}", fragment.session_id);
+                record_rejected_fragment(&telemetry, &fragment.session_id, &e);
+                continue;
+            }
+            {
+                let seq_key = format!("dwe:{}", fragment.session_id);
+                let Ok(mut seqs) = apply_state.sequence_versions.write() else {
+                    record_rejected_fragment(
+                        &telemetry,
+                        &fragment.session_id,
+                        "sequence lock poisoned",
+                    );
+                    continue;
+                };
+                if let Some(prev) = seqs.get(&seq_key) {
+                    if fragment.sequence <= prev.version {
+                        let error = format!(
+                            "stale fragment seq {} <= {}",
+                            fragment.sequence, prev.version
+                        );
+                        eprintln!("[dwe] {error} for '{}'; dropped", fragment.session_id);
+                        record_rejected_fragment(&telemetry, &fragment.session_id, &error);
+                        continue;
+                    }
+                }
+                seqs.insert(
+                    seq_key,
+                    SequenceState {
+                        version: fragment.sequence,
+                        timestamp: unix_now() as i64,
+                    },
+                );
+            }
+            let Ok(mut sessions) = apply_state.sessions.write() else {
+                record_rejected_fragment(&telemetry, &fragment.session_id, "session lock poisoned");
+                continue;
+            };
+            let Some(session) = sessions.get_mut(&fragment.session_id) else {
+                eprintln!(
+                    "[dwe] fragment for unknown session '{}' dropped",
+                    fragment.session_id
+                );
+                record_rejected_fragment(&telemetry, &fragment.session_id, "unknown session");
+                continue;
+            };
+            let mut applied_any = false;
+            for layer in &fragment.layers {
+                let total: usize = layer.shape.iter().product();
+                if total != layer.values.len() {
+                    let error = format!("layer {} shape/value mismatch", layer.layer_index);
+                    eprintln!("[dwe] {error}");
+                    record_rejected_fragment(&telemetry, &fragment.session_id, &error);
+                    continue;
+                }
+                let delta = Tensor::from_vec(layer.values.clone(), (total,), &apply_state.device)
+                    .and_then(|t| t.reshape(layer.shape.as_slice()));
+                match delta {
+                    Ok(delta) => {
+                        if let Err(e) =
+                            session.merge_delta(layer.layer_index, &delta, &apply_state.device)
+                        {
+                            let error =
+                                format!("merge failed for layer {}: {e}", layer.layer_index);
+                            eprintln!(
+                                "[dwe] merge failed for session '{}' layer {}: {e}",
+                                fragment.session_id, layer.layer_index
+                            );
+                            record_rejected_fragment(&telemetry, &fragment.session_id, &error);
+                        } else {
+                            applied_any = true;
+                        }
+                    }
+                    Err(e) => {
+                        let error = format!(
+                            "fragment tensor rebuild failed for layer {}: {e}",
+                            layer.layer_index
+                        );
+                        eprintln!(
+                            "[dwe] fragment tensor rebuild failed (layer {}): {e}",
+                            layer.layer_index
+                        );
+                        record_rejected_fragment(&telemetry, &fragment.session_id, &error);
+                    }
+                }
+            }
+            if applied_any {
+                session.last_used = unix_now();
+                record_applied_fragment(&telemetry, &fragment.session_id);
+            }
+        }
+    });
 }
 
 /// Start the HTTP server and block until it is stopped.
@@ -4998,7 +5186,10 @@ pub async fn run_server(
     // (AXIOM_HEAL_MEMORY overrides the path, 0/off disables the endpoints).
     let heal_memory_path = crate::heal_memory::HealMemory::default_path();
     if let Some(p) = heal_memory_path.as_ref() {
-        println!("[+] Swarm immunity ON — /v1/immunity serves and merges {}", p.display());
+        println!(
+            "[+] Swarm immunity ON — /v1/immunity serves and merges {}",
+            p.display()
+        );
     }
 
     let state = AppState::new(pipeline, model_id)
@@ -5035,12 +5226,21 @@ pub async fn run_server(
     let mcp_token = std::env::var("AXIOM_MCP_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty());
-    let mcp = if std::env::var("AXIOM_MCP_HTTP").map(|v| v == "1").unwrap_or(false) {
-        match crate::mcp_stdio::build_context(config.clone(), device.clone(), checkpoint_path.to_string())
-            .await
+    let mcp = if std::env::var("AXIOM_MCP_HTTP")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        match crate::mcp_stdio::build_context(
+            config.clone(),
+            device.clone(),
+            checkpoint_path.to_string(),
+        )
+        .await
         {
             Ok(c) => {
-                println!("[+] AXIOM_MCP_HTTP=1 — MCP tools served at POST /mcp (remote connectors)");
+                println!(
+                    "[+] AXIOM_MCP_HTTP=1 — MCP tools served at POST /mcp (remote connectors)"
+                );
                 if mcp_token.is_some() {
                     println!("[+] /mcp requires a bearer token (AXIOM_MCP_TOKEN set)");
                 } else {
@@ -5097,83 +5297,14 @@ pub async fn run_server(
         };
         if let Some(verify_secret) = verify_secret {
             let telemetry = state.dwe_bus.telemetry_handle();
-            let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<crate::dwe::DweFragment>(64);
-            let apply_state = state.clone();
-            tokio::spawn(async move {
-                while let Some(fragment) = in_rx.recv().await {
-                    // Authenticate before doing any work with the fragment.
-                    if let Err(e) = crate::dwe::verify_fragment(&fragment, &verify_secret) {
-                        eprintln!("[dwe] rejected fragment for '{}': {e}", fragment.session_id);
-                        continue;
-                    }
-                    // Replay rejection by (session, sequence), mirroring
-                    // /v1/cluster/sync's monotone sequence guard.
-                    {
-                        let seq_key = format!("dwe:{}", fragment.session_id);
-                        let Ok(mut seqs) = apply_state.sequence_versions.write() else {
-                            continue;
-                        };
-                        if let Some(prev) = seqs.get(&seq_key) {
-                            if fragment.sequence <= prev.version {
-                                eprintln!(
-                                    "[dwe] stale fragment seq {} <= {} for '{}'; dropped",
-                                    fragment.sequence, prev.version, fragment.session_id
-                                );
-                                continue;
-                            }
-                        }
-                        seqs.insert(
-                            seq_key,
-                            SequenceState {
-                                version: fragment.sequence,
-                                timestamp: unix_now() as i64,
-                            },
-                        );
-                    }
-                    let Ok(mut sessions) = apply_state.sessions.write() else {
-                        continue;
-                    };
-                    let Some(session) = sessions.get_mut(&fragment.session_id) else {
-                        eprintln!(
-                            "[dwe] fragment for unknown session '{}' dropped",
-                            fragment.session_id
-                        );
-                        continue;
-                    };
-                    for layer in &fragment.layers {
-                        let total: usize = layer.shape.iter().product();
-                        if total != layer.values.len() {
-                            eprintln!("[dwe] layer {} shape/value mismatch", layer.layer_index);
-                            continue;
-                        }
-                        let delta = Tensor::from_vec(
-                            layer.values.clone(),
-                            (total,),
-                            &apply_state.device,
-                        )
-                        .and_then(|t| t.reshape(layer.shape.as_slice()));
-                        match delta {
-                            Ok(delta) => {
-                                if let Err(e) = session.merge_delta(
-                                    layer.layer_index,
-                                    &delta,
-                                    &apply_state.device,
-                                ) {
-                                    eprintln!(
-                                        "[dwe] merge failed for session '{}' layer {}: {e}",
-                                        fragment.session_id, layer.layer_index
-                                    );
-                                }
-                            }
-                            Err(e) => eprintln!(
-                                "[dwe] fragment tensor rebuild failed (layer {}): {e}",
-                                layer.layer_index
-                            ),
-                        }
-                    }
-                    session.last_used = unix_now();
-                }
-            });
+            let (in_tx, in_rx) = tokio::sync::mpsc::channel::<crate::dwe::DweFragment>(64);
+            start_dwe_apply_loop(
+                state.clone(),
+                in_rx,
+                verify_secret,
+                fleet_key_prev(),
+                telemetry.clone(),
+            );
             let listener_addr = listen_addr.clone();
             tokio::spawn(async move {
                 if let Err(e) =
@@ -5200,7 +5331,11 @@ pub async fn run_server(
     println!("      POST /v1/responses                (native OpenAI passthrough)");
     println!(
         "[+] Responses input compression: {} (opt out with AXIOM_RESPONSES_COMPRESS=0)",
-        if responses_compression_enabled() { "ON (default)" } else { "OFF" }
+        if responses_compression_enabled() {
+            "ON (default)"
+        } else {
+            "OFF"
+        }
     );
     println!("      POST /v1/messages                 (Anthropic Messages API)");
     println!("      POST /v1/cluster/sync            (distributed delta merge)");
@@ -5240,10 +5375,16 @@ mod tests {
 
     #[test]
     fn savings_receipt_formats_bytes_and_ratio() {
-        assert_eq!(savings_receipt(41_200, 17_300), "41.2k in, 17.3k forwarded, 58% saved");
+        assert_eq!(
+            savings_receipt(41_200, 17_300),
+            "41.2k in, 17.3k forwarded, 58% saved"
+        );
         assert_eq!(savings_receipt(0, 0), "0.0k in, 0.0k forwarded, 0% saved");
         // Never negative even if out > in (fingerprint overhead on tiny bodies).
-        assert_eq!(savings_receipt(100, 250), "0.1k in, 0.2k forwarded, 0% saved");
+        assert_eq!(
+            savings_receipt(100, 250),
+            "0.1k in, 0.2k forwarded, 0% saved"
+        );
     }
 
     #[test]
@@ -5341,7 +5482,9 @@ mod tests {
     fn grounding_advisory_only_when_claims_flagged() {
         let evidence = "Axiom is an inference engine with online test-time training.";
         // Fully grounded → no advisory.
-        assert!(grounding_advisory_block("Axiom uses online test-time training.", evidence).is_none());
+        assert!(
+            grounding_advisory_block("Axiom uses online test-time training.", evidence).is_none()
+        );
         // Ungrounded claim → advisory naming it.
         let block = grounding_advisory_block(
             "Axiom was written in COBOL and launched on the moon.",
@@ -5352,9 +5495,11 @@ mod tests {
         assert!(block.contains("COBOL") || block.contains("moon"));
     }
 
-    async fn start_mock_upstream(reply_text: &'static str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::AtomicUsize;
+    async fn start_mock_upstream(
+        reply_text: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
         let app = axum::Router::new().route(
@@ -5371,7 +5516,9 @@ mod tests {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         (format!("http://{addr}"), calls)
     }
@@ -5381,31 +5528,58 @@ mod tests {
         use std::sync::atomic::Ordering;
         // Mock upstream returns a grounded revision on the corrective re-ask.
         let (base, calls) = start_mock_upstream("Axiom uses online test-time training.").await;
-        let forwarder = crate::anthropic_forwarder::AnthropicForwarder::new(Some("k".into()), Some(base));
+        let forwarder =
+            crate::anthropic_forwarder::AnthropicForwarder::new(Some("k".into()), Some(base));
         let outbound = serde_json::json!({"model":"m","max_tokens":64,
             "messages":[{"role":"user","content":"summarize the doc"}]});
         let ungrounded = serde_json::json!({"content":[{"type":"text",
             "text":"Axiom was funded by NASA in 1972."}]});
         let evidence = "Axiom is an inference engine with online test-time training.";
-        let revised = ground_correct_round(&forwarder, &ClientAuth::default(), &outbound, &ungrounded, evidence).await;
-        assert!(revised.is_some(), "flagged claim must trigger a corrective re-ask");
+        let revised = ground_correct_round(
+            &forwarder,
+            &ClientAuth::default(),
+            &outbound,
+            &ungrounded,
+            evidence,
+        )
+        .await;
+        assert!(
+            revised.is_some(),
+            "flagged claim must trigger a corrective re-ask"
+        );
         assert!(assistant_text(&revised.unwrap()).contains("test-time training"));
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one corrective re-ask");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one corrective re-ask"
+        );
     }
 
     #[tokio::test]
     async fn self_correction_is_noop_when_answer_is_grounded() {
         use std::sync::atomic::Ordering;
         let (base, calls) = start_mock_upstream("unused").await;
-        let forwarder = crate::anthropic_forwarder::AnthropicForwarder::new(Some("k".into()), Some(base));
+        let forwarder =
+            crate::anthropic_forwarder::AnthropicForwarder::new(Some("k".into()), Some(base));
         let outbound = serde_json::json!({"model":"m","max_tokens":64,
             "messages":[{"role":"user","content":"summarize"}]});
         let grounded = serde_json::json!({"content":[{"type":"text",
             "text":"Axiom uses online test-time training."}]});
         let evidence = "Axiom is an inference engine with online test-time training.";
-        let revised = ground_correct_round(&forwarder, &ClientAuth::default(), &outbound, &grounded, evidence).await;
+        let revised = ground_correct_round(
+            &forwarder,
+            &ClientAuth::default(),
+            &outbound,
+            &grounded,
+            evidence,
+        )
+        .await;
         assert!(revised.is_none(), "grounded answer → no re-ask");
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "no upstream call when nothing is flagged");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no upstream call when nothing is flagged"
+        );
     }
 
     #[tokio::test]
@@ -5414,24 +5588,41 @@ mod tests {
         // The re-ask returns an answer that is still ungrounded (shares nothing
         // with the evidence), so the guardrail must reject it and keep None.
         let (base, calls) = start_mock_upstream("Bananas ripen faster in zero gravity.").await;
-        let forwarder = crate::anthropic_forwarder::AnthropicForwarder::new(Some("k".into()), Some(base));
+        let forwarder =
+            crate::anthropic_forwarder::AnthropicForwarder::new(Some("k".into()), Some(base));
         let outbound = serde_json::json!({"model":"m","max_tokens":64,
             "messages":[{"role":"user","content":"summarize the doc"}]});
         let ungrounded = serde_json::json!({"content":[{"type":"text",
             "text":"Axiom was funded by NASA in 1972."}]});
         let evidence = "Axiom is an inference engine with online test-time training.";
-        let revised = ground_correct_round(&forwarder, &ClientAuth::default(), &outbound, &ungrounded, evidence).await;
-        assert!(revised.is_none(), "a revision that is not better grounded must be rejected");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "the re-ask still happened once");
+        let revised = ground_correct_round(
+            &forwarder,
+            &ClientAuth::default(),
+            &outbound,
+            &ungrounded,
+            evidence,
+        )
+        .await;
+        assert!(
+            revised.is_none(),
+            "a revision that is not better grounded must be rejected"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the re-ask still happened once"
+        );
     }
 
     #[test]
     fn annotate_response_grounding_respects_env_flag() {
         // Single test (sequential) to avoid racing on the process-global env var.
         let evidence = "Axiom uses online test-time training.";
-        let make = || serde_json::json!({
-            "content": [{"type": "text", "text": "Axiom was funded by NASA in 1972."}]
-        });
+        let make = || {
+            serde_json::json!({
+                "content": [{"type": "text", "text": "Axiom was funded by NASA in 1972."}]
+            })
+        };
 
         // Disabled → response untouched.
         std::env::remove_var("AXIOM_VERIFY_RESPONSES");
@@ -5446,8 +5637,14 @@ mod tests {
         annotate_response_grounding(&mut on, evidence);
         std::env::remove_var("AXIOM_VERIFY_RESPONSES");
         let text = on["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("<axiom_grounding"), "advisory must be appended");
-        assert!(text.starts_with("Axiom was funded by NASA"), "original answer preserved");
+        assert!(
+            text.contains("<axiom_grounding"),
+            "advisory must be appended"
+        );
+        assert!(
+            text.starts_with("Axiom was funded by NASA"),
+            "original answer preserved"
+        );
     }
 
     fn build_pipeline() -> InferencePipeline {
@@ -5746,7 +5943,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["error"].as_str().unwrap().contains("AXIOM_MCP_HTTP"));
         safe_drop(pipeline_arc).await;
@@ -5795,7 +5994,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["emitted"], serde_json::json!(["1", "2", "3"]));
         safe_drop(pipeline_arc).await;
@@ -5820,7 +6021,9 @@ mod tests {
                     .method(Method::POST)
                     .uri("/mcp")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -5836,7 +6039,9 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer wrong")
-                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -5852,7 +6057,9 @@ mod tests {
                     .uri("/mcp")
                     .header("content-type", "application/json")
                     .header("authorization", "Bearer s3cret")
-                    .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -5875,7 +6082,9 @@ mod tests {
             pm.save(&patch_path).unwrap();
         }
 
-        let state = make_test_state().await.with_heal_memory_path(Some(heal_path));
+        let state = make_test_state()
+            .await
+            .with_heal_memory_path(Some(heal_path));
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
 
@@ -5942,7 +6151,9 @@ mod tests {
             pm.save(&patch_path).unwrap();
         }
 
-        let state = make_test_state().await.with_heal_memory_path(Some(heal_path));
+        let state = make_test_state()
+            .await
+            .with_heal_memory_path(Some(heal_path));
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
 
@@ -5961,7 +6172,10 @@ mod tests {
         let export = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(export.len() > 2 * 1024 * 1024, "export should exceed the default limit");
+        assert!(
+            export.len() > 2 * 1024 * 1024,
+            "export should exceed the default limit"
+        );
 
         let resp = app
             .oneshot(

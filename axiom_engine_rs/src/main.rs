@@ -11,7 +11,7 @@ use axiom_engine::{
 use std::env;
 use std::path::PathBuf;
 
-use candle_core::{bail, Device, Result};
+use candle_core::{Device, Result, bail};
 use cli::{AxiomCommand, ChimeraCommand, DaemonCommand, ParsedCli, SwarmCommand};
 use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use inference::{InferencePipeline, InferenceRuntimeOptions};
@@ -64,7 +64,9 @@ fn resolve_production_model(legacy: AxiomConfig, default_ckpt: &str) -> (AxiomCo
     let ckpt = std::env::var("AXIOM_BPE_CKPT")
         .unwrap_or_else(|_| "checkpoints/axiom_production_bpe.bin".to_string());
     if !std::path::Path::new(&bpe).exists() {
-        eprintln!("[axiom] AXIOM_PRODUCTION_BPE=1 but tokenizer '{bpe}' missing — staying on legacy model");
+        eprintln!(
+            "[axiom] AXIOM_PRODUCTION_BPE=1 but tokenizer '{bpe}' missing — staying on legacy model"
+        );
         return (legacy, default_ckpt.to_string());
     }
     match tokenizers::Tokenizer::from_file(&bpe) {
@@ -78,7 +80,9 @@ fn resolve_production_model(legacy: AxiomConfig, default_ckpt: &str) -> (AxiomCo
                     Some(m) => (m.d_model, m.n_layers, m.lr_inner, m.norm_eps),
                     None => (256, 4, 1e-3, 1e-6),
                 };
-            eprintln!("[axiom] PRODUCTION MODEL = BPE (vocab {vocab}, d_model {d_model}, n_layers {n_layers}); checkpoint {ckpt}");
+            eprintln!(
+                "[axiom] PRODUCTION MODEL = BPE (vocab {vocab}, d_model {d_model}, n_layers {n_layers}); checkpoint {ckpt}"
+            );
             let cfg = AxiomConfig {
                 d_model,
                 n_layers,
@@ -525,11 +529,7 @@ impl agentic::Proposer for LlmTaskProposer<'_> {
         );
         let text = self.backend.generate(&prompt, 8192).ok()?;
         let edits = parse_multifile_response(&text, &self.targets);
-        if edits.is_empty() {
-            None
-        } else {
-            Some(edits)
-        }
+        if edits.is_empty() { None } else { Some(edits) }
     }
 }
 
@@ -562,7 +562,8 @@ fn parse_multifile_response(text: &str, targets: &[PathBuf]) -> agentic::EditSet
         let by_name: Vec<&PathBuf> = targets
             .iter()
             .filter(|t| {
-                t.file_name().map(|n| n.to_string_lossy().into_owned()) == Some(path_str.to_string())
+                t.file_name().map(|n| n.to_string_lossy().into_owned())
+                    == Some(path_str.to_string())
             })
             .collect();
         if by_name.len() == 1 {
@@ -597,7 +598,7 @@ fn strip_fences(text: &str) -> String {
     let trimmed = text.trim();
     if let Some(after) = trimmed.strip_prefix("```") {
         // Drop the rest of the opening fence line (possible language tag).
-        let body = after.splitn(2, '\n').nth(1).unwrap_or("");
+        let body = after.split_once('\n').map(|(_, body)| body).unwrap_or("");
         if let Some(end) = body.rfind("```") {
             return body[..end].trim_end().to_string();
         }
@@ -707,14 +708,13 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 context_api_key: None,
                 max_context_tokens: 0,
             };
-            let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            let pipeline =
+                InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
             // Persist the vibe next to the repo by default (matches the proxy's
             // default), overridable with AXIOM_VIBE_PATH.
             let vibe_path = std::env::var("AXIOM_VIBE_PATH")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| {
-                    std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH)
-                });
+                .unwrap_or_else(|_| std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH));
             prime::run_prime(&path, &pipeline, &vibe_path)?;
         }
         AxiomCommand::Bench { path } => {
@@ -731,7 +731,8 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 context_api_key: None,
                 max_context_tokens: 0,
             };
-            let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            let pipeline =
+                InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
             bench::run_bench(&path, &pipeline)?;
         }
         AxiomCommand::Solve {
@@ -747,9 +748,8 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     // self-select a default check, so `axiom solve` can run
                     // fully hands-off — point it at a broken repo and it figures
                     // out how to verify itself, then localizes and repairs.
-                    let root = std::env::current_dir().map_err(|e| {
-                        candle_core::Error::Msg(format!("axiom solve: cwd: {e}"))
-                    })?;
+                    let root = std::env::current_dir()
+                        .map_err(|e| candle_core::Error::Msg(format!("axiom solve: cwd: {e}")))?;
                     let lang = fault_locate::detect_language(&root).ok_or_else(|| {
                         candle_core::Error::Msg(
                             "axiom solve: no command given and no recognizable project \
@@ -815,9 +815,9 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             max_attempts,
             command,
         } => {
-            let (program, args) = command
-                .split_first()
-                .ok_or_else(|| candle_core::Error::Msg("axiom task needs a verify command".into()))?;
+            let (program, args) = command.split_first().ok_or_else(|| {
+                candle_core::Error::Msg("axiom task needs a verify command".into())
+            })?;
             let program = program.clone();
             let args = args.to_vec();
 
@@ -853,7 +853,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                                 "axiom task: --file {} is outside the project root — refusing \
                                  to edit files outside the tree",
                                 f.display()
-                            )))
+                            )));
                         }
                     }
                 }
@@ -936,7 +936,10 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 .map_err(|e| candle_core::Error::Msg(format!("eval thread failed: {e}")))?
                 .join()
                 .map_err(|_| candle_core::Error::Msg("eval thread panicked".into()))?;
-            println!("[axiom-eval-agentic] autonomous repair capability:\n{}", report.summary());
+            println!(
+                "[axiom-eval-agentic] autonomous repair capability:\n{}",
+                report.summary()
+            );
             if report.solved() != report.total() {
                 std::process::exit(1);
             }
@@ -964,8 +967,8 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             // Opt-in: AXIOM_RUN_REMEMBER=1 writes novel healed failures into the
             // recall memory store (AXIOM_MEMORY_DIR or the default), so the proxy
             // can surface them into Claude's context later.
-            let remember_into = (std::env::var("AXIOM_RUN_REMEMBER").as_deref() == Ok("1"))
-                .then(|| {
+            let remember_into =
+                (std::env::var("AXIOM_RUN_REMEMBER").as_deref() == Ok("1")).then(|| {
                     std::env::var("AXIOM_MEMORY_DIR")
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|_| std::path::PathBuf::from("checkpoints/memory"))
@@ -984,7 +987,11 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 let p = self_heal::predict_failure(&program, &args, &opts);
                 println!(
                     "[axiom-run] dry-run prediction: {} — {}",
-                    if p.likely { "LIKELY TO FAIL" } else { "no failure predicted" },
+                    if p.likely {
+                        "LIKELY TO FAIL"
+                    } else {
+                        "no failure predicted"
+                    },
                     p.rationale
                 );
                 for d in &p.missing_prerequisites {
@@ -1006,7 +1013,8 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             };
             // TTT adaptation recurses through candle's backward graph; give it a
             // large stack like every other adapt path in the engine.
-            let pipeline = InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            let pipeline =
+                InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
                 .spawn(move || self_heal::run_supervised(&pipeline, &program, &args, &opts))
@@ -1024,27 +1032,25 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 std::process::exit(report.exit_code.unwrap_or(1));
             }
         }
-        AxiomCommand::Immunity { query, prune } => {
-            match heal_memory::HealMemory::default_path() {
-                Some(path) => {
-                    let mut memory = heal_memory::HealMemory::load(&path);
-                    if prune {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let forgotten = memory.prune_stale(now);
-                        memory
-                            .save()
-                            .map_err(|e| candle_core::Error::Msg(format!("save failed: {e}")))?;
-                        println!("[axiom] pruned {forgotten} faded heal record(s).\n");
-                    }
-                    println!("{}", memory.report_text(query.as_deref()));
-                    println!("\n[axiom] heal memory: {}", path.display());
+        AxiomCommand::Immunity { query, prune } => match heal_memory::HealMemory::default_path() {
+            Some(path) => {
+                let mut memory = heal_memory::HealMemory::load(&path);
+                if prune {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let forgotten = memory.prune_stale(now);
+                    memory
+                        .save()
+                        .map_err(|e| candle_core::Error::Msg(format!("save failed: {e}")))?;
+                    println!("[axiom] pruned {forgotten} faded heal record(s).\n");
                 }
-                None => println!("[axiom] heal memory disabled (AXIOM_HEAL_MEMORY=0)."),
+                println!("{}", memory.report_text(query.as_deref()));
+                println!("\n[axiom] heal memory: {}", path.display());
             }
-        }
+            None => println!("[axiom] heal memory disabled (AXIOM_HEAL_MEMORY=0)."),
+        },
         AxiomCommand::Chimera { command } => {
             let read = |p: &std::path::Path| -> candle_core::Result<String> {
                 std::fs::read_to_string(p)
@@ -1058,14 +1064,17 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     match chimera::check(&src) {
                         Ok(()) => println!("[chimera] {} OK", file.display()),
                         Err(e) => {
-                            return Err(candle_core::Error::Msg(format!("[chimera] check failed: {e}")));
+                            return Err(candle_core::Error::Msg(format!(
+                                "[chimera] check failed: {e}"
+                            )));
                         }
                     }
                 }
                 ChimeraCommand::Run { file } => {
                     let src = read(&file)?;
-                    let res = chimera::run_source(&src, None)
-                        .map_err(|e| candle_core::Error::Msg(format!("[chimera] run failed: {e}")))?;
+                    let res = chimera::run_source(&src, None).map_err(|e| {
+                        candle_core::Error::Msg(format!("[chimera] run failed: {e}"))
+                    })?;
                     for line in &res.emitted {
                         println!("{line}");
                     }
@@ -1075,8 +1084,9 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 }
                 ChimeraCommand::Prove { file, out } => {
                     let src = read(&file)?;
-                    let res = chimera::run_source(&src, None)
-                        .map_err(|e| candle_core::Error::Msg(format!("[chimera] run failed: {e}")))?;
+                    let res = chimera::run_source(&src, None).map_err(|e| {
+                        candle_core::Error::Msg(format!("[chimera] run failed: {e}"))
+                    })?;
                     let cert = chimera::certify(&res, key);
                     let json = serde_json::to_string_pretty(&cert)
                         .map_err(|e| candle_core::Error::Msg(format!("serialize cert: {e}")))?;
@@ -1153,7 +1163,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     Err(_) if fleet_key.is_some() => {
                         return Err(candle_core::Error::Msg(
                             "AXIOM_FLEET_KEY set but peer returned an unsigned payload".into(),
-                        ))
+                        ));
                     }
                     Err(_) => fetched, // back-compat: unsigned peer
                 };
@@ -1166,31 +1176,25 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     .map_err(|e| candle_core::Error::Msg(format!("memory save failed: {e}")))?;
                 println!(
                     "[axiom] swarm immunity merged from {url}: +{} new program(s), {} merged, +{} dir(s), {} conflict(s), {} byzantine-rejected",
-                    report.programs_added, report.programs_merged, report.dirs_added,
-                    report.belief_conflicts, report.byzantine_rejected
+                    report.programs_added,
+                    report.programs_merged,
+                    report.dirs_added,
+                    report.belief_conflicts,
+                    report.byzantine_rejected
                 );
                 println!("[axiom] local memory: {}", local.display());
             }
         },
         AxiomCommand::Fleet { command } => match command {
-            cli::FleetCommand::Status => {
-                let key_set = std::env::var("AXIOM_FLEET_KEY")
-                    .map(|k| !k.trim().is_empty())
-                    .unwrap_or(false);
-                let peers = std::env::var("AXIOM_DWE_PEERS").unwrap_or_default();
-                let listen = std::env::var("AXIOM_DWE_LISTEN").unwrap_or_default();
-                println!(
-                    "fleet key configured : {}",
-                    if key_set { "yes" } else { "NO (required to listen)" }
-                );
-                println!(
-                    "dwe listen address   : {}",
-                    if listen.trim().is_empty() { "(off)" } else { listen.trim() }
-                );
-                println!(
-                    "dwe peers            : {}",
-                    if peers.trim().is_empty() { "(none)" } else { peers.trim() }
-                );
+            cli::FleetCommand::Status { offline, base_url } => {
+                if offline {
+                    print_offline_fleet_status();
+                } else {
+                    let base_url = base_url
+                        .or_else(|| std::env::var("AXIOM_BASE_URL").ok())
+                        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
+                    print_live_fleet_status(&base_url)?;
+                }
             }
             cli::FleetCommand::Join { peer } => {
                 println!(
@@ -1201,6 +1205,119 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 println!("export AXIOM_DWE_LISTEN=0.0.0.0:<this-node-port>");
             }
         },
+    }
+    Ok(())
+}
+
+fn print_offline_fleet_status() {
+    let key_set = std::env::var("AXIOM_FLEET_KEY")
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    let prev_key_set = std::env::var("AXIOM_FLEET_KEY_PREV")
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    let peers = std::env::var("AXIOM_DWE_PEERS").unwrap_or_default();
+    let listen = std::env::var("AXIOM_DWE_LISTEN").unwrap_or_default();
+    println!(
+        "fleet key configured : {}",
+        if key_set {
+            "yes"
+        } else {
+            "NO (required to listen)"
+        }
+    );
+    println!(
+        "previous key window  : {}",
+        if prev_key_set { "yes" } else { "no" }
+    );
+    println!(
+        "dwe listen address   : {}",
+        if listen.trim().is_empty() {
+            "(off)"
+        } else {
+            listen.trim()
+        }
+    );
+    println!(
+        "dwe peers            : {}",
+        if peers.trim().is_empty() {
+            "(none)"
+        } else {
+            peers.trim()
+        }
+    );
+}
+
+fn print_live_fleet_status(base_url: &str) -> Result<()> {
+    let base = base_url.trim_end_matches('/');
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| candle_core::Error::Msg(format!("fleet status client failed: {e}")))?;
+    client
+        .get(format!("{base}/metrics"))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| {
+            candle_core::Error::Msg(format!(
+                "live fleet status requires reachable {base}/metrics ({e}); use --offline for env-only status"
+            ))
+        })?;
+    let status: serde_json::Value = client
+        .get(format!("{base}/v1/fleet/status"))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| {
+            candle_core::Error::Msg(format!(
+                "live fleet status failed at {base}/v1/fleet/status ({e}); use --offline for env-only status"
+            ))
+        })?
+        .json()
+        .map_err(|e| candle_core::Error::Msg(format!("fleet status JSON decode failed: {e}")))?;
+
+    println!("fleet server         : {base}");
+    println!(
+        "fleet key configured : {}",
+        if status["key_configured"].as_bool().unwrap_or(false) {
+            "yes"
+        } else {
+            "NO (required to listen)"
+        }
+    );
+    println!(
+        "previous key window  : {}",
+        if status["previous_key_configured"].as_bool().unwrap_or(false) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "dwe listen address   : {}",
+        status["listen"].as_str().unwrap_or("(off)")
+    );
+    let peers = status["peers"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|peers| !peers.is_empty())
+        .unwrap_or_else(|| "(none)".to_string());
+    println!("dwe peers            : {peers}");
+    let dwe = &status["dwe"];
+    println!(
+        "dwe sent/recv/apply/reject : {}/{}/{}/{}",
+        dwe["sent_fragments"].as_u64().unwrap_or(0),
+        dwe["received_fragments"].as_u64().unwrap_or(0),
+        dwe["applied_fragments"].as_u64().unwrap_or(0),
+        dwe["rejected_fragments"].as_u64().unwrap_or(0)
+    );
+    if let Some(error) = dwe["last_error"].as_str() {
+        println!("dwe last error       : {error}");
     }
     Ok(())
 }

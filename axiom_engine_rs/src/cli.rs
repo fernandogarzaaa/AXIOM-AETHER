@@ -184,7 +184,14 @@ pub enum DaemonCommand {
 #[derive(Debug, Subcommand)]
 pub enum FleetCommand {
     /// Show DWE wiring and whether a fleet key is set on this node.
-    Status,
+    Status {
+        /// Read only local environment instead of querying the live HTTP server.
+        #[arg(long)]
+        offline: bool,
+        /// Live Axiom base URL to query.
+        #[arg(long)]
+        base_url: Option<String>,
+    },
     /// Print the environment a peer node must set to join this fleet.
     Join {
         /// Peer address as host:port (its AXIOM_DWE_LISTEN).
