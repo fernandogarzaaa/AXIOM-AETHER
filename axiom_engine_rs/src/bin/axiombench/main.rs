@@ -9,6 +9,7 @@
 //!   --out <path>   results JSON path (default bench/results/<unix_ts>.json)
 
 mod cognition;
+mod corpus;
 mod cost;
 mod fleet;
 mod trust;
@@ -59,10 +60,19 @@ fn write_results_md(root: &Path, results: &[PillarResult], generated: u64) -> st
     std::fs::write(root.join("RESULTS.md"), md)
 }
 
-fn parse_args() -> (bool, Option<PathBuf>) {
+enum Command {
+    Bench { live: bool, out: Option<PathBuf> },
+    Corpus(Vec<String>),
+}
+
+fn parse_args() -> Command {
     let mut live = false;
     let mut out: Option<PathBuf> = None;
-    let mut args = std::env::args().skip(1);
+    let argv = std::env::args().skip(1).collect::<Vec<_>>();
+    if argv.first().map(String::as_str) == Some("corpus") {
+        return Command::Corpus(argv.into_iter().skip(1).collect());
+    }
+    let mut args = argv.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--live" => live = true,
@@ -70,11 +80,21 @@ fn parse_args() -> (bool, Option<PathBuf>) {
             _ => {}
         }
     }
-    (live, out)
+    Command::Bench { live, out }
 }
 
 fn main() {
-    let (live, out) = parse_args();
+    let command = parse_args();
+    let (live, out) = match command {
+        Command::Bench { live, out } => (live, out),
+        Command::Corpus(args) => {
+            if let Err(error) = corpus::run(&args) {
+                eprintln!("[axiombench] {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+    };
     let base_url =
         std::env::var("AXIOM_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
 
@@ -94,7 +114,8 @@ fn main() {
 
     let generated = unix_ts();
     let root = repo_root();
-    let out_path = out.unwrap_or_else(|| root.join("bench/results").join(format!("{generated}.json")));
+    let out_path =
+        out.unwrap_or_else(|| root.join("bench/results").join(format!("{generated}.json")));
     if let Some(parent) = out_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -102,7 +123,10 @@ fn main() {
         .and_then(|mut f| f.write_all(results_json(&results, generated).to_string().as_bytes()))
     {
         Ok(()) => println!("results -> {}", out_path.display()),
-        Err(e) => eprintln!("[axiombench] could not write results {}: {e}", out_path.display()),
+        Err(e) => eprintln!(
+            "[axiombench] could not write results {}: {e}",
+            out_path.display()
+        ),
     }
     if let Err(e) = write_results_md(&root, &results, generated) {
         eprintln!("[axiombench] could not write RESULTS.md: {e}");
