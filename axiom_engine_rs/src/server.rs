@@ -4984,12 +4984,57 @@ pub async fn run_server(
     // deltas into the named session — the network mirror of /v1/cluster/sync.
     if let Ok(listen_addr) = std::env::var("AXIOM_DWE_LISTEN") {
         let listen_addr = listen_addr.trim().to_string();
-        if !listen_addr.is_empty() {
+        // Fail closed: never accept peer weight deltas without a fleet key to
+        // authenticate them. Configured-but-keyless ⇒ skip the listener.
+        let verify_secret = if listen_addr.is_empty() {
+            None
+        } else {
+            match fleet_key() {
+                Some(secret) => Some(secret),
+                None => {
+                    eprintln!(
+                        "[dwe] AXIOM_DWE_LISTEN is set but AXIOM_FLEET_KEY is not — refusing to \
+                         start an unauthenticated weight-fragment listener"
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(verify_secret) = verify_secret {
             let telemetry = state.dwe_bus.telemetry_handle();
             let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<crate::dwe::DweFragment>(64);
             let apply_state = state.clone();
             tokio::spawn(async move {
                 while let Some(fragment) = in_rx.recv().await {
+                    // Authenticate before doing any work with the fragment.
+                    if let Err(e) = crate::dwe::verify_fragment(&fragment, &verify_secret) {
+                        eprintln!("[dwe] rejected fragment for '{}': {e}", fragment.session_id);
+                        continue;
+                    }
+                    // Replay rejection by (session, sequence), mirroring
+                    // /v1/cluster/sync's monotone sequence guard.
+                    {
+                        let seq_key = format!("dwe:{}", fragment.session_id);
+                        let Ok(mut seqs) = apply_state.sequence_versions.write() else {
+                            continue;
+                        };
+                        if let Some(prev) = seqs.get(&seq_key) {
+                            if fragment.sequence <= prev.version {
+                                eprintln!(
+                                    "[dwe] stale fragment seq {} <= {} for '{}'; dropped",
+                                    fragment.sequence, prev.version, fragment.session_id
+                                );
+                                continue;
+                            }
+                        }
+                        seqs.insert(
+                            seq_key,
+                            SequenceState {
+                                version: fragment.sequence,
+                                timestamp: unix_now() as i64,
+                            },
+                        );
+                    }
                     let Ok(mut sessions) = apply_state.sessions.write() else {
                         continue;
                     };

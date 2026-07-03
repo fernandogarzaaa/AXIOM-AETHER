@@ -1,0 +1,44 @@
+{"claim": "The Axiom server listens on port 3000.", "evidence": "The Axiom server listens on port 3000 by default when started.", "supported": true}
+{"claim": "Compression is enabled by default.", "evidence": "Responses input compression is enabled by default whenever compression is active.", "supported": true}
+{"claim": "The proxy forwards traffic to the real Anthropic API.", "evidence": "The forwarder pins the proxy upstream to the real Anthropic API endpoint.", "supported": true}
+{"claim": "Fragments carry a fleet-key HMAC.", "evidence": "Each DWE fragment carries a fleet-key HMAC over its authenticated fields.", "supported": true}
+{"claim": "The listener refuses to start without a fleet key.", "evidence": "The DWE listener refuses to start without a configured fleet key.", "supported": true}
+{"claim": "Session recording is disabled by default.", "evidence": "Session recording is disabled by default and enabled with an environment variable.", "supported": true}
+{"claim": "Secrets are redacted before recordings are written.", "evidence": "Secret values are redacted at write time before recordings are persisted to disk.", "supported": true}
+{"claim": "The conformal gate reports a coverage guarantee.", "evidence": "The conformal gate reports a stated coverage guarantee for supported claims.", "supported": true}
+{"claim": "Weight merging supports the DARE-TIES method.", "evidence": "Weight merging supports both the DARE-TIES method and a uniform alpha blend.", "supported": true}
+{"claim": "The skeleton digest strips function bodies.", "evidence": "The structural skeleton digest strips function bodies while keeping declarations.", "supported": true}
+{"claim": "Healing recreates missing directories.", "evidence": "The self-healing runner recreates missing directories before retrying the command.", "supported": true}
+{"claim": "The immunity merge verifies provenance before trusting a peer.", "evidence": "The immunity merge verifies peer provenance before trusting and merging the payload.", "supported": true}
+{"claim": "Belief fusion uses Dempster-Shafer combination.", "evidence": "Swarm belief fusion uses reliability-discounted Dempster-Shafer combination.", "supported": true}
+{"claim": "The savings receipt reports tokens saved.", "evidence": "The per-session savings receipt reports bytes in, bytes forwarded, and tokens saved.", "supported": true}
+{"claim": "The WebSocket transport relays frames to the upstream.", "evidence": "The WebSocket transport transparently relays frames to the upstream Responses socket.", "supported": true}
+{"claim": "Codex signs in with a ChatGPT subscription token.", "evidence": "Codex signs in with a ChatGPT subscription token that reaches the ChatGPT backend.", "supported": true}
+{"claim": "The recorder writes one JSONL file per session.", "evidence": "The recorder writes one JSONL file per session under the sessions directory.", "supported": true}
+{"claim": "Compression preserves the position of user messages.", "evidence": "In-place compression preserves the position of every user and structural message.", "supported": true}
+{"claim": "The gate calibrates a threshold from labeled samples.", "evidence": "The conformal gate calibrates a threshold from labeled score and support samples.", "supported": true}
+{"claim": "Replay rejection drops stale fragment sequences.", "evidence": "Replay rejection drops any fragment whose sequence is stale for that session.", "supported": true}
+{"claim": "The MCP server exposes Axiom tools over stdio.", "evidence": "The MCP server exposes Axiom compression and memory tools over a stdio transport.", "supported": true}
+{"claim": "The hypervisor route lists mounted directory entries.", "evidence": "The hypervisor list route returns mounted directory entries from the neural VFS.", "supported": true}
+{"claim": "The lunar rover measured soil acidity on Mars.", "evidence": "The Axiom server listens on port 3000 by default when started.", "supported": false}
+{"claim": "Quarterly revenue grew fifteen percent in Europe.", "evidence": "Responses input compression is enabled by default whenever compression is active.", "supported": false}
+{"claim": "The recipe requires two cups of almond flour.", "evidence": "The forwarder pins the proxy upstream to the real Anthropic API endpoint.", "supported": false}
+{"claim": "Migratory whales navigate using magnetic fields.", "evidence": "Each DWE fragment carries a fleet-key HMAC over its authenticated fields.", "supported": false}
+{"claim": "The orchestra performed a symphony in D minor.", "evidence": "The DWE listener refuses to start without a configured fleet key.", "supported": false}
+{"claim": "Volcanic ash disrupted transatlantic flights in spring.", "evidence": "Session recording is disabled by default and enabled with an environment variable.", "supported": false}
+{"claim": "The museum acquired a Renaissance oil painting.", "evidence": "Secret values are redacted at write time before recordings are persisted to disk.", "supported": false}
+{"claim": "Coral reefs bleached during the warm ocean current.", "evidence": "The conformal gate reports a stated coverage guarantee for supported claims.", "supported": false}
+{"claim": "The marathon route climbed three steep hills.", "evidence": "Weight merging supports both the DARE-TIES method and a uniform alpha blend.", "supported": false}
+{"claim": "The vineyard harvested grapes in late September.", "evidence": "The structural skeleton digest strips function bodies while keeping declarations.", "supported": false}
+{"claim": "The Axiom server listens on port 8080.", "evidence": "The Axiom server listens on port 3000 by default when started.", "supported": false}
+{"claim": "Compression is disabled by default.", "evidence": "Responses input compression is enabled by default whenever compression is active.", "supported": false}
+{"claim": "The listener starts without a fleet key.", "evidence": "The DWE listener refuses to start without a configured fleet key.", "supported": false}
+{"claim": "Session recording is enabled by default.", "evidence": "Session recording is disabled by default and enabled with an environment variable.", "supported": false}
+{"claim": "Secrets are written verbatim into recordings.", "evidence": "Secret values are redacted at write time before recordings are persisted to disk.", "supported": false}
+{"claim": "Weight merging supports only a uniform alpha blend.", "evidence": "Weight merging supports both the DARE-TIES method and a uniform alpha blend.", "supported": false}
+{"claim": "The skeleton digest keeps function bodies intact.", "evidence": "The structural skeleton digest strips function bodies while keeping declarations.", "supported": false}
+{"claim": "The immunity merge trusts a peer without verifying provenance.", "evidence": "The immunity merge verifies peer provenance before trusting and merging the payload.", "supported": false}
+{"claim": "Replay rejection accepts stale fragment sequences.", "evidence": "Replay rejection drops any fragment whose sequence is stale for that session.", "supported": false}
+{"claim": "Compression discards the position of user messages.", "evidence": "In-place compression preserves the position of every user and structural message.", "supported": false}
+{"claim": "The recorder writes every session into a single shared file.", "evidence": "The recorder writes one JSONL file per session under the sessions directory.", "supported": false}
+{"claim": "The WebSocket transport blocks frames from the upstream.", "evidence": "The WebSocket transport transparently relays frames to the upstream Responses socket.", "supported": false}

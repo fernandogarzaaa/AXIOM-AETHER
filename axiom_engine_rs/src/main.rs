@@ -1172,6 +1172,35 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 println!("[axiom] local memory: {}", local.display());
             }
         },
+        AxiomCommand::Fleet { command } => match command {
+            cli::FleetCommand::Status => {
+                let key_set = std::env::var("AXIOM_FLEET_KEY")
+                    .map(|k| !k.trim().is_empty())
+                    .unwrap_or(false);
+                let peers = std::env::var("AXIOM_DWE_PEERS").unwrap_or_default();
+                let listen = std::env::var("AXIOM_DWE_LISTEN").unwrap_or_default();
+                println!(
+                    "fleet key configured : {}",
+                    if key_set { "yes" } else { "NO (required to listen)" }
+                );
+                println!(
+                    "dwe listen address   : {}",
+                    if listen.trim().is_empty() { "(off)" } else { listen.trim() }
+                );
+                println!(
+                    "dwe peers            : {}",
+                    if peers.trim().is_empty() { "(none)" } else { peers.trim() }
+                );
+            }
+            cli::FleetCommand::Join { peer } => {
+                println!(
+                    "# Add this node to the fleet by exporting (fleet key MUST match all peers):"
+                );
+                println!("export AXIOM_FLEET_KEY=<shared-secret>");
+                println!("export AXIOM_DWE_PEERS={peer}");
+                println!("export AXIOM_DWE_LISTEN=0.0.0.0:<this-node-port>");
+            }
+        },
     }
     Ok(())
 }

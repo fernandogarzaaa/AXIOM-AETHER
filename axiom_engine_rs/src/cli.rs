@@ -107,6 +107,11 @@ pub enum AxiomCommand {
         #[command(subcommand)]
         command: SwarmCommand,
     },
+    /// Fleet operations: inspect DWE wiring and print peer-join config.
+    Fleet {
+        #[command(subcommand)]
+        command: FleetCommand,
+    },
     /// Report what Axiom has learned about program failures (acquired immunity):
     /// remembered heals, per-program failure-tension history, and confidence.
     Immunity {
@@ -174,6 +179,17 @@ pub enum DaemonCommand {
     Stop,
     /// Print daemon PID, health, and log path.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FleetCommand {
+    /// Show DWE wiring and whether a fleet key is set on this node.
+    Status,
+    /// Print the environment a peer node must set to join this fleet.
+    Join {
+        /// Peer address as host:port (its AXIOM_DWE_LISTEN).
+        peer: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

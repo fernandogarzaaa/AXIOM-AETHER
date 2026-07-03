@@ -91,6 +91,12 @@ const SUPPORT_LOW: f32 = 0.30;
 /// Default δ for conformal coverage (0.10 → 90% coverage of genuinely supported claims).
 const DEFAULT_CONFORMAL_DELTA: f32 = 0.10;
 
+/// Shipped conformal threshold, calibrated on `bench/trust/claims.jsonl` at
+/// δ=0.10 (see `tests/trust_calibration.rs`). Active by default so `/v1/verify`
+/// carries a stated coverage guarantee out of the box regardless of how the
+/// server is launched; `AXIOM_CONFORMAL_THRESHOLD` overrides it.
+const SHIPPED_CONFORMAL_THRESHOLD: f32 = 0.6666667;
+
 /// Conformal factuality gate: calibrated support threshold replacing the
 /// hardcoded `SUPPORT_HIGH`/`SUPPORT_LOW` constants.
 ///
@@ -140,26 +146,24 @@ impl ConformalGate {
         }
     }
 
-    /// Load from environment variables, returning `None` when neither is set.
+    /// The active gate. `AXIOM_CONFORMAL_THRESHOLD` / `AXIOM_CONFORMAL_DELTA`
+    /// override the shipped calibrated defaults; absent an override, the
+    /// shipped calibrated gate is returned (never `None`), so the coverage
+    /// guarantee is active out of the box no matter how the server is started.
     pub fn from_env() -> Option<Self> {
         let delta = std::env::var("AXIOM_CONFORMAL_DELTA")
             .ok()
             .and_then(|d| d.trim().parse::<f32>().ok())
-            .map(|d| d.clamp(0.0, 1.0));
+            .map(|d| d.clamp(0.0, 1.0))
+            .unwrap_or(DEFAULT_CONFORMAL_DELTA);
 
-        if let Ok(t) = std::env::var("AXIOM_CONFORMAL_THRESHOLD") {
-            if let Ok(v) = t.trim().parse::<f32>() {
-                return Some(Self {
-                    threshold: v.clamp(0.0, 1.0),
-                    delta: delta.unwrap_or(DEFAULT_CONFORMAL_DELTA),
-                });
-            }
-        }
+        let threshold = std::env::var("AXIOM_CONFORMAL_THRESHOLD")
+            .ok()
+            .and_then(|t| t.trim().parse::<f32>().ok())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(SHIPPED_CONFORMAL_THRESHOLD);
 
-        delta.map(|d| Self {
-            threshold: SUPPORT_HIGH,
-            delta: d,
-        })
+        Some(Self { threshold, delta })
     }
 
     /// Verdict for a support score under this gate.
@@ -684,14 +688,17 @@ mod tests {
     }
 
     #[test]
-    fn conformal_gate_from_env_returns_none_without_vars() {
-        // As long as the conformal env vars are unset (typical test env), from_env
-        // returns None and verify uses the hardcoded thresholds.
+    fn conformal_gate_from_env_ships_calibrated_default() {
+        // With the conformal env vars unset (typical test env), from_env now
+        // returns the shipped calibrated gate (never None), so the coverage
+        // guarantee is active out of the box regardless of launch method.
         if std::env::var("AXIOM_CONFORMAL_THRESHOLD").is_err()
             && std::env::var("AXIOM_CONFORMAL_DELTA").is_err()
         {
-            assert!(ConformalGate::from_env().is_none());
-            // verify should behave exactly as before.
+            let gate = ConformalGate::from_env().expect("shipped default gate is always present");
+            assert!((gate.threshold - SHIPPED_CONFORMAL_THRESHOLD).abs() < 1e-6);
+            assert!((gate.delta - DEFAULT_CONFORMAL_DELTA).abs() < 1e-6);
+            // A fully-grounded claim is still Supported under the shipped gate.
             let r = verify("Axiom uses online test-time training.", EVIDENCE);
             assert_eq!(r.claims[0].verdict, Verdict::Supported);
         }
