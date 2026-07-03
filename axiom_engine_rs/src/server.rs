@@ -4986,15 +4986,21 @@ pub async fn run_server(
         let listen_addr = listen_addr.trim().to_string();
         // Fail closed: never accept peer weight deltas without a fleet key to
         // authenticate them. Configured-but-keyless ⇒ skip the listener.
-        let fleet_secret = fleet_key();
-        if !listen_addr.is_empty() && fleet_secret.is_none() {
-            eprintln!(
-                "[dwe] AXIOM_DWE_LISTEN is set but AXIOM_FLEET_KEY is not — refusing to start an \
-                 unauthenticated weight-fragment listener"
-            );
-        }
-        if !listen_addr.is_empty() && fleet_secret.is_some() {
-            let verify_secret = fleet_secret.expect("checked is_some");
+        let verify_secret = if listen_addr.is_empty() {
+            None
+        } else {
+            match fleet_key() {
+                Some(secret) => Some(secret),
+                None => {
+                    eprintln!(
+                        "[dwe] AXIOM_DWE_LISTEN is set but AXIOM_FLEET_KEY is not — refusing to \
+                         start an unauthenticated weight-fragment listener"
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(verify_secret) = verify_secret {
             let telemetry = state.dwe_bus.telemetry_handle();
             let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<crate::dwe::DweFragment>(64);
             let apply_state = state.clone();
