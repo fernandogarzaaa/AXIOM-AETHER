@@ -94,10 +94,18 @@ impl DweBus {
     }
 
     pub fn broadcast(&self, mut fragment: DweFragment) {
+        // Stamp a process-monotonic sequence so a peer's (session, sequence)
+        // replay guard never wrongly drops two legitimate updates produced in
+        // the same wall-clock second (producers seed `sequence` from seconds).
+        // A true replay re-sends identical signed bytes → identical sequence →
+        // correctly rejected; distinct updates always differ here.
+        static DWE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fragment.sequence = DWE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Sign every outbound fragment when a fleet key is configured so peers
-        // can authenticate it. Unsigned broadcast is only meaningful for a
-        // keyless (single-node / trusted-LAN) setup, where the listener also
-        // refuses to run — so in practice a peer only ever sees signed frames.
+        // can authenticate it. Signing happens AFTER the sequence is stamped so
+        // the HMAC covers the final sequence. Unsigned broadcast is only
+        // meaningful for a keyless (single-node) setup, where the listener also
+        // refuses to run — so a peer only ever sees signed frames.
         if let Ok(key) = std::env::var("AXIOM_FLEET_KEY") {
             if !key.trim().is_empty() {
                 sign_fragment(&mut fragment, key.as_bytes());

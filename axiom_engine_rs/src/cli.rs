@@ -107,7 +107,7 @@ pub enum AxiomCommand {
         #[command(subcommand)]
         command: SwarmCommand,
     },
-    /// Fleet operations: inspect DWE/immunity wiring and print peer-join config.
+    /// Fleet operations: inspect DWE wiring and print peer-join config.
     Fleet {
         #[command(subcommand)]
         command: FleetCommand,
