@@ -19,6 +19,9 @@ try {
     $env:CARGO_INCREMENTAL = '0'
     $env:CARGO_TARGET_DIR = 'target-test'
     cargo build --features tools --bin axiom_engine --bin axiombench --locked
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build failed with exit code $LASTEXITCODE"
+    }
 } finally {
     Pop-Location
 }
@@ -52,10 +55,28 @@ $mockJob = Start-Job -ScriptBlock {
 
 $proxy = $null
 try {
-    Start-Sleep -Milliseconds 500
-    if ($mockJob.State -ne 'Running') {
-        $mockError = Receive-Job $mockJob -ErrorAction SilentlyContinue | Out-String
-        throw "Responses mock did not start on port $MockPort. $mockError"
+    $mockReady = $false
+    for ($i = 1; $i -le 50; $i++) {
+        if ($mockJob.State -ne 'Running') {
+            $mockError = Receive-Job $mockJob -ErrorAction SilentlyContinue | Out-String
+            throw "Responses mock did not start on port $MockPort. $mockError"
+        }
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $connect = $client.BeginConnect('127.0.0.1', $MockPort, $null, $null)
+            if ($connect.AsyncWaitHandle.WaitOne(200)) {
+                $client.EndConnect($connect)
+                $mockReady = $true
+                break
+            }
+        } catch {
+        } finally {
+            $client.Close()
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    if (-not $mockReady) {
+        throw "Responses mock did not become ready on port $MockPort"
     }
 
     $env:AXIOM_PRODUCTION_BPE = '1'
@@ -102,6 +123,9 @@ try {
     try {
         $env:AXIOM_BASE_URL = "http://127.0.0.1:$ProxyPort"
         cargo run --features tools --bin axiombench --locked -- --live --out $Out
+        if ($LASTEXITCODE -ne 0) {
+            throw "axiombench live replay failed with exit code $LASTEXITCODE"
+        }
 
         $resultPath = Resolve-Path $Out
         $result = Get-Content $resultPath -Raw | ConvertFrom-Json
