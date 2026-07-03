@@ -59,5 +59,9 @@ jobs:
         working-directory: axiom_engine_rs
         run: cargo test --release --locked
 
+      - name: AxiomBench (deterministic pillars)
+        working-directory: axiom_engine_rs
+        run: cargo run --release --features tools --bin axiombench
+
       - name: End-to-end smoke (every pillar composes)
         run: ./scripts/demo_end_to_end.sh

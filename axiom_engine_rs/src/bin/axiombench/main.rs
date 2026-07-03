@@ -8,13 +8,9 @@
 //!   --live         include the cost pillar (needs a running proxy + corpus)
 //!   --out <path>   results JSON path (default bench/results/<unix_ts>.json)
 
-#[path = "axiombench_cognition.rs"]
 mod cognition;
-#[path = "axiombench_cost.rs"]
 mod cost;
-#[path = "axiombench_fleet.rs"]
 mod fleet;
-#[path = "axiombench_trust.rs"]
 mod trust;
 
 use cognition::PillarResult;
