@@ -104,6 +104,72 @@ async fn compressed_bad_request_retries_original_and_preserves_structural_items(
 }
 
 #[tokio::test]
+async fn compressed_responses_preserves_order_across_multiple_runs() {
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    async fn upstream(
+        State(captured): State<Arc<Mutex<Vec<Value>>>>,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        captured.lock().unwrap().push(body);
+        (
+            StatusCode::OK,
+            Json(json!({"id":"resp_multi","object":"response"})),
+        )
+    }
+    let upstream_app = Router::new()
+        .route("/v1/responses", post(upstream))
+        .with_state(captured.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+
+    let test_pipeline = tokio::task::spawn_blocking(pipeline).await.unwrap();
+    let state = AppState::new(test_pipeline, "test".into())
+        .with_openai_forwarder(Some(OpenAiForwarder::new(None, Some(base))))
+        .with_compressor_config(CompressorConfig {
+            enabled: true,
+            heavy_message_threshold_tokens: 1,
+            recall_top_k: 8,
+        });
+    let app = create_router(state);
+    let first_history = "first historical assistant answer ".repeat(120);
+    let second_history = "second historical assistant answer ".repeat(120);
+    let original = json!({"model":"gpt-5.5","input":[
+        {"role":"assistant","content":first_history},
+        {"role":"user","content":"bridge question"},
+        {"role":"assistant","content":second_history},
+        {"role":"user","content":"continue"}
+    ]});
+    let response = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test")
+                .body(Body::from(original.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let input = requests[0]["input"].as_array().unwrap();
+    assert_eq!(input.len(), 4);
+    assert!(input[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("<axiom_context_fingerprint"));
+    assert_eq!(input[1], original["input"][1]);
+    assert!(input[2]["content"]
+        .as_str()
+        .unwrap()
+        .contains("<axiom_context_fingerprint"));
+    assert_eq!(input[3], original["input"][3]);
+    task.abort();
+}
+
+#[tokio::test]
 async fn recording_persists_scrubbed_exchange_when_enabled() {
     let rec_dir = std::env::temp_dir().join(format!(
         "axiom_recproxy_{}",
