@@ -52,6 +52,12 @@ $mockJob = Start-Job -ScriptBlock {
 
 $proxy = $null
 try {
+    Start-Sleep -Milliseconds 500
+    if ($mockJob.State -ne 'Running') {
+        $mockError = Receive-Job $mockJob -ErrorAction SilentlyContinue | Out-String
+        throw "Responses mock did not start on port $MockPort. $mockError"
+    }
+
     $env:AXIOM_PRODUCTION_BPE = '1'
     $env:AXIOM_TOKENIZER = Join-Path $Repo 'checkpoints\axiom_bpe.json'
     $env:AXIOM_BPE_CKPT = Join-Path $Repo 'checkpoints\axiom_production_bpe.bin'
@@ -96,6 +102,13 @@ try {
     try {
         $env:AXIOM_BASE_URL = "http://127.0.0.1:$ProxyPort"
         cargo run --features tools --bin axiombench --locked -- --live --out $Out
+
+        $resultPath = Resolve-Path $Out
+        $result = Get-Content $resultPath -Raw | ConvertFrom-Json
+        $cost = $result.results | Where-Object { $_.name -eq 'cost' } | Select-Object -First 1
+        if (-not $cost -or [int]$cost.detail.replayed -le 0) {
+            throw "Live cost replay produced no successful replays; see $resultPath"
+        }
     } finally {
         Pop-Location
     }
