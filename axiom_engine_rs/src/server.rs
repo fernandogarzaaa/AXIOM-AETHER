@@ -37,7 +37,7 @@ use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::task::spawn_blocking;
+use tokio::task::{spawn_blocking, JoinSet};
 use tower_http::cors::CorsLayer;
 use tower_http::decompression::RequestDecompressionLayer;
 use uuid::Uuid;
@@ -72,6 +72,7 @@ use crate::vibe_memory::MasterVibe;
 use crate::weight_merge::{fleet_dare_ties, merge_checkpoint_files_with, MergeMethod, MergeSummary};
 
 const MAX_ACTIVE_VRAM_SESSIONS: usize = 32;
+const MAX_RESPONSES_RUN_CONCURRENCY: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -1409,6 +1410,26 @@ fn responses_compression_enabled() -> bool {
     }
 }
 
+fn responses_run_concurrency(run_count: usize) -> usize {
+    run_count.clamp(1, MAX_RESPONSES_RUN_CONCURRENCY)
+}
+
+fn cleanup_responses_run_subsessions(
+    state: &AppState,
+    session_id: &str,
+    run_count: usize,
+    is_transient: bool,
+) {
+    if !is_transient {
+        return;
+    }
+    for ordinal in 0..run_count {
+        let _ = state
+            .ttt_sessions
+            .take_session(&format!("{session_id}#r{ordinal}"));
+    }
+}
+
 async fn compressed_responses_payload(
     state: &AppState,
     body: &Value,
@@ -1433,28 +1454,82 @@ async fn compressed_responses_payload(
     let session_id = session_override
         .map(str::to_string)
         .unwrap_or_else(|| format!("responses-{}", Uuid::new_v4()));
+    let is_transient_session = session_override.is_none();
 
     // One fingerprint per contiguous run, each adapted in its own sub-session
-    // so a run's recall vector reflects only that run's context.
-    let mut fingerprints = Vec::with_capacity(plan.runs.len());
-    for (ordinal, run) in plan.runs.iter().enumerate() {
-        let run_session = format!("{session_id}#r{ordinal}");
-        let fp = responses_run_fingerprint(state, &run_session, &run.context, &plan.query).await?;
-        fingerprints.push(fp);
-    }
-
-    let compressed = apply_plan(body, &plan, &fingerprints)
-        .ok_or_else(|| ApiError::Internal("Responses compression transform failed".into()))?;
-
-    // Transient sessions (no client x-axiom-session-id) must not leak their
-    // per-run adaptation sub-sessions — nothing will ever drop them.
-    if session_override.is_none() {
-        for ordinal in 0..plan.runs.len() {
-            let _ = state
-                .ttt_sessions
-                .take_session(&format!("{session_id}#r{ordinal}"));
+    // so a run's recall vector reflects only that run's context. Runs are
+    // independent, so fan them out with a small cap and restore plan order
+    // before applying the transform.
+    let concurrency = responses_run_concurrency(plan.runs.len());
+    let mut fingerprints = vec![String::new(); plan.runs.len()];
+    let mut tasks = JoinSet::new();
+    let mut next_run = 0;
+    while next_run < plan.runs.len() || !tasks.is_empty() {
+        while next_run < plan.runs.len() && tasks.len() < concurrency {
+            let ordinal = next_run;
+            let run = &plan.runs[ordinal];
+            let state = state.clone();
+            let run_session = format!("{session_id}#r{ordinal}");
+            let context = run.context.clone();
+            let query = plan.query.clone();
+            tasks.spawn(async move {
+                let fingerprint =
+                    responses_run_fingerprint(&state, &run_session, &context, &query).await?;
+                Ok::<_, ApiError>((ordinal, fingerprint))
+            });
+            next_run += 1;
+        }
+        if let Some(result) = tasks.join_next().await {
+            let (ordinal, fingerprint) = match result {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => {
+                    cleanup_responses_run_subsessions(
+                        state,
+                        &session_id,
+                        plan.runs.len(),
+                        is_transient_session,
+                    );
+                    return Err(error);
+                }
+                Err(error) => {
+                    cleanup_responses_run_subsessions(
+                        state,
+                        &session_id,
+                        plan.runs.len(),
+                        is_transient_session,
+                    );
+                    return Err(ApiError::Internal(format!(
+                        "Responses run task failed: {error}"
+                    )));
+                }
+            };
+            fingerprints[ordinal] = fingerprint;
         }
     }
+
+    // Transient sessions (no client x-axiom-session-id) must not leak their
+    // per-run adaptation sub-sessions — nothing will ever drop them. Runs on
+    // BOTH the success and error branches of apply_plan and task fan-in.
+    let compressed = match apply_plan(body, &plan, &fingerprints) {
+        Some(c) => c,
+        None => {
+            cleanup_responses_run_subsessions(
+                state,
+                &session_id,
+                plan.runs.len(),
+                is_transient_session,
+            );
+            return Err(ApiError::Internal(
+                "Responses compression transform failed".into(),
+            ));
+        }
+    };
+    cleanup_responses_run_subsessions(
+        state,
+        &session_id,
+        plan.runs.len(),
+        is_transient_session,
+    );
 
     let bytes_in = serde_json::to_vec(body).map(|value| value.len()).unwrap_or(0) as u64;
     let bytes_out = serde_json::to_vec(&compressed)
