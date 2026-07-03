@@ -30,6 +30,11 @@ pub struct DweFragment {
     pub sequence: u64,
     pub layers: Vec<DweLayerDelta>,
     pub state_hash: String,
+    /// Fleet-key HMAC over the authenticated fields (see `sign_fragment`).
+    /// `None` on an unsigned fragment; the listener rejects unsigned input
+    /// when a fleet key is configured.
+    #[serde(default)]
+    pub hmac: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -195,6 +200,7 @@ pub fn extract_delta_fragment(
         sequence,
         layers,
         state_hash,
+        hmac: None,
     })
 }
 
@@ -219,6 +225,47 @@ pub fn deserialize_fragment(bytes: &[u8]) -> Result<DweFragment, String> {
         ));
     }
     bincode::deserialize(bytes).map_err(|e| e.to_string())
+}
+
+/// Deterministic HMAC preimage over the authenticated fields (everything but
+/// the `hmac` itself), so a signature covers schema, session, sequence, every
+/// layer delta, and the state hash.
+pub fn fragment_preimage(fragment: &DweFragment) -> Vec<u8> {
+    let shadow = (
+        &fragment.schema,
+        &fragment.session_id,
+        fragment.sequence,
+        &fragment.layers,
+        &fragment.state_hash,
+    );
+    bincode::serialize(&shadow).unwrap_or_default()
+}
+
+/// Sign a fragment in place with the fleet key (reuses the provenance HMAC).
+pub fn sign_fragment(fragment: &mut DweFragment, key: &[u8]) {
+    let mac = crate::provenance::hmac_sha256_hex(key, &fragment_preimage(fragment));
+    fragment.hmac = Some(mac);
+}
+
+/// Verify a fragment's HMAC against the fleet key (constant-time compare over
+/// equal-length hex). Rejects unsigned fragments.
+pub fn verify_fragment(fragment: &DweFragment, key: &[u8]) -> Result<(), String> {
+    let Some(mac) = fragment.hmac.as_deref() else {
+        return Err("fragment is unsigned".into());
+    };
+    let expected = crate::provenance::hmac_sha256_hex(key, &fragment_preimage(fragment));
+    if expected.len() != mac.len() {
+        return Err("hmac length mismatch".into());
+    }
+    let diff = expected
+        .bytes()
+        .zip(mac.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    if diff == 0 {
+        Ok(())
+    } else {
+        Err("hmac verification failed".into())
+    }
 }
 
 pub fn apply_fragment(
@@ -332,5 +379,47 @@ mod tests {
             local[0].to_vec2::<f32>().unwrap(),
             vec![vec![1.0, 1.0], vec![1.0, 1.0]]
         );
+    }
+
+    fn sample_fragment() -> DweFragment {
+        DweFragment {
+            schema: "axiom.dwe.v1".into(),
+            session_id: "s1".into(),
+            sequence: 7,
+            layers: vec![DweLayerDelta {
+                layer_index: 0,
+                shape: vec![2],
+                values: vec![1.0, 2.0],
+            }],
+            state_hash: "abc".into(),
+            hmac: None,
+        }
+    }
+
+    #[test]
+    fn signed_fragment_verifies_with_same_key() {
+        let key = b"fleet-secret";
+        let mut f = sample_fragment();
+        sign_fragment(&mut f, key);
+        assert!(f.hmac.is_some());
+        assert!(verify_fragment(&f, key).is_ok());
+    }
+
+    #[test]
+    fn tampered_fragment_fails_verification() {
+        let key = b"fleet-secret";
+        let mut f = sample_fragment();
+        sign_fragment(&mut f, key);
+        f.layers[0].values[0] = 99.0;
+        assert!(verify_fragment(&f, key).is_err());
+    }
+
+    #[test]
+    fn wrong_key_and_missing_hmac_fail() {
+        let mut f = sample_fragment();
+        sign_fragment(&mut f, b"key-a");
+        assert!(verify_fragment(&f, b"key-b").is_err());
+        f.hmac = None;
+        assert!(verify_fragment(&f, b"key-a").is_err());
     }
 }
