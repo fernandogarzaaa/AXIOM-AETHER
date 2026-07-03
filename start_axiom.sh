@@ -57,6 +57,9 @@ export AXIOM_TTT_COMPRESS_TOP_K="${AXIOM_TTT_COMPRESS_TOP_K:-32}"
 # Responses (Codex/OpenAI) input compression is ON by default when compression
 # is enabled. Export AXIOM_RESPONSES_COMPRESS=0 before launching to opt the
 # Responses path out specifically.
+# Session recording (scrubbed request/response JSONL under ~/.axiom/sessions)
+# is OFF by default. Export AXIOM_SESSION_RECORD=1 to enable;
+# AXIOM_SESSIONS_DIR overrides the output directory.
 
 # --- Compute device: GPU-first, CPU fallback -------------------------------
 # Default to "auto": the engine selects CUDA when the `cuda` feature is compiled

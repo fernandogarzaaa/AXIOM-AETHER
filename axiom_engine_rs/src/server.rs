@@ -279,6 +279,10 @@ pub struct AppState {
     pub controls: Arc<CompressionControls>,
     /// Safe user-mode VFS loopback that feeds file reads into TTT prefill.
     pub neural_vfs: Arc<NeuralVfs>,
+    /// Per-session compression savings ledger: session_id → (bytes_in,
+    /// bytes_forwarded). Fed at each compression record site; drained into a
+    /// one-line receipt when the session drops; summed for /metrics.
+    pub savings: Arc<Mutex<HashMap<String, (u64, u64)>>>,
     /// User-mode polymorphic runtime status and execution wrapper.
     pub poly_jit: Arc<PolyJitEngine>,
     /// SR-TTT exact residual path for high-surprisal identifiers.
@@ -321,6 +325,7 @@ impl AppState {
                 &CompressorConfig::default(),
             )),
             neural_vfs: Arc::new(NeuralVfs::new()),
+            savings: Arc::new(Mutex::new(HashMap::new())),
             poly_jit: Arc::new(PolyJitEngine::default()),
             exact_residual_cache: Arc::new(ExactAttentionResidualCache::default()),
             dwe_bus: Arc::new(DweBus::from_env()),
@@ -1291,12 +1296,27 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     state.refresh_session_metrics()?;
+    let mut rendered = metrics::render_metrics();
+    // Compression savings: lifetime monotone counters (session drops remove
+    // ledger entries for receipts, so the ledger alone would undercount).
+    let bytes_in = LIFETIME_SAVINGS_IN.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes_out = LIFETIME_SAVINGS_OUT.load(std::sync::atomic::Ordering::Relaxed);
+    let ratio = if bytes_in > 0 && bytes_out < bytes_in {
+        (bytes_in - bytes_out) as f64 / bytes_in as f64
+    } else {
+        0.0
+    };
+    rendered.push_str(&format!(
+        "# TYPE axiom_savings_bytes_in_total counter\naxiom_savings_bytes_in_total {bytes_in}\n\
+         # TYPE axiom_savings_bytes_forwarded_total counter\naxiom_savings_bytes_forwarded_total {bytes_out}\n\
+         # TYPE axiom_savings_ratio gauge\naxiom_savings_ratio {ratio:.4}\n"
+    ));
     Ok((
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        metrics::render_metrics(),
+        rendered,
     )
         .into_response())
 }
@@ -1425,13 +1445,33 @@ async fn compressed_responses_payload(
 
     let compressed = apply_plan(body, &plan, &fingerprints)
         .ok_or_else(|| ApiError::Internal("Responses compression transform failed".into()))?;
+
+    // Transient sessions (no client x-axiom-session-id) must not leak their
+    // per-run adaptation sub-sessions — nothing will ever drop them.
+    if session_override.is_none() {
+        for ordinal in 0..plan.runs.len() {
+            let _ = state
+                .ttt_sessions
+                .take_session(&format!("{session_id}#r{ordinal}"));
+        }
+    }
+
     let bytes_in = serde_json::to_vec(body).map(|value| value.len()).unwrap_or(0) as u64;
     let bytes_out = serde_json::to_vec(&compressed)
         .map(|value| value.len())
         .unwrap_or(0) as u64;
+    // Fingerprint + manifest overhead can exceed the replaced text on short
+    // multi-run transcripts — compression must never expand the payload.
+    if bytes_out >= bytes_in {
+        eprintln!(
+            "[axiom-ttt] responses compression skipped (would expand {bytes_in}=>{bytes_out} bytes); forwarding original"
+        );
+        return Ok(None);
+    }
     state
         .controls
         .record(plan.item_indices().len() as u64, bytes_in, bytes_out);
+    record_savings(state, &session_id, bytes_in, bytes_out);
     eprintln!(
         "[axiom-ttt] responses compressed session={} runs={} assistant_items={} tokens={} bytes={}=>{}",
         session_id,
@@ -1486,6 +1526,80 @@ async fn responses_run_fingerprint(
     .await
     .map_err(|error| ApiError::Internal(format!("blocking task join failed: {error}")))??;
     Ok(fingerprint.to_prompt_block())
+}
+
+/// One-line human receipt: thousands of bytes with one decimal + saved ratio.
+fn savings_receipt(bytes_in: u64, bytes_out: u64) -> String {
+    let saved_pct = if bytes_in > 0 && bytes_out < bytes_in {
+        ((bytes_in - bytes_out) * 100 / bytes_in) as u32
+    } else {
+        0
+    };
+    format!(
+        "{:.1}k in, {:.1}k forwarded, {}% saved",
+        bytes_in as f64 / 1000.0,
+        bytes_out as f64 / 1000.0,
+        saved_pct
+    )
+}
+
+/// Lifetime savings counters: monotone across the process, independent of the
+/// per-session ledger (whose entries are removed when sessions drop).
+static LIFETIME_SAVINGS_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIFETIME_SAVINGS_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Accumulate a compression event into the per-session savings ledger and the
+/// lifetime totals.
+fn record_savings(state: &AppState, session_id: &str, bytes_in: u64, bytes_out: u64) {
+    use std::sync::atomic::Ordering;
+    LIFETIME_SAVINGS_IN.fetch_add(bytes_in, Ordering::Relaxed);
+    LIFETIME_SAVINGS_OUT.fetch_add(bytes_out, Ordering::Relaxed);
+    if let Ok(mut ledger) = state.savings.lock() {
+        let entry = ledger.entry(session_id.to_string()).or_insert((0, 0));
+        entry.0 += bytes_in;
+        entry.1 += bytes_out;
+    }
+}
+
+/// Drop a session's ledger entry, printing its receipt when non-trivial.
+fn emit_savings_receipt(state: &AppState, session_id: &str) {
+    let entry = state
+        .savings
+        .lock()
+        .ok()
+        .and_then(|mut ledger| ledger.remove(session_id));
+    if let Some((bytes_in, bytes_out)) = entry {
+        if bytes_in > 0 {
+            eprintln!(
+                "[receipt] session {session_id}: {}",
+                savings_receipt(bytes_in, bytes_out)
+            );
+        }
+    }
+}
+
+/// Fire-and-forget session recording (AXIOM_SESSION_RECORD=1). `response` is
+/// the full JSON body when available, else `{"streamed":true,"status":N}`.
+/// File I/O runs on the blocking pool; failures never block the request path.
+fn record_proxy_exchange(
+    endpoint: &str,
+    session_id: &str,
+    request: &Value,
+    response: Value,
+    compressed: bool,
+) {
+    if !crate::session_recorder::recording_enabled() {
+        return;
+    }
+    let record = crate::session_recorder::ExchangeRecord {
+        ts: unix_now(),
+        endpoint: endpoint.to_string(),
+        session_id: session_id.to_string(),
+        request: request.clone(),
+        response,
+        compressed,
+    };
+    tokio::task::spawn_blocking(move || crate::session_recorder::record_exchange(record));
 }
 
 /// Client headers relayed verbatim to the Responses upstream, selected by
@@ -1719,6 +1833,15 @@ async fn create_response(
         }
     }
     let status = upstream.status();
+    // The Responses body always streams through untouched, so the record
+    // carries the request plus a streamed marker rather than a buffered body.
+    record_proxy_exchange(
+        "/v1/responses",
+        session_override.unwrap_or("anonymous"),
+        &body,
+        serde_json::json!({"streamed": true, "status": status.as_u16()}),
+        compressed.is_some(),
+    );
     let content_type = upstream
         .headers()
         .get(header::CONTENT_TYPE)
@@ -1890,6 +2013,7 @@ async fn delete_session(
     drop(sessions);
     if deleted {
         metrics::remove_session(&session_id);
+        emit_savings_receipt(&state, &session_id);
         let mut sequence_versions = state
             .sequence_versions
             .write()
@@ -2642,6 +2766,7 @@ async fn compressed_messages_path(
     state
         .controls
         .record(log_heavy_count as u64, bytes_in, bytes_out);
+    record_savings(state, &session_id, bytes_in, bytes_out);
 
     if let Some(router) = state.swarm_router.as_ref().as_ref() {
         match router.route_chat_payload(&outbound).await {
@@ -2730,6 +2855,13 @@ async fn compressed_messages_path(
     // flagging with nobody asking. Never alters the answer text itself; appends
     // a clearly-marked advisory only when claims are flagged.
     annotate_response_grounding(&mut forwarded, &heavy_combined);
+    record_proxy_exchange(
+        "/v1/messages",
+        &session_id,
+        body,
+        forwarded.clone(),
+        log_heavy_count > 0,
+    );
     Ok(forwarded)
 }
 
@@ -3078,6 +3210,7 @@ async fn compressed_openai_chat_path(
     state
         .controls
         .record(log_heavy_count as u64, bytes_in, bytes_out);
+    record_savings(state, &session_id, bytes_in, bytes_out);
 
     if let Some(router) = state.swarm_router.as_ref().as_ref() {
         match router.route_chat_payload(&outbound).await {
@@ -3170,6 +3303,17 @@ async fn compressed_openai_chat_path(
     }
 
     let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    // The forwarder buffers this body in full, so record it verbatim (JSON
+    // when parseable, else as a raw-string wrapper for SSE bodies).
+    let recorded_body = serde_json::from_str::<Value>(&upstream.body)
+        .unwrap_or_else(|_| serde_json::json!({"raw": upstream.body, "status": upstream.status}));
+    record_proxy_exchange(
+        "/v1/chat/completions",
+        &session_id,
+        body,
+        recorded_body,
+        log_heavy_count > 0,
+    );
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = upstream.content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -3389,6 +3533,7 @@ async fn ttt_session_drop(
         }
         None => false,
     };
+    emit_savings_receipt(&state, &id);
     Json(serde_json::json!({ "session_id": id, "removed": removed }))
 }
 
@@ -4952,6 +5097,14 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use candle_core::{DType, Device};
     use tower::ServiceExt;
+
+    #[test]
+    fn savings_receipt_formats_bytes_and_ratio() {
+        assert_eq!(savings_receipt(41_200, 17_300), "41.2k in, 17.3k forwarded, 58% saved");
+        assert_eq!(savings_receipt(0, 0), "0.0k in, 0.0k forwarded, 0% saved");
+        // Never negative even if out > in (fingerprint overhead on tiny bodies).
+        assert_eq!(savings_receipt(100, 250), "0.1k in, 0.2k forwarded, 0% saved");
+    }
 
     #[test]
     fn responses_compression_defaults_on_and_opts_out() {
