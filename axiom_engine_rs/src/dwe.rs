@@ -43,6 +43,7 @@ pub struct DweTelemetry {
     pub sent_fragments: u64,
     pub received_fragments: u64,
     pub applied_fragments: u64,
+    pub rejected_fragments: u64,
     pub last_session_id: Option<String>,
     pub last_fragment_bytes: usize,
     pub last_error: Option<String>,
@@ -52,14 +53,23 @@ pub struct DweTelemetry {
 pub struct DweBus {
     tx: mpsc::Sender<DweFragment>,
     telemetry: Arc<Mutex<DweTelemetry>>,
+    signing_key: Option<Vec<u8>>,
 }
 
 impl DweBus {
     pub fn new(peers: Vec<String>) -> Self {
+        Self::new_with_signing_key(peers, None)
+    }
+
+    pub fn new_with_signing_key(peers: Vec<String>, signing_key: Option<Vec<u8>>) -> Self {
         let (tx, rx) = mpsc::channel::<DweFragment>(DEFAULT_DWE_QUEUE);
         let telemetry = Arc::new(Mutex::new(DweTelemetry::default()));
         attach_broadcast_task(peers, rx, telemetry.clone());
-        Self { tx, telemetry }
+        Self {
+            tx,
+            telemetry,
+            signing_key,
+        }
     }
 
     pub fn disabled() -> Self {
@@ -78,7 +88,11 @@ impl DweBus {
                     .collect()
             })
             .unwrap_or_default();
-        Self::new(peers)
+        let signing_key = std::env::var("AXIOM_FLEET_KEY")
+            .ok()
+            .map(|key| key.trim().as_bytes().to_vec())
+            .filter(|key| !key.is_empty());
+        Self::new_with_signing_key(peers, signing_key)
     }
 
     /// Shared telemetry handle for wiring an inbound listener
@@ -106,9 +120,9 @@ impl DweBus {
         // the HMAC covers the final sequence. Unsigned broadcast is only
         // meaningful for a keyless (single-node) setup, where the listener also
         // refuses to run — so a peer only ever sees signed frames.
-        if let Ok(key) = std::env::var("AXIOM_FLEET_KEY") {
-            if !key.trim().is_empty() {
-                sign_fragment(&mut fragment, key.as_bytes());
+        if let Some(key) = &self.signing_key {
+            if !key.is_empty() {
+                sign_fragment(&mut fragment, key);
             }
         }
         if let Err(err) = self.tx.try_send(fragment) {
@@ -378,6 +392,48 @@ fn update_telemetry(telemetry: &Arc<Mutex<DweTelemetry>>, update: impl FnOnce(&m
     }
 }
 
+/// Verify during graceful fleet-key rotation. The current key is tried first;
+/// `previous_key`, when present, is accepted only as a rotation window fallback.
+pub fn verify_fragment_with_rotation(
+    fragment: &DweFragment,
+    current_key: &[u8],
+    previous_key: Option<&[u8]>,
+) -> Result<(), String> {
+    match verify_fragment(fragment, current_key) {
+        Ok(()) => Ok(()),
+        Err(current_error) => {
+            if previous_key
+                .map(|key| verify_fragment(fragment, key).is_ok())
+                .unwrap_or(false)
+            {
+                Ok(())
+            } else {
+                Err(current_error)
+            }
+        }
+    }
+}
+
+pub fn record_applied_fragment(telemetry: &Arc<Mutex<DweTelemetry>>, session_id: &str) {
+    update_telemetry(telemetry, |t| {
+        t.applied_fragments += 1;
+        t.last_session_id = Some(session_id.to_string());
+        t.last_error = None;
+    });
+}
+
+pub fn record_rejected_fragment(
+    telemetry: &Arc<Mutex<DweTelemetry>>,
+    session_id: &str,
+    error: &str,
+) {
+    update_telemetry(telemetry, |t| {
+        t.rejected_fragments += 1;
+        t.last_session_id = Some(session_id.to_string());
+        t.last_error = Some(error.to_string());
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +494,13 @@ mod tests {
         assert!(verify_fragment(&f, b"key-b").is_err());
         f.hmac = None;
         assert!(verify_fragment(&f, b"key-a").is_err());
+    }
+
+    #[test]
+    fn rotation_window_accepts_previous_key() {
+        let mut f = sample_fragment();
+        sign_fragment(&mut f, b"old-key");
+        assert!(verify_fragment_with_rotation(&f, b"new-key", Some(b"old-key")).is_ok());
+        assert!(verify_fragment_with_rotation(&f, b"new-key", Some(b"wrong")).is_err());
     }
 }

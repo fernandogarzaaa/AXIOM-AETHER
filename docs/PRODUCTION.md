@@ -23,7 +23,8 @@ state per inference step (TTT fast-weights).
 
 | Variable | Purpose | Production guidance |
 |---|---|---|
-| `AXIOM_FLEET_KEY` | HMAC key gating patch/immunity gossip provenance | **Required for fleet mode.** Set the same secret on every trusted node; absent ⇒ exports are unsigned and merges of signed exports are rejected. |
+| `AXIOM_FLEET_KEY` | Current HMAC key gating patch/immunity gossip provenance and DWE fragments | **Required for fleet mode.** Set the same secret on every trusted node; `AXIOM_DWE_LISTEN` refuses to start without it. |
+| `AXIOM_FLEET_KEY_PREV` | Previous fleet key accepted during rotation | Set only during a graceful key rotation window. Nodes sign outbound fragments with `AXIOM_FLEET_KEY` and accept inbound fragments signed by either current or previous key. Remove after all peers rotate. |
 | `AXIOM_HEAL_MEMORY` | Path to persistent heal memory (`axiom_heal_memory.json`); patch store sits alongside it | Point at durable storage; `0`/`off` disables persistence. The `/v1/patches*` endpoints return **503** when unset. |
 | `AXIOM_BACKEND` | LLM backend selection | Set per deployment. |
 | `AXIOM_DEVICE` | Compute device (`cpu`/`cuda`) | Match the host. |
@@ -32,11 +33,14 @@ state per inference step (TTT fast-weights).
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /v1/fleet/status` | Live fleet status: DWE telemetry, configured peers, listen address, and current/previous key configuration booleans. |
 | `GET /v1/patches` | This node's verified-patch store as a provenance-signed export. |
 | `POST /v1/patches/merge` | Fold a peer's signed export in — **Byzantine-robust** (bounded per-peer trust), 32 MiB body limit. |
 | `GET /v1/immunity` · `POST /v1/immunity/merge` | Environmental-immunity gossip (Dempster–Shafer, Byzantine-resistant). |
 
 ## Safety invariants (do not regress)
+
+`GET /metrics` also exports `axiom_dwe_sent`, `axiom_dwe_received`, `axiom_dwe_applied`, and `axiom_dwe_rejected`. Use `axiom fleet status` for the live HTTP view, or `axiom fleet status --offline` when the server is not running and you only need local environment wiring.
 
 1. **Re-verify before trust.** A peer's patch is *never* applied on trust. It is
    only written through `PatchMemory::try_candidates`, which writes, runs *this
