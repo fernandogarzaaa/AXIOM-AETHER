@@ -1,0 +1,1085 @@
+/// `POST /v1/messages` — Anthropic Messages API endpoint.
+///
+/// Drop-in target for the Anthropic SDK and Claude Code: clients that
+/// point `ANTHROPIC_BASE_URL` at this server receive responses in the
+/// native Messages format regardless of whether the local Axiom-TTT
+/// pipeline, a Claude backend, or the active-compression upstream
+/// produced them.
+///
+/// When `state.compression_active()` is true, the handler:
+/// 1. Partitions the inbound messages into heavy context (above the
+///    configured token threshold) and the surviving user query.
+/// 2. Spawns a blocking task that tokenises the heavy context, runs it
+///    through the TTT layer stack to mutate W̃ in-place, and extracts
+///    a [`MemoryFingerprint`] via an associative recall pass.
+/// 3. Rebuilds the outbound JSON payload with the heavy context stripped
+///    and the fingerprint prepended to the surviving user turn.
+/// 4. POSTs the lean payload to the real Anthropic API and returns the
+///    response verbatim.
+async fn create_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    // A client (e.g. the Claude CLI) can pin a deterministic TTT session by
+    // sending `X-Axiom-Session-Id`. This takes precedence over any body
+    // `session_id`, since real Anthropic clients never put session_id in the
+    // body. Both fall back to a transient UUID when absent.
+    let session_override = headers
+        .get("x-axiom-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if state.compression_active() {
+        // Capture the client's own credentials so we can relay them upstream.
+        // This is what makes the proxy work for a Claude *subscription*
+        // (OAuth bearer) as well as for raw API-key clients — the proxy never
+        // needs to hold a key of its own.
+        let header_str = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let client_auth = ClientAuth {
+            authorization: header_str("authorization"),
+            x_api_key: header_str("x-api-key"),
+            anthropic_version: header_str("anthropic-version"),
+            anthropic_beta: header_str("anthropic-beta"),
+        };
+        match compressed_messages_path(&state, &body, session_override.as_deref(), &client_auth)
+            .await
+        {
+            Ok(value) => return Json(value).into_response(),
+            Err(err) => return err.into_response(),
+        }
+    }
+
+    let req: AnthropicMessagesRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return ApiError::BadRequest(format!("invalid /v1/messages body: {e}")).into_response();
+        }
+    };
+    local_messages_path(state, req).map_or_else(|e| e.into_response(), |json| json.into_response())
+}
+
+fn local_messages_path(
+    state: AppState,
+    req: AnthropicMessagesRequest,
+) -> Result<Json<AnthropicMessagesResponse>, ApiError> {
+    let model = req.model.clone().unwrap_or_else(|| state.model_id.clone());
+    let system_text = req.system.as_ref().map(|c| c.to_text());
+
+    let text = match state.claude_backend.as_ref() {
+        Some(backend) => {
+            let turns: Vec<ChatTurn> = req
+                .messages
+                .iter()
+                .map(|m| ChatTurn {
+                    role: m.role.clone(),
+                    content: m.content.to_text(),
+                })
+                .collect();
+            backend
+                .generate_chat(&turns, req.max_tokens, system_text.clone())
+                .map_err(ApiError::Internal)?
+        }
+        None => {
+            let mut prompt_parts: Vec<String> = Vec::new();
+            if let Some(ref sys) = system_text {
+                prompt_parts.push(format!("system: {sys}"));
+            }
+            for msg in &req.messages {
+                prompt_parts.push(format!("{}: {}", msg.role, msg.content.to_text()));
+            }
+            let prompt = prompt_parts.join("\n");
+            run_generation(&state, &prompt, req.max_tokens, req.session_id.as_deref())?
+        }
+    };
+
+    let input_tokens: usize = req
+        .messages
+        .iter()
+        .map(|m| m.content.to_text().split_whitespace().count())
+        .sum();
+    let output_tokens = text.split_whitespace().count();
+
+    Ok(Json(AnthropicMessagesResponse {
+        id: format!("msg_{}", Uuid::new_v4().simple()),
+        response_type: "message".to_string(),
+        role: "assistant".to_string(),
+        content: vec![AnthropicOutputBlock {
+            block_type: "text".to_string(),
+            text,
+        }],
+        model,
+        stop_reason: "end_turn".to_string(),
+        stop_sequence: None,
+        usage: AnthropicUsage {
+            input_tokens,
+            output_tokens,
+        },
+    }))
+}
+
+/// Active-compression code path: partition → adapt → recall → forward.
+async fn compressed_messages_path(
+    state: &AppState,
+    body: &Value,
+    session_override: Option<&str>,
+    client_auth: &ClientAuth,
+) -> Result<Value, ApiError> {
+    let forwarder = state.anthropic_forwarder.as_ref().as_ref().cloned();
+    if forwarder.is_none() && state.swarm_router.as_ref().is_none() {
+        return Err(ApiError::Internal(
+            "compression active but no Anthropic forwarder or local swarm router".into(),
+        ));
+    }
+
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| ApiError::BadRequest("messages[] required".into()))?;
+
+    let cfg = state.compressor_config.clone();
+    // Threshold is read live from the runtime controls so a dashboard can retune
+    // it without a restart; top_k stays a startup constant.
+    let base_threshold = state.controls.threshold();
+    let top_k = cfg.recall_top_k;
+
+    let mut threshold = base_threshold;
+    let mut partitioned = partition_messages_for_state(state, &messages, threshold)?;
+
+    // Confidence-gated adaptive compression (opt-in, AXIOM_ADAPTIVE_COMPRESS=1):
+    // if the heavy context is surprising to the model (CE above the drift gate
+    // → novel/high-information, unsafe to skeletonize), raise the threshold so
+    // more is forwarded verbatim. The drift signal that flags hallucination on
+    // the response path here gates the compression budget on the request path.
+    if std::env::var("AXIOM_ADAPTIVE_COMPRESS").as_deref() == Ok("1")
+        && !partitioned.heavy_context.is_empty()
+    {
+        let heavy_text = partitioned
+            .heavy_context
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(ce) = mean_surprisal(state, &heavy_text) {
+            let gate = std::env::var("AXIOM_DRIFT_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(7.03);
+            let eff = crate::adaptive::adaptive_threshold(base_threshold, ce, gate);
+            if eff != threshold {
+                eprintln!(
+                    "[axiom-ttt] adaptive compression: heavy surprisal {ce:.2} vs gate {gate:.2} → threshold {threshold} -> {eff}"
+                );
+                threshold = eff;
+                partitioned = partition_messages_for_state(state, &messages, threshold)?;
+            }
+        }
+    }
+
+    // Resolve / create the TTT session. Precedence: the X-Axiom-Session-Id
+    // header (passed in as session_override), then a body `session_id`, then
+    // a minted transient UUID. Persistent compression benefits accrue only
+    // when the caller pins a stable id via one of the first two.
+    let session_id = session_override
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("transient-{}", Uuid::new_v4()));
+
+    let started = Instant::now();
+    let log_heavy_count = partitioned.heavy_context.len();
+    let log_heavy_tokens: usize = partitioned
+        .heavy_context
+        .iter()
+        .map(|c| c.token_count)
+        .sum();
+
+    // Tokenise the surviving user query (for the associative recall pass)
+    // alongside the heavy context — both happen inside spawn_blocking so
+    // we don't stall the async runtime on the gradient loop.
+    let user_query_text = partitioned
+        .target_user_index
+        .and_then(|idx| partitioned.surviving.get(idx))
+        .and_then(|m| m.get("content"))
+        .map(content_to_text)
+        .unwrap_or_default();
+    let heavy_combined = partitioned
+        .heavy_context
+        .iter()
+        .map(|c| c.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let fingerprint = if partitioned.heavy_context.is_empty() {
+        // Nothing to ingest — emit a zero-context fingerprint so the
+        // outbound payload still carries the schema marker.
+        empty_fingerprint(state, &session_id, started)?
+    } else {
+        let pipeline_arc = state.pipeline.clone();
+        let store = state.ttt_sessions.clone();
+        let session_id_clone = session_id.clone();
+        let heavy_clone = heavy_combined.clone();
+        let query_clone = user_query_text.clone();
+        let should_adapt = state.should_adapt_heavy_context(&session_id, &heavy_combined);
+        let exact_cache = state.exact_residual_cache.clone();
+        let dwe_sequence = unix_now();
+
+        // Spawn the compute-heavy loop on a blocking thread so the Tokio
+        // runtime keeps serving other requests during the gradient steps.
+        let fp_result: Result<_, ApiError> = tokio::task::spawn_blocking(move || {
+            let pipeline = pipeline_arc
+                .lock()
+                .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+            let session = store
+                .get_or_create(&session_id_clone, &pipeline)
+                .map_err(|e| ApiError::Internal(format!("session allocation failed: {e}")))?;
+            // tokio::sync::Mutex::blocking_lock is safe in spawn_blocking.
+            let mut session_states = session.blocking_lock();
+
+            let mut dwe_fragment = None;
+            let context_tokens_processed = if should_adapt {
+                let baseline = session_states.clone();
+                let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
+                let (fast_tokens, _sr_report) =
+                    exact_cache.route_tokens(&session_id_clone, &context_tokens, &heavy_clone);
+                adapt_session_blocking(&pipeline, &mut session_states, &fast_tokens)
+                    .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
+                dwe_fragment = extract_delta_fragment(
+                    &session_id_clone,
+                    dwe_sequence,
+                    &session_states,
+                    &baseline,
+                )
+                .ok();
+                context_tokens.len()
+            } else {
+                pipeline.token_count(&heavy_clone)
+            };
+
+            let residual_prompt = exact_cache.residual_prompt(&session_id_clone, 96);
+            let recall_query = if residual_prompt.is_empty() {
+                query_clone
+            } else {
+                format!("{query_clone}\n\n{residual_prompt}")
+            };
+            let query_tokens: Vec<u32> = pipeline.encode_text(&recall_query);
+            let fingerprint = extract_memory_vector_blocking(
+                &pipeline,
+                &mut session_states,
+                &query_tokens,
+                &session_id_clone,
+                context_tokens_processed,
+                started,
+                top_k,
+            )
+            .map_err(|e| ApiError::Internal(format!("memory extraction failed: {e}")))?;
+            Ok((fingerprint, dwe_fragment))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
+        let (fingerprint, dwe_fragment) = fp_result?;
+        if should_adapt {
+            if let Some(fragment) = dwe_fragment {
+                state.dwe_bus.broadcast(fragment);
+            }
+            state.mark_heavy_context_adapted(&session_id, &heavy_combined);
+            if let Err(e) = state.persist_compression_cache().await {
+                eprintln!("[axiom-ttt] compression cache persist skipped: {e}");
+            }
+        }
+        fingerprint
+    };
+
+    eprintln!(
+        "[axiom-ttt] compressed session={} heavy_msgs={} heavy_tokens~{} recall_norm={:.3} elapsed_ms={}",
+        fingerprint.session_id,
+        log_heavy_count,
+        log_heavy_tokens,
+        fingerprint.recall_norm,
+        fingerprint.elapsed_ms,
+    );
+
+    // Keep the original heavy source so a dropped symbol body can be expanded
+    // on demand via POST /v1/expand (the skeleton round-trip).
+    if !heavy_combined.trim().is_empty() {
+        state.store_source(&session_id, heavy_combined.clone());
+    }
+
+    let outbound = build_compressed_payload(body, &fingerprint, &partitioned);
+    // Strip session_id (and any other Axiom extensions) from the upstream payload.
+    let mut outbound = outbound;
+    if let Some(obj) = outbound.as_object_mut() {
+        obj.remove("session_id");
+    }
+
+    // Active immunity: if the conversation references a command Axiom has
+    // already learned to heal, inject a short advisory so Claude gets the fix
+    // without anyone asking — the self-healing loop running autonomously. Only
+    // fires on a precise command-signature match with a concrete learned heal.
+    inject_immunity_advisory(state, &mut outbound, &user_query_text, &heavy_combined);
+
+    // Record live compression stats for the dashboard: original vs forwarded
+    // payload size and how many heavy messages were absorbed this request.
+    let bytes_in = serde_json::to_string(body)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    let bytes_out = serde_json::to_string(&outbound)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    state
+        .controls
+        .record(log_heavy_count as u64, bytes_in, bytes_out);
+    record_savings(state, &session_id, bytes_in, bytes_out);
+
+    if let Some(router) = state.swarm_router.as_ref().as_ref() {
+        match router.route_chat_payload(&outbound).await {
+            Ok(local) => {
+                state
+                    .sandbox_local_synthesis(&session_id, &local.content)
+                    .await;
+                return Ok(local_anthropic_message_response(&outbound, local));
+            }
+            Err(e) => {
+                eprintln!("[swarm-router] local Anthropic route unavailable; falling back: {e}")
+            }
+        }
+    }
+
+    let forwarder = forwarder.ok_or_else(|| ApiError::Upstream {
+        status: StatusCode::BAD_GATEWAY.as_u16(),
+        message: "local swarm route failed and no Anthropic cloud forwarder is configured".into(),
+    })?;
+
+    // First attempt: forward the lean, compressed payload.
+    let mut forwarded = match forwarder
+        .forward_messages_json(&outbound, client_auth)
+        .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            // Graceful degradation: a compression-side fault (or a transient
+            // upstream/network hiccup) must never cost the client their turn. If
+            // we actually altered the payload and the failure is one the original
+            // payload could fix, retry ONCE with the uncompressed body. The TTT
+            // session already absorbed the heavy context above, so this only
+            // forgoes the token *savings* for this one request — never the answer.
+            let did_compress = log_heavy_count > 0;
+            if did_compress && should_retry_uncompressed(&err) {
+                eprintln!(
+                    "[axiom-ttt] compressed forward failed ({err}); retrying once with original \
+                     uncompressed payload (session={session_id})"
+                );
+                state.controls.record_degraded_fallback();
+                // The untouched client body, minus Axiom-only extensions.
+                let mut fallback = body.clone();
+                if let Some(obj) = fallback.as_object_mut() {
+                    obj.remove("session_id");
+                }
+                forwarder
+                    .forward_messages_json(&fallback, client_auth)
+                    .await
+                    .map_err(map_anthropic_forwarder_error)?
+            } else {
+                return Err(map_anthropic_forwarder_error(err));
+            }
+        }
+    };
+
+    // Self-correction (opt-in, AXIOM_GROUND_CORRECT=1): if the answer makes
+    // claims unsupported by the absorbed context, send ONE bounded follow-up
+    // asking the model to revise grounded in that context, and return the
+    // revision. Moves from *flagging* hallucinations to *reducing* them. Costs
+    // one extra upstream call only when claims are actually flagged.
+    if std::env::var("AXIOM_GROUND_CORRECT").as_deref() == Ok("1") {
+        if let Some(revised) = ground_correct_round(
+            &forwarder,
+            client_auth,
+            &outbound,
+            &forwarded,
+            &heavy_combined,
+        )
+        .await
+        {
+            forwarded = revised;
+        }
+    }
+
+    // Automatic epistemic monitoring (opt-in, AXIOM_EPISTEMIC_AUTO=1): fire a
+    // fire-and-forget semantic-judge validation of the answer against the
+    // absorbed context. No-op unless explicitly configured; never blocks or
+    // mutates the response.
+    crate::epistemic_drift::spawn_automatic_validation(
+        user_query_text,
+        assistant_text(&forwarded),
+        heavy_combined.clone(),
+        body.get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("anthropic-upstream")
+            .to_string(),
+    );
+
+    // Auto grounding-verification (opt-in): annotate the response in place with
+    // any claims not grounded in the context we just absorbed — hallucination
+    // flagging with nobody asking. Never alters the answer text itself; appends
+    // a clearly-marked advisory only when claims are flagged.
+    annotate_response_grounding(&mut forwarded, &heavy_combined);
+    record_proxy_exchange(
+        "/v1/messages",
+        &session_id,
+        body,
+        forwarded.clone(),
+        log_heavy_count > 0,
+    );
+    Ok(forwarded)
+}
+
+/// Extract the concatenated assistant text from an Anthropic `/v1/messages`
+/// response (`content[].text`).
+fn assistant_text(value: &Value) -> String {
+    value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// One bounded self-correction round. Returns the revised response only if the
+/// answer had unsupported claims AND the corrective re-ask succeeded; otherwise
+/// `None` (caller keeps the original). The follow-up reuses the *compressed*
+/// outbound context, so correction stays token-efficient.
+async fn ground_correct_round(
+    forwarder: &AnthropicForwarder,
+    client_auth: &ClientAuth,
+    outbound: &Value,
+    forwarded: &Value,
+    evidence: &str,
+) -> Option<Value> {
+    if evidence.trim().is_empty() {
+        return None;
+    }
+    let answer = assistant_text(forwarded);
+    let report = crate::hallucination::verify(&answer, evidence);
+    let flagged = report.flagged();
+    if flagged.is_empty() {
+        return None;
+    }
+    let claim_list = flagged
+        .iter()
+        .map(|c| format!("- {}", c.claim))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let correction = format!(
+        "Your previous answer contained claims that are NOT supported by the provided context:\n{claim_list}\n\n\
+         Revise your answer so every factual claim is grounded in the provided context. \
+         Remove or explicitly mark as uncertain anything the context does not support. \
+         Return only the corrected answer."
+    );
+
+    // Build the follow-up: the (compressed) turns we sent + the assistant's
+    // answer + the correction request.
+    let mut payload = outbound.clone();
+    let messages = payload.get_mut("messages").and_then(Value::as_array_mut)?;
+    messages.push(serde_json::json!({"role": "assistant", "content": answer}));
+    messages.push(serde_json::json!({"role": "user", "content": correction}));
+
+    match forwarder.forward_messages_json(&payload, client_auth).await {
+        Ok(revised) => {
+            // External-grounding guardrail: 2024 evidence (Huang et al. ICLR;
+            // TACL critical survey) shows intrinsic self-correction can *degrade*
+            // output. Keep the revision only if re-verifying it against the same
+            // evidence shows it is strictly *more* grounded than the original —
+            // i.e. gated on an external signal, not the model's self-critique.
+            let revised_answer = assistant_text(&revised);
+            if revised_answer.trim().is_empty() {
+                eprintln!("[axiom-ttt] self-correction rejected (revision was empty)");
+                return None;
+            }
+            let revised_report = crate::hallucination::verify(&revised_answer, evidence);
+            if revised_report.grounded_fraction > report.grounded_fraction {
+                eprintln!(
+                    "[axiom-ttt] self-correction accepted: grounded {:.2} → {:.2} ({} flagged claim(s) addressed)",
+                    report.grounded_fraction,
+                    revised_report.grounded_fraction,
+                    flagged.len()
+                );
+                Some(revised)
+            } else {
+                eprintln!(
+                    "[axiom-ttt] self-correction rejected: revision not better grounded ({:.2} → {:.2}); keeping original",
+                    report.grounded_fraction, revised_report.grounded_fraction
+                );
+                None
+            }
+        }
+        Err(e) => {
+            eprintln!("[axiom-ttt] self-correction skipped (re-ask failed: {e})");
+            None
+        }
+    }
+}
+
+/// Pure: the grounding advisory block for an assistant `text` against
+/// `evidence`, or `None` when nothing is flagged.
+fn grounding_advisory_block(text: &str, evidence: &str) -> Option<String> {
+    if text.trim().is_empty() || evidence.trim().is_empty() {
+        return None;
+    }
+    let report = crate::hallucination::verify(text, evidence);
+    let flagged = report.flagged();
+    if flagged.is_empty() {
+        return None;
+    }
+    let mut block = format!(
+        "\n\n<axiom_grounding grounded_fraction=\"{:.2}\">\nThe following claims are not grounded in the provided context — verify before relying on them:",
+        report.grounded_fraction
+    );
+    for c in &flagged {
+        block.push_str(&format!("\n  - {}", c.claim));
+    }
+    block.push_str("\n</axiom_grounding>");
+    Some(block)
+}
+
+/// Append a grounding advisory to the last `text` content block of an Anthropic
+/// `/v1/messages` response, in place. Opt-in via `AXIOM_VERIFY_RESPONSES=1`.
+fn annotate_response_grounding(value: &mut Value, evidence: &str) {
+    if std::env::var("AXIOM_VERIFY_RESPONSES").as_deref() != Ok("1") {
+        return;
+    }
+    // Concatenate assistant text blocks for verification.
+    let text: String = value
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let Some(block) = grounding_advisory_block(&text, evidence) else {
+        return;
+    };
+    // Append to the last text block (or push one if none exist).
+    if let Some(blocks) = value.get_mut("content").and_then(Value::as_array_mut) {
+        if let Some(last) = blocks
+            .iter_mut()
+            .rev()
+            .find(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        {
+            if let Some(t) = last.get("text").and_then(Value::as_str) {
+                last["text"] = Value::String(format!("{t}{block}"));
+            }
+        } else {
+            blocks.push(serde_json::json!({"type": "text", "text": block}));
+        }
+    }
+    eprintln!("[axiom-ttt] grounding: appended advisory for ungrounded response claims");
+}
+
+/// Map an Anthropic [`ForwarderError`] onto the client-facing [`ApiError`].
+fn map_anthropic_forwarder_error(err: ForwarderError) -> ApiError {
+    match err {
+        // Surface the real upstream status (401/429/5xx) to the client.
+        ForwarderError::Upstream { status, body } => ApiError::Upstream {
+            status,
+            message: format!("anthropic upstream {status}: {body}"),
+        },
+        // No credential at all → 401 so the client knows to authenticate.
+        ForwarderError::MissingAuth => ApiError::Upstream {
+            status: StatusCode::UNAUTHORIZED.as_u16(),
+            message: format!("{err}"),
+        },
+        // Network/decode failures mean we never got a usable response →
+        // 502 Bad Gateway rather than a misleading 500.
+        other => ApiError::Upstream {
+            status: StatusCode::BAD_GATEWAY.as_u16(),
+            message: format!("anthropic upstream call failed: {other}"),
+        },
+    }
+}
+
+/// Map an OpenAI [`OpenAiForwarderError`] onto the client-facing [`ApiError`].
+fn map_openai_forwarder_error(err: OpenAiForwarderError) -> ApiError {
+    match err {
+        OpenAiForwarderError::MissingAuth => ApiError::Upstream {
+            status: StatusCode::UNAUTHORIZED.as_u16(),
+            message: format!("{err}"),
+        },
+        other => ApiError::Upstream {
+            status: StatusCode::BAD_GATEWAY.as_u16(),
+            message: format!("OpenAI upstream call failed: {other}"),
+        },
+    }
+}
+
+/// OpenAI-compatible active-compression path: partition -> adapt -> recall ->
+/// forward to `/v1/chat/completions`.
+async fn compressed_openai_chat_path(
+    state: &AppState,
+    body: &Value,
+    session_override: Option<&str>,
+    client_auth: &OpenAiClientAuth,
+) -> Result<Response, ApiError> {
+    let forwarder = state.openai_forwarder.as_ref().as_ref().cloned();
+    if forwarder.is_none() && state.swarm_router.as_ref().is_none() {
+        return Err(ApiError::Internal(
+            "OpenAI compression active but no OpenAI forwarder or local swarm router".into(),
+        ));
+    }
+
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| ApiError::BadRequest("messages[] required".into()))?;
+
+    let cfg = state.compressor_config.clone();
+    let threshold = state.controls.threshold();
+    let top_k = cfg.recall_top_k;
+    let partitioned = partition_messages_for_state(state, &messages, threshold)?;
+
+    let session_id = session_override
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("transient-{}", Uuid::new_v4()));
+
+    let started = Instant::now();
+    let log_heavy_count = partitioned.heavy_context.len();
+    let log_heavy_tokens: usize = partitioned
+        .heavy_context
+        .iter()
+        .map(|c| c.token_count)
+        .sum();
+
+    let user_query_text = partitioned
+        .target_user_index
+        .and_then(|idx| partitioned.surviving.get(idx))
+        .and_then(|m| m.get("content"))
+        .map(content_to_text)
+        .unwrap_or_default();
+    let heavy_combined = partitioned
+        .heavy_context
+        .iter()
+        .map(|c| c.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let fingerprint = if partitioned.heavy_context.is_empty() {
+        empty_fingerprint(state, &session_id, started)?
+    } else {
+        let pipeline_arc = state.pipeline.clone();
+        let store = state.ttt_sessions.clone();
+        let session_id_clone = session_id.clone();
+        let heavy_clone = heavy_combined.clone();
+        let query_clone = user_query_text.clone();
+        let should_adapt = state.should_adapt_heavy_context(&session_id, &heavy_combined);
+        let exact_cache = state.exact_residual_cache.clone();
+        let dwe_sequence = unix_now();
+
+        let fp_result: Result<_, ApiError> = spawn_blocking(move || {
+            let pipeline = pipeline_arc
+                .lock()
+                .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+            let session = store
+                .get_or_create(&session_id_clone, &pipeline)
+                .map_err(|e| ApiError::Internal(format!("session allocation failed: {e}")))?;
+            let mut session_states = session.blocking_lock();
+
+            let mut dwe_fragment = None;
+            let context_tokens_processed = if should_adapt {
+                let baseline = session_states.clone();
+                let context_tokens: Vec<u32> = pipeline.encode_text(&heavy_clone);
+                let (fast_tokens, _sr_report) =
+                    exact_cache.route_tokens(&session_id_clone, &context_tokens, &heavy_clone);
+                adapt_session_blocking(&pipeline, &mut session_states, &fast_tokens)
+                    .map_err(|e| ApiError::Internal(format!("TTT adapt failed: {e}")))?;
+                dwe_fragment = extract_delta_fragment(
+                    &session_id_clone,
+                    dwe_sequence,
+                    &session_states,
+                    &baseline,
+                )
+                .ok();
+                context_tokens.len()
+            } else {
+                pipeline.token_count(&heavy_clone)
+            };
+
+            let residual_prompt = exact_cache.residual_prompt(&session_id_clone, 96);
+            let recall_query = if residual_prompt.is_empty() {
+                query_clone
+            } else {
+                format!("{query_clone}\n\n{residual_prompt}")
+            };
+            let query_tokens: Vec<u32> = pipeline.encode_text(&recall_query);
+            let fingerprint = extract_memory_vector_blocking(
+                &pipeline,
+                &mut session_states,
+                &query_tokens,
+                &session_id_clone,
+                context_tokens_processed,
+                started,
+                top_k,
+            )
+            .map_err(|e| ApiError::Internal(format!("memory extraction failed: {e}")))?;
+            Ok((fingerprint, dwe_fragment))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("blocking task join failed: {e}")))?;
+        let (fingerprint, dwe_fragment) = fp_result?;
+        if should_adapt {
+            if let Some(fragment) = dwe_fragment {
+                state.dwe_bus.broadcast(fragment);
+            }
+            state.mark_heavy_context_adapted(&session_id, &heavy_combined);
+            if let Err(e) = state.persist_compression_cache().await {
+                eprintln!("[axiom-ttt] compression cache persist skipped: {e}");
+            }
+        }
+        fingerprint
+    };
+
+    eprintln!(
+        "[axiom-ttt] openai compressed session={} heavy_msgs={} heavy_tokens~{} recall_norm={:.3} elapsed_ms={}",
+        fingerprint.session_id,
+        log_heavy_count,
+        log_heavy_tokens,
+        fingerprint.recall_norm,
+        fingerprint.elapsed_ms,
+    );
+
+    if !heavy_combined.trim().is_empty() {
+        state.store_source(&session_id, heavy_combined.clone());
+    }
+
+    let mut outbound = build_compressed_payload(body, &fingerprint, &partitioned);
+    if let Some(obj) = outbound.as_object_mut() {
+        obj.remove("session_id");
+    }
+
+    let bytes_in = serde_json::to_string(body)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    let bytes_out = serde_json::to_string(&outbound)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    state
+        .controls
+        .record(log_heavy_count as u64, bytes_in, bytes_out);
+    record_savings(state, &session_id, bytes_in, bytes_out);
+
+    if let Some(router) = state.swarm_router.as_ref().as_ref() {
+        match router.route_chat_payload(&outbound).await {
+            Ok(local) => {
+                state
+                    .sandbox_local_synthesis(&session_id, &local.content)
+                    .await;
+                return local_openai_chat_response(&outbound, local);
+            }
+            Err(e) => {
+                eprintln!("[swarm-router] local OpenAI route unavailable; falling back: {e}")
+            }
+        }
+    }
+
+    let forwarder = forwarder.ok_or_else(|| ApiError::Upstream {
+        status: StatusCode::BAD_GATEWAY.as_u16(),
+        message: "local swarm route failed and no OpenAI cloud forwarder is configured".into(),
+    })?;
+
+    // Graceful degradation (mirrors the Anthropic path): a compression-side fault
+    // must never cost the client their turn. We retry ONCE with the original
+    // uncompressed body — for a transient network fault, or for a recoverable
+    // non-2xx status (5xx / 400) that our injected fingerprint may have caused.
+    // Unlike the Anthropic forwarder, this one returns Ok even for non-2xx (the
+    // status rides in the response), so we inspect both the Err and the status.
+    let did_compress = log_heavy_count > 0;
+    let fallback_body = || {
+        let mut fallback = body.clone();
+        if let Some(obj) = fallback.as_object_mut() {
+            obj.remove("session_id");
+        }
+        fallback
+    };
+
+    let mut fell_back = false;
+    let mut upstream = match forwarder
+        .forward_chat_completions_text(&outbound, client_auth)
+        .await
+    {
+        Ok(resp) => resp,
+        Err(OpenAiForwarderError::Network(msg)) if did_compress => {
+            eprintln!(
+                "[axiom-ttt] compressed OpenAI forward failed (network error: {msg}); retrying \
+                 once with original uncompressed payload (session={session_id})"
+            );
+            state.controls.record_degraded_fallback();
+            fell_back = true;
+            forwarder
+                .forward_chat_completions_text(&fallback_body(), client_auth)
+                .await
+                .map_err(map_openai_forwarder_error)?
+        }
+        Err(other) => return Err(map_openai_forwarder_error(other)),
+    };
+
+    if !fell_back && did_compress && (upstream.status >= 500 || upstream.status == 400) {
+        eprintln!(
+            "[axiom-ttt] compressed OpenAI forward returned {}; retrying once with original \
+             uncompressed payload (session={session_id})",
+            upstream.status
+        );
+        state.controls.record_degraded_fallback();
+        if let Ok(retry) = forwarder
+            .forward_chat_completions_text(&fallback_body(), client_auth)
+            .await
+        {
+            upstream = retry;
+        }
+    }
+
+    // Automatic epistemic monitoring (opt-in, AXIOM_EPISTEMIC_AUTO=1): mirror the
+    // Anthropic forwarder path for OpenAI-compatible responses. Handles both a
+    // single JSON completion and a streamed SSE body. Fire-and-forget; no-op
+    // unless a judge is configured; never blocks or mutates the response. The
+    // enabled-check gates body parsing so the hot path does no work when off.
+    if upstream.status < 300 && crate::epistemic_drift::automatic_validation_enabled() {
+        let answer = openai_assistant_answer(&upstream.body);
+        if !answer.is_empty() {
+            crate::epistemic_drift::spawn_automatic_validation(
+                user_query_text.clone(),
+                answer,
+                heavy_combined.clone(),
+                body.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("openai-upstream")
+                    .to_string(),
+            );
+        }
+    }
+
+    let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    // The forwarder buffers this body in full, so record it verbatim (JSON
+    // when parseable, else as a raw-string wrapper for SSE bodies).
+    let recorded_body = serde_json::from_str::<Value>(&upstream.body)
+        .unwrap_or_else(|_| serde_json::json!({"raw": upstream.body, "status": upstream.status}));
+    record_proxy_exchange(
+        "/v1/chat/completions",
+        &session_id,
+        body,
+        recorded_body,
+        log_heavy_count > 0,
+    );
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = upstream.content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    } else {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    builder
+        .body(axum::body::Body::from(upstream.body))
+        .map_err(|e| ApiError::Internal(format!("response build failed: {e}")))
+}
+
+/// Extract the assistant answer text from an OpenAI-compatible chat-completion
+/// response body, handling both a single JSON object (non-streamed:
+/// `choices[0].message.content`) and a streamed SSE body (concatenating
+/// `choices[].delta.content` across `data:` frames, ignoring the `[DONE]`
+/// sentinel). Returns an empty string when no answer can be recovered.
+fn openai_assistant_answer(body: &str) -> String {
+    // Non-streamed: the whole body is one JSON completion object.
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if let Some(text) = value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+        {
+            return text.to_string();
+        }
+    }
+    // Streamed (SSE): concatenate the incremental delta content from each frame.
+    let mut answer = String::new();
+    for line in body.lines() {
+        let Some(payload) = line.trim_start().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(chunk) = serde_json::from_str::<Value>(payload) {
+            if let Some(piece) = chunk
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+            {
+                answer.push_str(piece);
+            }
+        }
+    }
+    answer
+}
+
+fn local_openai_chat_response(
+    outbound: &Value,
+    local: SwarmChatResult,
+) -> Result<Response, ApiError> {
+    let completion_id = format!("chatcmpl-local-{}", Uuid::new_v4());
+    let created = unix_now();
+    let model = local.model;
+    let content = local.content;
+    let stream = outbound
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if stream {
+        let mut body = String::new();
+        for piece in content.split_inclusive(' ') {
+            body.push_str("data: ");
+            body.push_str(&openai_stream_delta(
+                &completion_id,
+                created,
+                &model,
+                piece,
+            )?);
+            body.push_str("\n\n");
+        }
+        body.push_str("data: ");
+        body.push_str(&openai_stream_stop(&completion_id, created, &model)?);
+        body.push_str("\n\n");
+        body.push_str("data: [DONE]\n\n");
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from(body))
+            .map_err(|e| ApiError::Internal(format!("local stream response build failed: {e}")));
+    }
+
+    let body = openai_completion_body(&completion_id, created, &model, &content)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body))
+        .map_err(|e| ApiError::Internal(format!("local response build failed: {e}")))
+}
+
+fn openai_stream_delta(
+    completion_id: &str,
+    created: u64,
+    model: &str,
+    piece: &str,
+) -> Result<String, ApiError> {
+    let id = json_string(completion_id)?;
+    let model = json_string(model)?;
+    let piece = json_string(piece)?;
+    Ok(format!(
+        r#"{{"id":{id},"object":"chat.completion.chunk","created":{created},"model":{model},"choices":[{{"index":0,"delta":{{"role":"assistant","content":{piece}}},"finish_reason":null}}]}}"#
+    ))
+}
+
+fn openai_stream_stop(completion_id: &str, created: u64, model: &str) -> Result<String, ApiError> {
+    let id = json_string(completion_id)?;
+    let model = json_string(model)?;
+    Ok(format!(
+        r#"{{"id":{id},"object":"chat.completion.chunk","created":{created},"model":{model},"choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}]}}"#
+    ))
+}
+
+fn openai_completion_body(
+    completion_id: &str,
+    created: u64,
+    model: &str,
+    content: &str,
+) -> Result<String, ApiError> {
+    let id = json_string(completion_id)?;
+    let model = json_string(model)?;
+    let content = json_string(content)?;
+    Ok(format!(
+        r#"{{"id":{id},"object":"chat.completion","created":{created},"model":{model},"choices":[{{"index":0,"message":{{"role":"assistant","content":{content}}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}}}"#
+    ))
+}
+
+fn json_string(value: &str) -> Result<String, ApiError> {
+    serde_json::to_string(value).map_err(|e| ApiError::Internal(format!("json encode failed: {e}")))
+}
+
+fn local_anthropic_message_response(outbound: &Value, local: SwarmChatResult) -> Value {
+    let input_tokens = outbound
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .map(|m| m.get("content").map(content_to_text).unwrap_or_default())
+                .map(|text| text.split_whitespace().count())
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let id = json_string(&format!("msg_local_{}", Uuid::new_v4().simple()))
+        .unwrap_or_else(|_| "\"msg_local\"".to_string());
+    let model = json_string(&local.model).unwrap_or_else(|_| "\"local\"".to_string());
+    let content = json_string(&local.content).unwrap_or_else(|_| "\"\"".to_string());
+    let body = format!(
+        r#"{{"id":{id},"type":"message","role":"assistant","content":[{{"type":"text","text":{content}}}],"model":{model},"stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":{input_tokens},"output_tokens":0}}}}"#
+    );
+    serde_json::from_str(&body).unwrap_or(Value::Null)
+}
+
+fn empty_fingerprint(
+    state: &AppState,
+    session_id: &str,
+    started: Instant,
+) -> Result<MemoryFingerprint, ApiError> {
+    let pipeline = state
+        .pipeline
+        .lock()
+        .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+    let n_layers = pipeline.model().config.n_layers;
+    let d_model = pipeline.model().config.d_model;
+    Ok(MemoryFingerprint {
+        schema: "axiom-ttt-context-fingerprint/v2".to_string(),
+        session_id: session_id.to_string(),
+        context_tokens_processed: 0,
+        n_layers,
+        d_model,
+        state_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        layer_frobenius_norms: vec![0.0; n_layers],
+        recall_norm: 0.0,
+        recall_l1: 0.0,
+        recall_top_k_indices: Vec::new(),
+        recall_top_k_decoded: String::new(),
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+fn content_to_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b: &Value| b.get("text").and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}

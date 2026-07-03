@@ -1,4 +1,4 @@
-# restart_proxy.ps1 — definitively stop every Axiom proxy/watchdog instance and
+# restart_proxy.ps1 - definitively stop every Axiom proxy/watchdog instance and
 # start exactly one, pinned to CPU for stability. Idempotent and quote-safe.
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -22,6 +22,6 @@ Start-Process -FilePath $bash `
 Write-Host '== waiting for port 3000 =='
 for ($i = 1; $i -le 30; $i++) {
     Start-Sleep -Seconds 1
-    $c = Get-NetTCPConnection -LocalPort 3000 -State Listen
+    $c = Get-NetTCPConnection -LocalPort 3000 -State Listen -ErrorAction SilentlyContinue
     if ($c) { Write-Host "  PROXY UP after ${i}s (PID $($c.OwningProcess | Select-Object -First 1))"; break }
 }
