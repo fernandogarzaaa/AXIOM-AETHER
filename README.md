@@ -37,6 +37,15 @@ general answer-quality claims that are not proven by the repository.
 For a compact index of surfaces, see [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md).
 For research upgrades and what is still planned, see [`docs/UPGRADES.md`](docs/UPGRADES.md).
 
+### AxiomBench
+
+`cargo run --release --features tools --bin axiombench` measures Axiom on four
+axes — **cognition** (skeleton symbol round-trip fidelity), **trust** (calibrated
+grounding-gate coverage), **fleet** (cross-node immunity transfer + fragment
+auth), and **cost** (corpus token reduction, `--live`). The three deterministic
+pillars run in CI on every push; the current headline numbers live in
+[`RESULTS.md`](RESULTS.md).
+
 ## Verification Status
 
 The default CI workflow builds and tests the Rust workspace on Ubuntu:
