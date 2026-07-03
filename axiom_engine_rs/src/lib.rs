@@ -20,6 +20,7 @@ pub mod data_gen;
 pub mod dwe;
 pub mod embedder;
 pub mod encoder;
+pub mod entrypoint;
 pub mod epistemic_drift;
 pub mod fault_locate;
 pub mod hamiltonian;

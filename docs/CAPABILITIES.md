@@ -14,10 +14,10 @@ weights, O(1)/step, no fine-tune pipeline.
 
 | Pillar | What it does | Where |
 |---|---|---|
-| **1. Context compression** | Absorb heavy context into `W̃`, forward a Claude-readable structural skeleton (~80% fewer input tokens), recover bodies on demand. | `context_compressor.rs`, `skeleton.rs`, `/v1/messages` |
+| **1. Context compression** | Absorb heavy context into `W̃`, forward compact fingerprints, recover bodies on demand, and compress safe-prefix `/v1/responses` transcripts by replacing contiguous assistant runs in place. | `context_compressor.rs`, `responses_compressor.rs`, `skeleton.rs`, `/v1/messages`, `/v1/responses` |
 | **2. Self-healing runtime** | Run a program; on failure, feel the tension (CE), absorb it, heal the environment, and learn immunity. | `self_heal.rs`, `heal_memory.rs`, `axiom run` |
 | **3. Autonomy** | Drive a failing verify command to green by chaining environment-heal + source-repair + verify. | `solve.rs`, `axiom solve` |
-| **Grounding (anti-hallucination)** | Flag response claims unsupported by the evidence; spend tokens back only where grounding needs them. | `hallucination.rs`, `/v1/verify` |
+| **Grounding (anti-hallucination)** | Flag response claims unsupported by the evidence with a shipped conformal threshold, and benchmark neural-tier contradiction catch-rate against a lexical baseline. | `hallucination.rs`, `bench/trust/claims.jsonl`, `/v1/verify` |
 
 Cross-cutting: a **verifiable epistemic swarm** (Beta-belief confidence +
 Dempster-Shafer merge + tamper-evident provenance) lets nodes share what they
@@ -40,15 +40,16 @@ learn safely (`belief.rs`, `provenance.rs`, `/v1/immunity`).
 | `solve [--source PATH] [--max-rounds N] -- <cmd>` | Autonomous drive-to-green (Pillar 3). |
 | `immunity [query] [--prune]` | Report/curate acquired immunity (heals + Beta confidence). |
 | `swarm connect <peer>` / `swarm immunity <host:port>` | Register a DWE peer / pull+merge a peer's immunity (provenance-verified). |
+| `fleet status [--offline] [--base-url URL]` / `fleet join <peer>` | Inspect live fleet telemetry (`/metrics` + `/v1/fleet/status`) or print env-only wiring; emit join env for a peer. |
 | `daemon start\|stop\|status`, `mount <dir>` | Background hypervisor + Neural VFS. |
 
 ## HTTP endpoints (`--mode server`)
 
-**Inference / compression:** `/v1/messages`, `/v1/chat/completions`,
+**Inference / compression:** `/v1/messages`, `/v1/responses`, `/v1/chat/completions`,
 `/v1/completions`, `/v1/models`, `/v1/adapt`, `/v1/expand`, `/v1/config`, `/metrics`.
 **TTT sessions:** `/v1/sessions[/:id[/checkpoint]]`, `/v1/ttt/sessions[/:id]`, `/v1/ttt/feedback`.
 **Grounding:** `/v1/verify` (modes: lexical, `neural:true`, `expand:true`).
-**Swarm immunity:** `/v1/immunity` (signed export), `/v1/immunity/merge` (verify-before-trust), `/v1/cluster/sync`, `/v1/cluster/merge`.
+**Swarm immunity / fleet:** `/v1/fleet/status`, `/v1/immunity` (signed export), `/v1/immunity/merge` (verify-before-trust), `/v1/cluster/sync`, `/v1/cluster/merge`; `/metrics` exports `axiom_dwe_sent`, `axiom_dwe_received`, `axiom_dwe_applied`, and `axiom_dwe_rejected`.
 **Hypervisor:** `/v1/hypervisor/mount`, `/v1/hypervisor/read` (VFS→TTT prefill), `/v1/hypervisor/jit_run` (reversible source repair), `/v1/hypervisor/jit_status`, `/v1/swarm/matrix_state`.
 
 ## MCP tools (`--mode mcp`)
@@ -69,7 +70,7 @@ learn safely (`belief.rs`, `provenance.rs`, `/v1/immunity`).
 | `AXIOM_PRODUCTION_BPE` + `AXIOM_TOKENIZER` + `AXIOM_BPE_CKPT` | Use a trained BPE checkpoint. |
 | `AXIOM_HEAL_MEMORY` | Heal-memory path (`0`/`off` disables). |
 | `AXIOM_RUN_VIBE`, `AXIOM_RUN_REMEMBER` | Persist a run's W̃ / write novel fixes to recall memory. |
-| `AXIOM_FLEET_KEY` | HMAC peer-auth for swarm-immunity exchange. |
+| `AXIOM_FLEET_KEY`, `AXIOM_FLEET_KEY_PREV` | Current and previous HMAC keys for swarm-immunity exchange and DWE fragments; previous key is accepted only during rotation. |
 | `AXIOM_IMMUNITY_INJECT` | Active-immunity advisory injection (`0` to disable). |
 | `AXIOM_VERIFY_RESPONSES` | Opt-in auto grounding-verification of responses. |
 | `AXIOM_SWARM_LOCAL` + `AXIOM_OLLAMA_*` | Ollama-first local routing. |
@@ -82,7 +83,8 @@ learn safely (`belief.rs`, `provenance.rs`, `/v1/immunity`).
 - **Vibe memory** (`vibe_memory.rs`) — EMA-merged persistent `W̃` (codebase DNA).
 - **Tiered recall memory** (`memory_store.rs`, `memory_recall.rs`) — embedded store the proxy and `axiom_recall` share; the self-heal bridge writes novel fixes here.
 - **SR-TTT** (`surprisal.rs`) — exact residual cache for high-surprisal identifiers (secrets/hashes).
-- **DWE** (`dwe.rs`) — binary `W̃`-delta exchange between peers.
+- **DWE** (`dwe.rs`, `server/routes_fleet.rs`) — binary `W̃`-delta exchange between peers, HMAC authenticated, replay guarded, and observable through live counters/status.
+- **AxiomBench** (`src/bin/axiombench/`) — reproducible cognition, trust, fleet, and live cost evidence; `RESULTS.md` carries the current headline table.
 - **Hypervisor** — Neural VFS (`vfs.rs`), Poly JIT source repair (`poly_jit.rs`) ranked by a Q-TTT simulator (`q_manifold.rs`, `hamiltonian.rs`), compile-check sandbox (`sandbox.rs`).
 - **Training** — `train_tokenizer`, `train_semantic` (early-stopping on held-out CE), `eval_model` (acceptance + drift-gate calibration); `scripts/train_cpu_quickstart.sh`.
 

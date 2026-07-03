@@ -33,7 +33,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "axiom"
-path = "src/main.rs"
+path = "src/bin/axiom.rs"
 
 [features]
 default = []
