@@ -60,6 +60,9 @@ export AXIOM_TTT_COMPRESS_TOP_K="${AXIOM_TTT_COMPRESS_TOP_K:-32}"
 # Session recording (scrubbed request/response JSONL under ~/.axiom/sessions)
 # is OFF by default. Export AXIOM_SESSION_RECORD=1 to enable;
 # AXIOM_SESSIONS_DIR overrides the output directory.
+# Fleet weight exchange (DWE): the AXIOM_DWE_LISTEN listener REQUIRES
+# AXIOM_FLEET_KEY (a shared secret matched across all peers) — it fails closed
+# without one. `axiom fleet join <peer>` prints the exact exports to set.
 
 # --- Compute device: GPU-first, CPU fallback -------------------------------
 # Default to "auto": the engine selects CUDA when the `cuda` feature is compiled
