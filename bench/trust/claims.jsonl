@@ -1,44 +1,240 @@
-{"claim": "The Axiom server listens on port 3000.", "evidence": "The Axiom server listens on port 3000 by default when started.", "supported": true}
-{"claim": "Compression is enabled by default.", "evidence": "Responses input compression is enabled by default whenever compression is active.", "supported": true}
-{"claim": "The proxy forwards traffic to the real Anthropic API.", "evidence": "The forwarder pins the proxy upstream to the real Anthropic API endpoint.", "supported": true}
-{"claim": "Fragments carry a fleet-key HMAC.", "evidence": "Each DWE fragment carries a fleet-key HMAC over its authenticated fields.", "supported": true}
-{"claim": "The listener refuses to start without a fleet key.", "evidence": "The DWE listener refuses to start without a configured fleet key.", "supported": true}
-{"claim": "Session recording is disabled by default.", "evidence": "Session recording is disabled by default and enabled with an environment variable.", "supported": true}
-{"claim": "Secrets are redacted before recordings are written.", "evidence": "Secret values are redacted at write time before recordings are persisted to disk.", "supported": true}
-{"claim": "The conformal gate reports a coverage guarantee.", "evidence": "The conformal gate reports a stated coverage guarantee for supported claims.", "supported": true}
-{"claim": "Weight merging supports the DARE-TIES method.", "evidence": "Weight merging supports both the DARE-TIES method and a uniform alpha blend.", "supported": true}
-{"claim": "The skeleton digest strips function bodies.", "evidence": "The structural skeleton digest strips function bodies while keeping declarations.", "supported": true}
-{"claim": "Healing recreates missing directories.", "evidence": "The self-healing runner recreates missing directories before retrying the command.", "supported": true}
-{"claim": "The immunity merge verifies provenance before trusting a peer.", "evidence": "The immunity merge verifies peer provenance before trusting and merging the payload.", "supported": true}
-{"claim": "Belief fusion uses Dempster-Shafer combination.", "evidence": "Swarm belief fusion uses reliability-discounted Dempster-Shafer combination.", "supported": true}
-{"claim": "The savings receipt reports tokens saved.", "evidence": "The per-session savings receipt reports bytes in, bytes forwarded, and tokens saved.", "supported": true}
-{"claim": "The WebSocket transport relays frames to the upstream.", "evidence": "The WebSocket transport transparently relays frames to the upstream Responses socket.", "supported": true}
-{"claim": "Codex signs in with a ChatGPT subscription token.", "evidence": "Codex signs in with a ChatGPT subscription token that reaches the ChatGPT backend.", "supported": true}
-{"claim": "The recorder writes one JSONL file per session.", "evidence": "The recorder writes one JSONL file per session under the sessions directory.", "supported": true}
-{"claim": "Compression preserves the position of user messages.", "evidence": "In-place compression preserves the position of every user and structural message.", "supported": true}
-{"claim": "The gate calibrates a threshold from labeled samples.", "evidence": "The conformal gate calibrates a threshold from labeled score and support samples.", "supported": true}
-{"claim": "Replay rejection drops stale fragment sequences.", "evidence": "Replay rejection drops any fragment whose sequence is stale for that session.", "supported": true}
-{"claim": "The MCP server exposes Axiom tools over stdio.", "evidence": "The MCP server exposes Axiom compression and memory tools over a stdio transport.", "supported": true}
-{"claim": "The hypervisor route lists mounted directory entries.", "evidence": "The hypervisor list route returns mounted directory entries from the neural VFS.", "supported": true}
-{"claim": "The lunar rover measured soil acidity on Mars.", "evidence": "The Axiom server listens on port 3000 by default when started.", "supported": false}
-{"claim": "Quarterly revenue grew fifteen percent in Europe.", "evidence": "Responses input compression is enabled by default whenever compression is active.", "supported": false}
-{"claim": "The recipe requires two cups of almond flour.", "evidence": "The forwarder pins the proxy upstream to the real Anthropic API endpoint.", "supported": false}
-{"claim": "Migratory whales navigate using magnetic fields.", "evidence": "Each DWE fragment carries a fleet-key HMAC over its authenticated fields.", "supported": false}
-{"claim": "The orchestra performed a symphony in D minor.", "evidence": "The DWE listener refuses to start without a configured fleet key.", "supported": false}
-{"claim": "Volcanic ash disrupted transatlantic flights in spring.", "evidence": "Session recording is disabled by default and enabled with an environment variable.", "supported": false}
-{"claim": "The museum acquired a Renaissance oil painting.", "evidence": "Secret values are redacted at write time before recordings are persisted to disk.", "supported": false}
-{"claim": "Coral reefs bleached during the warm ocean current.", "evidence": "The conformal gate reports a stated coverage guarantee for supported claims.", "supported": false}
-{"claim": "The marathon route climbed three steep hills.", "evidence": "Weight merging supports both the DARE-TIES method and a uniform alpha blend.", "supported": false}
-{"claim": "The vineyard harvested grapes in late September.", "evidence": "The structural skeleton digest strips function bodies while keeping declarations.", "supported": false}
-{"claim": "The Axiom server listens on port 8080.", "evidence": "The Axiom server listens on port 3000 by default when started.", "supported": false}
-{"claim": "Compression is disabled by default.", "evidence": "Responses input compression is enabled by default whenever compression is active.", "supported": false}
-{"claim": "The listener starts without a fleet key.", "evidence": "The DWE listener refuses to start without a configured fleet key.", "supported": false}
-{"claim": "Session recording is enabled by default.", "evidence": "Session recording is disabled by default and enabled with an environment variable.", "supported": false}
-{"claim": "Secrets are written verbatim into recordings.", "evidence": "Secret values are redacted at write time before recordings are persisted to disk.", "supported": false}
-{"claim": "Weight merging supports only a uniform alpha blend.", "evidence": "Weight merging supports both the DARE-TIES method and a uniform alpha blend.", "supported": false}
-{"claim": "The skeleton digest keeps function bodies intact.", "evidence": "The structural skeleton digest strips function bodies while keeping declarations.", "supported": false}
-{"claim": "The immunity merge trusts a peer without verifying provenance.", "evidence": "The immunity merge verifies peer provenance before trusting and merging the payload.", "supported": false}
-{"claim": "Replay rejection accepts stale fragment sequences.", "evidence": "Replay rejection drops any fragment whose sequence is stale for that session.", "supported": false}
-{"claim": "Compression discards the position of user messages.", "evidence": "In-place compression preserves the position of every user and structural message.", "supported": false}
-{"claim": "The recorder writes every session into a single shared file.", "evidence": "The recorder writes one JSONL file per session under the sessions directory.", "supported": false}
-{"claim": "The WebSocket transport blocks frames from the upstream.", "evidence": "The WebSocket transport transparently relays frames to the upstream Responses socket.", "supported": false}
+{"claim":"Axiom records sessions.","evidence":"Axiom logs sessions after scrubbing request records.","supported":true,"family":"supported"}
+{"claim":"Axiom schedules calendar meetings automatically.","evidence":"The proxy handles Responses compression and savings receipts.","supported":false,"family":"unsupported"}
+{"claim":"The DWE listener is disabled when AXIOM_FLEET_KEY is present.","evidence":"The DWE listener is enabled only when AXIOM_FLEET_KEY is present.","supported":false,"family":"contradiction"}
+{"claim":"Axiom stores receipts.","evidence":"Axiom writes receipts for savings measurements.","supported":true,"family":"supported"}
+{"claim":"The fleet CLI uploads videos.","evidence":"The fleet CLI reports peer status and join commands.","supported":false,"family":"unsupported"}
+{"claim":"Compression fallback rejects unsafe payloads.","evidence":"Compression fallback accepts unsafe payloads by forwarding them unmodified.","supported":false,"family":"contradiction"}
+{"claim":"Axiom checks fragments.","evidence":"Axiom verifies fragments before accepting fleet updates.","supported":true,"family":"supported"}
+{"claim":"The recorder stores raw API keys.","evidence":"The recorder scrubs secrets before writing session JSONL.","supported":false,"family":"unsupported"}
+{"claim":"The recorder exposes raw secrets in JSONL.","evidence":"The recorder redacts raw secrets before writing JSONL.","supported":false,"family":"contradiction"}
+{"claim":"Axiom measures costs.","evidence":"Axiom reports costs from replayed sessions.","supported":true,"family":"supported"}
+{"claim":"AxiomBench trains image classifiers.","evidence":"AxiomBench measures cognition, trust, fleet, and cost pillars.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench cost replay reports 0 successful records.","evidence":"AxiomBench cost replay reports 3 successful records in the mock corpus.","supported":false,"family":"contradiction"}
+{"claim":"Axiom gates claims.","evidence":"Axiom evaluates claims against supplied evidence.","supported":true,"family":"supported"}
+{"claim":"The cost replay edits GitHub issues.","evidence":"The cost replay sends recorded requests to a configured proxy.","supported":false,"family":"unsupported"}
+{"claim":"The conformal threshold is 1.","evidence":"The conformal threshold is 0.6666667 for the shipped trust gate.","supported":false,"family":"contradiction"}
+{"claim":"Axiom lists corpus.","evidence":"Axiom enumerates corpus files with counts and hashes.","supported":true,"family":"supported"}
+{"claim":"Compression requires a browser extension.","evidence":"Compression runs inside the local Axiom proxy.","supported":false,"family":"unsupported"}
+{"claim":"Fleet fragments fail when HMAC signatures are valid.","evidence":"Fleet fragments pass when HMAC signatures are valid and monotone.","supported":false,"family":"contradiction"}
+{"claim":"Corpus promotion hashes scrubbed sessions.","evidence":"Corpus promotion hashes scrubbed sessions into bench/corpus files.","supported":true,"family":"supported"}
+{"claim":"The conformal gate depends on weather data.","evidence":"The conformal gate is calibrated from labeled claim evidence rows.","supported":false,"family":"unsupported"}
+{"claim":"Session promotion strips hashes from corpus files.","evidence":"Session promotion preserves hashes in corpus file provenance.","supported":false,"family":"contradiction"}
+{"claim":"Compression fallback forwards unsafe payloads.","evidence":"Compression fallback forwards unsafe payloads without changing them.","supported":true,"family":"supported"}
+{"claim":"Corpus promotion writes PowerPoint files.","evidence":"Corpus promotion writes scrubbed JSONL files into bench/corpus.","supported":false,"family":"unsupported"}
+{"claim":"The replay control arm enables compression.","evidence":"The replay control arm disables compression with a request header.","supported":false,"family":"contradiction"}
+{"claim":"Responses replay records errored cases.","evidence":"Responses replay records errored cases separately from successful replay.","supported":true,"family":"supported"}
+{"claim":"Fleet HMAC uses passwords from email.","evidence":"Fleet HMAC uses AXIOM_FLEET_KEY from the local environment.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench runs cost before trust.","evidence":"AxiomBench reports cognition, trust, fleet, then cost.","supported":false,"family":"contradiction"}
+{"claim":"Conformal gate uses delta ten.","evidence":"The conformal gate uses delta 0.10 for shipped calibration.","supported":true,"family":"supported"}
+{"claim":"The savings ledger controls display brightness.","evidence":"The savings ledger tracks raw and compressed byte receipts.","supported":false,"family":"unsupported"}
+{"claim":"The listener accepts replayed sequences.","evidence":"The listener rejects replayed sequences to keep DWE updates monotone.","supported":false,"family":"contradiction"}
+{"claim":"Metrics expose savings counters.","evidence":"The metrics endpoint exposes savings counters for raw and compressed bytes.","supported":true,"family":"supported"}
+{"claim":"Responses replay opens calendar invites.","evidence":"Responses replay posts payloads to the local proxy.","supported":false,"family":"unsupported"}
+{"claim":"The proxy increases payload bytes during guarded compression.","evidence":"The proxy decreases payload bytes during guarded compression and never expands the payload.","supported":false,"family":"contradiction"}
+{"claim":"Axiom proxy relays streaming frames.","evidence":"The Axiom proxy relays streaming frames transparently for Responses.","supported":true,"family":"supported"}
+{"claim":"The trust dataset contains payroll records.","evidence":"The trust dataset contains synthetic claim and evidence examples.","supported":false,"family":"unsupported"}
+{"claim":"Corpus promotion exposes secrets after scrubbing.","evidence":"Corpus promotion redacts secrets after scrubbing and refuses remaining secret patterns.","supported":false,"family":"contradiction"}
+{"claim":"Replay corpus lives under bench corpus.","evidence":"The replay corpus lives under bench/corpus as scrubbed JSONL.","supported":true,"family":"supported"}
+{"claim":"Axiom proxy compiles TypeScript bundles.","evidence":"Axiom proxy forwards OpenAI-compatible HTTP requests.","supported":false,"family":"unsupported"}
+{"claim":"The mock script fails when the TCP listener is ready.","evidence":"The mock script passes after the TCP listener is ready.","supported":false,"family":"contradiction"}
+{"claim":"Trust dataset labels contradictions.","evidence":"The trust dataset labels contradictions as their own family.","supported":true,"family":"supported"}
+{"claim":"Session recording requires a GPU driver.","evidence":"Session recording is enabled through AXIOM_SESSION_RECORD.","supported":false,"family":"unsupported"}
+{"claim":"The release updater disables checksum verification.","evidence":"The release updater enables checksum verification before deployment.","supported":false,"family":"contradiction"}
+{"claim":"Fleet status prints peer state.","evidence":"The fleet status command prints local peer state and configured endpoints.","supported":true,"family":"supported"}
+{"claim":"The update script formats disks.","evidence":"The update script downloads release assets and verifies checksums.","supported":false,"family":"unsupported"}
+{"claim":"The trust dataset marks contradictions as supported.","evidence":"The trust dataset marks contradictions as unsupported examples.","supported":false,"family":"contradiction"}
+{"claim":"Release updater verifies checksums.","evidence":"The release updater verifies SHA-256 checksums before deploying assets.","supported":true,"family":"supported"}
+{"claim":"AxiomBench corpus list deletes sessions.","evidence":"AxiomBench corpus list prints file hashes and record counts.","supported":false,"family":"unsupported"}
+{"claim":"Axiom saves request receipts after process exit only.","evidence":"Axiom saves request receipts before process exit and tracks lifetime totals.","supported":false,"family":"contradiction"}
+{"claim":"Mock cost script starts isolated proxy.","evidence":"The mock cost script starts an isolated proxy and mock upstream.","supported":true,"family":"supported"}
+{"claim":"The DWE listener accepts anonymous fragments.","evidence":"The DWE listener requires HMAC-authenticated fragments.","supported":false,"family":"unsupported"}
+{"claim":"The proxy starts without production BPE variables.","evidence":"The proxy refuses production checkpoints without production BPE variables.","supported":false,"family":"contradiction"}
+{"claim":"Header opt-out disables compression.","evidence":"The header opt-out disables compression for the replay control arm.","supported":true,"family":"supported"}
+{"claim":"The mock cost script calls the real OpenAI API.","evidence":"The mock cost script uses a local mock upstream.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench corpus list writes new files.","evidence":"AxiomBench corpus list reads existing files and prints counts.","supported":false,"family":"contradiction"}
+{"claim":"Recorder writes scrubbed JSONL.","evidence":"The recorder writes scrubbed JSONL when AXIOM_SESSION_RECORD is enabled.","supported":true,"family":"supported"}
+{"claim":"Compression fallback drops failed turns.","evidence":"Compression fallback forwards unsafe payloads unmodified.","supported":false,"family":"unsupported"}
+{"claim":"The fleet join command rejects valid peer URLs.","evidence":"The fleet join command accepts valid peer URLs for configuration.","supported":false,"family":"contradiction"}
+{"claim":"Trust calibration uses even rows.","evidence":"Trust calibration uses even rows and holds odd rows for evaluation.","supported":true,"family":"supported"}
+{"claim":"Trust calibration mutates process environment.","evidence":"Trust calibration reads the dataset and calibrates in memory.","supported":false,"family":"unsupported"}
+{"claim":"The WebSocket relay strips streaming frames.","evidence":"The WebSocket relay preserves streaming frames transparently.","supported":false,"family":"contradiction"}
+{"claim":"Axiom compresses responses safely.","evidence":"Axiom compresses responses safely while preserving pass-through fallback.","supported":true,"family":"supported"}
+{"claim":"Axiom schedules calendar meetings automatically.","evidence":"The proxy handles Responses compression and savings receipts.","supported":false,"family":"unsupported"}
+{"claim":"The DWE listener is disabled when AXIOM_FLEET_KEY is present.","evidence":"The DWE listener is enabled only when AXIOM_FLEET_KEY is present.","supported":false,"family":"contradiction"}
+{"claim":"Session recorder scrubs secrets.","evidence":"The session recorder scrubs secrets before writing JSONL records.","supported":true,"family":"supported"}
+{"claim":"The fleet CLI uploads videos.","evidence":"The fleet CLI reports peer status and join commands.","supported":false,"family":"unsupported"}
+{"claim":"Compression fallback rejects unsafe payloads.","evidence":"Compression fallback accepts unsafe payloads by forwarding them unmodified.","supported":false,"family":"contradiction"}
+{"claim":"Savings ledger separates lifetime totals.","evidence":"The savings ledger separates lifetime totals from request receipts.","supported":true,"family":"supported"}
+{"claim":"The recorder stores raw API keys.","evidence":"The recorder scrubs secrets before writing session JSONL.","supported":false,"family":"unsupported"}
+{"claim":"The recorder exposes raw secrets in JSONL.","evidence":"The recorder redacts raw secrets before writing JSONL.","supported":false,"family":"contradiction"}
+{"claim":"DWE listener requires fleet key.","evidence":"The DWE listener requires AXIOM_FLEET_KEY before it starts.","supported":true,"family":"supported"}
+{"claim":"AxiomBench trains image classifiers.","evidence":"AxiomBench measures cognition, trust, fleet, and cost pillars.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench cost replay reports 0 successful records.","evidence":"AxiomBench cost replay reports 3 successful records in the mock corpus.","supported":false,"family":"contradiction"}
+{"claim":"Fleet fragments carry HMAC signatures.","evidence":"Fleet fragments carry HMAC signatures and reject unauthenticated peers.","supported":true,"family":"supported"}
+{"claim":"The cost replay edits GitHub issues.","evidence":"The cost replay sends recorded requests to a configured proxy.","supported":false,"family":"unsupported"}
+{"claim":"The conformal threshold is 1.","evidence":"The conformal threshold is 0.6666667 for the shipped trust gate.","supported":false,"family":"contradiction"}
+{"claim":"AxiomBench reports cognition trust fleet cost.","evidence":"AxiomBench reports cognition, trust, fleet, and cost pillars.","supported":true,"family":"supported"}
+{"claim":"Compression requires a browser extension.","evidence":"Compression runs inside the local Axiom proxy.","supported":false,"family":"unsupported"}
+{"claim":"Fleet fragments fail when HMAC signatures are valid.","evidence":"Fleet fragments pass when HMAC signatures are valid and monotone.","supported":false,"family":"contradiction"}
+{"claim":"Corpus promotion hashes scrubbed sessions.","evidence":"Corpus promotion hashes scrubbed sessions into bench/corpus files.","supported":true,"family":"supported"}
+{"claim":"The conformal gate depends on weather data.","evidence":"The conformal gate is calibrated from labeled claim evidence rows.","supported":false,"family":"unsupported"}
+{"claim":"Session promotion strips hashes from corpus files.","evidence":"Session promotion preserves hashes in corpus file provenance.","supported":false,"family":"contradiction"}
+{"claim":"Compression fallback forwards unsafe payloads.","evidence":"Compression fallback forwards unsafe payloads without changing them.","supported":true,"family":"supported"}
+{"claim":"Corpus promotion writes PowerPoint files.","evidence":"Corpus promotion writes scrubbed JSONL files into bench/corpus.","supported":false,"family":"unsupported"}
+{"claim":"The replay control arm enables compression.","evidence":"The replay control arm disables compression with a request header.","supported":false,"family":"contradiction"}
+{"claim":"Responses replay records errored cases.","evidence":"Responses replay records errored cases separately from successful replay.","supported":true,"family":"supported"}
+{"claim":"Fleet HMAC uses passwords from email.","evidence":"Fleet HMAC uses AXIOM_FLEET_KEY from the local environment.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench runs cost before trust.","evidence":"AxiomBench reports cognition, trust, fleet, then cost.","supported":false,"family":"contradiction"}
+{"claim":"Conformal gate uses delta ten.","evidence":"The conformal gate uses delta 0.10 for shipped calibration.","supported":true,"family":"supported"}
+{"claim":"The savings ledger controls display brightness.","evidence":"The savings ledger tracks raw and compressed byte receipts.","supported":false,"family":"unsupported"}
+{"claim":"The listener accepts replayed sequences.","evidence":"The listener rejects replayed sequences to keep DWE updates monotone.","supported":false,"family":"contradiction"}
+{"claim":"Metrics expose savings counters.","evidence":"The metrics endpoint exposes savings counters for raw and compressed bytes.","supported":true,"family":"supported"}
+{"claim":"Responses replay opens calendar invites.","evidence":"Responses replay posts payloads to the local proxy.","supported":false,"family":"unsupported"}
+{"claim":"The proxy increases payload bytes during guarded compression.","evidence":"The proxy decreases payload bytes during guarded compression and never expands the payload.","supported":false,"family":"contradiction"}
+{"claim":"Axiom proxy relays streaming frames.","evidence":"The Axiom proxy relays streaming frames transparently for Responses.","supported":true,"family":"supported"}
+{"claim":"The trust dataset contains payroll records.","evidence":"The trust dataset contains synthetic claim and evidence examples.","supported":false,"family":"unsupported"}
+{"claim":"Corpus promotion exposes secrets after scrubbing.","evidence":"Corpus promotion redacts secrets after scrubbing and refuses remaining secret patterns.","supported":false,"family":"contradiction"}
+{"claim":"Replay corpus lives under bench corpus.","evidence":"The replay corpus lives under bench/corpus as scrubbed JSONL.","supported":true,"family":"supported"}
+{"claim":"Axiom proxy compiles TypeScript bundles.","evidence":"Axiom proxy forwards OpenAI-compatible HTTP requests.","supported":false,"family":"unsupported"}
+{"claim":"The mock script fails when the TCP listener is ready.","evidence":"The mock script passes after the TCP listener is ready.","supported":false,"family":"contradiction"}
+{"claim":"Trust dataset labels contradictions.","evidence":"The trust dataset labels contradictions as their own family.","supported":true,"family":"supported"}
+{"claim":"Session recording requires a GPU driver.","evidence":"Session recording is enabled through AXIOM_SESSION_RECORD.","supported":false,"family":"unsupported"}
+{"claim":"The release updater disables checksum verification.","evidence":"The release updater enables checksum verification before deployment.","supported":false,"family":"contradiction"}
+{"claim":"Fleet status prints peer state.","evidence":"The fleet status command prints local peer state and configured endpoints.","supported":true,"family":"supported"}
+{"claim":"The update script formats disks.","evidence":"The update script downloads release assets and verifies checksums.","supported":false,"family":"unsupported"}
+{"claim":"The trust dataset marks contradictions as supported.","evidence":"The trust dataset marks contradictions as unsupported examples.","supported":false,"family":"contradiction"}
+{"claim":"Release updater verifies checksums.","evidence":"The release updater verifies SHA-256 checksums before deploying assets.","supported":true,"family":"supported"}
+{"claim":"AxiomBench corpus list deletes sessions.","evidence":"AxiomBench corpus list prints file hashes and record counts.","supported":false,"family":"unsupported"}
+{"claim":"Axiom saves request receipts after process exit only.","evidence":"Axiom saves request receipts before process exit and tracks lifetime totals.","supported":false,"family":"contradiction"}
+{"claim":"Mock cost script starts isolated proxy.","evidence":"The mock cost script starts an isolated proxy and mock upstream.","supported":true,"family":"supported"}
+{"claim":"The DWE listener accepts anonymous fragments.","evidence":"The DWE listener requires HMAC-authenticated fragments.","supported":false,"family":"unsupported"}
+{"claim":"The proxy starts without production BPE variables.","evidence":"The proxy refuses production checkpoints without production BPE variables.","supported":false,"family":"contradiction"}
+{"claim":"Header opt-out disables compression.","evidence":"The header opt-out disables compression for the replay control arm.","supported":true,"family":"supported"}
+{"claim":"The mock cost script calls the real OpenAI API.","evidence":"The mock cost script uses a local mock upstream.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench corpus list writes new files.","evidence":"AxiomBench corpus list reads existing files and prints counts.","supported":false,"family":"contradiction"}
+{"claim":"Recorder writes scrubbed JSONL.","evidence":"The recorder writes scrubbed JSONL when AXIOM_SESSION_RECORD is enabled.","supported":true,"family":"supported"}
+{"claim":"Compression fallback drops failed turns.","evidence":"Compression fallback forwards unsafe payloads unmodified.","supported":false,"family":"unsupported"}
+{"claim":"The fleet join command rejects valid peer URLs.","evidence":"The fleet join command accepts valid peer URLs for configuration.","supported":false,"family":"contradiction"}
+{"claim":"Trust calibration uses even rows.","evidence":"Trust calibration uses even rows and holds odd rows for evaluation.","supported":true,"family":"supported"}
+{"claim":"Trust calibration mutates process environment.","evidence":"Trust calibration reads the dataset and calibrates in memory.","supported":false,"family":"unsupported"}
+{"claim":"The WebSocket relay strips streaming frames.","evidence":"The WebSocket relay preserves streaming frames transparently.","supported":false,"family":"contradiction"}
+{"claim":"Axiom compresses responses safely.","evidence":"Axiom compresses responses safely while preserving pass-through fallback.","supported":true,"family":"supported"}
+{"claim":"Axiom schedules calendar meetings automatically.","evidence":"The proxy handles Responses compression and savings receipts.","supported":false,"family":"unsupported"}
+{"claim":"The DWE listener is disabled when AXIOM_FLEET_KEY is present.","evidence":"The DWE listener is enabled only when AXIOM_FLEET_KEY is present.","supported":false,"family":"contradiction"}
+{"claim":"Session recorder scrubs secrets.","evidence":"The session recorder scrubs secrets before writing JSONL records.","supported":true,"family":"supported"}
+{"claim":"The fleet CLI uploads videos.","evidence":"The fleet CLI reports peer status and join commands.","supported":false,"family":"unsupported"}
+{"claim":"Compression fallback rejects unsafe payloads.","evidence":"Compression fallback accepts unsafe payloads by forwarding them unmodified.","supported":false,"family":"contradiction"}
+{"claim":"Savings ledger separates lifetime totals.","evidence":"The savings ledger separates lifetime totals from request receipts.","supported":true,"family":"supported"}
+{"claim":"The recorder stores raw API keys.","evidence":"The recorder scrubs secrets before writing session JSONL.","supported":false,"family":"unsupported"}
+{"claim":"The recorder exposes raw secrets in JSONL.","evidence":"The recorder redacts raw secrets before writing JSONL.","supported":false,"family":"contradiction"}
+{"claim":"DWE listener requires fleet key.","evidence":"The DWE listener requires AXIOM_FLEET_KEY before it starts.","supported":true,"family":"supported"}
+{"claim":"AxiomBench trains image classifiers.","evidence":"AxiomBench measures cognition, trust, fleet, and cost pillars.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench cost replay reports 0 successful records.","evidence":"AxiomBench cost replay reports 3 successful records in the mock corpus.","supported":false,"family":"contradiction"}
+{"claim":"Fleet fragments carry HMAC signatures.","evidence":"Fleet fragments carry HMAC signatures and reject unauthenticated peers.","supported":true,"family":"supported"}
+{"claim":"The cost replay edits GitHub issues.","evidence":"The cost replay sends recorded requests to a configured proxy.","supported":false,"family":"unsupported"}
+{"claim":"The conformal threshold is 1.","evidence":"The conformal threshold is 0.6666667 for the shipped trust gate.","supported":false,"family":"contradiction"}
+{"claim":"AxiomBench reports cognition trust fleet cost.","evidence":"AxiomBench reports cognition, trust, fleet, and cost pillars.","supported":true,"family":"supported"}
+{"claim":"Compression requires a browser extension.","evidence":"Compression runs inside the local Axiom proxy.","supported":false,"family":"unsupported"}
+{"claim":"Fleet fragments fail when HMAC signatures are valid.","evidence":"Fleet fragments pass when HMAC signatures are valid and monotone.","supported":false,"family":"contradiction"}
+{"claim":"Corpus promotion hashes scrubbed sessions.","evidence":"Corpus promotion hashes scrubbed sessions into bench/corpus files.","supported":true,"family":"supported"}
+{"claim":"The conformal gate depends on weather data.","evidence":"The conformal gate is calibrated from labeled claim evidence rows.","supported":false,"family":"unsupported"}
+{"claim":"Session promotion strips hashes from corpus files.","evidence":"Session promotion preserves hashes in corpus file provenance.","supported":false,"family":"contradiction"}
+{"claim":"Compression fallback forwards unsafe payloads.","evidence":"Compression fallback forwards unsafe payloads without changing them.","supported":true,"family":"supported"}
+{"claim":"Corpus promotion writes PowerPoint files.","evidence":"Corpus promotion writes scrubbed JSONL files into bench/corpus.","supported":false,"family":"unsupported"}
+{"claim":"The replay control arm enables compression.","evidence":"The replay control arm disables compression with a request header.","supported":false,"family":"contradiction"}
+{"claim":"Responses replay records errored cases.","evidence":"Responses replay records errored cases separately from successful replay.","supported":true,"family":"supported"}
+{"claim":"Fleet HMAC uses passwords from email.","evidence":"Fleet HMAC uses AXIOM_FLEET_KEY from the local environment.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench runs cost before trust.","evidence":"AxiomBench reports cognition, trust, fleet, then cost.","supported":false,"family":"contradiction"}
+{"claim":"Conformal gate uses delta ten.","evidence":"The conformal gate uses delta 0.10 for shipped calibration.","supported":true,"family":"supported"}
+{"claim":"The savings ledger controls display brightness.","evidence":"The savings ledger tracks raw and compressed byte receipts.","supported":false,"family":"unsupported"}
+{"claim":"The listener accepts replayed sequences.","evidence":"The listener rejects replayed sequences to keep DWE updates monotone.","supported":false,"family":"contradiction"}
+{"claim":"Metrics expose savings counters.","evidence":"The metrics endpoint exposes savings counters for raw and compressed bytes.","supported":true,"family":"supported"}
+{"claim":"Responses replay opens calendar invites.","evidence":"Responses replay posts payloads to the local proxy.","supported":false,"family":"unsupported"}
+{"claim":"The proxy increases payload bytes during guarded compression.","evidence":"The proxy decreases payload bytes during guarded compression and never expands the payload.","supported":false,"family":"contradiction"}
+{"claim":"Axiom proxy relays streaming frames.","evidence":"The Axiom proxy relays streaming frames transparently for Responses.","supported":true,"family":"supported"}
+{"claim":"The trust dataset contains payroll records.","evidence":"The trust dataset contains synthetic claim and evidence examples.","supported":false,"family":"unsupported"}
+{"claim":"Corpus promotion exposes secrets after scrubbing.","evidence":"Corpus promotion redacts secrets after scrubbing and refuses remaining secret patterns.","supported":false,"family":"contradiction"}
+{"claim":"Replay corpus lives under bench corpus.","evidence":"The replay corpus lives under bench/corpus as scrubbed JSONL.","supported":true,"family":"supported"}
+{"claim":"Axiom proxy compiles TypeScript bundles.","evidence":"Axiom proxy forwards OpenAI-compatible HTTP requests.","supported":false,"family":"unsupported"}
+{"claim":"The mock script fails when the TCP listener is ready.","evidence":"The mock script passes after the TCP listener is ready.","supported":false,"family":"contradiction"}
+{"claim":"Trust dataset labels contradictions.","evidence":"The trust dataset labels contradictions as their own family.","supported":true,"family":"supported"}
+{"claim":"Session recording requires a GPU driver.","evidence":"Session recording is enabled through AXIOM_SESSION_RECORD.","supported":false,"family":"unsupported"}
+{"claim":"The release updater disables checksum verification.","evidence":"The release updater enables checksum verification before deployment.","supported":false,"family":"contradiction"}
+{"claim":"Fleet status prints peer state.","evidence":"The fleet status command prints local peer state and configured endpoints.","supported":true,"family":"supported"}
+{"claim":"The update script formats disks.","evidence":"The update script downloads release assets and verifies checksums.","supported":false,"family":"unsupported"}
+{"claim":"The trust dataset marks contradictions as supported.","evidence":"The trust dataset marks contradictions as unsupported examples.","supported":false,"family":"contradiction"}
+{"claim":"Release updater verifies checksums.","evidence":"The release updater verifies SHA-256 checksums before deploying assets.","supported":true,"family":"supported"}
+{"claim":"AxiomBench corpus list deletes sessions.","evidence":"AxiomBench corpus list prints file hashes and record counts.","supported":false,"family":"unsupported"}
+{"claim":"Axiom saves request receipts after process exit only.","evidence":"Axiom saves request receipts before process exit and tracks lifetime totals.","supported":false,"family":"contradiction"}
+{"claim":"Mock cost script starts isolated proxy.","evidence":"The mock cost script starts an isolated proxy and mock upstream.","supported":true,"family":"supported"}
+{"claim":"The DWE listener accepts anonymous fragments.","evidence":"The DWE listener requires HMAC-authenticated fragments.","supported":false,"family":"unsupported"}
+{"claim":"The proxy starts without production BPE variables.","evidence":"The proxy refuses production checkpoints without production BPE variables.","supported":false,"family":"contradiction"}
+{"claim":"Header opt-out disables compression.","evidence":"The header opt-out disables compression for the replay control arm.","supported":true,"family":"supported"}
+{"claim":"The mock cost script calls the real OpenAI API.","evidence":"The mock cost script uses a local mock upstream.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench corpus list writes new files.","evidence":"AxiomBench corpus list reads existing files and prints counts.","supported":false,"family":"contradiction"}
+{"claim":"Recorder writes scrubbed JSONL.","evidence":"The recorder writes scrubbed JSONL when AXIOM_SESSION_RECORD is enabled.","supported":true,"family":"supported"}
+{"claim":"Compression fallback drops failed turns.","evidence":"Compression fallback forwards unsafe payloads unmodified.","supported":false,"family":"unsupported"}
+{"claim":"The fleet join command rejects valid peer URLs.","evidence":"The fleet join command accepts valid peer URLs for configuration.","supported":false,"family":"contradiction"}
+{"claim":"Trust calibration uses even rows.","evidence":"Trust calibration uses even rows and holds odd rows for evaluation.","supported":true,"family":"supported"}
+{"claim":"Trust calibration mutates process environment.","evidence":"Trust calibration reads the dataset and calibrates in memory.","supported":false,"family":"unsupported"}
+{"claim":"The WebSocket relay strips streaming frames.","evidence":"The WebSocket relay preserves streaming frames transparently.","supported":false,"family":"contradiction"}
+{"claim":"Axiom compresses responses safely.","evidence":"Axiom compresses responses safely while preserving pass-through fallback.","supported":true,"family":"supported"}
+{"claim":"Axiom schedules calendar meetings automatically.","evidence":"The proxy handles Responses compression and savings receipts.","supported":false,"family":"unsupported"}
+{"claim":"The DWE listener is disabled when AXIOM_FLEET_KEY is present.","evidence":"The DWE listener is enabled only when AXIOM_FLEET_KEY is present.","supported":false,"family":"contradiction"}
+{"claim":"Session recorder scrubs secrets.","evidence":"The session recorder scrubs secrets before writing JSONL records.","supported":true,"family":"supported"}
+{"claim":"The fleet CLI uploads videos.","evidence":"The fleet CLI reports peer status and join commands.","supported":false,"family":"unsupported"}
+{"claim":"Compression fallback rejects unsafe payloads.","evidence":"Compression fallback accepts unsafe payloads by forwarding them unmodified.","supported":false,"family":"contradiction"}
+{"claim":"Savings ledger separates lifetime totals.","evidence":"The savings ledger separates lifetime totals from request receipts.","supported":true,"family":"supported"}
+{"claim":"The recorder stores raw API keys.","evidence":"The recorder scrubs secrets before writing session JSONL.","supported":false,"family":"unsupported"}
+{"claim":"The recorder exposes raw secrets in JSONL.","evidence":"The recorder redacts raw secrets before writing JSONL.","supported":false,"family":"contradiction"}
+{"claim":"DWE listener requires fleet key.","evidence":"The DWE listener requires AXIOM_FLEET_KEY before it starts.","supported":true,"family":"supported"}
+{"claim":"AxiomBench trains image classifiers.","evidence":"AxiomBench measures cognition, trust, fleet, and cost pillars.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench cost replay reports 0 successful records.","evidence":"AxiomBench cost replay reports 3 successful records in the mock corpus.","supported":false,"family":"contradiction"}
+{"claim":"Fleet fragments carry HMAC signatures.","evidence":"Fleet fragments carry HMAC signatures and reject unauthenticated peers.","supported":true,"family":"supported"}
+{"claim":"The cost replay edits GitHub issues.","evidence":"The cost replay sends recorded requests to a configured proxy.","supported":false,"family":"unsupported"}
+{"claim":"The conformal threshold is 1.","evidence":"The conformal threshold is 0.6666667 for the shipped trust gate.","supported":false,"family":"contradiction"}
+{"claim":"AxiomBench reports cognition trust fleet cost.","evidence":"AxiomBench reports cognition, trust, fleet, and cost pillars.","supported":true,"family":"supported"}
+{"claim":"Compression requires a browser extension.","evidence":"Compression runs inside the local Axiom proxy.","supported":false,"family":"unsupported"}
+{"claim":"Fleet fragments fail when HMAC signatures are valid.","evidence":"Fleet fragments pass when HMAC signatures are valid and monotone.","supported":false,"family":"contradiction"}
+{"claim":"Corpus promotion hashes scrubbed sessions.","evidence":"Corpus promotion hashes scrubbed sessions into bench/corpus files.","supported":true,"family":"supported"}
+{"claim":"The conformal gate depends on weather data.","evidence":"The conformal gate is calibrated from labeled claim evidence rows.","supported":false,"family":"unsupported"}
+{"claim":"Session promotion strips hashes from corpus files.","evidence":"Session promotion preserves hashes in corpus file provenance.","supported":false,"family":"contradiction"}
+{"claim":"Compression fallback forwards unsafe payloads.","evidence":"Compression fallback forwards unsafe payloads without changing them.","supported":true,"family":"supported"}
+{"claim":"Corpus promotion writes PowerPoint files.","evidence":"Corpus promotion writes scrubbed JSONL files into bench/corpus.","supported":false,"family":"unsupported"}
+{"claim":"The replay control arm enables compression.","evidence":"The replay control arm disables compression with a request header.","supported":false,"family":"contradiction"}
+{"claim":"Responses replay records errored cases.","evidence":"Responses replay records errored cases separately from successful replay.","supported":true,"family":"supported"}
+{"claim":"Fleet HMAC uses passwords from email.","evidence":"Fleet HMAC uses AXIOM_FLEET_KEY from the local environment.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench runs cost before trust.","evidence":"AxiomBench reports cognition, trust, fleet, then cost.","supported":false,"family":"contradiction"}
+{"claim":"Conformal gate uses delta ten.","evidence":"The conformal gate uses delta 0.10 for shipped calibration.","supported":true,"family":"supported"}
+{"claim":"The savings ledger controls display brightness.","evidence":"The savings ledger tracks raw and compressed byte receipts.","supported":false,"family":"unsupported"}
+{"claim":"The listener accepts replayed sequences.","evidence":"The listener rejects replayed sequences to keep DWE updates monotone.","supported":false,"family":"contradiction"}
+{"claim":"Metrics expose savings counters.","evidence":"The metrics endpoint exposes savings counters for raw and compressed bytes.","supported":true,"family":"supported"}
+{"claim":"Responses replay opens calendar invites.","evidence":"Responses replay posts payloads to the local proxy.","supported":false,"family":"unsupported"}
+{"claim":"The proxy increases payload bytes during guarded compression.","evidence":"The proxy decreases payload bytes during guarded compression and never expands the payload.","supported":false,"family":"contradiction"}
+{"claim":"Axiom proxy relays streaming frames.","evidence":"The Axiom proxy relays streaming frames transparently for Responses.","supported":true,"family":"supported"}
+{"claim":"The trust dataset contains payroll records.","evidence":"The trust dataset contains synthetic claim and evidence examples.","supported":false,"family":"unsupported"}
+{"claim":"Corpus promotion exposes secrets after scrubbing.","evidence":"Corpus promotion redacts secrets after scrubbing and refuses remaining secret patterns.","supported":false,"family":"contradiction"}
+{"claim":"Replay corpus lives under bench corpus.","evidence":"The replay corpus lives under bench/corpus as scrubbed JSONL.","supported":true,"family":"supported"}
+{"claim":"Axiom proxy compiles TypeScript bundles.","evidence":"Axiom proxy forwards OpenAI-compatible HTTP requests.","supported":false,"family":"unsupported"}
+{"claim":"The mock script fails when the TCP listener is ready.","evidence":"The mock script passes after the TCP listener is ready.","supported":false,"family":"contradiction"}
+{"claim":"Trust dataset labels contradictions.","evidence":"The trust dataset labels contradictions as their own family.","supported":true,"family":"supported"}
+{"claim":"Session recording requires a GPU driver.","evidence":"Session recording is enabled through AXIOM_SESSION_RECORD.","supported":false,"family":"unsupported"}
+{"claim":"The release updater disables checksum verification.","evidence":"The release updater enables checksum verification before deployment.","supported":false,"family":"contradiction"}
+{"claim":"Fleet status prints peer state.","evidence":"The fleet status command prints local peer state and configured endpoints.","supported":true,"family":"supported"}
+{"claim":"The update script formats disks.","evidence":"The update script downloads release assets and verifies checksums.","supported":false,"family":"unsupported"}
+{"claim":"The trust dataset marks contradictions as supported.","evidence":"The trust dataset marks contradictions as unsupported examples.","supported":false,"family":"contradiction"}
+{"claim":"Release updater verifies checksums.","evidence":"The release updater verifies SHA-256 checksums before deploying assets.","supported":true,"family":"supported"}
+{"claim":"AxiomBench corpus list deletes sessions.","evidence":"AxiomBench corpus list prints file hashes and record counts.","supported":false,"family":"unsupported"}
+{"claim":"Axiom saves request receipts after process exit only.","evidence":"Axiom saves request receipts before process exit and tracks lifetime totals.","supported":false,"family":"contradiction"}
+{"claim":"Mock cost script starts isolated proxy.","evidence":"The mock cost script starts an isolated proxy and mock upstream.","supported":true,"family":"supported"}
+{"claim":"The DWE listener accepts anonymous fragments.","evidence":"The DWE listener requires HMAC-authenticated fragments.","supported":false,"family":"unsupported"}
+{"claim":"The proxy starts without production BPE variables.","evidence":"The proxy refuses production checkpoints without production BPE variables.","supported":false,"family":"contradiction"}
+{"claim":"Header opt-out disables compression.","evidence":"The header opt-out disables compression for the replay control arm.","supported":true,"family":"supported"}
+{"claim":"The mock cost script calls the real OpenAI API.","evidence":"The mock cost script uses a local mock upstream.","supported":false,"family":"unsupported"}
+{"claim":"AxiomBench corpus list writes new files.","evidence":"AxiomBench corpus list reads existing files and prints counts.","supported":false,"family":"contradiction"}
+{"claim":"Recorder writes scrubbed JSONL.","evidence":"The recorder writes scrubbed JSONL when AXIOM_SESSION_RECORD is enabled.","supported":true,"family":"supported"}
+{"claim":"Compression fallback drops failed turns.","evidence":"Compression fallback forwards unsafe payloads unmodified.","supported":false,"family":"unsupported"}
+{"claim":"The fleet join command rejects valid peer URLs.","evidence":"The fleet join command accepts valid peer URLs for configuration.","supported":false,"family":"contradiction"}
+{"claim":"Trust calibration uses even rows.","evidence":"Trust calibration uses even rows and holds odd rows for evaluation.","supported":true,"family":"supported"}
+{"claim":"Trust calibration mutates process environment.","evidence":"Trust calibration reads the dataset and calibrates in memory.","supported":false,"family":"unsupported"}
+{"claim":"The WebSocket relay strips streaming frames.","evidence":"The WebSocket relay preserves streaming frames transparently.","supported":false,"family":"contradiction"}

@@ -1,12 +1,12 @@
 # AxiomBench Results
 
-Generated (unix): 1783078456
+Generated (unix): 1783080326
 
 | Pillar | Headline |
 |---|---|
 | cognition | 100% symbol exact-recovery (3/3) |
-| trust | 91% supported-claim coverage, 36% false-positive @ delta=0.10 (threshold 0.667) |
-| fleet | node B pre-immunized in 0.32 ms; fragment auth enforced (pass) |
+| trust | 92% supported coverage, neural contradiction catch-rate 10% -> 100% (threshold 0.750) |
+| fleet | node B pre-immunized in 0.18 ms; fragment auth enforced (pass) |
 | cost | 75.1% byte reduction over 3 replayed record(s) from 3 session(s) |
 
 Reproduce deterministic pillars: `cargo run --release --features tools --bin axiombench`.

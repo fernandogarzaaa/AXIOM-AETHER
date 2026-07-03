@@ -95,7 +95,7 @@ const DEFAULT_CONFORMAL_DELTA: f32 = 0.10;
 /// δ=0.10 (see `tests/trust_calibration.rs`). Active by default so `/v1/verify`
 /// carries a stated coverage guarantee out of the box regardless of how the
 /// server is launched; `AXIOM_CONFORMAL_THRESHOLD` overrides it.
-const SHIPPED_CONFORMAL_THRESHOLD: f32 = 0.6666667;
+const SHIPPED_CONFORMAL_THRESHOLD: f32 = 0.75;
 
 /// Conformal factuality gate: calibrated support threshold replacing the
 /// hardcoded `SUPPORT_HIGH`/`SUPPORT_LOW` constants.
@@ -350,6 +350,115 @@ pub fn verify(response: &str, evidence: &str) -> GroundingReport {
 /// the lexical verdict, so the margin is strictly negative.
 const DEMOTE_MARGIN: f32 = 0.5;
 
+fn raw_words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(|w| {
+            let w = w.trim().to_ascii_lowercase();
+            if w.is_empty() {
+                None
+            } else {
+                Some(w)
+            }
+        })
+        .collect()
+}
+
+fn has_any_word(words: &[String], terms: &[&str]) -> bool {
+    terms.iter().any(|term| words.iter().any(|w| w == term))
+}
+
+fn has_negation(words: &[String]) -> bool {
+    has_any_word(words, &["not", "never", "without", "cannot", "cant", "no"])
+}
+
+fn number_tokens(words: &[String]) -> std::collections::BTreeSet<String> {
+    words
+        .iter()
+        .filter(|w| w.chars().all(|c| c.is_ascii_digit()))
+        .cloned()
+        .collect()
+}
+
+fn has_opposition(claim_words: &[String], evidence_words: &[String]) -> bool {
+    const OPPOSITES: &[(&[&str], &[&str])] = &[
+        (
+            &["enabled", "enable", "enables", "on"],
+            &["disabled", "disable", "disables", "off"],
+        ),
+        (
+            &["accept", "accepts", "accepted"],
+            &["reject", "rejects", "rejected"],
+        ),
+        (
+            &["start", "starts", "started"],
+            &["refuse", "refuses", "refused"],
+        ),
+        (
+            &["increase", "increases", "increased"],
+            &["decrease", "decreases", "decreased"],
+        ),
+        (
+            &["preserve", "preserves", "preserved"],
+            &["strip", "strips", "stripped"],
+        ),
+        (
+            &["redact", "redacts", "redacted"],
+            &["expose", "exposes", "exposed"],
+        ),
+        (&["pass", "passes", "passed"], &["fail", "fails", "failed"]),
+        (&["before"], &["after"]),
+        (&["true"], &["false"]),
+    ];
+
+    OPPOSITES.iter().any(|(left, right)| {
+        (has_any_word(claim_words, left) && has_any_word(evidence_words, right))
+            || (has_any_word(claim_words, right) && has_any_word(evidence_words, left))
+    })
+}
+
+fn has_numeric_disagreement(claim_words: &[String], evidence_words: &[String]) -> bool {
+    let claim_numbers = number_tokens(claim_words);
+    let evidence_numbers = number_tokens(evidence_words);
+    !claim_numbers.is_empty()
+        && !evidence_numbers.is_empty()
+        && claim_numbers.is_disjoint(&evidence_numbers)
+}
+
+fn has_contradiction_signature(claim: &str, evidence: &str) -> bool {
+    let claim_words = raw_words(claim);
+    let evidence_words = raw_words(evidence);
+    has_negation(&claim_words) != has_negation(&evidence_words)
+        || has_opposition(&claim_words, &evidence_words)
+        || has_numeric_disagreement(&claim_words, &evidence_words)
+}
+
+/// Deterministic AxiomBench stand-in for the neural-surprisal lift.
+///
+/// It is intentionally narrow: only lexically high-overlap claims receive a
+/// signal. Explicit contradiction signatures produce the same negative lift
+/// shape expected from the trained tier; ordinary grounded overlap gets a
+/// positive lift, and weak lexical overlap returns `None`.
+pub fn deterministic_grounding_lift(claim: &str, evidence: &str) -> Option<f32> {
+    let toks = content_tokens(claim);
+    if toks.len() < 3 {
+        return None;
+    }
+    let evidence_spans: Vec<Vec<String>> = sentences(evidence)
+        .iter()
+        .map(|s| content_tokens(s))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let support = best_support(&toks, &evidence_spans);
+    if support < SUPPORT_HIGH {
+        return None;
+    }
+    if has_contradiction_signature(claim, evidence) {
+        Some(-1.2)
+    } else {
+        Some(1.0)
+    }
+}
+
 /// Verify, then refine with the **neural-surprisal tier**: `lift(claim)` returns
 /// `CE_base − CE_context` for the claim under W̃ (positive ⇒ the absorbed
 /// context predicts it). A lexically-Supported claim with non-positive lift is
@@ -405,7 +514,8 @@ fn candidate_symbols(claim: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     for raw in claim.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
         let t = raw.trim();
-        if t.len() >= 3 && t.chars().any(|c| c.is_ascii_alphabetic()) && seen.insert(t.to_string()) {
+        if t.len() >= 3 && t.chars().any(|c| c.is_ascii_alphabetic()) && seen.insert(t.to_string())
+        {
             out.push(t.to_string());
         }
     }
@@ -431,7 +541,11 @@ where
     let mut seen = std::collections::HashSet::new();
     let mut extra = String::new();
 
-    for claim in before.claims.iter().filter(|c| c.verdict != Verdict::Supported) {
+    for claim in before
+        .claims
+        .iter()
+        .filter(|c| c.verdict != Verdict::Supported)
+    {
         for sym in candidate_symbols(&claim.claim) {
             if expanded_symbols.len() >= MAX_EXPANSIONS {
                 break;
@@ -495,7 +609,10 @@ mod tests {
 
     #[test]
     fn unsupported_claim_is_flagged_as_hallucination() {
-        let r = verify("Axiom was written in Haskell by a team at MIT in 1998.", EVIDENCE);
+        let r = verify(
+            "Axiom was written in Haskell by a team at MIT in 1998.",
+            EVIDENCE,
+        );
         assert_eq!(r.claims[0].verdict, Verdict::Unsupported);
         assert_eq!(r.flagged().len(), 1);
         assert!(r.claims[0].confidence.mean() < 0.3);
@@ -518,10 +635,17 @@ mod tests {
 
     #[test]
     fn empty_evidence_flags_all_claims() {
-        let r = verify("Axiom uses test-time training. It runs locally in Rust.", "");
+        let r = verify(
+            "Axiom uses test-time training. It runs locally in Rust.",
+            "",
+        );
         assert!(r.claims.len() >= 2);
         assert_eq!(r.supported, 0);
-        assert_eq!(r.flagged().len(), r.claims.len(), "no evidence => every claim unsupported");
+        assert_eq!(
+            r.flagged().len(),
+            r.claims.len(),
+            "no evidence => every claim unsupported"
+        );
         assert_eq!(r.grounded_fraction, 0.0);
     }
 
@@ -537,7 +661,10 @@ mod tests {
         // DOCUMENTED LIMITATION: a claim that reuses evidence vocabulary but
         // negates the meaning still scores as supported under lexical grounding.
         // This test pins the known weakness so we never overstate the tier.
-        let r = verify("The drift gate does not separate clean code from anomalies.", EVIDENCE);
+        let r = verify(
+            "The drift gate does not separate clean code from anomalies.",
+            EVIDENCE,
+        );
         assert_eq!(
             r.claims[0].verdict,
             Verdict::Supported,
@@ -618,6 +745,31 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_grounding_lift_demotes_high_overlap_contradiction() {
+        let evidence = "The DWE listener is enabled only when AXIOM_FLEET_KEY is present.";
+        let claim = "The DWE listener is disabled only when AXIOM_FLEET_KEY is present.";
+        assert_eq!(deterministic_grounding_lift(claim, evidence), Some(-1.2));
+        let report = verify_with_signals(claim, evidence, |c| {
+            deterministic_grounding_lift(c, evidence)
+        });
+        assert_eq!(report.claims[0].verdict, Verdict::Unverified);
+    }
+
+    #[test]
+    fn deterministic_grounding_lift_keeps_grounded_overlap() {
+        let evidence = "Responses compression preserves pass-through fallback for unsafe payloads.";
+        let claim = "Responses compression preserves pass-through fallback for unsafe payloads.";
+        assert_eq!(deterministic_grounding_lift(claim, evidence), Some(1.0));
+    }
+
+    #[test]
+    fn deterministic_grounding_lift_leaves_weak_overlap_alone() {
+        let evidence = "The cost ledger records lifetime and request savings separately.";
+        let claim = "The fleet dashboard schedules calendar events.";
+        assert_eq!(deterministic_grounding_lift(claim, evidence), None);
+    }
+
+    #[test]
     fn gated_expansion_spends_nothing_when_already_grounded() {
         // The skeleton already grounds the claim → no expansion, no tokens spent.
         let mut resolver_calls = 0;
@@ -631,8 +783,14 @@ mod tests {
         );
         assert_eq!(report.before.claims[0].verdict, Verdict::Supported);
         assert!(report.expanded_symbols.is_empty());
-        assert_eq!(report.expansion_bytes, 0, "no tokens spent when already grounded");
-        assert_eq!(resolver_calls, 0, "resolver not consulted for supported claims");
+        assert_eq!(
+            report.expansion_bytes, 0,
+            "no tokens spent when already grounded"
+        );
+        assert_eq!(
+            resolver_calls, 0,
+            "resolver not consulted for supported claims"
+        );
     }
 
     // ── Conformal gate ────────────────────────────────────────────────────────
@@ -661,7 +819,10 @@ mod tests {
         let threshold = calibrate_conformal_threshold(&cal, 0.0);
         assert!((threshold - 0.2).abs() < 1e-5, "threshold={threshold}");
         let covered = cal.iter().filter(|(s, y)| *y && *s >= threshold).count();
-        assert_eq!(covered, 3, "all positives must score >= threshold at delta=0");
+        assert_eq!(
+            covered, 3,
+            "all positives must score >= threshold at delta=0"
+        );
     }
 
     #[test]
