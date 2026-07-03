@@ -54,8 +54,9 @@ fn write_results_md(root: &Path, results: &[PillarResult], generated: u64) -> st
         md.push_str(&format!("| {} | {} |\n", r.name, r.headline));
     }
     md.push_str(
-        "\nReproduce: `cargo run --release --features tools --bin axiombench` \
-         (add `--live` for the cost pillar).\n",
+        "\nReproduce deterministic pillars: `cargo run --release --features tools --bin axiombench`.\n\
+         Reproduce the live cost pillar without upstream credentials: \
+         `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\run_axiombench_cost_mock.ps1`.\n",
     );
     std::fs::write(root.join("RESULTS.md"), md)
 }
