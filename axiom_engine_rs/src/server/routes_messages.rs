@@ -358,57 +358,64 @@ async fn compressed_messages_path(
         message: "local swarm route failed and no Anthropic cloud forwarder is configured".into(),
     })?;
 
-    // Streaming clients (Claude Code sends `stream:true`) receive a
-    // `text/event-stream` upstream body that is NOT a single JSON value. Relay it
-    // verbatim; JSON-parsing it is what produced the `502 decode error: expected
-    // value at line 1 column 1`. The epistemic/ground-correct passes below operate
-    // on parsed JSON and do not apply to a live stream, so streaming forwards clean.
+    // Streaming clients (Claude Code sends `stream:true`) get a
+    // `text/event-stream` upstream body. Relay `bytes_stream()` straight into the
+    // client response: never JSON-parse it (that caused the `502 decode error:
+    // expected value at line 1 column 1`) and never buffer it (which withholds
+    // token chunks and lets long generations hit the request timeout). The
+    // epistemic/ground-correct passes need a parsed body and so do not apply to a
+    // live stream.
     let client_wants_stream = body
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if client_wants_stream {
         let mut upstream = forwarder
-            .forward_messages_raw(&outbound, client_auth)
+            .forward_messages_stream(&outbound, client_auth)
             .await
             .map_err(map_anthropic_forwarder_error)?;
-        // Mirror the non-stream degradation: if compression may have caused an
-        // upstream 4xx/5xx, retry ONCE with the original uncompressed body.
+        // Status/headers arrive before the body, so we can still retry ONCE with
+        // the uncompressed payload on a 4xx/5xx that compression may have caused,
+        // before streaming anything to the client.
         let did_compress = log_heavy_count > 0;
-        if did_compress && (upstream.status >= 500 || upstream.status == 400) {
+        if did_compress
+            && (upstream.status() == StatusCode::BAD_REQUEST
+                || upstream.status().is_server_error())
+        {
             eprintln!(
                 "[axiom-ttt] compressed stream forward returned {}; retrying once with \
                  original uncompressed payload (session={session_id})",
-                upstream.status
+                upstream.status()
             );
             state.controls.record_degraded_fallback();
             let mut fallback = body.clone();
             if let Some(obj) = fallback.as_object_mut() {
                 obj.remove("session_id");
             }
-            if let Ok(retry) = forwarder.forward_messages_raw(&fallback, client_auth).await {
+            if let Ok(retry) = forwarder.forward_messages_stream(&fallback, client_auth).await {
                 upstream = retry;
             }
         }
+        let status = upstream.status();
+        // The body streams through untouched, so record the request plus a
+        // streamed marker rather than a buffered body.
         record_proxy_exchange(
             "/v1/messages",
             &session_id,
             body,
-            serde_json::from_str::<Value>(&upstream.body).unwrap_or_else(|_| {
-                serde_json::json!({"raw": upstream.body, "status": upstream.status})
-            }),
+            serde_json::json!({"streamed": true, "status": status.as_u16()}),
             did_compress,
         );
-        let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let builder = Response::builder().status(status).header(
-            header::CONTENT_TYPE,
-            upstream
-                .content_type
-                .as_deref()
-                .unwrap_or("text/event-stream"),
-        );
-        return builder
-            .body(axum::body::Body::from(upstream.body))
+        let content_type = upstream
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| "text/event-stream".to_string());
+        return Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(axum::body::Body::from_stream(upstream.bytes_stream()))
             .map_err(|e| ApiError::Internal(format!("stream response build failed: {e}")));
     }
 
