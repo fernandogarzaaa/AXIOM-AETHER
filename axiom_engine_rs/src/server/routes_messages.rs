@@ -49,7 +49,7 @@ async fn create_message(
         match compressed_messages_path(&state, &body, session_override.as_deref(), &client_auth)
             .await
         {
-            Ok(value) => return Json(value).into_response(),
+            Ok(resp) => return resp,
             Err(err) => return err.into_response(),
         }
     }
@@ -128,7 +128,7 @@ async fn compressed_messages_path(
     body: &Value,
     session_override: Option<&str>,
     client_auth: &ClientAuth,
-) -> Result<Value, ApiError> {
+) -> Result<Response, ApiError> {
     let forwarder = state.anthropic_forwarder.as_ref().as_ref().cloned();
     if forwarder.is_none() && state.swarm_router.as_ref().is_none() {
         return Err(ApiError::Internal(
@@ -345,7 +345,7 @@ async fn compressed_messages_path(
                 state
                     .sandbox_local_synthesis(&session_id, &local.content)
                     .await;
-                return Ok(local_anthropic_message_response(&outbound, local));
+                return Ok(Json(local_anthropic_message_response(&outbound, local)).into_response());
             }
             Err(e) => {
                 eprintln!("[swarm-router] local Anthropic route unavailable; falling back: {e}")
@@ -357,6 +357,67 @@ async fn compressed_messages_path(
         status: StatusCode::BAD_GATEWAY.as_u16(),
         message: "local swarm route failed and no Anthropic cloud forwarder is configured".into(),
     })?;
+
+    // Streaming clients (Claude Code sends `stream:true`) get a
+    // `text/event-stream` upstream body. Relay `bytes_stream()` straight into the
+    // client response: never JSON-parse it (that caused the `502 decode error:
+    // expected value at line 1 column 1`) and never buffer it (which withholds
+    // token chunks and lets long generations hit the request timeout). The
+    // epistemic/ground-correct passes need a parsed body and so do not apply to a
+    // live stream.
+    let client_wants_stream = body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if client_wants_stream {
+        let mut upstream = forwarder
+            .forward_messages_stream(&outbound, client_auth)
+            .await
+            .map_err(map_anthropic_forwarder_error)?;
+        // Status/headers arrive before the body, so we can still retry ONCE with
+        // the uncompressed payload on a 4xx/5xx that compression may have caused,
+        // before streaming anything to the client.
+        let did_compress = log_heavy_count > 0;
+        if did_compress
+            && (upstream.status() == StatusCode::BAD_REQUEST
+                || upstream.status().is_server_error())
+        {
+            eprintln!(
+                "[axiom-ttt] compressed stream forward returned {}; retrying once with \
+                 original uncompressed payload (session={session_id})",
+                upstream.status()
+            );
+            state.controls.record_degraded_fallback();
+            let mut fallback = body.clone();
+            if let Some(obj) = fallback.as_object_mut() {
+                obj.remove("session_id");
+            }
+            if let Ok(retry) = forwarder.forward_messages_stream(&fallback, client_auth).await {
+                upstream = retry;
+            }
+        }
+        let status = upstream.status();
+        // The body streams through untouched, so record the request plus a
+        // streamed marker rather than a buffered body.
+        record_proxy_exchange(
+            "/v1/messages",
+            &session_id,
+            body,
+            serde_json::json!({"streamed": true, "status": status.as_u16()}),
+            did_compress,
+        );
+        let content_type = upstream
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .unwrap_or_else(|| "text/event-stream".to_string());
+        return Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(axum::body::Body::from_stream(upstream.bytes_stream()))
+            .map_err(|e| ApiError::Internal(format!("stream response build failed: {e}")));
+    }
 
     // First attempt: forward the lean, compressed payload.
     let mut forwarded = match forwarder
@@ -438,7 +499,7 @@ async fn compressed_messages_path(
         forwarded.clone(),
         log_heavy_count > 0,
     );
-    Ok(forwarded)
+    Ok(Json(forwarded).into_response())
 }
 
 /// Extract the concatenated assistant text from an Anthropic `/v1/messages`
