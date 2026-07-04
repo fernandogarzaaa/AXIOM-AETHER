@@ -8,10 +8,11 @@
 //! heavy text from the outbound JSON, and prepends the fingerprint
 //! to the surviving user prompt before forwarding to Anthropic.
 //!
-//! All HTTP is `reqwest` async (non-blocking). The current
-//! `forward_messages_json` path buffers the upstream JSON body in full
-//! before returning — appropriate for non-streaming Messages calls. A
-//! streaming-passthrough variant is not implemented yet.
+//! All HTTP is `reqwest` async (non-blocking). `forward_messages_json`
+//! buffers and JSON-parses the upstream body (non-streaming Messages calls).
+//! `forward_messages_raw` buffers the body verbatim — including a
+//! `text/event-stream` response produced by a `stream:true` request — and
+//! relays it untouched; that is what the streaming client path uses.
 
 use std::time::Duration;
 
@@ -147,6 +148,76 @@ impl AnthropicForwarder {
         }
         serde_json::from_str(&body).map_err(|e| ForwarderError::Decode(e.to_string()))
     }
+
+    /// Raw passthrough forward: returns the upstream status, content-type, and
+    /// body verbatim, WITHOUT JSON-parsing. Required for streaming
+    /// (`stream:true`) responses, whose `text/event-stream` body is not a single
+    /// JSON value and must reach the client untouched — parsing it is what
+    /// produced the `decode error: expected value at line 1 column 1` 502s. Only
+    /// transport failures (network / missing auth) surface as errors; every HTTP
+    /// status returns normally so the caller can relay it (and its body) verbatim.
+    pub async fn forward_messages_raw(
+        &self,
+        payload: &Value,
+        auth: &ClientAuth,
+    ) -> Result<RawForwardedResponse, ForwarderError> {
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let mut request = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header(
+                "anthropic-version",
+                auth.anthropic_version
+                    .as_deref()
+                    .unwrap_or(ANTHROPIC_VERSION),
+            );
+
+        if let Some(beta) = auth.anthropic_beta.as_deref() {
+            request = request.header("anthropic-beta", beta);
+        }
+
+        if let Some(authz) = auth.authorization.as_deref() {
+            request = request.header("authorization", authz);
+        } else if let Some(key) = auth.x_api_key.as_deref() {
+            request = request.header("x-api-key", key);
+        } else if let Some(key) = self.api_key.as_deref() {
+            request = request.header("x-api-key", key);
+        } else {
+            return Err(ForwarderError::MissingAuth);
+        }
+
+        let response = request
+            .json(payload)
+            .send()
+            .await
+            .map_err(|e| ForwarderError::Network(e.to_string()))?;
+
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = response
+            .text()
+            .await
+            .map_err(|e| ForwarderError::Network(format!("body read failed: {e}")))?;
+        Ok(RawForwardedResponse {
+            status,
+            content_type,
+            body,
+        })
+    }
+}
+
+/// Verbatim upstream `/v1/messages` response used by the streaming passthrough
+/// path. The body is NOT parsed, so it carries a JSON object, an SSE event
+/// stream, or an error page unchanged.
+pub struct RawForwardedResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: String,
 }
 
 #[derive(Debug)]

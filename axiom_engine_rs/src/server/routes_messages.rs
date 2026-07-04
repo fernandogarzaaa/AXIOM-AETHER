@@ -49,7 +49,7 @@ async fn create_message(
         match compressed_messages_path(&state, &body, session_override.as_deref(), &client_auth)
             .await
         {
-            Ok(value) => return Json(value).into_response(),
+            Ok(resp) => return resp,
             Err(err) => return err.into_response(),
         }
     }
@@ -128,7 +128,7 @@ async fn compressed_messages_path(
     body: &Value,
     session_override: Option<&str>,
     client_auth: &ClientAuth,
-) -> Result<Value, ApiError> {
+) -> Result<Response, ApiError> {
     let forwarder = state.anthropic_forwarder.as_ref().as_ref().cloned();
     if forwarder.is_none() && state.swarm_router.as_ref().is_none() {
         return Err(ApiError::Internal(
@@ -345,7 +345,7 @@ async fn compressed_messages_path(
                 state
                     .sandbox_local_synthesis(&session_id, &local.content)
                     .await;
-                return Ok(local_anthropic_message_response(&outbound, local));
+                return Ok(Json(local_anthropic_message_response(&outbound, local)).into_response());
             }
             Err(e) => {
                 eprintln!("[swarm-router] local Anthropic route unavailable; falling back: {e}")
@@ -357,6 +357,60 @@ async fn compressed_messages_path(
         status: StatusCode::BAD_GATEWAY.as_u16(),
         message: "local swarm route failed and no Anthropic cloud forwarder is configured".into(),
     })?;
+
+    // Streaming clients (Claude Code sends `stream:true`) receive a
+    // `text/event-stream` upstream body that is NOT a single JSON value. Relay it
+    // verbatim; JSON-parsing it is what produced the `502 decode error: expected
+    // value at line 1 column 1`. The epistemic/ground-correct passes below operate
+    // on parsed JSON and do not apply to a live stream, so streaming forwards clean.
+    let client_wants_stream = body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if client_wants_stream {
+        let mut upstream = forwarder
+            .forward_messages_raw(&outbound, client_auth)
+            .await
+            .map_err(map_anthropic_forwarder_error)?;
+        // Mirror the non-stream degradation: if compression may have caused an
+        // upstream 4xx/5xx, retry ONCE with the original uncompressed body.
+        let did_compress = log_heavy_count > 0;
+        if did_compress && (upstream.status >= 500 || upstream.status == 400) {
+            eprintln!(
+                "[axiom-ttt] compressed stream forward returned {}; retrying once with \
+                 original uncompressed payload (session={session_id})",
+                upstream.status
+            );
+            state.controls.record_degraded_fallback();
+            let mut fallback = body.clone();
+            if let Some(obj) = fallback.as_object_mut() {
+                obj.remove("session_id");
+            }
+            if let Ok(retry) = forwarder.forward_messages_raw(&fallback, client_auth).await {
+                upstream = retry;
+            }
+        }
+        record_proxy_exchange(
+            "/v1/messages",
+            &session_id,
+            body,
+            serde_json::from_str::<Value>(&upstream.body).unwrap_or_else(|_| {
+                serde_json::json!({"raw": upstream.body, "status": upstream.status})
+            }),
+            did_compress,
+        );
+        let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
+        let builder = Response::builder().status(status).header(
+            header::CONTENT_TYPE,
+            upstream
+                .content_type
+                .as_deref()
+                .unwrap_or("text/event-stream"),
+        );
+        return builder
+            .body(axum::body::Body::from(upstream.body))
+            .map_err(|e| ApiError::Internal(format!("stream response build failed: {e}")));
+    }
 
     // First attempt: forward the lean, compressed payload.
     let mut forwarded = match forwarder
@@ -438,7 +492,7 @@ async fn compressed_messages_path(
         forwarded.clone(),
         log_heavy_count > 0,
     );
-    Ok(forwarded)
+    Ok(Json(forwarded).into_response())
 }
 
 /// Extract the concatenated assistant text from an Anthropic `/v1/messages`
