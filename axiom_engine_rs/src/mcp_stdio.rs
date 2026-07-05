@@ -22,7 +22,7 @@
 //!   `isError: true` to signal architectural deviation.
 
 use std::error::Error;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -933,11 +933,11 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .and_then(Value::as_str)
                 .unwrap_or("mcp")
                 .to_string();
-            let proxy_url = ctx.proxy_url.clone();
             let awareness = ctx.awareness.clone();
             let awareness_session_id = session_id.clone();
+            let ctx_for_status = ctx.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                status_blocking(&session_id, &proxy_url)
+                status_blocking(&session_id, &ctx_for_status)
             })
             .await
             .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
@@ -1140,9 +1140,53 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
     }
 }
 
-/// `axiom_status` worker — calls `GET /v1/awareness/{session_id}` on the running
-/// proxy and formats the JSON as a human-readable status block.
-fn status_blocking(session_id: &str, proxy_url: &str) -> Result<String, String> {
+/// `axiom_status` worker — reports local MCP awareness first, then falls back to
+/// the HTTP proxy's awareness endpoint when a proxy session exists there.
+fn status_blocking(session_id: &str, ctx: &McpContext) -> Result<String, String> {
+    if let Some(local) = ctx.awareness.get(session_id) {
+        let budget = local
+            .budget()
+            .map(|n| format!("{n} tokens"))
+            .unwrap_or_else(|| "not set".to_string());
+        let spent = local
+            .tokens_spent
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let tool_calls = local
+            .tool_calls_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let expansions = local
+            .expansion_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let ratio = local
+            .compression_ratio()
+            .map(|r| format!("{:.1}%", r * 100.0))
+            .unwrap_or_else(|| "no data".to_string());
+        let model = local
+            .target_model
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let rec = local.recommendation().unwrap_or_else(|| "—".to_string());
+        let vibe_ready = ctx
+            .vibe
+            .lock()
+            .map(|v| v.is_initialized())
+            .unwrap_or(false);
+        return Ok(format!(
+            "=== Axiom MCP Session Awareness: {session_id} ===
+             model            : {model}
+             budget remaining : {budget}
+             spent on Axiom   : {spent} tokens across {tool_calls} tool calls
+             compression ratio: {ratio} (expand misses: {expansions})
+             master vibe ready: {vibe_ready}
+             available tools  : {}
+             recommendation   : {rec}",
+            tool_names().len()
+        ));
+    }
+
+    let proxy_url = &ctx.proxy_url;
     let url = format!(
         "{}/v1/awareness/{}",
         proxy_url.trim_end_matches('/'),
@@ -1156,7 +1200,8 @@ fn status_blocking(session_id: &str, proxy_url: &str) -> Result<String, String> 
     let status = resp.status();
     if status.as_u16() == 404 {
         return Ok(format!(
-            "No awareness state for session '{session_id}' yet.              Call POST /v1/budget to report your token budget."
+            "No awareness state for session '{session_id}' yet. Call POST /v1/budget on the HTTP proxy or pass session_id through MCP tool calls to initialize local MCP awareness. available_tools={}",
+            tool_names().len()
         ));
     }
     if !status.is_success() {
@@ -1189,6 +1234,20 @@ fn status_blocking(session_id: &str, proxy_url: &str) -> Result<String, String> 
          recommendation   : {rec}",
         tight_flag = if tight { " ⚠ TIGHT" } else { "" }
     ))
+}
+
+fn tool_names() -> Vec<String> {
+    let list = tools_list();
+    list["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 /// `axiom_expand` worker — HTTP-calls the running proxy's `POST /v1/expand` to
@@ -1264,6 +1323,7 @@ fn compress_path_blocking(path: &str, ctx: &McpContext) -> Result<String, String
     } else {
         for entry in walkdir::WalkDir::new(p)
             .into_iter()
+            .filter_entry(|e| !should_skip_compression_path(e.path()))
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
@@ -1334,6 +1394,35 @@ fn compress_path_blocking(path: &str, ctx: &McpContext) -> Result<String, String
     Ok(fingerprint.to_prompt_block())
 }
 
+fn should_skip_compression_path(path: &Path) -> bool {
+    const SKIP_NAMES: &[&str] = &[
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "env",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
+        "checkpoints",
+    ];
+    path.components().any(|component| {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        let name = name.to_string_lossy();
+        SKIP_NAMES.iter().any(|skip| name.eq_ignore_ascii_case(skip))
+    })
+}
+
 /// `axiom_evaluate_drift` worker. Returns `(report_text, is_drift)`.
 fn evaluate_drift_blocking(code: &str, ctx: &McpContext) -> Result<(String, bool), String> {
     let pipeline = ctx
@@ -1351,7 +1440,7 @@ fn evaluate_drift_blocking(code: &str, ctx: &McpContext) -> Result<(String, bool
     let n = ids.len();
     let device = pipeline.device();
 
-    let mut states = start_states(ctx, &pipeline)?;
+    let (mut states, baseline_ready) = drift_states(ctx, &pipeline)?;
 
     // Next-token prediction: predict ids[1..] from ids[..n-1].
     let input =
@@ -1370,15 +1459,40 @@ fn evaluate_drift_blocking(code: &str, ctx: &McpContext) -> Result<(String, bool
     let loss = candle_nn::loss::cross_entropy(&logits_2d, &targets).map_err(|e| e.to_string())?;
     let loss_val = loss.to_scalar::<f32>().map_err(|e| e.to_string())?;
 
+    if !baseline_ready {
+        let report = format!(
+            "cross_entropy_loss={loss_val:.4} baseline_threshold={:.4} tokens_scored={n} drift=UNAVAILABLE confidence=low reason=no_master_vibe_baseline",
+            ctx.drift_threshold
+        );
+        eprintln!("[mcp] evaluate_drift -> {report}");
+        return Ok((report, false));
+    }
+
     let is_drift = loss_val > ctx.drift_threshold;
     let report = format!(
-        "cross_entropy_loss={loss_val:.4} baseline_threshold={:.4} tokens_scored={} drift={}",
+        "cross_entropy_loss={loss_val:.4} baseline_threshold={:.4} tokens_scored={} drift={} confidence=normal",
         ctx.drift_threshold,
         n,
         if is_drift { "YES" } else { "no" }
     );
     eprintln!("[mcp] evaluate_drift -> {report}");
     Ok((report, is_drift))
+}
+
+fn drift_states(
+    ctx: &McpContext,
+    pipeline: &InferencePipeline,
+) -> Result<(Vec<Tensor>, bool), String> {
+    let primed = ctx
+        .vibe
+        .lock()
+        .ok()
+        .and_then(|vibe| vibe.prime_states());
+    if let Some(states) = primed {
+        Ok((states, true))
+    } else {
+        Ok((pipeline.init_session_states().map_err(|e| e.to_string())?, false))
+    }
 }
 
 /// Embed via the trained contrastive encoder when present, else the pipeline
@@ -1781,6 +1895,23 @@ mod tests {
         let fetch = tools.iter().find(|t| t["name"] == "fetch").unwrap();
         assert_eq!(search["inputSchema"]["required"][0], "query");
         assert_eq!(fetch["inputSchema"]["required"][0], "id");
+    }
+
+    #[test]
+    fn compression_path_filter_skips_generated_and_vendor_dirs() {
+        assert!(should_skip_compression_path(Path::new("repo/.venv/lib/site.py")));
+        assert!(should_skip_compression_path(Path::new("repo/target/debug/lib.rs")));
+        assert!(should_skip_compression_path(Path::new("repo/app/__pycache__/x.pyc")));
+        assert!(!should_skip_compression_path(Path::new("repo/src/lib.rs")));
+    }
+
+    #[test]
+    fn tool_names_matches_tools_list() {
+        let names = tool_names();
+        assert!(names.contains(&"axiom_remember".to_string()));
+        assert!(names.contains(&"axiom_expand".to_string()));
+        assert!(names.contains(&"search".to_string()));
+        assert!(names.contains(&"fetch".to_string()));
     }
 
     #[test]

@@ -202,7 +202,7 @@ const STOPWORDS: &[&str] = &[
 fn content_tokens(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_ascii_alphanumeric())
         .filter_map(|w| {
-            let w = w.trim().to_ascii_lowercase();
+            let w = normalize_content_token(w);
             if w.len() >= 2 && !STOPWORDS.contains(&w.as_str()) {
                 Some(w)
             } else {
@@ -212,12 +212,50 @@ fn content_tokens(s: &str) -> Vec<String> {
         .collect()
 }
 
+fn normalize_content_token(raw: &str) -> String {
+    let mut word = raw.trim().to_ascii_lowercase();
+    if word.is_empty() {
+        return word;
+    }
+    word = match word.as_str() {
+        "passed" | "passes" | "passing" => "pass".to_string(),
+        "failed" | "fails" | "failing" => "fail".to_string(),
+        "tests" => "test".to_string(),
+        "files" => "file".to_string(),
+        "claims" => "claim".to_string(),
+        "issues" => "issue".to_string(),
+        "versions" => "version".to_string(),
+        "tools" => "tool".to_string(),
+        other => other.to_string(),
+    };
+    if word.len() > 4 && word.ends_with("ies") {
+        word.truncate(word.len() - 3);
+        word.push('y');
+    } else if word.len() > 4 && word.ends_with('s') && !word.ends_with("ss") {
+        word.pop();
+    }
+    word
+}
+
 /// Split prose into sentence-like spans (on `. ! ?` and newlines).
 fn sentences(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    for ch in text.chars() {
-        if ch == '.' || ch == '!' || ch == '?' || ch == '\n' {
+    let chars: Vec<char> = text.chars().collect();
+    for (idx, ch) in chars.iter().copied().enumerate() {
+        let split = match ch {
+            '!' | '?' | '\n' => true,
+            '.' => {
+                let prev = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
+                let next = chars.get(idx + 1).copied();
+                let prev_can_end =
+                    prev.is_some_and(|c| c.is_ascii_alphanumeric() || c == '\'' || c == '"');
+                let next_can_end = next.is_none_or(|c| c.is_whitespace() || c == '\'' || c == '"');
+                prev_can_end && next_can_end
+            }
+            _ => false,
+        };
+        if split {
             let t = cur.trim();
             if !t.is_empty() {
                 out.push(t.to_string());
@@ -268,7 +306,15 @@ fn best_support(claim_tokens: &[String], evidence_spans: &[Vec<String>]) -> f32 
     }
     let mut best = 0.0f32;
     for span in evidence_spans {
-        let matched = claim_tokens.iter().filter(|t| span.contains(t)).count();
+        let mut matched = claim_tokens.iter().filter(|t| span.contains(t)).count();
+        if claim_tokens.iter().any(|t| t == "test")
+            && span.iter().any(|t| t == "pass" || t == "fail")
+            && span.iter().any(|t| t.chars().all(|c| c.is_ascii_digit()))
+            && !span.iter().any(|t| t == "test")
+        {
+            matched += 1;
+        }
+        matched = matched.min(claim_tokens.len());
         let containment = matched as f32 / claim_tokens.len() as f32;
         if containment > best {
             best = containment;
@@ -648,6 +694,21 @@ mod tests {
     #[test]
     fn questions_and_fragments_are_not_claims() {
         assert!(extract_claims("What is Axiom? Ok. Yes.").is_empty());
+    }
+
+    #[test]
+    fn verifier_normalizes_simple_command_output_claims() {
+        let evidence = "pytest output was '.. [100%] 2 passed in 1.66s'.";
+        let r = verify("pytest passed with 2 tests.", evidence);
+        assert_eq!(r.claims.len(), 1);
+        assert_eq!(r.claims[0].verdict, Verdict::Supported);
+    }
+
+    #[test]
+    fn sentence_splitter_preserves_command_dots_and_decimals() {
+        let spans = sentences("pytest output was '.. [100%] 2 passed in 1.66s'. Done.");
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].contains(".. [100%] 2 passed in 1.66s"));
     }
 
     #[test]
