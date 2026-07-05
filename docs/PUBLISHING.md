@@ -31,8 +31,9 @@ training toolchain. Build the dev tools with `cargo build --features tools`.
 
 ## Release procedure
 
-1. Bump `version` in **both** `axiom_engine_rs/Cargo.toml` and
-   `axiom_engine_rs/pyproject.toml` (keep them in lockstep).
+1. Bump `version` in **only** `axiom_engine_rs/Cargo.toml`; the
+   `axiom_engine_rs/pyproject.toml` project version is dynamic, so maturin
+   derives the `axiom-aether` wheel version from Cargo metadata.
 2. Commit, then tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 3. `publish.yml` runs on the tag:
    - `crates-io`: `cargo publish --locked`.
@@ -57,8 +58,8 @@ training toolchain. Build the dev tools with `cargo build --features tools`.
 cd axiom_engine_rs
 cargo publish --dry-run --allow-dirty          # packaging + metadata + size
 cargo build --release --bin axiom              # the shipped command
-maturin build -b bin && \
-  pip install target/wheels/axiom_aether-*.whl  # wheel installs `axiom`
+maturin build --release --bindings bin --out dist && \
+  pip install dist/axiom_aether-*.whl           # wheel installs `axiom`
 ../scripts/new_user_simulation.sh              # full first-run journey, 9/9
 ```
 

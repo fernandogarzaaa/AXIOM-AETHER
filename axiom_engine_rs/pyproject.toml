@@ -13,7 +13,10 @@ build-backend = "maturin"
 
 [project]
 name = "axiom-aether"
-version = "0.1.6"
+# Single source of truth: maturin reads the version from Cargo.toml's
+# `[package] version`. Keeping a static version here previously drifted from
+# Cargo.toml and made the wheel publish the wrong (already-existing) version.
+dynamic = ["version"]
 description = "Axiom-TTT: online test-time-training inference engine and self-healing runtime (prebuilt `axiom` binary)"
 readme = "README.md"
 requires-python = ">=3.8"
