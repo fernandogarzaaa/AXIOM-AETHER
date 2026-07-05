@@ -295,6 +295,50 @@ pub fn partition_messages(
     }
 }
 
+/// Client harnesses (e.g. Claude Code) inject deterministic instructional
+/// boilerplate into the first user turn wrapped in `<system-reminder>...
+/// </system-reminder>`. That text is not user-authored conversation
+/// history: it's the same on every session. Sweeping it into
+/// `heavy_context` and re-presenting it to the model via the fingerprint's
+/// `decode_instructions` as "prior heavy context" relevant to "the user's
+/// intent" is a false claim on a first turn (there is no prior context
+/// yet) — text a well-calibrated model correctly refuses to trust,
+/// surfacing as spurious prompt-injection warnings. Reminder spans are
+/// therefore excluded from the threshold check and extraction entirely;
+/// they pass through in the surviving payload untouched. Genuine heavy
+/// content sitting alongside a reminder in the same block (e.g. a large
+/// paste after the reminder) is unaffected — only the reminder text itself
+/// is carved out before the token count is taken.
+fn split_system_reminders(text: &str) -> (String, Vec<String>) {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    if !text.contains(OPEN) {
+        return (text.to_string(), Vec::new());
+    }
+    let mut remainder = String::with_capacity(text.len());
+    let mut reminders = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        remainder.push_str(&rest[..start]);
+        let after_open = &rest[start..];
+        match after_open.find(CLOSE) {
+            Some(end_rel) => {
+                let end = end_rel + CLOSE.len();
+                reminders.push(after_open[..end].to_string());
+                rest = &after_open[end..];
+            }
+            None => {
+                // Unterminated tag: keep the rest as reminder content rather
+                // than risk compressing a truncated instruction block.
+                reminders.push(after_open.to_string());
+                rest = "";
+            }
+        }
+    }
+    remainder.push_str(rest);
+    (remainder, reminders)
+}
+
 fn split_content(
     role: &str,
     content: &Value,
@@ -303,18 +347,35 @@ fn split_content(
 ) -> (Value, Vec<ExtractedContent>) {
     match content {
         Value::String(text) => {
-            let count = token_counter(text);
-            if count >= threshold_tokens {
-                (
-                    Value::String(String::new()),
-                    vec![ExtractedContent {
-                        role: role.to_string(),
-                        text: text.clone(),
-                        token_count: count,
-                    }],
-                )
+            let (remainder, reminders) = split_system_reminders(text);
+            if reminders.is_empty() {
+                let count = token_counter(text);
+                if count >= threshold_tokens {
+                    (
+                        Value::String(String::new()),
+                        vec![ExtractedContent {
+                            role: role.to_string(),
+                            text: text.clone(),
+                            token_count: count,
+                        }],
+                    )
+                } else {
+                    (Value::String(text.clone()), Vec::new())
+                }
             } else {
-                (Value::String(text.clone()), Vec::new())
+                let count = token_counter(&remainder);
+                if count >= threshold_tokens {
+                    (
+                        Value::String(reminders.join("\n\n")),
+                        vec![ExtractedContent {
+                            role: role.to_string(),
+                            text: remainder,
+                            token_count: count,
+                        }],
+                    )
+                } else {
+                    (Value::String(text.clone()), Vec::new())
+                }
             }
         }
         Value::Array(blocks) => {
@@ -328,13 +389,19 @@ fn split_content(
                     .map(str::to_string);
                 if block_type == "text" {
                     if let Some(text) = text_opt {
-                        let count = token_counter(&text);
+                        let (remainder, reminders) = split_system_reminders(&text);
+                        let count = token_counter(&remainder);
                         if count >= threshold_tokens {
                             extracted.push(ExtractedContent {
                                 role: role.to_string(),
-                                text,
+                                text: remainder,
                                 token_count: count,
                             });
+                            if !reminders.is_empty() {
+                                let mut kept_block = block.clone();
+                                kept_block["text"] = Value::String(reminders.join("\n\n"));
+                                kept.push(kept_block);
+                            }
                             continue;
                         }
                     }
@@ -561,6 +628,50 @@ mod tests {
         let blocks = part.surviving[0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["text"], "explain this codebase");
+    }
+
+    #[test]
+    fn partition_excludes_system_reminder_from_heavy_extraction() {
+        // Regression test: a large `<system-reminder>` block (client-injected
+        // boilerplate, e.g. CLAUDE.md/env context) alongside a short real
+        // question must NOT be swept into heavy_context. Before this fix the
+        // combined text crossed the threshold, so Axiom compressed the
+        // reminder and re-presented it as "prior heavy context" bearing on
+        // "the user's intent" -- a false claim on a first turn that Claude
+        // Code correctly flagged as prompt injection.
+        let reminder_body = (0..300)
+            .map(|i| format!("envfact{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!(
+            "<system-reminder>{reminder_body}</system-reminder>\nwhat does this repo do?"
+        );
+        let messages = vec![json!({"role": "user", "content": text.clone()})];
+        let part = partition_messages(&messages, 100, ws);
+        assert!(
+            part.heavy_context.is_empty(),
+            "system-reminder content must never be extracted as heavy context"
+        );
+        assert_eq!(part.surviving.len(), 1);
+        assert_eq!(part.surviving[0]["content"], text);
+    }
+
+    #[test]
+    fn partition_still_extracts_genuine_heavy_text_next_to_a_reminder() {
+        // A real oversized paste alongside a reminder still gets compressed;
+        // only the reminder span itself is excluded from the threshold check.
+        let reminder = "<system-reminder>short boilerplate</system-reminder>";
+        let big_paste = (0..300)
+            .map(|i| format!("logline{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!("{reminder}\n{big_paste}");
+        let messages = vec![json!({"role": "user", "content": text})];
+        let part = partition_messages(&messages, 100, ws);
+        assert_eq!(part.heavy_context.len(), 1);
+        assert_eq!(part.heavy_context[0].text.trim(), big_paste);
+        // The reminder itself survives, untouched, in the outbound payload.
+        assert_eq!(part.surviving[0]["content"], reminder);
     }
 
     #[test]
