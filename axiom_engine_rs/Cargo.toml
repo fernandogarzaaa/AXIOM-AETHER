@@ -1,6 +1,6 @@
 [package]
 name = "axiom_engine"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Axiom-TTT Inference Engine – Rust implementation using candle"
 license = "MIT"
@@ -17,6 +17,8 @@ default-run = "axiom"
 # build output (crates.io enforces a size limit these would blow past).
 exclude = [
     "target/*",
+    "target-*/*",
+    "dist/*",
     "checkpoints/*",
     "**/*.safetensors",
     "**/*.gguf",
