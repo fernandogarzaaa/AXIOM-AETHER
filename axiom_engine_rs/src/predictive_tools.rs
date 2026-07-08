@@ -12,9 +12,9 @@
 
 use serde_json::{json, Value};
 
-use crate::alignment_loop::{AlignmentLoop, AlignmentLoopState};
-use crate::state_predictor::{SemanticStateMap, StatePredictor, MILESTONE_LABELS, MAX_MILESTONES, render_state_map};
-use crate::trajectory_sampler::{TrajectorySampler, TrajectorySampleResult, render_trajectory_result};
+use crate::alignment_loop::AlignmentLoop;
+use crate::state_predictor::{SemanticStateMap, StatePredictor, render_state_map};
+use crate::trajectory_sampler::{TrajectorySampler, render_trajectory_result};
 
 /// Return the JSON tool definitions for the three predictive tools.
 ///

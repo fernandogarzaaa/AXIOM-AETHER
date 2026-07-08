@@ -32,7 +32,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::belief::BetaBelief;
-use crate::state_predictor::{SemanticStateMap, SemanticMilestone, MILESTONE_LABELS};
+use crate::state_predictor::{SemanticStateMap, SemanticMilestone};
 
 /// Default drift threshold: if the drift score exceeds this, a correction is applied.
 pub const DEFAULT_DRIFT_THRESHOLD: f32 = 0.5;

@@ -30,7 +30,7 @@
 //! workflow vectors into a single meta-vector. This allows scaling to 20M+ token
 //! repositories while keeping per-chunk compute bounded.
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Device, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -394,8 +394,8 @@ fn ttt_state_statistics(state: &[f32]) -> Vec<f32> {
     let variance = state.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n;
     let std = variance.sqrt();
     let norm = state.iter().map(|v| v * v).sum::<f32>().sqrt();
-    let min = state.iter().fold(f32::INFINITY, f32::min);
-    let max = state.iter().fold(f32::NEG_INFINITY, f32::max);
+    let min = state.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+    let max = state.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let abs_mean = state.iter().map(|v| v.abs()).sum::<f32>() / n;
 
     // Spectral-ish features: energy in different frequency bands via hashing.
