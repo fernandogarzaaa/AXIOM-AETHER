@@ -196,7 +196,7 @@ pub fn handle_sample_trajectories(args: &Value) -> Value {
     };
 
     let sampler = TrajectorySampler::new(
-        crate::trajectory_sampler::MAX_BRANCHES,
+        crate::trajectory_sampler::DEFAULT_NUM_BRANCHES,
         prune_threshold,
     );
 
@@ -204,25 +204,17 @@ pub fn handle_sample_trajectories(args: &Value) -> Value {
     let rendered = render_trajectory_result(&result);
     let result_json = serde_json::to_string(&result).unwrap_or_default();
 
-    let manifold_info = if let Some(m) = &manifold {
-        let telemetry = m.telemetry();
-        json!({
-            "branches": telemetry.branches,
-            "bond_dimension": telemetry.bond_dimension,
-            "entropy_bits": telemetry.entropy_bits
-        })
-    } else {
-        json!({})
-    };
+    let manifold_info = json!({
+        "node_count": manifold.nodes.len(),
+        "edge_count": manifold.edges.len(),
+    });
 
     json!({
         "result": result_json,
         "rendered": rendered,
-        "selected_branch": result.selected,
-        "total_branches": result.branches.len(),
-        "pruned_count": result.branches.iter().filter(|b| b.pruned).count(),
-        "total_compute_cost": result.total_compute_cost,
-        "entropy_bits": result.entropy_bits,
+        "surviving_branches": result.branches.len(),
+        "total_explored": result.total_explored,
+        "pruned_count": result.pruned,
         "manifold": manifold_info
     })
 }

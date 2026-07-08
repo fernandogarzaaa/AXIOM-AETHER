@@ -1,4 +1,4 @@
-//! trajectory_sampler.rs - Branch-and-bound trajectory sampling over the
+<arg_value>//! trajectory_sampler.rs - Branch-and-bound trajectory sampling over the
 //! cognitive state manifold.  The sampler produces parallel trajectories,
 //! scores them with a composite of novelty + coherence + budget-fit, prunes
 //! low-scoring branches, and evolves survivors with Gaussian perturbation.
@@ -118,7 +118,7 @@ impl TrajectorySampler {
                 format!("branch_{}", i)
             } else {
                 let ms = &map.milestones[i % map.milestones.len()];
-                format!("{} ({:.2})", ms.label, ms.confidence)
+                format!("{} ({:.2})", ms.label, ms.confidence.mean())
             };
 
             branches.push(TrajectoryBranch {
@@ -230,7 +230,7 @@ impl TrajectorySampler {
         if milestones.is_empty() || state.is_empty() {
             return 0.5;
         }
-        let avg_conf: f32 = milestones.iter().map(|m| m.confidence).sum::<f32>() / milestones.len() as f32;
+        let avg_conf: f32 = milestones.iter().map(|m| m.confidence.mean()).sum::<f32>() / milestones.len() as f32;
         let norm: f32 = state.iter().map(|v| v * v).sum::<f32>().sqrt();
         (avg_conf * 0.7 + (norm / 10.0).min(1.0) * 0.3).clamp(0.0, 1.0)
     }
@@ -309,18 +309,27 @@ mod tests {
         let milestones = vec![
             SemanticMilestone {
                 label: "hypothesis".to_string(),
-                confidence: 0.8,
+                label_idx: 0,
+                predicted_state: vec![1.0, 0.0, 0.0, 0.0],
                 token_budget: 512,
+                branch_hints: vec![],
+                confidence: BetaBelief::from_confidence(0.8, 4.0),
             },
             SemanticMilestone {
                 label: "decomposition".to_string(),
-                confidence: 0.7,
+                label_idx: 1,
+                predicted_state: vec![0.0, 1.0, 0.0, 0.0],
                 token_budget: 1024,
+                branch_hints: vec![],
+                confidence: BetaBelief::from_confidence(0.7, 4.0),
             },
             SemanticMilestone {
                 label: "execution".to_string(),
-                confidence: 0.6,
+                label_idx: 2,
+                predicted_state: vec![0.0, 0.0, 1.0, 0.0],
                 token_budget: 2048,
+                branch_hints: vec![],
+                confidence: BetaBelief::from_confidence(0.6, 4.0),
             },
         ];
         SemanticStateMap {
