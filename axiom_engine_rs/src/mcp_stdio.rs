@@ -1,4 +1,4 @@
-//! Native Model Context Protocol (MCP) server over a JSON-RPC 2.0 stdio
+﻿//! Native Model Context Protocol (MCP) server over a JSON-RPC 2.0 stdio
 //! transport.
 //!
 //! This exposes Axiom to a host LLM (e.g. Claude Code) as a first-class tool
