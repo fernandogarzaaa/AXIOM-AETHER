@@ -1,55 +1,77 @@
-FROM rust:1-slim AS builder
+﻿# Dockerfile — multi-stage build for the Axiom-TTT engine.
+#
+# Builds the Rust `axiom_engine` binary in a builder stage, then copies it into
+# a lean runtime image. The image ships WITHOUT trained weights (see
+# .dockerignore) — they are seeded at runtime from AXIOM_CHECKPOINT_URL /
+# AXIOM_TOKENIZER_URL or mounted as a volume (see scripts/docker_entrypoint.sh).
+#
+# Platforms: linux/amd64 + linux/arm64 (see .github/workflows/docker.yml).
 
-# OCI image labels (used by GHCR)
-LABEL org.opencontainers.image.source="https://github.com/fernandogarzaaa/AXIOM-AETHER"
-LABEL org.opencontainers.image.description="Axiom-TTT Inference Engine — OpenAI-compatible API with online Test-Time Training"
-LABEL org.opencontainers.image.licenses="MIT"
+# ---------------------------------------------------------------------------
+# Stage 1: Builder — compile the Rust binary
+# ---------------------------------------------------------------------------
+FROM rust:1.85-bookworm AS builder
 
-WORKDIR /usr/src/axiom_engine
-COPY . .
-
-RUN apt-get update && apt-get install -y \
+# Install build dependencies (tree-sitter needs a C compiler)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
-    build-essential \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /usr/src/axiom_engine/axiom_engine_rs
-RUN cargo build --release
+WORKDIR /build
 
+# Copy the crate source first (better layer caching — dependencies change less
+# often than the application code).
+COPY axiom_engine_rs/ ./axiom_engine_rs/
+
+# Build the release binary. We build from the crate directory so Cargo.toml
+# paths resolve correctly. The `--locked` flag uses the committed Cargo.lock
+# for reproducible builds.
+RUN cd axiom_engine_rs && \
+    cargo build --release --locked --bin axiom_engine && \
+    strip target/release/axiom_engine
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime — lean image with just the binary and entrypoint
+# ---------------------------------------------------------------------------
 FROM debian:bookworm-slim
 
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y \
-    libssl3 \
+# Install runtime dependencies (ca-certificates for HTTPS, curl for checkpoint
+# download in the entrypoint, libssl for TLS).
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/src/axiom_engine/axiom_engine_rs/target/release/axiom_engine /app/axiom_engine
+# Create the app directory structure
+WORKDIR /app
+RUN mkdir -p /app/checkpoints /app/tokenizer_cache
+
+# Copy the binary from the builder stage
+COPY --from=builder /build/axiom_engine_rs/target/release/axiom_engine /app/axiom_engine
+
+# Copy the entrypoint script
 COPY scripts/docker_entrypoint.sh /app/docker_entrypoint.sh
 RUN chmod +x /app/docker_entrypoint.sh
 
-RUN mkdir -p /app/checkpoints /app/tokenizer_cache
-
-# Run as a non-root user (k8s Pod Security Standards / restricted profile friendly).
-RUN useradd --system --uid 10001 --home-dir /app axiom \
-    && chown -R axiom:axiom /app
-USER axiom
-
+# Expose the default server port
 EXPOSE 8080
 
-ENV AXIOM_HOST="0.0.0.0"
-ENV AXIOM_PORT="8080"
-ENV AXIOM_DEVICE="cpu"
-ENV RUST_LOG="info"
+# Environment defaults (overridable at runtime)
+ENV AXIOM_HOST=0.0.0.0 \
+    AXIOM_PORT=8080 \
+    AXIOM_DEVICE=cpu \
+    RUST_LOG=info \
+    AXIOM_BPE_CKPT=/app/checkpoints/axiom_production_bpe.bin \
+    AXIOM_TOKENIZER=/app/checkpoints/axiom_bpe.json
 
-# Liveness for orchestrators that honor HEALTHCHECK (compose, Swarm).
-# Kubernetes uses the httpGet probes in the Helm chart instead.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${AXIOM_PORT}/healthz" || exit 1
+# Health check — the /healthz endpoint returns 200 when the server is ready
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:${AXIOM_PORT}/healthz || exit 1
 
-# The entrypoint optionally seeds the checkpoint/tokenizer, then execs the engine.
+# Use the entrypoint script which optionally downloads checkpoints, then
+# hands off to the server.
 ENTRYPOINT ["/app/docker_entrypoint.sh"]
-CMD ["--mode", "server"]
+CMD ["--mode", "server", "--host", "0.0.0.0", "--port", "8080"]

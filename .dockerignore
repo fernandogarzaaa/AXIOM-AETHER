@@ -30,3 +30,14 @@ logs/
 docs/
 *.bat
 axiom_autostart_task.xml
+
+# Python reference implementation (not needed in the Rust Docker image)
+axiom_engine/
+pyproject.toml
+axiom_engine_rs/pyproject.toml
+
+# Cline config (local only)
+.clinerules
+
+# Bench results
+bench/results/
