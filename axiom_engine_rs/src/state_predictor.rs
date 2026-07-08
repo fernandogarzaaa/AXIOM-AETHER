@@ -79,6 +79,18 @@ pub struct SemanticStateMap {
     pub context_state: Vec<f32>,
 }
 
+#[allow(clippy::derivable_impls)]
+impl Default for SemanticStateMap {
+    fn default() -> Self {
+        Self {
+            milestones: Vec::new(),
+            confidence: BetaBelief::default(),
+            session_id: String::new(),
+            context_state: Vec::new(),
+        }
+    }
+}
+
 /// The state prediction head — a learned projection from context state to
 /// milestone predictions.
 ///
