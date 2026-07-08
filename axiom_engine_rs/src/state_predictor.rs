@@ -278,7 +278,7 @@ fn argmax(t: &Tensor) -> Result<usize> {
 /// Max value of a tensor (scalar).
 fn max_value(t: &Tensor) -> Result<f32> {
     let vec = t.squeeze(0)?.to_vec1::<f32>()?;
-    Ok(vec.into_iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)))
+    Ok(vec.into_iter().fold(f32::NEG_INFINITY, |a, b| a.max(b)))
 }
 
 /// Render a state map as a human-readable string for logging/debugging.
