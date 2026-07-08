@@ -154,9 +154,7 @@ impl StatePredictor {
 
             // Predict the token budget (clamped to [16, 4096]).
             let budget_logit = self.budget_proj.forward(&projected)?;
-            let budget_raw = budget_logit
-                .squeeze(D::Minus1)?
-                .to_scalar::<f32>()?;
+            let budget_raw = budget_logit.squeeze(0)?.squeeze(0)?.to_scalar::<f32>()?;
             let token_budget = (budget_raw.exp().clamp(16.0, 4096.0)) as usize;
 
             // Extract the predicted state as a vector for serialization.
@@ -265,7 +263,7 @@ fn generate_branch_hints(label: &str, step: usize) -> Vec<String> {
 
 /// Argmax of a 1-D tensor (returns the index of the max element).
 fn argmax(t: &Tensor) -> Result<usize> {
-    let vec = t.squeeze(D::Minus1)?.to_vec1::<f32>()?;
+    let vec = t.squeeze(0)?.to_vec1::<f32>()?;
     let mut best_idx = 0;
     let mut best_val = f32::NEG_INFINITY;
     for (i, &v) in vec.iter().enumerate() {
@@ -279,7 +277,7 @@ fn argmax(t: &Tensor) -> Result<usize> {
 
 /// Max value of a tensor (scalar).
 fn max_value(t: &Tensor) -> Result<f32> {
-    let vec = t.squeeze(D::Minus1)?.to_vec1::<f32>()?;
+    let vec = t.squeeze(0)?.to_vec1::<f32>()?;
     Ok(vec.into_iter().fold(f32::NEG_INFINITY, f32::max))
 }
 
