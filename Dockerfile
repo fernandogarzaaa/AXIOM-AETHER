@@ -10,7 +10,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Builder — compile the Rust binary
 # ---------------------------------------------------------------------------
-FROM rust:1.86-bookworm AS builder
+FROM rust:1.87-bookworm AS builder
 
 # Install build dependencies (tree-sitter needs a C compiler)
 RUN apt-get update && apt-get install -y --no-install-recommends \
