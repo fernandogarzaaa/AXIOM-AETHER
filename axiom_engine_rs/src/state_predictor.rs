@@ -121,7 +121,7 @@ impl StatePredictor {
         context_state: &Tensor,
         session_id: &str,
         max_milestones: usize,
-        device: &Device,
+        _device: &Device,
     ) -> Result<SemanticStateMap> {
         let max_milestones = max_milestones.min(MAX_MILESTONES);
         let mut milestones = Vec::with_capacity(max_milestones);
