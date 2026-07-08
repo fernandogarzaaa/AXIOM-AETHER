@@ -1,8 +1,8 @@
-[package]
+﻿[package]
 name = "axiom_engine"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
-description = "Axiom-TTT Inference Engine – Rust implementation using candle"
+description = "Axiom-TTT Inference Engine â€“ Rust implementation using candle"
 license = "MIT"
 repository = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
 homepage = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "science"]
 # `axiom` is the canonical entrypoint (so `cargo run` and maturin's bin wheel
 # select it rather than ambiguating over the many dev/bench binaries).
 default-run = "axiom"
-# Keep the published crate to source only — never ship checkpoints, models, or
+# Keep the published crate to source only â€” never ship checkpoints, models, or
 # build output (crates.io enforces a size limit these would blow past).
 exclude = [
     "target/*",
@@ -45,7 +45,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 # Dev/training/eval binaries (src/bin/*). Off by default so `cargo install`,
 # the pip wheel, Docker, and release builds ship only the user-facing `axiom`
-# command — not the training toolchain. Build them with `--features tools`.
+# command â€” not the training toolchain. Build them with `--features tools`.
 tools = []
 
 # Dev/training/eval binaries, gated behind the `tools` feature (see above).
