@@ -48,7 +48,7 @@
         let map = make_state_map();
         let mut result = sampler.sample(&map);
         let before: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();
-        sampler.evolve_branches(&mut result, 0.5);udget)
+        sampler.evolve_branches(&mut result, 0.5);
 //! 3. **Information gain** - expected reduction in uncertainty
 //!
 //! The composite score is `vialet sampler = TrajectorySampler::new(8, 0.001);
