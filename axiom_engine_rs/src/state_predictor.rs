@@ -1,4 +1,4 @@
-﻿//! state_predictor.rs — State-Based Look-Ahead Prediction.
+//! state_predictor.rs — State-Based Look-Ahead Prediction.
 //!
 //! Forecasts high-level semantic states (hypothesis generation, code execution,
 //! verification) rather than immediately predicting the next standard language
@@ -278,7 +278,7 @@ fn argmax(t: &Tensor) -> Result<usize> {
 /// Max value of a tensor (scalar).
 fn max_value(t: &Tensor) -> Result<f32> {
     let vec = t.squeeze(0)?.to_vec1::<f32>()?;
-    Ok(vec.into_iter().fold(f32::NEG_INFINITY, f32::max))
+    Ok(vec.into_iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)))
 }
 
 /// Render a state map as a human-readable string for logging/debugging.
