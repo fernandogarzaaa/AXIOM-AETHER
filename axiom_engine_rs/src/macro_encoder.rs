@@ -221,15 +221,11 @@ impl StructuralFeatures {
 }
 
 /// The macro encoder — compresses large context into workflow vectors.
-pub struct MacroEncoder {
-    device: Device,
-}
+pub struct MacroEncoder;
 
 impl MacroEncoder {
     /// Create a new macro encoder on the given device.
-    pub fn new(device: Device) -> Self {
-        Self { device }
-    }
+    pub fn new(_device: Device) -> Self { Self }
 
     /// Encode a skeleton + TTT state into a workflow vector.
     ///
@@ -417,7 +413,7 @@ fn ttt_state_statistics(state: &[f32]) -> Vec<f32> {
         max,
         abs_mean,
         variance,
-        (n as f32).ln_1p(),
+        n.ln_1p(),
     ];
     stats.extend_from_slice(&band_energy);
     stats.extend_from_slice(&[
