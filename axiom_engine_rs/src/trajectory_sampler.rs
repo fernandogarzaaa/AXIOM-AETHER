@@ -1,4 +1,4 @@
-<arg_value>//! trajectory_sampler.rs - Branch-and-bound trajectory sampling over the
+//! trajectory_sampler.rs - Branch-and-bound trajectory sampling over the
 //! cognitive state manifold.  The sampler produces parallel trajectories,
 //! scores them with a composite of novelty + coherence + budget-fit, prunes
 //! low-scoring branches, and evolves survivors with Gaussian perturbation.
@@ -222,7 +222,6 @@ impl TrajectorySampler {
             return 0.5;
         }
         let dist = Self::l2_dist(candidate, reference);
-        // Map distance to [0, 1] novelty: closer = less novel
         let novelty = 1.0 / (1.0 + dist);
         novelty.clamp(0.0, 1.0)
     }
@@ -231,9 +230,7 @@ impl TrajectorySampler {
         if milestones.is_empty() || state.is_empty() {
             return 0.5;
         }
-        // Average confidence of milestones
         let avg_conf: f32 = milestones.iter().map(|m| m.confidence).sum::<f32>() / milestones.len() as f32;
-        // State norm as a proxy for coherence
         let norm: f32 = state.iter().map(|v| v * v).sum::<f32>().sqrt();
         (avg_conf * 0.7 + (norm / 10.0).min(1.0) * 0.3).clamp(0.0, 1.0)
     }
@@ -242,7 +239,6 @@ impl TrajectorySampler {
         if milestones.is_empty() {
             return 0.5;
         }
-        // Average token budget normalized to [0, 1]
         let avg_budget: f32 = milestones.iter().map(|m| m.token_budget as f32).sum::<f32>()
             / milestones.len() as f32
             / 4096.0;
@@ -362,7 +358,6 @@ mod tests {
         let sampler = TrajectorySampler::new(8, 0.99);
         let map = make_state_map();
         let result = sampler.sample(&map);
-        // With a very high threshold, most branches should be pruned
         assert!(result.pruned > 0, "should prune some branches");
     }
 
@@ -388,7 +383,6 @@ mod tests {
         sampler.evolve_branches(&mut result, 0.5);
         let after: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();
         assert_eq!(before.len(), after.len(), "evolve should not change branch count");
-        // At least one score should change
         let changed = before.iter().zip(after.iter()).any(|(a, b)| (a - b).abs() > 1e-6);
         assert!(changed, "evolution should change scores");
     }
