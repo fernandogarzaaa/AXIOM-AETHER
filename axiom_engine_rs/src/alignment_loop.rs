@@ -1,4 +1,4 @@
-﻿//! alignment_loop.rs — Self-Correcting Feedback Loop.
+//! alignment_loop.rs - Self-Correcting Feedback Loop.
 //!
 //! Continuously evaluates the active output generation against the predicted
 //! state map established by the state predictor. If the output logic deviates
@@ -10,15 +10,15 @@
 //!
 //! The alignment loop operates in three stages:
 //!
-//! 1. **Monitoring** — For each generated token/chunk, extract the current
+//! 1. **Monitoring** - For each generated token/chunk, extract the current
 //!    generation state and compare it against the expected milestone in the
 //!    `SemanticStateMap`.
 //!
-//! 2. **Drift detection** — Compute a drift score between the current generation
+//! 2. **Drift detection** - Compute a drift score between the current generation
 //!    state and the predicted milestone state. If the drift exceeds a threshold,
 //!    flag a misalignment.
 //!
-//! 3. **Correction** — Apply a localized TTT fast-weight update that nudges W̃
+//! 3. **Correction** - Apply a localized TTT fast-weight update that nudges W̃
 //!    toward the predicted milestone state. This is a small, bounded update
 //!    (not a full re-adaptation) that steers generation back on track.
 //!
@@ -27,7 +27,7 @@
 //! The existing `hallucination.rs` grounding check is *post-hoc* (verify after
 //! generation). The alignment loop is *continuous* (monitor during generation)
 //! and *corrective* (apply W̃ updates mid-stream). It does not replace
-//! grounding — it complements it by catching drift early.
+//! grounding - it complements it by catching drift early.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +43,7 @@ pub const DEFAULT_CORRECTION_LR: f32 = 0.01;
 /// Maximum number of corrections per generation session.
 pub const MAX_CORRECTIONS: usize = 16;
 
-/// A single alignment check — the result of comparing generation state to the
+/// A single alignment check - the result of comparing generation state to the
 /// predicted milestone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlignmentCheck {
@@ -61,7 +61,7 @@ pub struct AlignmentCheck {
     pub confidence: BetaBelief,
 }
 
-/// The alignment loop's state — tracks corrections across a generation session.
+/// The alignment loop's state - tracks corrections across a generation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlignmentLoopState {
     /// The state map being aligned against.
@@ -80,7 +80,7 @@ pub struct AlignmentLoopState {
     pub completed: bool,
 }
 
-/// The alignment loop — monitors and corrects generation drift.
+/// The alignment loop - monitors and corrects generation drift.
 pub struct AlignmentLoop {
     drift_threshold: f32,
     correction_lr: f32,

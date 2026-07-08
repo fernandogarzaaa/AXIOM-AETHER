@@ -1,11 +1,11 @@
-﻿//! predictive_tools.rs — MCP tool definitions for the Predictive Reasoning Engine.
+//! predictive_tools.rs - MCP tool definitions for the Predictive Reasoning Engine.
 //!
 //! This module provides the tool schemas and handler functions for the three
 //! new MCP tools that expose the Predictive Reasoning Engine to AI agents:
 //!
-//! - `axiom_predict_states` — forecast semantic milestones from context
-//! - `axiom_sample_trajectories` — fork and score reasoning branches
-//! - `axiom_align_generation` — monitor and correct generation drift
+//! - `axiom_predict_states` - forecast semantic milestones from context
+//! - `axiom_sample_trajectories` - fork and score reasoning branches
+//! - `axiom_align_generation` - monitor and correct generation drift
 //!
 //! These are designed to be integrated into `mcp_stdio.rs`'s `tools_list()`
 //! and `handle_tools_call()` functions.

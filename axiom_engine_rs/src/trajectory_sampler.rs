@@ -1,4 +1,4 @@
-﻿//! trajectory_sampler.rs — Concurrent Trajectory Sampling.
+//! trajectory_sampler.rs - Concurrent Trajectory Sampling.
 //!
 //! Forks the reasoning process into multiple parallel pathways during the
 //! look-ahead phase. A resource-allocation scoring model evaluates the vialet sampler = TrajectorySampler::new(8, 0.001);
@@ -27,7 +27,7 @@
         let map = make_state_map();
         let mut result = sampler.sample(&map);
         let before: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();
-        sampler.evolve_branches(&mut result, 0.5);ility** — expected success prolet sampler = TrajectorySampler::new(8, 0.001);
+        sampler.evolve_branches(&mut result, 0.5);ility** - expected success prolet sampler = TrajectorySampler::new(8, 0.001);
         let map = make_state_map();
         let mut result = sampler.sample(&map);
         let before: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();
@@ -44,12 +44,12 @@
         let mut result = sampler.sample(&map);
         let before: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();
         sampler.evolve_branches(&mut result, 0.5);elief confidence)
-//! 2. **Compute cost** — estimated GPU seconds (from token let sampler = TrajectorySampler::new(8, 0.001);
+//! 2. **Compute cost** - estimated GPU seconds (from token let sampler = TrajectorySampler::new(8, 0.001);
         let map = make_state_map();
         let mut result = sampler.sample(&map);
         let before: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();
         sampler.evolve_branches(&mut result, 0.5);udget)
-//! 3. **Information gain** — expected reduction in uncertainty
+//! 3. **Information gain** - expected reduction in uncertainty
 //!
 //! The composite score is `vialet sampler = TrajectorySampler::new(8, 0.001);
         let map = make_state_map();
@@ -142,7 +142,7 @@ pulet sampler = TrajectorySampler::new(8, 0.001);
         let map = make_state_map();
         let mut result = sampler.sample(&map);
         let before: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();
-        sampler.evolve_branches(&mut result, 0.5);ranch — one forked reasoning pathway.
+        sampler.evolve_branches(&mut result, 0.5);ranch - one forked reasoning pathway.
 #[derive(Delet sampler = TrajectorySampler::new(8, 0.001);
         let map = make_state_map();
         let mut result = sampler.sample(&map);
@@ -281,7 +281,7 @@ pulet sampler = TrajectorySampler::new(8, 0.001);
         sampler.evolve_branches(&mut result, 0.5);elief,
 }
 
-/// Result of trajectory sampling — the set of let sampler = TrajectorySampler::new(8, 0.001);
+/// Result of trajectory sampling - the set of let sampler = TrajectorySampler::new(8, 0.001);
         let map = make_state_map();
         let mut result = sampler.sample(&map);
         let before: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();
@@ -364,7 +364,7 @@ pulet sampler = TrajectorySampler::new(8, 0.001);
         sampler.evolve_branches(&mut result, 0.5);its: f32,
 }
 
-/// The trajectory sampler — forks and scores reasoning let sampler = TrajectorySampler::new(8, 0.001);
+/// The trajectory sampler - forks and scores reasoning let sampler = TrajectorySampler::new(8, 0.001);
         let map = make_state_map();
         let mut result = sampler.sample(&map);
         let before: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();

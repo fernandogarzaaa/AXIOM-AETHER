@@ -1,23 +1,23 @@
-﻿//! macro_encoder.rs — Macro-Compression Encoder.
+//! macro_encoder.rs - Macro-Compression Encoder.
 //!
 //! Condenses massive contextual inputs (like a 20-million token repository) into
 //! high-density workflow vectors. Acts as a specialized middleware filter that
-//! shrinks input volume — bypassing the token bottlenecks of standard frontier
+//! shrinks input volume - bypassing the token bottlenecks of standard frontier
 //! models while retaining complete structural integrity.
 //!
 //! ## Architecture
 //!
 //! The macro encoder operates in three stages:
 //!
-//! 1. **Structural extraction** — Uses the existing `skeleton.rs` to extract
+//! 1. **Structural extraction** - Uses the existing `skeleton.rs` to extract
 //!    signatures, imports, and doc comments from source code. This produces a
 //!    readable structural skeleton (~80% byte reduction).
 //!
-//! 2. **TTT state absorption** — The skeleton + full source are absorbed into
+//! 2. **TTT state absorption** - The skeleton + full source are absorbed into
 //!    the TTT fast-weight matrix W̃ via `adapt_session`. The resulting W̃
 //!    encodes the structural logic and syntax patterns of the codebase.
 //!
-//! 3. **Workflow vector encoding** — The W̃ matrix is compressed into a
+//! 3. **Workflow vector encoding** - The W̃ matrix is compressed into a
 //!    fixed-dimensional workflow vector that captures the "shape" of the work:
 //!    function call graph density, data flow patterns, control flow complexity,
 //!    and module coupling. This vector can be used as a compact prompt prefix
@@ -40,7 +40,7 @@ pub const WORKFLOW_VECTOR_DIM: usize = 128;
 /// Maximum tokens per chunk in hierarchical compression.
 pub const MAX_CHUNK_TOKENS: usize = 8192;
 
-/// A workflow vector — the dense output of the macro encoder.
+/// A workflow vector - the dense output of the macro encoder.
 ///
 /// This vector encodes the "shape" of a codebase or context:
 /// - Call graph density (how interconnected functions are)
@@ -220,7 +220,7 @@ impl StructuralFeatures {
     }
 }
 
-/// The macro encoder — compresses large context into workflow vectors.
+/// The macro encoder - compresses large context into workflow vectors.
 pub struct MacroEncoder;
 
 impl MacroEncoder {
@@ -306,7 +306,7 @@ impl MacroEncoder {
         let mut chunk_vectors: Vec<WorkflowVector> = Vec::with_capacity(chunks.len());
 
         for chunk in &chunks {
-            // For each chunk, build a skeleton (simplified — no tree-sitter here,
+            // For each chunk, build a skeleton (simplified - no tree-sitter here,
             // just line-based extraction) and use the chunk text as the "TTT state"
             // proxy (in a real deployment, this would call adapt_session).
             let skeleton = simple_skeleton(chunk);

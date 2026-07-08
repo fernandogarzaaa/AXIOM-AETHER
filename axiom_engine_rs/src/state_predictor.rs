@@ -1,4 +1,4 @@
-//! state_predictor.rs — State-Based Look-Ahead Prediction.
+//! state_predictor.rs - State-Based Look-Ahead Prediction.
 //!
 //! Forecasts high-level semantic states (hypothesis generation, code execution,
 //! verification) rather than immediately predicting the next standard language
@@ -21,12 +21,12 @@
 //! The milestone labels are drawn from a fixed vocabulary of cognitive phases
 //! that cover the typical reasoning lifecycle:
 //!
-//! - `hypothesis` — initial hypothesis or plan formation
-//! - `decomposition` — breaking the problem into sub-tasks
-//! - `execution` — generating code or performing computation
-//! - `verification` — checking output against requirements
-//! - `refinement` — iterative improvement based on feedback
-//! - `synthesis` — combining results into a final answer
+//! - `hypothesis` - initial hypothesis or plan formation
+//! - `decomposition` - breaking the problem into sub-tasks
+//! - `execution` - generating code or performing computation
+//! - `verification` - checking output against requirements
+//! - `refinement` - iterative improvement based on feedback
+//! - `synthesis` - combining results into a final answer
 
 use candle_core::{Device, Result, Tensor, D};
 use candle_nn::{Linear, Module, VarBuilder};
@@ -66,7 +66,7 @@ pub struct SemanticMilestone {
     pub confidence: BetaBelief,
 }
 
-/// A complete state map — the sequence of predicted cognitive milestones.
+/// A complete state map - the sequence of predicted cognitive milestones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticStateMap {
     /// The predicted milestone sequence.
@@ -91,13 +91,13 @@ impl Default for SemanticStateMap {
     }
 }
 
-/// The state prediction head — a learned projection from context state to
+/// The state prediction head - a learned projection from context state to
 /// milestone predictions.
 ///
 /// Architecture:
-/// - `state_proj`: Linear(d_model -> d_model) — projects the context state
-/// - `label_proj`: Linear(d_model -> num_labels) — classifies the milestone label
-/// - `budget_proj`: Linear(d_model -> 1) — predicts the token budget
+/// - `state_proj`: Linear(d_model -> d_model) - projects the context state
+/// - `label_proj`: Linear(d_model -> num_labels) - classifies the milestone label
+/// - `budget_proj`: Linear(d_model -> 1) - predicts the token budget
 ///
 /// The predictor runs autoregressively: each predicted state feeds back as
 /// input to predict the next milestone, up to `MAX_MILESTONES`.
