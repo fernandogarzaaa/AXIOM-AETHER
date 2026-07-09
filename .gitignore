@@ -24,3 +24,6 @@ axiom_master_vibe.bin
 # Deployed release tag recorded by scripts/update_axiom.ps1 (runtime state)
 .axiom_release_version
 bench/results/*.json
+
+# Temp files from CI debugging
+tmp_*.txt
