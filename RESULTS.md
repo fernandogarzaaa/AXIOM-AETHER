@@ -1,0 +1,13 @@
+# AxiomBench Results
+
+Generated (unix): 1783089448
+
+| Pillar | Headline |
+|---|---|
+| cognition | 100% symbol exact-recovery (3/3) |
+| trust | 100% supported coverage, neural contradiction catch-rate 10% -> 100% (threshold 0.750) |
+| fleet | node B pre-immunized in 0.17 ms; signed DWE applied in 0.10 ms (pass) |
+| cost | 75.1% byte reduction over 3 replayed record(s) from 3 session(s) |
+
+Reproduce deterministic pillars: `cargo run --release --features tools --bin axiombench`.
+Reproduce the live cost pillar without upstream credentials: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_axiombench_cost_mock.ps1`.

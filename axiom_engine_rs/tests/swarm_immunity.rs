@@ -32,6 +32,13 @@ fn unique_tmp(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("axiom_swarm_{tag}_{nanos}"))
 }
 
+/// Render a path for embedding in `sh -c` scripts: sh eats unquoted
+/// backslashes, so Windows `\` separators would silently mangle the path.
+/// Forward slashes work on all platforms; on Unix this is the identity.
+fn sh_path(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 fn supervise(
     cmd: String,
     args: Vec<String>,
@@ -198,7 +205,7 @@ fn herd_immunity_end_to_end() {
     // Machine A: the program crashes on a missing dir, heals, succeeds, learns.
     let base = unique_tmp("herd_env");
     let out_dir = base.join("out");
-    let script = format!("echo fleet-output > {}", out_dir.join("r.txt").display());
+    let script = format!("echo fleet-output > {}", sh_path(&out_dir.join("r.txt")));
     let args = vec!["-c".to_string(), script];
     let mem_a = unique_tmp("herd_a").with_extension("json");
 

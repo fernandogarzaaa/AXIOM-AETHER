@@ -22,17 +22,29 @@ general answer-quality claims that are not proven by the repository.
 | Surface | What it does | Main code |
 |---|---|---|
 | Online TTT engine | Updates per-session fast weights during inference and adaptation. | `axiom_engine_rs/src/ttt_block.rs`, `model.rs`, `inference.rs` |
-| Context compression proxy | Accepts Anthropic Messages and OpenAI Chat Completions style traffic, absorbs heavy context locally, and forwards a smaller readable payload. | `server.rs`, `context_compressor.rs`, `skeleton.rs`, `anthropic_forwarder.rs`, `openai_forwarder.rs` |
+| Context compression proxy | Accepts Anthropic Messages and OpenAI Chat Completions style traffic, absorbs heavy context locally, and forwards a smaller readable payload. | `server/routes_messages.rs`, `server/routes_chat.rs`, `context_compressor.rs`, `skeleton.rs`, `anthropic_forwarder.rs`, `openai_forwarder.rs` |
+| Responses input compression | **On by default.** Replaces old, text-only assistant turns in the safe prefix of `/v1/responses` transcripts with a dense recall fingerprint — each contiguous run collapses in place, so every user/tool/structural item keeps its position. Disable with `AXIOM_RESPONSES_COMPRESS=0`. | `responses_compressor.rs`, `server/routes_responses.rs` |
+| Session recording & receipts | Opt-in scrubbed per-session request/response JSONL (`AXIOM_SESSION_RECORD=1`, `~/.axiom/sessions/`), plus always-on token-savings receipts: `axiom_savings_*` counters on `/metrics` and a one-line receipt when a session drops. | `session_recorder.rs`, `server/routes_responses.rs`, `server/routes_hypervisor.rs` |
 | MCP server | Exposes Axiom as stdio JSON-RPC tools for compression, drift checks, expansion, memory, immunity, and grounding. | `mcp_stdio.rs` |
-| Self-healing runner | Runs a command, detects supported environment failures, applies bounded heals, and records learned immunity. | `self_heal.rs`, `heal_memory.rs`, `main.rs` |
+| Self-healing runner | Runs a command, detects supported environment failures, applies bounded heals, and records learned immunity. | `self_heal.rs`, `heal_memory.rs`, `entrypoint.rs` |
 | Autonomous solve loop | Uses the runner plus source repair attempts to drive a verifier command toward green. | `solve.rs`, `poly_jit.rs`, `sandbox.rs` |
-| Grounding verification | Checks whether response claims are supported by supplied evidence and can expand dropped symbols when a session digest is available. | `hallucination.rs`, `/v1/verify` in `server.rs` |
-| Swarm and provenance | Shares selected learned state through signed immunity export/merge and weighted belief logic. Patch gossip is Byzantine-robust (bounded per-peer trust). | `belief.rs`, `provenance.rs`, `weight_merge.rs`, `patch_memory.rs` |
+| Grounding verification | Checks whether response claims are supported by supplied evidence and can expand dropped symbols when a session digest is available. | `hallucination.rs`, `/v1/verify` in `server/routes_verify.rs` |
+| Swarm and provenance | Shares selected learned state through signed immunity export/merge and weighted belief logic. Patch gossip is Byzantine-robust (bounded per-peer trust). DWE weight fragments are fleet-key HMAC authenticated with replay rejection and current/previous key rotation; `/v1/fleet/status` and `axiom_dwe_*` metrics expose live fleet health. Compose peers with `axiom fleet status\|join`. | `belief.rs`, `provenance.rs`, `weight_merge.rs`, `patch_memory.rs`, `dwe.rs`, `server/routes_fleet.rs` |
+| Calibrated trust gate | `/v1/verify` ships a data-calibrated conformal threshold (calibrated on `bench/trust/claims.jsonl` at δ=0.10 for ≥90% coverage of genuinely supported claims), plus a neural contradiction-catch-rate benchmark. A `calibrate` request mode retunes it for your own labeled data. | `hallucination.rs`, `bench/trust/`, `server/routes_verify.rs` |
 | ChimeraLang DSL | In-tree Rust implementation of the [ChimeraLang](https://github.com/fernandogarzaaa/ChimeraLang) AI-cognition language: `belief/inquire/resolve/guard/evolve` programs run on the same `BetaBelief` + provenance substrate, with tamper-evident run certificates. | `chimera.rs`, CLI `axiom chimera`, `/v1/chimera/run` |
 | Search ingestion node | Scrapes web pages, ingests text through local TTT, and emits an Axiom fingerprint for downstream use. | `src/bin/search_node.rs`, `search_scrape.rs`, `search_ingest.rs` |
 
 For a compact index of surfaces, see [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md).
 For research upgrades and what is still planned, see [`docs/UPGRADES.md`](docs/UPGRADES.md).
+
+### AxiomBench
+
+`cargo run --release --features tools --bin axiombench` measures Axiom on four
+axes — **cognition** (skeleton symbol round-trip fidelity), **trust** (calibrated
+grounding-gate coverage), **fleet** (cross-node immunity transfer + fragment
+auth), and **cost** (corpus token reduction, `--live`). The three deterministic
+pillars run in CI on every push; the current headline numbers live in
+[`RESULTS.md`](RESULTS.md).
 
 ## Verification Status
 
@@ -294,7 +306,8 @@ Useful environment variables:
 | `AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS` | Compression threshold. |
 | `AXIOM_VIBE` / `AXIOM_VIBE_PRIME` | Persistent fast-weight memory controls. |
 | `AXIOM_HEAL_MEMORY` | Path for learned heal memory, or `0`/`off` to disable. |
-| `AXIOM_FLEET_KEY` | HMAC key for swarm immunity exchange. |
+| `AXIOM_FLEET_KEY` | Current HMAC key for swarm immunity exchange and DWE fragments. Required when `AXIOM_DWE_LISTEN` is set. |
+| `AXIOM_FLEET_KEY_PREV` | Optional previous fleet key accepted during graceful key rotation; remove after all peers use `AXIOM_FLEET_KEY`. |
 | `AXIOM_VERIFY_RESPONSES` | Opt in to response grounding advisories. |
 | `AXIOM_ROUTER_CONSENSUS` | Set to `1` to enable consensus mode: the router asks two providers and fuses answers via `BetaBelief`. |
 | `AXIOM_CONFORMAL_THRESHOLD` | Pre-calibrated support threshold τ for the conformal factuality gate; replaces the hardcoded 0.60 cutoff. |

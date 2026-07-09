@@ -30,6 +30,11 @@ pub struct DweFragment {
     pub sequence: u64,
     pub layers: Vec<DweLayerDelta>,
     pub state_hash: String,
+    /// Fleet-key HMAC over the authenticated fields (see `sign_fragment`).
+    /// `None` on an unsigned fragment; the listener rejects unsigned input
+    /// when a fleet key is configured.
+    #[serde(default)]
+    pub hmac: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -38,6 +43,7 @@ pub struct DweTelemetry {
     pub sent_fragments: u64,
     pub received_fragments: u64,
     pub applied_fragments: u64,
+    pub rejected_fragments: u64,
     pub last_session_id: Option<String>,
     pub last_fragment_bytes: usize,
     pub last_error: Option<String>,
@@ -47,14 +53,23 @@ pub struct DweTelemetry {
 pub struct DweBus {
     tx: mpsc::Sender<DweFragment>,
     telemetry: Arc<Mutex<DweTelemetry>>,
+    signing_key: Option<Vec<u8>>,
 }
 
 impl DweBus {
     pub fn new(peers: Vec<String>) -> Self {
+        Self::new_with_signing_key(peers, None)
+    }
+
+    pub fn new_with_signing_key(peers: Vec<String>, signing_key: Option<Vec<u8>>) -> Self {
         let (tx, rx) = mpsc::channel::<DweFragment>(DEFAULT_DWE_QUEUE);
         let telemetry = Arc::new(Mutex::new(DweTelemetry::default()));
         attach_broadcast_task(peers, rx, telemetry.clone());
-        Self { tx, telemetry }
+        Self {
+            tx,
+            telemetry,
+            signing_key,
+        }
     }
 
     pub fn disabled() -> Self {
@@ -73,7 +88,17 @@ impl DweBus {
                     .collect()
             })
             .unwrap_or_default();
-        Self::new(peers)
+        let signing_key = std::env::var("AXIOM_FLEET_KEY")
+            .ok()
+            .map(|key| key.trim().as_bytes().to_vec())
+            .filter(|key| !key.is_empty());
+        Self::new_with_signing_key(peers, signing_key)
+    }
+
+    /// Shared telemetry handle for wiring an inbound listener
+    /// (`start_dwe_listener`) to the same counters the bus reports.
+    pub fn telemetry_handle(&self) -> Arc<Mutex<DweTelemetry>> {
+        self.telemetry.clone()
     }
 
     pub fn telemetry(&self) -> DweTelemetry {
@@ -82,7 +107,24 @@ impl DweBus {
         telemetry
     }
 
-    pub fn broadcast(&self, fragment: DweFragment) {
+    pub fn broadcast(&self, mut fragment: DweFragment) {
+        // Stamp a process-monotonic sequence so a peer's (session, sequence)
+        // replay guard never wrongly drops two legitimate updates produced in
+        // the same wall-clock second (producers seed `sequence` from seconds).
+        // A true replay re-sends identical signed bytes → identical sequence →
+        // correctly rejected; distinct updates always differ here.
+        static DWE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fragment.sequence = DWE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Sign every outbound fragment when a fleet key is configured so peers
+        // can authenticate it. Signing happens AFTER the sequence is stamped so
+        // the HMAC covers the final sequence. Unsigned broadcast is only
+        // meaningful for a keyless (single-node) setup, where the listener also
+        // refuses to run — so a peer only ever sees signed frames.
+        if let Some(key) = &self.signing_key {
+            if !key.is_empty() {
+                sign_fragment(&mut fragment, key);
+            }
+        }
         if let Err(err) = self.tx.try_send(fragment) {
             update_telemetry(&self.telemetry, |t| {
                 t.last_error = Some(format!("dwe queue full: {err}"));
@@ -189,6 +231,7 @@ pub fn extract_delta_fragment(
         sequence,
         layers,
         state_hash,
+        hmac: None,
     })
 }
 
@@ -213,6 +256,47 @@ pub fn deserialize_fragment(bytes: &[u8]) -> Result<DweFragment, String> {
         ));
     }
     bincode::deserialize(bytes).map_err(|e| e.to_string())
+}
+
+/// Deterministic HMAC preimage over the authenticated fields (everything but
+/// the `hmac` itself), so a signature covers schema, session, sequence, every
+/// layer delta, and the state hash.
+pub fn fragment_preimage(fragment: &DweFragment) -> Vec<u8> {
+    let shadow = (
+        &fragment.schema,
+        &fragment.session_id,
+        fragment.sequence,
+        &fragment.layers,
+        &fragment.state_hash,
+    );
+    bincode::serialize(&shadow).unwrap_or_default()
+}
+
+/// Sign a fragment in place with the fleet key (reuses the provenance HMAC).
+pub fn sign_fragment(fragment: &mut DweFragment, key: &[u8]) {
+    let mac = crate::provenance::hmac_sha256_hex(key, &fragment_preimage(fragment));
+    fragment.hmac = Some(mac);
+}
+
+/// Verify a fragment's HMAC against the fleet key (constant-time compare over
+/// equal-length hex). Rejects unsigned fragments.
+pub fn verify_fragment(fragment: &DweFragment, key: &[u8]) -> Result<(), String> {
+    let Some(mac) = fragment.hmac.as_deref() else {
+        return Err("fragment is unsigned".into());
+    };
+    let expected = crate::provenance::hmac_sha256_hex(key, &fragment_preimage(fragment));
+    if expected.len() != mac.len() {
+        return Err("hmac length mismatch".into());
+    }
+    let diff = expected
+        .bytes()
+        .zip(mac.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    if diff == 0 {
+        Ok(())
+    } else {
+        Err("hmac verification failed".into())
+    }
 }
 
 pub fn apply_fragment(
@@ -308,6 +392,48 @@ fn update_telemetry(telemetry: &Arc<Mutex<DweTelemetry>>, update: impl FnOnce(&m
     }
 }
 
+/// Verify during graceful fleet-key rotation. The current key is tried first;
+/// `previous_key`, when present, is accepted only as a rotation window fallback.
+pub fn verify_fragment_with_rotation(
+    fragment: &DweFragment,
+    current_key: &[u8],
+    previous_key: Option<&[u8]>,
+) -> Result<(), String> {
+    match verify_fragment(fragment, current_key) {
+        Ok(()) => Ok(()),
+        Err(current_error) => {
+            if previous_key
+                .map(|key| verify_fragment(fragment, key).is_ok())
+                .unwrap_or(false)
+            {
+                Ok(())
+            } else {
+                Err(current_error)
+            }
+        }
+    }
+}
+
+pub fn record_applied_fragment(telemetry: &Arc<Mutex<DweTelemetry>>, session_id: &str) {
+    update_telemetry(telemetry, |t| {
+        t.applied_fragments += 1;
+        t.last_session_id = Some(session_id.to_string());
+        t.last_error = None;
+    });
+}
+
+pub fn record_rejected_fragment(
+    telemetry: &Arc<Mutex<DweTelemetry>>,
+    session_id: &str,
+    error: &str,
+) {
+    update_telemetry(telemetry, |t| {
+        t.rejected_fragments += 1;
+        t.last_session_id = Some(session_id.to_string());
+        t.last_error = Some(error.to_string());
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +452,55 @@ mod tests {
             local[0].to_vec2::<f32>().unwrap(),
             vec![vec![1.0, 1.0], vec![1.0, 1.0]]
         );
+    }
+
+    fn sample_fragment() -> DweFragment {
+        DweFragment {
+            schema: "axiom.dwe.v1".into(),
+            session_id: "s1".into(),
+            sequence: 7,
+            layers: vec![DweLayerDelta {
+                layer_index: 0,
+                shape: vec![2],
+                values: vec![1.0, 2.0],
+            }],
+            state_hash: "abc".into(),
+            hmac: None,
+        }
+    }
+
+    #[test]
+    fn signed_fragment_verifies_with_same_key() {
+        let key = b"fleet-secret";
+        let mut f = sample_fragment();
+        sign_fragment(&mut f, key);
+        assert!(f.hmac.is_some());
+        assert!(verify_fragment(&f, key).is_ok());
+    }
+
+    #[test]
+    fn tampered_fragment_fails_verification() {
+        let key = b"fleet-secret";
+        let mut f = sample_fragment();
+        sign_fragment(&mut f, key);
+        f.layers[0].values[0] = 99.0;
+        assert!(verify_fragment(&f, key).is_err());
+    }
+
+    #[test]
+    fn wrong_key_and_missing_hmac_fail() {
+        let mut f = sample_fragment();
+        sign_fragment(&mut f, b"key-a");
+        assert!(verify_fragment(&f, b"key-b").is_err());
+        f.hmac = None;
+        assert!(verify_fragment(&f, b"key-a").is_err());
+    }
+
+    #[test]
+    fn rotation_window_accepts_previous_key() {
+        let mut f = sample_fragment();
+        sign_fragment(&mut f, b"old-key");
+        assert!(verify_fragment_with_rotation(&f, b"new-key", Some(b"old-key")).is_ok());
+        assert!(verify_fragment_with_rotation(&f, b"new-key", Some(b"wrong")).is_err());
     }
 }

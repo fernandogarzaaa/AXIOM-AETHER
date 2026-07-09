@@ -1,23 +1,23 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 #
-# start_axiom.sh — boot the Axiom-TTT context-compression proxy.
+# start_axiom.sh â€” boot the Axiom-TTT context-compression proxy.
 #
 # This launches the Rust `axiom_engine` server in `--mode server`. The server
 # exposes an Anthropic-compatible POST /v1/messages endpoint. When compression
 # is enabled it absorbs "heavy" context locally (TTT) and forwards a lean,
 # fingerprinted payload to the REAL Anthropic API.
 #
-# IMPORTANT — upstream vs. client routing
+# IMPORTANT â€” upstream vs. client routing
 # ----------------------------------------
 # The forwarder reads ANTHROPIC_BASE_URL to choose ITS OWN upstream
 # (see src/anthropic_forwarder.rs). If you point ANTHROPIC_BASE_URL at this
 # proxy (127.0.0.1:3000) in the SAME shell that runs the server, the proxy
 # forwards to itself -> infinite loop. This script therefore pins the server's
 # upstream to the real Anthropic API and ignores any inherited client value.
-# Client redirection belongs in a SEPARATE shell — see axiom.env.
+# Client redirection belongs in a SEPARATE shell â€” see axiom.env.
 #
 set -uo pipefail
-# Note: -e intentionally omitted — the watchdog loop below needs to survive
+# Note: -e intentionally omitted â€” the watchdog loop below needs to survive
 # crashes and restart the binary without the script itself exiting.
 
 # --- Resolve paths ---------------------------------------------------------
@@ -29,7 +29,7 @@ BIN="$CRATE_DIR/target/release/axiom_engine"
 HOST="${AXIOM_HOST:-127.0.0.1}"
 PORT="${AXIOM_PORT:-3000}"
 
-# --- Upstream (real Anthropic) — never the proxy itself --------------------
+# --- Upstream (real Anthropic) â€” never the proxy itself --------------------
 # Allow an explicit override via AXIOM_UPSTREAM_URL, but default to the real API
 # and refuse to forward to ourselves.
 UPSTREAM="${AXIOM_UPSTREAM_URL:-https://api.anthropic.com}"
@@ -46,14 +46,23 @@ esac
 # Compression is the whole point of the proxy, so default it ON. Override with
 # AXIOM_TTT_COMPRESS=0 to run a pure passthrough.
 export AXIOM_TTT_COMPRESS="${AXIOM_TTT_COMPRESS:-1}"
-# Threshold is per-message, counted in whitespace words (≈4× undercount vs BPE).
-# 200 words ≈ ~800 real tokens: only genuinely large pastes (whole files, big
+# Threshold is per-message, counted in whitespace words (â‰ˆ4Ã— undercount vs BPE).
+# 200 words â‰ˆ ~800 real tokens: only genuinely large pastes (whole files, big
 # code blocks) compress; normal conversation passes through untouched. This is
-# the conservative "see it working" setting — the skeleton excels on the large
+# the conservative "see it working" setting â€” the skeleton excels on the large
 # code that crosses it, and `axiom_expand` recovers any dropped body on demand.
 # Raise back to 512+ (or set AXIOM_TTT_COMPRESS=0) to revert.
-export AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS="${AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS:-200}"
+export AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS="${AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS:-400}"
 export AXIOM_TTT_COMPRESS_TOP_K="${AXIOM_TTT_COMPRESS_TOP_K:-32}"
+# Responses (Codex/OpenAI) input compression is ON by default when compression
+# is enabled. Export AXIOM_RESPONSES_COMPRESS=0 before launching to opt the
+# Responses path out specifically.
+# Session recording (scrubbed request/response JSONL under ~/.axiom/sessions)
+# is OFF by default. Export AXIOM_SESSION_RECORD=1 to enable;
+# AXIOM_SESSIONS_DIR overrides the output directory.
+# Fleet weight exchange (DWE): the AXIOM_DWE_LISTEN listener REQUIRES
+# AXIOM_FLEET_KEY (a shared secret matched across all peers) â€” it fails closed
+# without one. `axiom fleet join <peer>` prints the exact exports to set.
 
 # --- Compute device: GPU-first, CPU fallback -------------------------------
 # Default to "auto": the engine selects CUDA when the `cuda` feature is compiled
@@ -74,16 +83,16 @@ if [ "${AXIOM_DEVICE}" = "cuda" ]; then
     if [ -n "$VRAM_USED" ] && [ -n "$VRAM_TOTAL" ] && [ "$VRAM_TOTAL" -gt 0 ]; then
         VRAM_PCT=$(( VRAM_USED * 100 / VRAM_TOTAL ))
         if [ "$VRAM_PCT" -gt 70 ]; then
-            echo "[start_axiom] WARNING: GPU memory ${VRAM_PCT}% used (${VRAM_USED}/${VRAM_TOTAL}MiB) — switching to CPU to avoid OOM"
+            echo "[start_axiom] WARNING: GPU memory ${VRAM_PCT}% used (${VRAM_USED}/${VRAM_TOTAL}MiB) â€” switching to CPU to avoid OOM"
             export AXIOM_DEVICE=cpu
         else
-            echo "[start_axiom] GPU memory OK: ${VRAM_PCT}% used — proceeding with CUDA"
+            echo "[start_axiom] GPU memory OK: ${VRAM_PCT}% used â€” proceeding with CUDA"
         fi
     fi
 fi
 # If a local CUDA 12.6 toolkit is present (the GPU build links cudarc against it),
 # put its runtime libraries on PATH so they load at device-init time. Skipped
-# harmlessly on machines without it — AXIOM_DEVICE=auto then just uses CPU.
+# harmlessly on machines without it â€” AXIOM_DEVICE=auto then just uses CPU.
 AXIOM_CUDA_HOME="${AXIOM_CUDA_HOME:-$HOME/cuda-12.6}"
 if [ -d "$AXIOM_CUDA_HOME/bin" ]; then
     export PATH="$AXIOM_CUDA_HOME/bin:$AXIOM_CUDA_HOME/nvvm/bin:$PATH"
@@ -126,7 +135,7 @@ if [ -f "$PROD_CKPT" ]; then
     echo "[start_axiom] Using production checkpoint: $PROD_CKPT"
     CKPT_ARGS=(--checkpoint "$PROD_CKPT")
 else
-    echo "[start_axiom] WARNING: $PROD_CKPT not found — booting with the crate's"
+    echo "[start_axiom] WARNING: $PROD_CKPT not found â€” booting with the crate's"
     echo "[start_axiom]          default fresh init (a small CPU model, d_model=64,"
     echo "[start_axiom]          n_layers=2, vocab=256). The compression fingerprint"
     echo "[start_axiom]          from this model is LOW FIDELITY. Do not route real"
@@ -158,7 +167,7 @@ echo "[start_axiom]   compression : $AXIOM_TTT_COMPRESS (threshold=$AXIOM_TTT_CO
 if [ -d "$AXIOM_CUDA_HOME/bin" ]; then
     echo "[start_axiom]   device      : $AXIOM_DEVICE (GPU-first; CUDA 12.6 toolkit on PATH, CPU fallback)"
 else
-    echo "[start_axiom]   device      : $AXIOM_DEVICE (no local CUDA toolkit — CPU unless system CUDA present)"
+    echo "[start_axiom]   device      : $AXIOM_DEVICE (no local CUDA toolkit â€” CPU unless system CUDA present)"
 fi
 echo "[start_axiom]   log         : $LOG_FILE"
 echo
@@ -166,7 +175,7 @@ echo
 # --- Watchdog: restart on crash, fall back to CPU if CUDA fails -----------
 # Tee so compression metric lines are visible live AND captured for smoke tests.
 # On each exit we check the log for CUDA errors and switch device to cpu if
-# found — this means a driver update can never permanently brick the proxy.
+# found â€” this means a driver update can never permanently brick the proxy.
 _WATCH_DEVICE="$AXIOM_DEVICE"
 _ATTEMPT=0
 while true; do
@@ -182,7 +191,7 @@ while true; do
     # Detect CUDA failure and fall back to CPU for the next attempt
     if [ "$_WATCH_DEVICE" != "cpu" ]; then
         if grep -qE "CUDA_ERROR|cuda error|DriverError|pipeline lock poisoned" "$LOG_FILE" 2>/dev/null; then
-            echo "[watchdog] CUDA error detected in log — switching to CPU for next run"
+            echo "[watchdog] CUDA error detected in log â€” switching to CPU for next run"
             _WATCH_DEVICE=cpu
         fi
     fi
@@ -190,3 +199,4 @@ while true; do
     echo "[watchdog] Restarting in 3 seconds..."
     sleep 3
 done
+

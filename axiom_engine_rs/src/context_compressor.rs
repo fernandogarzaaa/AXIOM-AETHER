@@ -185,6 +185,38 @@ pub struct MemoryFingerprint {
 }
 
 impl MemoryFingerprint {
+    /// Human-readable confidence tier for downstream users and tools. This is a
+    /// diagnostic guardrail: a fingerprint with zero recall, non-finite norms,
+    /// or undecodable/punctuation-only recall should not be treated as a strong
+    /// semantic summary.
+    pub fn confidence_tier(&self) -> &'static str {
+        if self.recall_norm <= 1e-6
+            || !self.recall_norm.is_finite()
+            || !self.recall_l1.is_finite()
+            || self.layer_frobenius_norms.iter().any(|v| !v.is_finite())
+            || decoded_is_low_signal(&self.recall_top_k_decoded)
+        {
+            "low"
+        } else {
+            "normal"
+        }
+    }
+
+    pub fn confidence_reason(&self) -> &'static str {
+        if self.recall_norm <= 1e-6 {
+            "zero_or_near_zero_recall_norm"
+        } else if !self.recall_norm.is_finite()
+            || !self.recall_l1.is_finite()
+            || self.layer_frobenius_norms.iter().any(|v| !v.is_finite())
+        {
+            "non_finite_fingerprint_statistics"
+        } else if decoded_is_low_signal(&self.recall_top_k_decoded) {
+            "decoded_recall_is_empty_or_punctuation_only"
+        } else {
+            "recall_statistics_look_usable"
+        }
+    }
+
     /// Format the fingerprint as a strict XML/Markdown block suitable for
     /// prepending to a downstream frontier-model prompt.
     ///
@@ -223,6 +255,8 @@ impl MemoryFingerprint {
              recall_top_k_indices={top:?}\n\
              {decoded}layers={layers} d_model={d}\n\
              layer_frobenius_norms={norms}\n\
+             compression_confidence={confidence}\n\
+             compression_confidence_reason={confidence_reason}\n\
              state_hash={hash}\n\
              compression_ms={ms}\n\
              </recall_layout>\n\
@@ -248,6 +282,8 @@ impl MemoryFingerprint {
             layers = self.n_layers,
             d = self.d_model,
             norms = layer_norm_summary,
+            confidence = self.confidence_tier(),
+            confidence_reason = self.confidence_reason(),
             norm = self.recall_norm,
             l1 = self.recall_l1,
             top = self.recall_top_k_indices,
@@ -256,6 +292,14 @@ impl MemoryFingerprint {
             ms = self.elapsed_ms,
         )
     }
+}
+
+fn decoded_is_low_signal(decoded: &str) -> bool {
+    let trimmed = decoded.trim();
+    trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .any(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
 }
 
 // ---------------------------------------------------------------------------
@@ -520,16 +564,23 @@ impl CompressionControls {
 
     /// Set a budget-derived compression target (60 % of agent's remaining tokens).
     pub fn set_budget_target(&self, tokens: usize) {
-        self.budget_target_tokens.store(tokens, std::sync::atomic::Ordering::Relaxed);
-        self.budget_target_set.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.budget_target_tokens
+            .store(tokens, std::sync::atomic::Ordering::Relaxed);
+        self.budget_target_set
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Effective threshold: min(configured threshold, budget target) when a
     /// budget has been set; otherwise just the configured threshold.
     pub fn effective_threshold(&self) -> usize {
         let base = self.threshold();
-        if self.budget_target_set.load(std::sync::atomic::Ordering::Relaxed) {
-            let budget_t = self.budget_target_tokens.load(std::sync::atomic::Ordering::Relaxed);
+        if self
+            .budget_target_set
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let budget_t = self
+                .budget_target_tokens
+                .load(std::sync::atomic::Ordering::Relaxed);
             base.min(budget_t)
         } else {
             base
@@ -686,9 +737,31 @@ mod tests {
         assert!(block.contains("<recall_layout>"));
         assert!(block.contains("</recall_layout>"));
         assert!(block.contains("<decode_instructions>"));
+        assert!(block.contains("compression_confidence=normal"));
+        assert!(block.contains("compression_confidence_reason=recall_statistics_look_usable"));
         assert!(block.contains("state_hash=sha256:deadbeef"));
         assert!(block.contains("alpha beta gamma"));
         assert!(block.trim_end().ends_with("</axiom_context_fingerprint>"));
+    }
+
+    #[test]
+    fn fingerprint_confidence_flags_zero_recall_and_infinite_norms() {
+        let fp = MemoryFingerprint {
+            schema: "axiom-ttt-context-fingerprint/v2".into(),
+            session_id: "sess-low".into(),
+            context_tokens_processed: 10,
+            n_layers: 2,
+            d_model: 16,
+            state_hash: "sha256:bad".into(),
+            layer_frobenius_norms: vec![f32::INFINITY, 1.0],
+            recall_norm: 0.0,
+            recall_l1: 0.0,
+            recall_top_k_indices: vec![0, 1],
+            recall_top_k_decoded: "!\"#$".into(),
+            elapsed_ms: 1,
+        };
+        assert_eq!(fp.confidence_tier(), "low");
+        assert!(fp.to_prompt_block().contains("compression_confidence=low"));
     }
 
     #[test]

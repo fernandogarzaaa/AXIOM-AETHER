@@ -1,0 +1,146 @@
+# AXIOM AETHER — Cline Project Rules
+
+## Project Overview
+
+AXIOM AETHER is a local-first Rust research runtime for online Test-Time Training (TTT).
+The core engine maintains per-session fast-weight matrices (W̃) that update via real
+gradient steps on every token at inference time — enabling context compression, drift
+detection, grounding verification, and self-healing execution loops.
+
+**Primary language:** Rust (edition 2021)
+**ML framework:** candle (candle-core 0.10.2, candle-nn 0.10.2)
+**HTTP framework:** axum 0.7
+**Binary:** `axiom_engine.exe` / `axiom` (v0.2.5)
+**Repo root:** `d:\AXIOM-AETHER`
+**Crate root:** `d:\AXIOM-AETHER\axiom_engine_rs`
+
+## Architecture (Four Pillars)
+
+1. **Context Compression** — Absorbs heavy context into W̃ via TTT, forwards compact
+   fingerprints, recovers bodies on demand. Routes: `/v1/messages`, `/v1/responses`,
+   `/v1/chat/completions`.
+2. **Self-Healing Runtime** — Runs commands, detects failures, applies bounded heals,
+   records learned immunity. CLI: `axiom run -- {cmd}`.
+3. **Autonomous Solve** — Drives a failing verify command to green via environment-heal
+   + source-repair + verify loops. CLI: `axiom solve -- {cmd}`.
+4. **Grounding/Trust** — Flags response claims unsupported by evidence using a calibrated
+   conformal gate (δ=0.10, threshold=0.75). Endpoint: `/v1/verify`.
+
+## Axiom MCP Tools (available via the `axiom` MCP server)
+
+### Context & Compression
+- **`axiom_compress_path`** — Absorb a directory through TTT and return a context
+  fingerprint. Use at the start of a task to load codebase context. The fingerprint
+  includes skeleton signatures, top-k recall indices, and a session id for expansion.
+- **`axiom_expand`** — Retrieve a symbol body that compression dropped from a digest.
+  Use when you see an `<axiom_context_digest>` skeleton and need the full implementation.
+- **`axiom_evaluate_drift`** — Score code against current fast-weights. Returns
+  `isError: true` when cross-entropy exceeds the drift threshold (7.03), signaling
+  architectural deviation from absorbed patterns.
+
+### Memory (Persistent)
+- **`axiom_remember`** — Store decisions, fixes, conventions, snippets. Always set
+  `scope` to `project:axiom-aether` for repo-specific memory or `personal` for
+  cross-project conventions. Use `kind` to categorize: `decision`, `code`,
+  `conversation`, `fix`.
+- **`axiom_recall`** — Search long-term memory. Returns exact stored text, never
+  paraphrased. Use to answer "what did we decide about X?" or "have I solved this
+  before?".
+- **`axiom_forget`** — Tombstone a memory by id (from `axiom_recall` results).
+
+### Grounding & Verification
+- **`axiom_verify`** — Check response claims against supplied evidence. Returns
+  per-claim verdicts (SUPPORTED/UNSUPPORTED/UNVERIFIED) and grounded fraction. Use
+  before asserting facts from a document or codebase.
+- **`axiom_validate_epistemic`** — Semantic LLM judge for soft hallucination
+  detection. Requires epistemic judge configuration via env vars.
+
+### Self-Healing
+- **`axiom_immunity`** — Report learned self-healing experience for a command. Use
+  when debugging a failing command — Axiom may already know the fix.
+
+### Session Awareness
+- **`axiom_status`** — Report token budget, tokens spent, compression ratio, and
+  expansion-miss count. Call to check context budget remaining.
+
+### Task Board (Inter-Agent)
+- **`axiom_post_task`** — Post a task to a named channel for another agent to claim.
+- **`axiom_claim_task`** — Claim the next available task from a channel.
+- **`axiom_task_result`** — Report the result of a claimed task.
+- **`axiom_list_tasks`** — List tasks in a channel, optionally filtered by status.
+- **`axiom_channels`** — List all task-board channels with at least one task.
+
+### ChatGPT Connector Aliases
+- **`search`** — Search Axiom's memory, return ranked results as {id, title, url}.
+- **`fetch`** — Fetch full text of a memory record by id.
+
+## Proxy Configuration
+
+The HTTP proxy runs on `127.0.0.1:3000` with:
+- **Compression ON** (threshold=200 tokens, top_k=32)
+- **Responses compression ON** (default)
+- **Passthrough auth** (no proxy-owned API key; relays client headers)
+- **BPE model** (`axiom_production_bpe.bin` + `axiom_bpe.json`)
+- **Vibe memory OFF** in current proxy config (AXIOM_VIBE=0 in restart_proxy.ps1)
+- **Device:** CPU (no CUDA toolkit on this machine)
+
+### Key Environment Variables
+| Variable | Value | Purpose |
+|---|---|---|
+| `AXIOM_PRODUCTION_BPE` | `1` | Enable trained BPE checkpoint |
+| `AXIOM_TOKENIZER` | `checkpoints/axiom_bpe.json` | BPE tokenizer path |
+| `AXIOM_BPE_CKPT` | `checkpoints/axiom_production_bpe.bin` | Trained checkpoint |
+| `AXIOM_TTT_COMPRESS` | `1` | Enable proxy compression |
+| `AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS` | `200` | Compression threshold (whitespace words) |
+| `AXIOM_DRIFT_THRESHOLD` | `7.03` | BPE-calibrated drift gate |
+| `AXIOM_DEVICE` | `cpu` | Force CPU (no GPU) |
+| `AXIOM_VIBE` | `0` (proxy) / `1` (MCP) | Persistent fast-weight memory |
+
+## Coding Conventions
+
+### Rust
+- Follow `cargo fmt` and `cargo clippy` standards
+- All diagnostics to `stderr` (`eprintln!`) — `stdout` is reserved for JSON-RPC in MCP mode
+- Use `spawn_blocking` for `reqwest::blocking::Client` operations (never inside async context)
+- Tests: `cargo test --release --locked` (118 tests currently passing)
+- Features: `default = []`, `cuda` and `metal` are opt-in, `tools` gates dev binaries
+
+### File Organization
+- Source: `axiom_engine_rs/src/`
+- Server routes: `axiom_engine_rs/src/server/`
+- Dev/bench binaries: `axiom_engine_rs/src/bin/` (gated behind `tools` feature)
+- Tests: `axiom_engine_rs/tests/` + inline `#[cfg(test)]` modules
+- Scripts: `scripts/` (PowerShell `.ps1` for Windows, `.sh` for Linux/macOS)
+- Docs: `docs/`
+
+### Commit Style
+- Keep public claims evidence-backed
+- Label experimental features as such
+- Include reproduction commands for metrics
+
+## Windows-Specific Notes
+
+- **Shell:** PowerShell (not cmd or bash by default)
+- **Binary path:** `d:\AXIOM-AETHER\axiom_engine_rs\target\release\axiom_engine.exe`
+- **Checkpoint path:** `d:\AXIOM-AETHER\checkpoints\axiom_production_bpe.bin`
+- **Proxy startup:** Use `scripts\start_axiom_proxy.ps1` (Windows-native) or `scripts\restart_proxy.ps1`
+- **Autostart:** Task Scheduler XML at `axiom_autostart_task.xml`
+- **Watchdog:** `scripts\axiom_proxy_watchdog.ps1` (run via Task Scheduler every 5 min)
+- **No CUDA:** This machine has no CUDA toolkit — always use `AXIOM_DEVICE=cpu`
+
+## Tool Usage Guidelines for Cline
+
+1. **Start of task:** Call `axiom_compress_path` on the relevant directory to load
+   codebase context into fast-weights, then `axiom_recall` to check for prior decisions.
+2. **Before asserting facts:** Call `axiom_verify` with the response and evidence to
+   ground claims.
+3. **After making decisions:** Call `axiom_remember` with `scope: "project:axiom-aether"`
+   and appropriate `kind` to persist the decision.
+4. **When debugging failures:** Call `axiom_immunity` with the failing command — Axiom
+   may have learned a heal.
+5. **When context is large:** Call `axiom_status` to check token budget and compression
+   ratio; use `axiom_expand` to retrieve dropped symbol bodies as needed.
+6. **For code review:** Call `axiom_evaluate_drift` with new code to check for
+   architectural deviation from codebase patterns.
+7. **Never assume memory is populated:** `axiom_recall`/`search` only return what has
+   been explicitly stored via `axiom_remember`.
