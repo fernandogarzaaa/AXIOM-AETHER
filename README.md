@@ -25,7 +25,7 @@ general answer-quality claims that are not proven by the repository.
 | Context compression proxy | Accepts Anthropic Messages and OpenAI Chat Completions style traffic, absorbs heavy context locally, and forwards a smaller readable payload. | `server/routes_messages.rs`, `server/routes_chat.rs`, `context_compressor.rs`, `skeleton.rs`, `anthropic_forwarder.rs`, `openai_forwarder.rs` |
 | Responses input compression | **On by default.** Replaces old, text-only assistant turns in the safe prefix of `/v1/responses` transcripts with a dense recall fingerprint — each contiguous run collapses in place, so every user/tool/structural item keeps its position. Disable with `AXIOM_RESPONSES_COMPRESS=0`. | `responses_compressor.rs`, `server/routes_responses.rs` |
 | Session recording & receipts | Opt-in scrubbed per-session request/response JSONL (`AXIOM_SESSION_RECORD=1`, `~/.axiom/sessions/`), plus always-on token-savings receipts: `axiom_savings_*` counters on `/metrics` and a one-line receipt when a session drops. | `session_recorder.rs`, `server/routes_responses.rs`, `server/routes_hypervisor.rs` |
-| MCP server | Exposes Axiom as stdio JSON-RPC tools for compression, drift checks, expansion, memory, immunity, and grounding. | `mcp_stdio.rs` |
+| MCP server | Exposes Axiom as 20 stdio/HTTP JSON-RPC tools: compression, drift, expansion, memory, grounding, epistemic validation, immunity, status, a multi-agent task board, ChatGPT connector `search`/`fetch`, and (experimental, untrained) predictive-reasoning tools. | `mcp_stdio.rs`, `predictive_tools.rs` |
 | Self-healing runner | Runs a command, detects supported environment failures, applies bounded heals, and records learned immunity. | `self_heal.rs`, `heal_memory.rs`, `entrypoint.rs` |
 | Autonomous solve loop | Uses the runner plus source repair attempts to drive a verifier command toward green. | `solve.rs`, `poly_jit.rs`, `sandbox.rs` |
 | Grounding verification | Checks whether response claims are supported by supplied evidence and can expand dropped symbols when a session digest is available. | `hallucination.rs`, `/v1/verify` in `server/routes_verify.rs` |
@@ -245,18 +245,62 @@ Run Axiom as an MCP server:
 axiom_engine --mode mcp --checkpoint checkpoints/axiom_production_bpe.bin
 ```
 
-Tool catalog:
+Tool catalog (20 tools):
+
+**Compression & drift**
 
 | Tool | Purpose |
 |---|---|
 | `axiom_compress_path` | Absorb a file or directory and return an Axiom context digest. |
 | `axiom_evaluate_drift` | Score code against the current fast weights and flag drift above threshold. |
 | `axiom_expand` | Retrieve a symbol body that compression dropped from a session digest. |
+
+**Memory**
+
+| Tool | Purpose |
+|---|---|
 | `axiom_remember` | Store a long-term memory item. |
 | `axiom_recall` | Search long-term memory. |
 | `axiom_forget` | Tombstone a remembered item. |
+
+**Grounding, immunity & status**
+
+| Tool | Purpose |
+|---|---|
 | `axiom_verify` | Check response claims against supplied evidence. |
+| `axiom_validate_epistemic` | Flag epistemic drift in a claim against the session's grounded state. |
 | `axiom_immunity` | Report learned self-healing experience for a command. |
+| `axiom_status` | Report the live session's token-savings / awareness counters. |
+
+**Task board** (multi-agent coordination)
+
+| Tool | Purpose |
+|---|---|
+| `axiom_post_task` | Post a task to a channel for another agent to claim. |
+| `axiom_claim_task` | Claim the next pending task from a channel. |
+| `axiom_task_result` | Mark a claimed task done or failed with a result. |
+| `axiom_list_tasks` | List tasks on a channel, optionally filtered by status. |
+| `axiom_channels` | List task-board channels that have at least one task. |
+
+**ChatGPT deep-research connector aliases**
+
+| Tool | Purpose |
+|---|---|
+| `search` | Search entrypoint for the ChatGPT connector contract. |
+| `fetch` | Retrieve a document body by id for the ChatGPT connector contract. |
+
+**Predictive reasoning engine** — ⚠️ experimental, **untrained**
+
+Wired and reachable, but the state-prediction head has **no trained checkpoint
+yet**, so output is not a calibrated forecast: responses carry `trained: false`
+and an explicit `state_source`. Treat as scaffolding, not inference. See
+[`docs/UPGRADES.md`](docs/UPGRADES.md).
+
+| Tool | Purpose |
+|---|---|
+| `axiom_predict_states` | Project a context summary into a sequence of predicted cognitive milestones. |
+| `axiom_sample_trajectories` | Deterministically sample and score candidate reasoning trajectories over a predicted state map. |
+| `axiom_align_generation` | Score generation drift against a predicted state map and return a suggested correction vector (not auto-applied to `W_tilde`). |
 
 Claude-style MCP config example:
 
