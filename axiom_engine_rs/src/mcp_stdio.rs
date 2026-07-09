@@ -79,6 +79,10 @@ pub struct McpContext {
     /// Per-session token-awareness store (PR #72). Used to record tool response
     /// costs and conditionally annotate responses with a meta cost line.
     awareness: Arc<AwarenessStore>,
+    /// In-flight `axiom_align_generation` loop state, keyed by the caller's
+    /// `session_id`. Process-lifetime only (not persisted to disk); grows
+    /// with the number of distinct session_ids used, same as `awareness`.
+    align_states: Arc<Mutex<std::collections::HashMap<String, crate::alignment_loop::AlignmentLoopState>>>,
 }
 
 /// Assemble an [`McpContext`] (pipeline + vibe + memory + embedder) from config,
@@ -180,6 +184,7 @@ pub async fn build_context(
             }
         ),
         awareness: Arc::new(AwarenessStore::new()),
+        align_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
     })
 }
 
@@ -1144,7 +1149,15 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             success_response(id, tool_text_result(&text, false))
         }
         "axiom_predict_states" => {
-            if args.get("context_summary").and_then(Value::as_str).is_none() {
+            // Reject blank/whitespace-only summaries here, not just inside
+            // handle_predict_states: otherwise this still spawns a blocking
+            // worker and locks ctx.pipeline before discovering the input was
+            // invalid.
+            if !args
+                .get("context_summary")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+            {
                 return error_response(id, -32602, "axiom_predict_states requires string 'context_summary'");
             }
             let session_id = args
@@ -1197,7 +1210,21 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .unwrap_or("predictive")
                 .to_string();
             let awareness = ctx.awareness.clone();
-            let result = crate::predictive_tools::handle_align_generation(&args);
+            // Resume this session's in-flight alignment loop (if any) so
+            // repeated calls advance through the milestone sequence instead
+            // of comparing against milestone 0 every time.
+            let existing_state = ctx
+                .align_states
+                .lock()
+                .ok()
+                .and_then(|mut m| m.remove(&session_id));
+            let (result, new_state) =
+                crate::predictive_tools::handle_align_generation_with_state(&args, existing_state);
+            if let Some(state) = new_state {
+                if let Ok(mut m) = ctx.align_states.lock() {
+                    m.insert(session_id.clone(), state);
+                }
+            }
             let is_error = result.get("error").is_some();
             let mirror = serde_json::to_string(&result).unwrap_or_default();
             record_and_annotate(&awareness, &session_id, "axiom_align_generation", &mirror);
