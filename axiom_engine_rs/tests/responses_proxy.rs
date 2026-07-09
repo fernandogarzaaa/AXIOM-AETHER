@@ -176,7 +176,12 @@ async fn responses_stream_relays_semantic_sse_events_unchanged() {
 }
 
 #[tokio::test]
-async fn responses_get_returns_json_diagnostic_instead_of_405() {
+async fn responses_plain_get_returns_json_diagnostic_instead_of_bare_rejection() {
+    // A GET without a complete WebSocket handshake (e.g. a misconfigured
+    // client probing the endpoint, or a bare `Upgrade: websocket` header with
+    // no Sec-WebSocket-Key) must get a structured JSON diagnostic instead of
+    // axum's plain-text extractor rejection. A *valid* WebSocket handshake on
+    // this route is relayed upstream and is not what this test exercises.
     let (upstream, _capture, task) = start_mock_responses_upstream(false).await;
     let app = proxy_app(upstream).await;
     let response = app
@@ -200,11 +205,13 @@ async fn responses_get_returns_json_diagnostic_instead_of_405() {
     let response_json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         response_json["error"]["code"],
-        "responses_requires_http_post"
+        "responses_requires_post_or_websocket"
     );
-    assert!(response_json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("not ws://127.0.0.1:3000"));
+    let message = response_json["error"]["message"].as_str().unwrap();
+    assert!(message.contains("POST"), "message should mention the HTTP POST path");
+    assert!(
+        message.contains("WebSocket"),
+        "message should mention the supported WebSocket upgrade path"
+    );
     task.abort();
 }

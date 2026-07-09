@@ -352,11 +352,30 @@ fn responses_ws_upstream(headers: &HeaderMap) -> String {
 /// does not interpret the protocol: client auth and relay headers are
 /// forwarded on the CONNECT, then frames are pumped verbatim both ways until
 /// either side closes. Compression does not apply on this path.
+///
+/// A GET that is *not* a complete WebSocket handshake (`ws` extracts to
+/// `None`) gets a structured JSON diagnostic instead of axum's plain-text
+/// extractor rejection, so misconfigured local Codex/OpenAI clients that try
+/// to parse the error body as JSON see an actionable message (PR #84).
 async fn responses_websocket(
-    ws: axum::extract::ws::WebSocketUpgrade,
+    ws: Option<axum::extract::ws::WebSocketUpgrade>,
     headers: HeaderMap,
 ) -> Response {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let Some(ws) = ws else {
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "GET /v1/responses requires a complete WebSocket handshake (Codex relays frames upstream); for plain HTTP use POST with a JSON body — streaming Responses are delivered as SSE over HTTP.",
+                    "type": "invalid_request_error",
+                    "code": "responses_requires_post_or_websocket"
+                }
+            })),
+        )
+            .into_response();
+    };
 
     let upstream_url = responses_ws_upstream(&headers);
     let mut request = match upstream_url.as_str().into_client_request() {
