@@ -68,7 +68,7 @@ pub fn predictive_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "axiom_align_generation",
-            "description": "Check alignment between current generation state and the predicted semantic milestones. Detects logic drift and applies localized fast-weight corrections to steer generation back on track. Use during generation to monitor and correct reasoning deviations.",
+            "description": "Check alignment between current generation state and the predicted semantic milestones. Detects logic drift and computes a suggested localized fast-weight correction vector — this vector is returned for the caller to act on, it is NOT applied to the live session's W̃ automatically. Use during generation to monitor reasoning deviations.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -97,11 +97,21 @@ pub fn predictive_tool_definitions() -> Vec<Value> {
 
 /// Handle the `axiom_predict_states` tool call.
 ///
-/// Creates a StatePredictor (with random init if no checkpoint), runs prediction,
-/// and returns the state map as JSON.
+/// Creates a StatePredictor (always randomly initialized — no trained
+/// checkpoint exists yet for this head) and runs prediction over a context
+/// state vector.
+///
+/// `context_override`, when `Some`, is the real session embedding (e.g. from
+/// `embed_text` against the live TTT pipeline) and is used verbatim as both
+/// the predictor's input and its `d_model`. When `None` (no live pipeline
+/// available, e.g. a standalone/offline call), falls back to a deterministic
+/// hash of `context_summary` — a proxy, not a real semantic state. The
+/// response always reports which path was taken via `state_source`, and
+/// `trained: false` so callers never mistake this for a calibrated model.
 pub fn handle_predict_states(
     args: &Value,
     device: &candle_core::Device,
+    context_override: Option<&[f32]>,
 ) -> Value {
     let context_summary = args
         .get("context_summary")
@@ -123,8 +133,23 @@ pub fn handle_predict_states(
         });
     }
 
-    // Create a state predictor with random init (no trained checkpoint yet).
-    let config = crate::config::AxiomConfig::runtime_small();
+    let (context_state, state_source): (Vec<f32>, &str) = match context_override {
+        Some(v) if !v.is_empty() => (v.to_vec(), "session_embedding"),
+        _ => {
+            let d = crate::config::AxiomConfig::runtime_small().d_model;
+            (
+                summary_to_state_vector(context_summary, d),
+                "hashed_summary_fallback",
+            )
+        }
+    };
+
+    // State predictor head is always randomly initialized (no trained
+    // checkpoint yet); its d_model must match whatever context vector we have.
+    let config = crate::config::AxiomConfig {
+        d_model: context_state.len(),
+        ..crate::config::AxiomConfig::runtime_small()
+    };
     let varmap = candle_nn::VarMap::new();
     let vb = candle_nn::VarBuilder::from_varmap(
         &varmap,
@@ -139,9 +164,6 @@ pub fn handle_predict_states(
             });
         }
     };
-
-    // Create a context state vector from the summary (hash-based proxy).
-    let context_state = summary_to_state_vector(context_summary, config.d_model);
 
     let map = match predictor.predict_from_vec(&context_state, &session_id, max_milestones, device) {
         Ok(m) => m,
@@ -159,7 +181,10 @@ pub fn handle_predict_states(
         "state_map": map_json,
         "rendered": rendered,
         "milestone_count": map.milestones.len(),
-        "confidence": map.confidence.mean()
+        "confidence": map.confidence.mean(),
+        "trained": false,
+        "state_source": state_source,
+        "note": "StatePredictor uses randomly-initialized weights (no trained checkpoint exists yet). Milestone labels, budgets, and confidence values are not yet meaningful predictions."
     })
 }
 
@@ -219,11 +244,28 @@ pub fn handle_sample_trajectories(args: &Value) -> Value {
     })
 }
 
-/// Handle the `axiom_align_generation` tool call.
-///
-/// Deserializes the state map and generation state, runs alignment check,
-/// and returns the result.
+/// Handle the `axiom_align_generation` tool call as a single, stateless check
+/// (always starts a fresh `AlignmentLoopState`). Kept for standalone/offline
+/// callers; MCP dispatch should use [`handle_align_generation_with_state`] so
+/// repeated calls for the same session actually advance through the
+/// milestone sequence instead of re-comparing against milestone 0 every time.
 pub fn handle_align_generation(args: &Value) -> Value {
+    handle_align_generation_with_state(args, None).0
+}
+
+/// Handle the `axiom_align_generation` tool call, optionally resuming a
+/// caller-supplied `AlignmentLoopState` from a prior call (the MCP dispatch
+/// layer persists this per session_id). Returns the JSON result plus the
+/// (possibly new) loop state for the caller to persist for next time.
+///
+/// `existing_state` is reused only when its `state_map.session_id` matches
+/// the state map in this call's `state_map_json` — a differing or absent
+/// match starts a fresh loop, so switching to a new prediction naturally
+/// resets progress instead of comparing against a stale milestone.
+pub fn handle_align_generation_with_state(
+    args: &Value,
+    existing_state: Option<crate::alignment_loop::AlignmentLoopState>,
+) -> (Value, Option<crate::alignment_loop::AlignmentLoopState>) {
     let state_map_json = args
         .get("state_map_json")
         .and_then(Value::as_str)
@@ -242,45 +284,68 @@ pub fn handle_align_generation(args: &Value) -> Value {
         .unwrap_or(0.01) as f32;
 
     if state_map_json.is_empty() || generation_state_json.is_empty() {
-        return json!({
-            "error": "state_map_json and generation_state are required"
-        });
+        return (
+            json!({ "error": "state_map_json and generation_state are required" }),
+            existing_state,
+        );
     }
 
     let state_map: SemanticStateMap = match serde_json::from_str(state_map_json) {
         Ok(m) => m,
         Err(e) => {
-            return json!({
-                "error": format!("failed to parse state map: {e}")
-            });
+            return (
+                json!({ "error": format!("failed to parse state map: {e}") }),
+                existing_state,
+            );
         }
     };
 
     let generation_state: Vec<f32> = match serde_json::from_str(generation_state_json) {
         Ok(v) => v,
         Err(e) => {
-            return json!({
-                "error": format!("failed to parse generation state: {e}")
-            });
+            return (
+                json!({ "error": format!("failed to parse generation state: {e}") }),
+                existing_state,
+            );
         }
     };
 
     let loop_ = AlignmentLoop::new(drift_threshold, correction_lr, crate::alignment_loop::MAX_CORRECTIONS);
-    let mut loop_state = loop_.init(state_map);
+    let mut loop_state = match existing_state {
+        Some(s) if s.state_map.session_id == state_map.session_id => s,
+        _ => loop_.init(state_map),
+    };
     let check = loop_.check_alignment(&mut loop_state, &generation_state);
+
+    // The tool description promises a correction vector when a correction is
+    // triggered; compute it (not just the scalar strength) so callers have
+    // something to actually apply.
+    let correction_vector = if check.corrected {
+        loop_state
+            .state_map
+            .milestones
+            .get(check.milestone_idx)
+            .map(|m| loop_.compute_correction(&generation_state, m, correction_lr))
+    } else {
+        None
+    };
 
     let summary = AlignmentLoop::summary(&loop_state);
     let check_json = serde_json::to_string(&check).unwrap_or_default();
+    let completed = loop_state.completed;
 
-    json!({
+    let result = json!({
         "check": check_json,
         "summary": summary,
         "drift_score": check.drift_score,
         "corrected": check.corrected,
         "correction_strength": check.correction_strength,
+        "correction_vector": correction_vector,
         "milestone": check.milestone_label,
-        "completed": loop_state.completed
-    })
+        "completed": completed
+    });
+
+    (result, Some(loop_state))
 }
 
 /// Convert a text summary to a state vector (hash-based proxy for TTT state).
@@ -319,8 +384,32 @@ mod tests {
             "context_summary": "Write a function to sort an array",
             "max_milestones": 3
         });
-        let result = handle_predict_states(&args, &candle_core::Device::Cpu);
+        let result = handle_predict_states(&args, &candle_core::Device::Cpu, None);
         assert!(result["state_map"].is_string() || result["error"].is_string());
+    }
+
+    #[test]
+    fn predict_states_uses_provided_context_and_reports_source() {
+        // When a real session embedding is supplied, the predictor must use it
+        // (not the hash-of-summary fallback) and say so honestly in the output.
+        let args = json!({ "context_summary": "test", "max_milestones": 2 });
+        let real_embedding = vec![0.25f32; 16];
+        let result = handle_predict_states(&args, &candle_core::Device::Cpu, Some(&real_embedding));
+        assert_eq!(result["state_source"], "session_embedding");
+        let map: SemanticStateMap =
+            serde_json::from_str(result["state_map"].as_str().unwrap()).unwrap();
+        assert_eq!(map.context_state.len(), 16);
+    }
+
+    #[test]
+    fn predict_states_without_context_falls_back_and_marks_untrained() {
+        // No trained checkpoint exists yet. Callers must never be told a
+        // prediction is trustworthy when it came from randomly-initialized
+        // weights over a hash-of-text proxy state.
+        let args = json!({ "context_summary": "test", "max_milestones": 2 });
+        let result = handle_predict_states(&args, &candle_core::Device::Cpu, None);
+        assert_eq!(result["state_source"], "hashed_summary_fallback");
+        assert_eq!(result["trained"], false);
     }
 
     #[test]
@@ -330,6 +419,92 @@ mod tests {
         });
         let result = handle_sample_trajectories(&args);
         assert!(result["error"].is_string());
+    }
+
+    #[test]
+    fn align_generation_with_state_persists_milestone_across_calls() {
+        use crate::belief::BetaBelief;
+        use crate::state_predictor::SemanticMilestone;
+
+        let state_map = SemanticStateMap {
+            milestones: vec![
+                SemanticMilestone {
+                    label: "hypothesis".to_string(),
+                    label_idx: 0,
+                    predicted_state: vec![1.0, 0.0, 0.0, 0.0],
+                    token_budget: 128,
+                    branch_hints: vec![],
+                    confidence: BetaBelief::from_confidence(0.8, 4.0),
+                },
+                SemanticMilestone {
+                    label: "execution".to_string(),
+                    label_idx: 2,
+                    predicted_state: vec![0.0, 1.0, 0.0, 0.0],
+                    token_budget: 256,
+                    branch_hints: vec![],
+                    confidence: BetaBelief::from_confidence(0.7, 4.0),
+                },
+            ],
+            confidence: BetaBelief::default(),
+            session_id: "sess-1".to_string(),
+            context_state: vec![0.5; 4],
+        };
+        let state_map_json = serde_json::to_string(&state_map).unwrap();
+
+        // First call: generation matches milestone 0 exactly -> advances to milestone 1.
+        let args1 = json!({
+            "state_map_json": state_map_json,
+            "generation_state": serde_json::to_string(&vec![1.0f32, 0.0, 0.0, 0.0]).unwrap()
+        });
+        let (result1, state1) = handle_align_generation_with_state(&args1, None);
+        assert_eq!(result1["milestone"], "hypothesis");
+        let state1 = state1.expect("loop state should be returned for a valid call");
+        assert_eq!(state1.current_milestone, 1);
+
+        // Second call, resuming state1: generation now matches milestone 1
+        // ("execution"). This only reports "execution" if the loop state
+        // actually persisted across calls instead of resetting to milestone 0.
+        let args2 = json!({
+            "state_map_json": state_map_json,
+            "generation_state": serde_json::to_string(&vec![0.0f32, 1.0, 0.0, 0.0]).unwrap()
+        });
+        let (result2, state2) = handle_align_generation_with_state(&args2, Some(state1));
+        assert_eq!(
+            result2["milestone"], "execution",
+            "second call should compare against milestone 1, not reset to milestone 0"
+        );
+        assert!(state2.unwrap().completed);
+    }
+
+    #[test]
+    fn align_generation_returns_correction_vector_when_corrected() {
+        use crate::belief::BetaBelief;
+        use crate::state_predictor::SemanticMilestone;
+
+        let state_map = SemanticStateMap {
+            milestones: vec![SemanticMilestone {
+                label: "hypothesis".to_string(),
+                label_idx: 0,
+                predicted_state: vec![1.0, 0.0, 0.0],
+                token_budget: 128,
+                branch_hints: vec![],
+                confidence: BetaBelief::from_confidence(0.8, 4.0),
+            }],
+            confidence: BetaBelief::default(),
+            session_id: "sess-2".to_string(),
+            context_state: vec![0.5; 3],
+        };
+        let args = json!({
+            "state_map_json": serde_json::to_string(&state_map).unwrap(),
+            // Orthogonal to the milestone's predicted_state -> high drift -> corrected.
+            "generation_state": serde_json::to_string(&vec![0.0f32, 0.0, 1.0]).unwrap()
+        });
+        let result = handle_align_generation(&args);
+        assert_eq!(result["corrected"], true);
+        assert!(
+            result["correction_vector"].is_array(),
+            "a correction vector must be returned when a correction is applied, since the tool description promises it"
+        );
     }
 
     #[test]

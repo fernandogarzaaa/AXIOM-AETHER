@@ -1,4 +1,4 @@
-﻿pub mod adaptive;
+pub mod adaptive;
 pub mod agentic;
 pub mod agentic_eval;
 pub mod alignment_loop;
@@ -33,7 +33,6 @@ pub mod inference;
 pub mod jit_streamer;
 pub mod kernel;
 pub mod lsp;
-pub mod macro_encoder;
 pub mod mcp_stdio;
 pub mod memory_pool;
 pub mod memory_recall;

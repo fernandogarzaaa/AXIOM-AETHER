@@ -1,4 +1,4 @@
-﻿//! Native Model Context Protocol (MCP) server over a JSON-RPC 2.0 stdio
+//! Native Model Context Protocol (MCP) server over a JSON-RPC 2.0 stdio
 //! transport.
 //!
 //! This exposes Axiom to a host LLM (e.g. Claude Code) as a first-class tool
@@ -79,6 +79,10 @@ pub struct McpContext {
     /// Per-session token-awareness store (PR #72). Used to record tool response
     /// costs and conditionally annotate responses with a meta cost line.
     awareness: Arc<AwarenessStore>,
+    /// In-flight `axiom_align_generation` loop state, keyed by the caller's
+    /// `session_id`. Process-lifetime only (not persisted to disk); grows
+    /// with the number of distinct session_ids used, same as `awareness`.
+    align_states: Arc<Mutex<std::collections::HashMap<String, crate::alignment_loop::AlignmentLoopState>>>,
 }
 
 /// Assemble an [`McpContext`] (pipeline + vibe + memory + embedder) from config,
@@ -180,6 +184,7 @@ pub async fn build_context(
             }
         ),
         awareness: Arc::new(AwarenessStore::new()),
+        align_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
     })
 }
 
@@ -293,7 +298,7 @@ async fn handle_message(line: &str, ctx: &McpContext) -> Option<Value> {
 
 /// Static tool catalogue with strict input schemas.
 fn tools_list() -> Value {
-    json!({
+    let mut catalogue = json!({
         "tools": [
             {
                 "name": "axiom_compress_path",
@@ -544,7 +549,14 @@ fn tools_list() -> Value {
                 }
             }
         ]
-    })
+    });
+    // Predictive Reasoning Engine tools (state prediction, trajectory sampling,
+    // alignment checking). Merged in separately from `predictive_tools.rs` so
+    // that module owns its own schemas; see handle_tools_call for dispatch.
+    if let Some(tools) = catalogue["tools"].as_array_mut() {
+        tools.extend(crate::predictive_tools::predictive_tool_definitions());
+    }
+    catalogue
 }
 
 /// Route `tools/call` to the named tool, returning a JSON-RPC response whose
@@ -1136,6 +1148,88 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             let text = record_and_annotate(&ctx.awareness, &session_id, "axiom_channels", &text);
             success_response(id, tool_text_result(&text, false))
         }
+        "axiom_predict_states" => {
+            // Reject blank/whitespace-only summaries here, not just inside
+            // handle_predict_states: otherwise this still spawns a blocking
+            // worker and locks ctx.pipeline before discovering the input was
+            // invalid.
+            if !args
+                .get("context_summary")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                return error_response(id, -32602, "axiom_predict_states requires string 'context_summary'");
+            }
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("predictive")
+                .to_string();
+            let awareness = ctx.awareness.clone();
+            let args_owned = args.clone();
+            let ctx_for_predict = ctx.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                predict_states_blocking(&args_owned, &ctx_for_predict)
+            })
+            .await
+            .unwrap_or_else(|e| json!({ "error": format!("worker join error: {e}") }));
+            let is_error = result.get("error").is_some();
+            let mirror = serde_json::to_string(&result).unwrap_or_default();
+            record_and_annotate(&awareness, &session_id, "axiom_predict_states", &mirror);
+            success_response(id, tool_structured_result(result, is_error))
+        }
+        "axiom_sample_trajectories" => {
+            if args.get("state_map_json").and_then(Value::as_str).is_none() {
+                return error_response(id, -32602, "axiom_sample_trajectories requires string 'state_map_json'");
+            }
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("predictive")
+                .to_string();
+            let awareness = ctx.awareness.clone();
+            let result = crate::predictive_tools::handle_sample_trajectories(&args);
+            let is_error = result.get("error").is_some();
+            let mirror = serde_json::to_string(&result).unwrap_or_default();
+            record_and_annotate(&awareness, &session_id, "axiom_sample_trajectories", &mirror);
+            success_response(id, tool_structured_result(result, is_error))
+        }
+        "axiom_align_generation" => {
+            if args.get("state_map_json").and_then(Value::as_str).is_none()
+                || args.get("generation_state").and_then(Value::as_str).is_none()
+            {
+                return error_response(
+                    id,
+                    -32602,
+                    "axiom_align_generation requires string 'state_map_json' and 'generation_state'",
+                );
+            }
+            let session_id = args
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("predictive")
+                .to_string();
+            let awareness = ctx.awareness.clone();
+            // Resume this session's in-flight alignment loop (if any) so
+            // repeated calls advance through the milestone sequence instead
+            // of comparing against milestone 0 every time.
+            let existing_state = ctx
+                .align_states
+                .lock()
+                .ok()
+                .and_then(|mut m| m.remove(&session_id));
+            let (result, new_state) =
+                crate::predictive_tools::handle_align_generation_with_state(&args, existing_state);
+            if let Some(state) = new_state {
+                if let Ok(mut m) = ctx.align_states.lock() {
+                    m.insert(session_id.clone(), state);
+                }
+            }
+            let is_error = result.get("error").is_some();
+            let mirror = serde_json::to_string(&result).unwrap_or_default();
+            record_and_annotate(&awareness, &session_id, "axiom_align_generation", &mirror);
+            success_response(id, tool_structured_result(result, is_error))
+        }
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
     }
 }
@@ -1234,6 +1328,44 @@ fn status_blocking(session_id: &str, ctx: &McpContext) -> Result<String, String>
          recommendation   : {rec}",
         tight_flag = if tight { " ⚠ TIGHT" } else { "" }
     ))
+}
+
+/// `axiom_predict_states` worker — embeds `context_summary` through the live
+/// TTT pipeline for a real context state vector, falling back to
+/// `predictive_tools`'s hash-of-text proxy if embedding fails or the pipeline
+/// lock is unavailable. Runs on a blocking thread: `embed_text` drives a full
+/// forward pass through the model.
+fn predict_states_blocking(args: &Value, ctx: &McpContext) -> Value {
+    let context_summary = args
+        .get("context_summary")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let guard = match ctx.pipeline.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return crate::predictive_tools::handle_predict_states(args, &Device::Cpu, None);
+        }
+    };
+    let device = guard.device().clone();
+    let embedding = if context_summary.trim().is_empty() {
+        None
+    } else {
+        match embed_text(&guard, &context_summary) {
+            Ok(v) if !v.is_empty() => Some(v),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!(
+                    "[mcp] axiom_predict_states: embed_text failed, falling back to hash proxy: {e}"
+                );
+                None
+            }
+        }
+    };
+    drop(guard);
+
+    crate::predictive_tools::handle_predict_states(args, &device, embedding.as_deref())
 }
 
 fn tool_names() -> Vec<String> {
@@ -1840,7 +1972,7 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 20);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
@@ -1895,6 +2027,49 @@ mod tests {
         let fetch = tools.iter().find(|t| t["name"] == "fetch").unwrap();
         assert_eq!(search["inputSchema"]["required"][0], "query");
         assert_eq!(fetch["inputSchema"]["required"][0], "id");
+    }
+
+    #[test]
+    fn tools_list_includes_predictive_tools() {
+        // Regression guard for commit 788d430: the predictive engine modules
+        // existed but were never merged into tools_list(), so the three tools
+        // were unreachable. This asserts they are actually exposed.
+        let list = tools_list();
+        let names: Vec<&str> = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"axiom_predict_states"), "axiom_predict_states not exposed");
+        assert!(names.contains(&"axiom_sample_trajectories"), "axiom_sample_trajectories not exposed");
+        assert!(names.contains(&"axiom_align_generation"), "axiom_align_generation not exposed");
+    }
+
+    #[test]
+    fn no_source_file_has_utf8_bom() {
+        // Regression guard for commit 788d430, which silently prepended a UTF-8
+        // BOM to mcp_stdio.rs. A leading BOM is invisible in most diffs and was
+        // the root of a long tail of encoding-fix commits.
+        let bom = [0xEF_u8, 0xBB, 0xBF];
+        let mut offenders = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from("src")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().map(|e| e == "rs").unwrap_or(false) {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        if bytes.starts_with(&bom) {
+                            offenders.push(path.display().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "source files with a UTF-8 BOM: {offenders:?}");
     }
 
     #[test]
