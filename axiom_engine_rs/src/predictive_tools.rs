@@ -68,7 +68,7 @@ pub fn predictive_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "axiom_align_generation",
-            "description": "Check alignment between current generation state and the predicted semantic milestones. Detects logic drift and applies localized fast-weight corrections to steer generation back on track. Use during generation to monitor and correct reasoning deviations.",
+            "description": "Check alignment between current generation state and the predicted semantic milestones. Detects logic drift and computes a suggested localized fast-weight correction vector — this vector is returned for the caller to act on, it is NOT applied to the live session's W̃ automatically. Use during generation to monitor reasoning deviations.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -97,11 +97,21 @@ pub fn predictive_tool_definitions() -> Vec<Value> {
 
 /// Handle the `axiom_predict_states` tool call.
 ///
-/// Creates a StatePredictor (with random init if no checkpoint), runs prediction,
-/// and returns the state map as JSON.
+/// Creates a StatePredictor (always randomly initialized — no trained
+/// checkpoint exists yet for this head) and runs prediction over a context
+/// state vector.
+///
+/// `context_override`, when `Some`, is the real session embedding (e.g. from
+/// `embed_text` against the live TTT pipeline) and is used verbatim as both
+/// the predictor's input and its `d_model`. When `None` (no live pipeline
+/// available, e.g. a standalone/offline call), falls back to a deterministic
+/// hash of `context_summary` — a proxy, not a real semantic state. The
+/// response always reports which path was taken via `state_source`, and
+/// `trained: false` so callers never mistake this for a calibrated model.
 pub fn handle_predict_states(
     args: &Value,
     device: &candle_core::Device,
+    context_override: Option<&[f32]>,
 ) -> Value {
     let context_summary = args
         .get("context_summary")
@@ -123,8 +133,23 @@ pub fn handle_predict_states(
         });
     }
 
-    // Create a state predictor with random init (no trained checkpoint yet).
-    let config = crate::config::AxiomConfig::runtime_small();
+    let (context_state, state_source): (Vec<f32>, &str) = match context_override {
+        Some(v) if !v.is_empty() => (v.to_vec(), "session_embedding"),
+        _ => {
+            let d = crate::config::AxiomConfig::runtime_small().d_model;
+            (
+                summary_to_state_vector(context_summary, d),
+                "hashed_summary_fallback",
+            )
+        }
+    };
+
+    // State predictor head is always randomly initialized (no trained
+    // checkpoint yet); its d_model must match whatever context vector we have.
+    let config = crate::config::AxiomConfig {
+        d_model: context_state.len(),
+        ..crate::config::AxiomConfig::runtime_small()
+    };
     let varmap = candle_nn::VarMap::new();
     let vb = candle_nn::VarBuilder::from_varmap(
         &varmap,
@@ -139,9 +164,6 @@ pub fn handle_predict_states(
             });
         }
     };
-
-    // Create a context state vector from the summary (hash-based proxy).
-    let context_state = summary_to_state_vector(context_summary, config.d_model);
 
     let map = match predictor.predict_from_vec(&context_state, &session_id, max_milestones, device) {
         Ok(m) => m,
@@ -159,7 +181,10 @@ pub fn handle_predict_states(
         "state_map": map_json,
         "rendered": rendered,
         "milestone_count": map.milestones.len(),
-        "confidence": map.confidence.mean()
+        "confidence": map.confidence.mean(),
+        "trained": false,
+        "state_source": state_source,
+        "note": "StatePredictor uses randomly-initialized weights (no trained checkpoint exists yet). Milestone labels, budgets, and confidence values are not yet meaningful predictions."
     })
 }
 
@@ -319,8 +344,32 @@ mod tests {
             "context_summary": "Write a function to sort an array",
             "max_milestones": 3
         });
-        let result = handle_predict_states(&args, &candle_core::Device::Cpu);
+        let result = handle_predict_states(&args, &candle_core::Device::Cpu, None);
         assert!(result["state_map"].is_string() || result["error"].is_string());
+    }
+
+    #[test]
+    fn predict_states_uses_provided_context_and_reports_source() {
+        // When a real session embedding is supplied, the predictor must use it
+        // (not the hash-of-summary fallback) and say so honestly in the output.
+        let args = json!({ "context_summary": "test", "max_milestones": 2 });
+        let real_embedding = vec![0.25f32; 16];
+        let result = handle_predict_states(&args, &candle_core::Device::Cpu, Some(&real_embedding));
+        assert_eq!(result["state_source"], "session_embedding");
+        let map: SemanticStateMap =
+            serde_json::from_str(result["state_map"].as_str().unwrap()).unwrap();
+        assert_eq!(map.context_state.len(), 16);
+    }
+
+    #[test]
+    fn predict_states_without_context_falls_back_and_marks_untrained() {
+        // No trained checkpoint exists yet. Callers must never be told a
+        // prediction is trustworthy when it came from randomly-initialized
+        // weights over a hash-of-text proxy state.
+        let args = json!({ "context_summary": "test", "max_milestones": 2 });
+        let result = handle_predict_states(&args, &candle_core::Device::Cpu, None);
+        assert_eq!(result["state_source"], "hashed_summary_fallback");
+        assert_eq!(result["trained"], false);
     }
 
     #[test]

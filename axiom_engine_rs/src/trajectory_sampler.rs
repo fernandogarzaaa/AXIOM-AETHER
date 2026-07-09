@@ -1,7 +1,12 @@
-//! trajectory_sampler.rs - Branch-and-bound trajectory sampling over the
-//! cognitive state manifold.  The sampler produces parallel trajectories,
-//! scores them with a composite of novelty + coherence + budget-fit, prunes
-//! low-scoring branches, and evolves survivors with Gaussian perturbation.
+//! trajectory_sampler.rs - Deterministic trajectory sampling over the
+//! cognitive state manifold. The sampler produces parallel trajectories via
+//! deterministic sinusoidal perturbation of the context state (not random
+//! sampling — same input always yields the same branches), scores them with
+//! a composite of novelty + coherence + budget-fit, and prunes branches below
+//! a threshold. `evolve_branches` applies a further deterministic perturbation
+//! round to surviving branches. There is no exploration tree or bounding
+//! search (i.e. this is not branch-and-bound in the classical sense), and the
+//! perturbation is not Gaussian-distributed.
 //!
 //! Designed to be called by the MCP `axiom_sample_trajectories` tool.
 

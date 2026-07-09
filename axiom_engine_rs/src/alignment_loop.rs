@@ -1,10 +1,19 @@
-//! alignment_loop.rs - Self-Correcting Feedback Loop.
+//! alignment_loop.rs - Drift Detection and Correction-Vector Computation.
 //!
 //! Continuously evaluates the active output generation against the predicted
 //! state map established by the state predictor. If the output logic deviates
-//! from the projected semantic milestone, the system autonomously applies
-//! localized fast-weight corrections to steer the execution back on track
-//! without requiring a prompt restart.
+//! from the projected semantic milestone, this computes a correction vector
+//! that *could* steer generation back on track.
+//!
+//! ## Current status: detection is wired, application is not
+//!
+//! `check_alignment` computes `correction_strength` and (via
+//! `compute_correction`) a full correction vector, but **nothing in this
+//! module writes that vector back into the TTT fast-weight matrix W̃.**
+//! Callers receive the suggested correction as data; applying it to a live
+//! session's W̃ (and validating that doing so actually improves generation
+//! rather than destabilizing it) is unimplemented follow-up work, not a
+//! documentation gap.
 //!
 //! ## Architecture
 //!
@@ -18,16 +27,17 @@
 //!    state and the predicted milestone state. If the drift exceeds a threshold,
 //!    flag a misalignment.
 //!
-//! 3. **Correction** - Apply a localized TTT fast-weight update that nudges W̃
-//!    toward the predicted milestone state. This is a small, bounded update
-//!    (not a full re-adaptation) that steers generation back on track.
+//! 3. **Correction (vector only)** - Compute a localized TTT fast-weight
+//!    update vector that *would* nudge W̃ toward the predicted milestone
+//!    state. This is returned to the caller; it is not applied here.
 //!
 //! ## Key difference from existing grounding
 //!
 //! The existing `hallucination.rs` grounding check is *post-hoc* (verify after
 //! generation). The alignment loop is *continuous* (monitor during generation)
-//! and *corrective* (apply W̃ updates mid-stream). It does not replace
-//! grounding - it complements it by catching drift early.
+//! and computes correction data mid-stream. It does not replace grounding —
+//! it complements it by catching drift early — but unlike grounding, its
+//! correction output is not yet actionable without further wiring.
 
 use serde::{Deserialize, Serialize};
 
