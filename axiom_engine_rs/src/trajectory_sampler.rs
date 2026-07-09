@@ -1,4 +1,4 @@
-<arg_value>//! trajectory_sampler.rs - Branch-and-bound trajectory sampling over the
+//! trajectory_sampler.rs - Branch-and-bound trajectory sampling over the
 //! cognitive state manifold.  The sampler produces parallel trajectories,
 //! scores them with a composite of novelty + coherence + budget-fit, prunes
 //! low-scoring branches, and evolves survivors with Gaussian perturbation.
