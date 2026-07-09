@@ -1153,10 +1153,10 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             // handle_predict_states: otherwise this still spawns a blocking
             // worker and locks ctx.pipeline before discovering the input was
             // invalid.
-            if !args
+            if args
                 .get("context_summary")
                 .and_then(Value::as_str)
-                .is_some_and(|s| !s.trim().is_empty())
+                .is_none_or(|s| s.trim().is_empty())
             {
                 return error_response(id, -32602, "axiom_predict_states requires string 'context_summary'");
             }
