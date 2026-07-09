@@ -303,7 +303,8 @@ pub fn render_trajectory_result(result: &TrajectorySampleResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state_predictor::{SemanticStateMap, SemanticMilestone, BetaBelief};
+    use crate::state_predictor::{SemanticStateMap, SemanticMilestone};
+    use crate::belief::BetaBelief;
 
     fn make_state_map() -> SemanticStateMap {
         let milestones = vec![
