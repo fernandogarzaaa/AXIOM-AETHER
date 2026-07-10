@@ -323,6 +323,12 @@ pub struct AppState {
     /// (default `checkpoints/cvm`). See
     /// docs/superpowers/plans/2026-07-10-cvm-cost-stack.md, step S2.
     pub cvm_store: Arc<CvmStore>,
+    /// S6 (CVM cost stack) actuarial keepalive. Defaults to
+    /// `KeepaliveManager::disabled()` (spawns nothing, stores nothing);
+    /// `run_server` opts in explicitly via `with_keepalive_manager` when
+    /// `AXIOM_KEEPALIVE=1`. See
+    /// docs/superpowers/plans/2026-07-10-cvm-cost-stack.md, step S6.
+    pub keepalive: crate::keepalive::KeepaliveManager,
 }
 
 impl AppState {
@@ -360,6 +366,7 @@ impl AppState {
             heal_memory_path: Arc::new(None),
             awareness: AwarenessStore::new(),
             cvm_store: Arc::new(Self::open_cvm_store()),
+            keepalive: crate::keepalive::KeepaliveManager::disabled(),
         }
     }
 
@@ -376,6 +383,14 @@ impl AppState {
             let fallback = std::env::temp_dir().join("axiom-cvm-fallback");
             CvmStore::open(fallback).expect("temp dir CVM store open must succeed")
         })
+    }
+
+    /// Opt into S6 actuarial keepalive (see [`crate::keepalive`]). Callers
+    /// should pass a manager built via `KeepaliveManager::from_env` (or
+    /// `::disabled()` to explicitly no-op).
+    pub fn with_keepalive_manager(mut self, manager: crate::keepalive::KeepaliveManager) -> Self {
+        self.keepalive = manager;
+        self
     }
 
     /// Enable the swarm-immunity endpoints against this heal-memory file.

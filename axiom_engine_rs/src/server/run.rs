@@ -166,6 +166,13 @@ pub async fn run_server(
         .with_compressor_config(compressor_config)
         .with_master_vibe(master_vibe)
         .with_heal_memory_path(heal_memory_path);
+    // S6 (CVM cost stack): actuarial keepalive, AXIOM_KEEPALIVE=1 opt-in
+    // only (KeepaliveManager::from_env prints the required security boot
+    // banner when enabled; a no-op manager otherwise).
+    let keepalive_awareness = state.awareness.clone();
+    let state = state.with_keepalive_manager(crate::keepalive::KeepaliveManager::from_env(
+        keepalive_awareness,
+    ));
     // AXIOM_BACKEND=router/openai/opendrop: assemble the multi-provider router
     // from the live pipeline + Claude (ANTHROPIC_API_KEY) + OpenAI creds. None
     // unless one of those modes is set. Built on a blocking thread because it
