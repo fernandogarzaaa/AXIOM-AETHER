@@ -45,6 +45,12 @@ pub struct AwarenessState {
     /// (see `prefix_diet::DietReport`) -- the dedup tier's own contribution
     /// to S0's uncached-equivalent counterfactual.
     prefix_diet_tokens_removed: AtomicUsize,
+    /// S6 (CVM cost stack) actuarial keepalive: pings sent and their
+    /// estimated $ saved (a cache-read re-price avoided a full cache-write
+    /// re-price) -- always labeled `estimated` since the counterfactual it
+    /// avoided never actually happens when the ping works.
+    keepalive_pings_sent: AtomicUsize,
+    keepalive_estimated_usd_saved_micros: AtomicUsize,
 }
 
 /// A snapshot of a session's accumulated dollar-true cost, for `/metrics` and
@@ -64,6 +70,10 @@ pub struct CostSummary {
     pub estimated: bool,
     /// S4: running total of tokens removed by prefix-diet dedup.
     pub prefix_diet_tokens_removed: u64,
+    /// S6: running total of keepalive pings sent this session.
+    pub keepalive_pings_sent: u64,
+    /// S6: estimated $ saved by those pings (always an estimate).
+    pub keepalive_estimated_usd_saved: f64,
 }
 
 impl CostSummary {
@@ -99,6 +109,8 @@ impl Default for AwarenessState {
             cost_output_tokens: AtomicUsize::new(0),
             cost_estimated: AtomicBool::new(false),
             prefix_diet_tokens_removed: AtomicUsize::new(0),
+            keepalive_pings_sent: AtomicUsize::new(0),
+            keepalive_estimated_usd_saved_micros: AtomicUsize::new(0),
         }
     }
 }
@@ -177,6 +189,11 @@ impl AwarenessState {
             estimated: self.cost_estimated.load(Ordering::Relaxed),
             prefix_diet_tokens_removed: self.prefix_diet_tokens_removed.load(Ordering::Relaxed)
                 as u64,
+            keepalive_pings_sent: self.keepalive_pings_sent.load(Ordering::Relaxed) as u64,
+            keepalive_estimated_usd_saved: self
+                .keepalive_estimated_usd_saved_micros
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
         }
     }
 
@@ -184,6 +201,14 @@ impl AwarenessState {
     pub fn record_prefix_diet(&self, tokens_removed: usize) {
         self.prefix_diet_tokens_removed
             .fetch_add(tokens_removed, Ordering::Relaxed);
+    }
+
+    /// Record one S6 keepalive ping and its estimated $ saved.
+    pub fn record_keepalive_ping(&self, estimated_usd_saved: f64) {
+        self.keepalive_pings_sent.fetch_add(1, Ordering::Relaxed);
+        let micros = (estimated_usd_saved.max(0.0) * 1_000_000.0).round() as usize;
+        self.keepalive_estimated_usd_saved_micros
+            .fetch_add(micros, Ordering::Relaxed);
     }
 
     /// Current budget remaining, or `None` if the agent has not reported one.
