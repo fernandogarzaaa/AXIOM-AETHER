@@ -399,6 +399,30 @@ async fn compressed_messages_path(
         log_heavy_count,
     );
 
+    // S3 (CVM cost stack) digest admission control: replace heavy
+    // tool_result blocks in the newest turn (by definition after every
+    // cache breakpoint, not yet cached) with a digest + stub; the full
+    // text goes to the L2 store. Default off (AXIOM_CVM_DIGEST=off) until
+    // S5 passes. See docs/superpowers/plans/2026-07-10-cvm-cost-stack.md.
+    let digest_mode =
+        std::env::var("AXIOM_CVM_DIGEST").unwrap_or_else(|_| "off".to_string());
+    if digest_mode != "off" {
+        let threshold = std::env::var("AXIOM_CVM_DIGEST_THRESHOLD_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(crate::digest::DEFAULT_DIGEST_THRESHOLD_TOKENS);
+        apply_digest_admission(
+            state,
+            &session_id,
+            &mut outbound,
+            &digest_mode,
+            threshold,
+            forwarder.as_ref(),
+            client_auth,
+        )
+        .await;
+    }
+
     // S4 (CVM cost stack) prefix diet: lossless dedup of the fixed system
     // prefix. Gated the same way as S1's compression -- only when the
     // client actually caches (dedup output is a pure function of input
@@ -1358,4 +1382,134 @@ fn content_to_text(content: &Value) -> String {
             .join(""),
         _ => String::new(),
     }
+}
+
+/// Extract the flattened text of a `tool_result` content block's own
+/// `content` field (which is independently either a string or an array of
+/// text blocks, per the Anthropic Messages API -- distinct from
+/// `content_to_text`, which reads a *message's* top-level `content`).
+fn tool_result_text(block: &Value) -> Option<String> {
+    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+        return None;
+    }
+    let inner = block.get("content")?;
+    let text = content_to_text(inner);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Overwrite a `tool_result` block's `content` with plain replacement text
+/// (a valid, simpler-than-original shape the Anthropic API accepts).
+fn set_tool_result_text(block: &mut Value, new_text: &str) {
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert("content".to_string(), Value::String(new_text.to_string()));
+    }
+}
+
+/// S3 (CVM cost stack) digest admission control: for each `tool_result`
+/// block in the newest turn (`outbound["messages"]`'s last message -- by
+/// construction always part of the mutable tail, since a real newest turn
+/// comes after any `cache_control` breakpoint) whose token estimate is at
+/// or above `threshold_tokens`, replace it with a stub + digest, storing
+/// the full original text in the L2 store (`cvm_store`).
+#[allow(clippy::too_many_arguments)]
+async fn apply_digest_admission(
+    state: &AppState,
+    session_id: &str,
+    outbound: &mut Value,
+    digest_mode: &str,
+    threshold_tokens: usize,
+    forwarder: Option<&AnthropicForwarder>,
+    client_auth: &ClientAuth,
+) {
+    let Some(messages) = outbound.get("messages").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(newest_idx) = messages.len().checked_sub(1) else {
+        return;
+    };
+    let Some(content) = messages[newest_idx].get("content").and_then(Value::as_array) else {
+        return;
+    };
+
+    let candidates: Vec<(usize, String)> = content
+        .iter()
+        .enumerate()
+        .filter_map(|(i, block)| {
+            let text = tool_result_text(block)?;
+            (whitespace_token_count(&text) >= threshold_tokens).then_some((i, text))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+
+    let turn = state.digest_turn_next(session_id);
+    let mut replacements: Vec<(usize, String)> = Vec::with_capacity(candidates.len());
+    let mut bytes_in = 0usize;
+    let mut bytes_out = 0usize;
+
+    for (i, text) in candidates {
+        let orig_tokens = whitespace_token_count(&text);
+        let budget = ((orig_tokens as f64) * 0.15).round() as usize;
+
+        let digest_text = if digest_mode == "haiku" {
+            match forwarder {
+                Some(fwd) => {
+                    match crate::digest::haiku_digest(fwd, client_auth, &text, budget).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!(
+                                "[axiom-cvm] haiku digest failed ({e}); falling back to skeleton"
+                            );
+                            crate::digest::SkeletonDigestor.digest(&text, budget)
+                        }
+                    }
+                }
+                None => crate::digest::SkeletonDigestor.digest(&text, budget),
+            }
+        } else {
+            crate::digest::SkeletonDigestor.digest(&text, budget)
+        };
+
+        let page_id = match state.cvm_store.put(session_id, "tool_result", &text) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("[axiom-cvm] failed to store digested page: {e}");
+                continue;
+            }
+        };
+        state.digest_page_turn_set(session_id, &page_id, turn);
+        let stub = crate::cvm_store::build_stub(&page_id, orig_tokens, "tool_result", &text);
+        let replacement =
+            format!("{stub}\n{digest_text}\n[AXIOM-PAGE-END expand with axiom_expand(\"{page_id}\")]");
+        bytes_in += text.len();
+        bytes_out += replacement.len();
+        replacements.push((i, replacement));
+    }
+    if replacements.is_empty() {
+        return;
+    }
+
+    if let Some(content) = outbound
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .and_then(|m| m.get_mut(newest_idx))
+        .and_then(|m| m.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    {
+        for (i, replacement) in &replacements {
+            if let Some(block) = content.get_mut(*i) {
+                set_tool_result_text(block, replacement);
+            }
+        }
+    }
+
+    state
+        .awareness
+        .get_or_create(session_id)
+        .record_digest(replacements.len(), bytes_in, bytes_out);
+    eprintln!(
+        "[axiom-cvm] digest: mode={digest_mode} blocks={} bytes_in={bytes_in} bytes_out={bytes_out}",
+        replacements.len(),
+    );
 }

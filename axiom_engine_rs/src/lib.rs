@@ -21,6 +21,7 @@ pub mod corpus;
 pub mod cost_ledger;
 pub mod cvm_store;
 pub mod data_gen;
+pub mod digest;
 pub mod dwe;
 pub mod embedder;
 pub mod encoder;

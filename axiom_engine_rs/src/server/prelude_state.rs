@@ -43,7 +43,8 @@ use tower_http::decompression::RequestDecompressionLayer;
 use uuid::Uuid;
 
 use crate::anthropic_forwarder::{
-    build_compressed_payload, partition_messages, AnthropicForwarder, ClientAuth, ForwarderError,
+    build_compressed_payload, partition_messages, whitespace_token_count, AnthropicForwarder,
+    ClientAuth, ForwarderError,
 };
 use crate::backend_router::{Router as BackendRouter, TaskKind};
 use crate::claude_backend::{ChatTurn, ClaudeBackend};
@@ -55,6 +56,7 @@ use crate::context_compressor::{
     should_retry_uncompressed, CompressionControls, CompressorConfig, MemoryFingerprint,
     SessionStates, TttSessionStore,
 };
+use crate::digest::Digestor;
 use crate::dwe::{
     extract_delta_fragment, record_applied_fragment, record_rejected_fragment, DweBus, DweTelemetry,
 };
@@ -293,6 +295,18 @@ pub struct AppState {
     /// S4 (CVM cost stack) prefix-diet: the last request's dedup report per
     /// session, served by `GET /v1/prefix-diet/report/:session_id`.
     prefix_diet_last: Arc<RwLock<HashMap<String, crate::prefix_diet::DietReport>>>,
+    /// S3 (CVM cost stack) digest admission control: a monotonically
+    /// increasing per-session turn counter, incremented once per real
+    /// `/v1/messages` request that reaches the digestion hook. Recorded
+    /// alongside each digested page (out-of-band, not inside `CvmPage`
+    /// itself, to avoid touching S2's already-shipped `CvmStore::put`
+    /// signature) so a later `/v1/expand` fault can compute
+    /// `turns_since_digest` -- S7's training signal. See
+    /// docs/superpowers/plans/2026-07-10-cvm-cost-stack.md, step S3.
+    digest_turn: Arc<RwLock<HashMap<String, u64>>>,
+    /// S3: turn number at which each `(session_id, page_id)` was digested,
+    /// for the `turns_since_digest` fault computation above.
+    digest_page_turn: Arc<RwLock<HashMap<(String, String), u64>>>,
     /// Runtime-mutable compression controls + live counters. Lets a dashboard
     /// retune the threshold / on-off without a restart (`/v1/config`).
     pub controls: Arc<CompressionControls>,
@@ -354,6 +368,8 @@ impl AppState {
             adapted_context_hashes: Arc::new(RwLock::new(HashMap::new())),
             cache_safety_memo: Arc::new(RwLock::new(HashMap::new())),
             prefix_diet_last: Arc::new(RwLock::new(HashMap::new())),
+            digest_turn: Arc::new(RwLock::new(HashMap::new())),
+            digest_page_turn: Arc::new(RwLock::new(HashMap::new())),
             controls: Arc::new(CompressionControls::from_config(
                 &CompressorConfig::default(),
             )),
@@ -489,6 +505,48 @@ impl AppState {
             }
             map.insert(session_id, report);
         }
+    }
+
+    /// S3: advance and return `session_id`'s digest-turn counter. Call once
+    /// per real request that reaches the digestion hook (not once per page
+    /// digested -- multiple heavy tool_results in one turn share a turn
+    /// number).
+    pub(crate) fn digest_turn_next(&self, session_id: &str) -> u64 {
+        let Ok(mut map) = self.digest_turn.write() else {
+            return 0;
+        };
+        let entry = map.entry(session_id.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// S3: record the turn at which `page_id` was digested for `session_id`.
+    pub(crate) fn digest_page_turn_set(&self, session_id: &str, page_id: &str, turn: u64) {
+        if let Ok(mut map) = self.digest_page_turn.write() {
+            if map.len() >= 4096 {
+                map.clear();
+            }
+            map.insert((session_id.to_string(), page_id.to_string()), turn);
+        }
+    }
+
+    /// S3: `turns_since_digest` for a fault -- the session's current turn
+    /// minus the turn `page_id` was created at, or `0` if unknown (e.g. the
+    /// process restarted since digestion).
+    pub(crate) fn digest_turns_since(&self, session_id: &str, page_id: &str) -> u64 {
+        let created_turn = self
+            .digest_page_turn
+            .read()
+            .ok()
+            .and_then(|m| m.get(&(session_id.to_string(), page_id.to_string())).copied())
+            .unwrap_or(0);
+        let current_turn = self
+            .digest_turn
+            .read()
+            .ok()
+            .and_then(|m| m.get(session_id).copied())
+            .unwrap_or(0);
+        current_turn.saturating_sub(created_turn)
     }
 
     async fn adapt_feedback_to_cache(

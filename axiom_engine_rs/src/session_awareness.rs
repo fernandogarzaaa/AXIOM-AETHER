@@ -51,6 +51,11 @@ pub struct AwarenessState {
     /// avoided never actually happens when the ping works.
     keepalive_pings_sent: AtomicUsize,
     keepalive_estimated_usd_saved_micros: AtomicUsize,
+    /// S3 (CVM cost stack) digest admission control: running totals of
+    /// digested tool_result blocks and their bytes in/out.
+    digest_blocks: AtomicUsize,
+    digest_bytes_in: AtomicUsize,
+    digest_bytes_out: AtomicUsize,
 }
 
 /// A snapshot of a session's accumulated dollar-true cost, for `/metrics` and
@@ -74,6 +79,12 @@ pub struct CostSummary {
     pub keepalive_pings_sent: u64,
     /// S6: estimated $ saved by those pings (always an estimate).
     pub keepalive_estimated_usd_saved: f64,
+    /// S3: running total of tool_result blocks digested.
+    pub digest_blocks: u64,
+    /// S3: running total of original bytes before digestion.
+    pub digest_bytes_in: u64,
+    /// S3: running total of bytes after digestion (stub + digest text).
+    pub digest_bytes_out: u64,
 }
 
 impl CostSummary {
@@ -111,6 +122,9 @@ impl Default for AwarenessState {
             prefix_diet_tokens_removed: AtomicUsize::new(0),
             keepalive_pings_sent: AtomicUsize::new(0),
             keepalive_estimated_usd_saved_micros: AtomicUsize::new(0),
+            digest_blocks: AtomicUsize::new(0),
+            digest_bytes_in: AtomicUsize::new(0),
+            digest_bytes_out: AtomicUsize::new(0),
         }
     }
 }
@@ -194,6 +208,9 @@ impl AwarenessState {
                 .keepalive_estimated_usd_saved_micros
                 .load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
+            digest_blocks: self.digest_blocks.load(Ordering::Relaxed) as u64,
+            digest_bytes_in: self.digest_bytes_in.load(Ordering::Relaxed) as u64,
+            digest_bytes_out: self.digest_bytes_out.load(Ordering::Relaxed) as u64,
         }
     }
 
@@ -209,6 +226,14 @@ impl AwarenessState {
         let micros = (estimated_usd_saved.max(0.0) * 1_000_000.0).round() as usize;
         self.keepalive_estimated_usd_saved_micros
             .fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// Record one request's digest admission control activity (S3).
+    pub fn record_digest(&self, blocks: usize, bytes_in: usize, bytes_out: usize) {
+        self.digest_blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.digest_bytes_in.fetch_add(bytes_in, Ordering::Relaxed);
+        self.digest_bytes_out
+            .fetch_add(bytes_out, Ordering::Relaxed);
     }
 
     /// Current budget remaining, or `None` if the agent has not reported one.
