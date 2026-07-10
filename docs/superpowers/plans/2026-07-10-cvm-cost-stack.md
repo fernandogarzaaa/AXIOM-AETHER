@@ -433,6 +433,18 @@ Strongest model tier for this step.
 **Acceptance.** A decision recorded here with real numbers at each gate; whichever
 branch ships, measure faults/session for ≥ 1 week before vs after.
 
+### S7 status: BLOCKED on real fault data (2026-07-10)
+
+Task 1's own gate ("collect ≥ 2 weeks of fault logs") cannot be satisfied yet:
+`AXIOM_CVM_DIGEST` defaults to `off` (S3, gated on S5) and `checkpoints/cvm/faults.jsonl`
+has never been populated by real traffic — S5's harness (this plan, step S5) has been
+built but not yet run against a live account, so no default has flipped and no fault
+data exists to collect. Per task 1's explicit instruction, this step STOPS here rather
+than fabricating a decision from data that doesn't exist. Re-open S7 only after: (a) S5
+runs for real and passes, (b) `AXIOM_CVM_DIGEST=skeleton` ships as the default, and (c)
+≥ 2 weeks of production `faults.jsonl` accumulates. If that log shows < 50 total faults
+at that point, S7 closes as a success per task 1 without further work.
+
 ---
 
 ## S8 — Rollout
