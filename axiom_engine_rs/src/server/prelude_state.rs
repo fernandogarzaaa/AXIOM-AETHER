@@ -279,6 +279,16 @@ pub struct AppState {
     /// Repeated full-context prompts from Claude/Codex can then reuse the
     /// already-mutated fast-weights instead of redoing the same TTT prefill.
     adapted_context_hashes: Arc<RwLock<HashMap<String, String>>>,
+    /// S1 (CVM cost stack) cache-safety determinism memo: key =
+    /// "{session_id}:{sha256(mutable-tail raw JSON)}", value = the exact
+    /// `messages` JSON array previously sent upstream for that identical
+    /// mutable-tail content. The TTT fingerprint pipeline is not naturally
+    /// deterministic across repeated calls (each call mutates live session
+    /// state), so identical input is guaranteed identical WIRE output by
+    /// overwriting the freshly-computed messages with this memoized copy
+    /// rather than by making the pipeline itself pure. See
+    /// docs/superpowers/plans/2026-07-10-cvm-cost-stack.md, step S1.
+    cache_safety_memo: Arc<RwLock<HashMap<String, String>>>,
     /// Runtime-mutable compression controls + live counters. Lets a dashboard
     /// retune the threshold / on-off without a restart (`/v1/config`).
     pub controls: Arc<CompressionControls>,
@@ -326,6 +336,7 @@ impl AppState {
             master_vibe: Arc::new(Mutex::new(None)),
             source_store: Arc::new(RwLock::new(HashMap::new())),
             adapted_context_hashes: Arc::new(RwLock::new(HashMap::new())),
+            cache_safety_memo: Arc::new(RwLock::new(HashMap::new())),
             controls: Arc::new(CompressionControls::from_config(
                 &CompressorConfig::default(),
             )),
@@ -377,6 +388,28 @@ impl AppState {
                 map.clear();
             }
             map.insert(session_id.to_string(), context_hash(source));
+        }
+    }
+
+    /// S1 cache-safety: look up a previously-memoized mutable-tail messages
+    /// array for `key` ("{session_id}:{sha256(mutable-tail raw JSON)}").
+    pub(crate) fn cache_safety_memo_get(&self, key: &str) -> Option<String> {
+        self.cache_safety_memo
+            .read()
+            .ok()
+            .and_then(|map| map.get(key).cloned())
+    }
+
+    /// S1 cache-safety: store the messages array actually sent upstream for
+    /// `key`, so a later request with byte-identical mutable-tail content
+    /// reuses it verbatim instead of re-deriving a fresh (and possibly
+    /// different) fingerprint.
+    pub(crate) fn cache_safety_memo_set(&self, key: String, messages_json: String) {
+        if let Ok(mut map) = self.cache_safety_memo.write() {
+            if map.len() >= 512 {
+                map.clear();
+            }
+            map.insert(key, messages_json);
         }
     }
 

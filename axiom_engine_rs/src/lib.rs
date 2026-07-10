@@ -8,6 +8,7 @@ pub mod backend_router;
 pub mod belief;
 pub mod bench;
 pub mod bootstrap;
+pub mod cache_safety;
 pub mod chimera;
 pub mod claude_backend;
 pub mod cli;

@@ -142,6 +142,59 @@ async fn compressed_messages_path(
         .cloned()
         .ok_or_else(|| ApiError::BadRequest("messages[] required".into()))?;
 
+    // Resolve / create the TTT session. Precedence: the X-Axiom-Session-Id
+    // header (passed in as session_override), then a body `session_id`, then
+    // a minted transient UUID. Persistent compression benefits accrue only
+    // when the caller pins a stable id via one of the first two. Resolved
+    // here (rather than after partitioning, as before S1) because the
+    // cache-safety determinism memo below is keyed by session_id.
+    let session_id = session_override
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("transient-{}", Uuid::new_v4()));
+
+    // S1 (CVM cost stack): cache-safety. Anthropic prompt caching is a
+    // byte-exact prefix match; any change at or before a `cache_control`
+    // breakpoint invalidates the client's cache for everything after it,
+    // and simulation showed compression then costs MORE than it saves.
+    // Split messages into a frozen prefix (never touched by compression)
+    // and a mutable tail (the only part eligible for extraction). See
+    // docs/superpowers/plans/2026-07-10-cvm-cost-stack.md, step S1.
+    let cache_safe_enabled = std::env::var("AXIOM_CACHE_SAFE").as_deref() != Ok("0");
+    let uses_cache = cache_safe_enabled && crate::cache_safety::request_uses_cache(body);
+    let frozen_len = if uses_cache {
+        crate::cache_safety::frozen_prefix_len(body, &messages)
+    } else {
+        0
+    };
+    let (frozen_messages, mutable_messages): (Vec<Value>, Vec<Value>) = if frozen_len > 0 {
+        (messages[..frozen_len].to_vec(), messages[frozen_len..].to_vec())
+    } else {
+        (Vec::new(), messages.clone())
+    };
+    // Freeze-on-first-send determinism: the TTT fingerprint pipeline is not
+    // naturally deterministic across repeated calls (each call mutates live
+    // session state -- confirmed empirically: identical input produces a
+    // different state_hash per call). Memoize the exact outbound messages
+    // produced for a given mutable-tail content so identical input always
+    // yields identical WIRE output, matching the abort criteria's required
+    // mechanism rather than relying on the pipeline itself being pure.
+    let mutable_hash = {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(&mutable_messages).unwrap_or_default();
+        let digest = Sha256::digest(&bytes);
+        format!("{digest:x}")
+    };
+    let memo_key = format!("{session_id}:{mutable_hash}");
+    let memoized_mutable_messages: Option<Vec<Value>> = uses_cache
+        .then(|| state.cache_safety_memo_get(&memo_key))
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok());
+
     let cfg = state.compressor_config.clone();
     // Threshold is read live from the runtime controls so a dashboard can retune
     // it without a restart; top_k stays a startup constant.
@@ -149,7 +202,7 @@ async fn compressed_messages_path(
     let top_k = cfg.recall_top_k;
 
     let mut threshold = base_threshold;
-    let mut partitioned = partition_messages_for_state(state, &messages, threshold)?;
+    let mut partitioned = partition_messages_for_state(state, &mutable_messages, threshold)?;
 
     // Confidence-gated adaptive compression (opt-in, AXIOM_ADAPTIVE_COMPRESS=1):
     // if the heavy context is surprising to the model (CE above the drift gate
@@ -176,23 +229,10 @@ async fn compressed_messages_path(
                     "[axiom-ttt] adaptive compression: heavy surprisal {ce:.2} vs gate {gate:.2} → threshold {threshold} -> {eff}"
                 );
                 threshold = eff;
-                partitioned = partition_messages_for_state(state, &messages, threshold)?;
+                partitioned = partition_messages_for_state(state, &mutable_messages, threshold)?;
             }
         }
     }
-
-    // Resolve / create the TTT session. Precedence: the X-Axiom-Session-Id
-    // header (passed in as session_override), then a body `session_id`, then
-    // a minted transient UUID. Persistent compression benefits accrue only
-    // when the caller pins a stable id via one of the first two.
-    let session_id = session_override
-        .map(str::to_string)
-        .or_else(|| {
-            body.get("session_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| format!("transient-{}", Uuid::new_v4()));
 
     let started = Instant::now();
     let log_heavy_count = partitioned.heavy_context.len();
@@ -325,6 +365,39 @@ async fn compressed_messages_path(
     // without anyone asking — the self-healing loop running autonomously. Only
     // fires on a precise command-signature match with a concrete learned heal.
     inject_immunity_advisory(state, &mut outbound, &user_query_text, &heavy_combined);
+
+    // S1 (CVM cost stack) cache-safety, continued: `outbound["messages"]` at
+    // this point is entirely derived from `mutable_messages` (the frozen
+    // prefix was excluded from partitioning above). Enforce determinism --
+    // reuse a prior identical-input result verbatim if one exists, else
+    // memoize this one -- then splice the untouched frozen prefix back onto
+    // the front. See the memo/frozen-len computation near the top of this
+    // function for the rationale.
+    if uses_cache {
+        if let Some(mutable_out) = memoized_mutable_messages {
+            outbound["messages"] = Value::Array(mutable_out);
+        } else if let Some(arr) = outbound.get("messages").and_then(Value::as_array) {
+            if let Ok(serialized) = serde_json::to_string(arr) {
+                state.cache_safety_memo_set(memo_key.clone(), serialized);
+            }
+        }
+    }
+    if !frozen_messages.is_empty() {
+        let mutable_out = outbound
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut spliced = frozen_messages.clone();
+        spliced.extend(mutable_out);
+        outbound["messages"] = Value::Array(spliced);
+    }
+    eprintln!(
+        "[axiom-ttt] cache_safe: frozen_blocks={} mutable_blocks={} compressed={}",
+        frozen_messages.len(),
+        mutable_messages.len(),
+        log_heavy_count,
+    );
 
     // Record live compression stats for the dashboard: original vs forwarded
     // payload size and how many heavy messages were absorbed this request.
