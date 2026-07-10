@@ -317,6 +317,29 @@ reach the simulated 23%.
 
 ---
 
+### ~~S4 status: DONE-BUT-WEAK~~ (2026-07-10, PR #109)
+
+Implemented and tested (`prefix_diet.rs`, gated `AXIOM_PREFIX_DEDUP=1`, default **0**,
+unchanged). Real measurement on this machine's actual `~/.claude` rule set (`CLAUDE.md` +
+all 29 `rules/**/*.md` files, 59,349 bytes / 6,871 approx. tokens, the same file set
+rendered verbatim into this very session's system prompt): **0.00% gain** — this specific
+30-file set contains no byte-identical repeated blocks ≥ 400 bytes; every file is
+distinct content (English rules, Chinese translations, and web-specific overrides all
+differ). Below the 5% bar → abort criteria triggered, default stays off.
+
+The mechanism itself is verified correct and effective when duplication is actually
+present: a constructed scenario re-injecting `CLAUDE.md` a second time (simulating the
+historically-observed "file included twice" pattern this step was designed for)
+measured **32.21% token reduction** (2,201 → 1,492 tokens, 4 blocks deduped) on the same
+real file content. The gap between 0% (this machine, today, this file set) and 32%
+(when duplication exists) confirms the lossless dedup tier is sound but its real-world
+yield is entirely conditional on Claude Code/the user's config actually duplicating
+content — not guaranteed, and not present in the current baseline. Only the lossy tier
+(trimming tool descriptions, eval-gated, maintainer sign-off) can reach the simulated
+23% unconditionally.
+
+---
+
 ## S5 — Behavior eval gate (blocks all default flips)
 
 **Context brief.** No simulation can answer: do digests/stubs/dedup markers confuse the

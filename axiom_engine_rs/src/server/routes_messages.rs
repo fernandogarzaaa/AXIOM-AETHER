@@ -399,6 +399,28 @@ async fn compressed_messages_path(
         log_heavy_count,
     );
 
+    // S4 (CVM cost stack) prefix diet: lossless dedup of the fixed system
+    // prefix. Gated the same way as S1's compression -- only when the
+    // client actually caches (dedup output is a pure function of input
+    // bytes, so it stays byte-stable turn over turn, which is what makes it
+    // cache-safe without S1's determinism-memo mechanism). Default off
+    // (AXIOM_PREFIX_DEDUP=1 opt-in) until S5 flips it.
+    if std::env::var("AXIOM_PREFIX_DEDUP").as_deref() == Ok("1") && uses_cache {
+        if let Some(system) = outbound.get("system").cloned() {
+            let (dieted, report) = crate::prefix_diet::diet_system_field(&system);
+            outbound["system"] = dieted;
+            state
+                .awareness
+                .get_or_create(&session_id)
+                .record_prefix_diet(report.dedup_tokens);
+            state.prefix_diet_last_set(session_id.clone(), report);
+            eprintln!(
+                "[axiom-ttt] prefix_diet: original_tokens={} dedup_tokens={} blocks_deduped={}",
+                report.original_tokens, report.dedup_tokens, report.blocks_deduped,
+            );
+        }
+    }
+
     // Record live compression stats for the dashboard: original vs forwarded
     // payload size and how many heavy messages were absorbed this request.
     let bytes_in = serde_json::to_string(body)
