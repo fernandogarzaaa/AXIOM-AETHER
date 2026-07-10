@@ -49,6 +49,7 @@ use crate::backend_router::{Router as BackendRouter, TaskKind};
 use crate::claude_backend::{ChatTurn, ClaudeBackend};
 use crate::cluster::StateDeltaUpdate;
 use crate::config::AxiomConfig;
+use crate::cvm_store::CvmStore;
 use crate::context_compressor::{
     adapt_session_blocking, extract_memory_vector_blocking, feedback_adaptation_text,
     should_retry_uncompressed, CompressionControls, CompressorConfig, MemoryFingerprint,
@@ -313,6 +314,12 @@ pub struct AppState {
     /// token costs of Axiom responses, and compression metrics so Axiom can
     /// adapt autonomously. Populated via `POST /v1/budget`.
     pub awareness: AwarenessStore,
+    /// S2 (CVM cost stack) L2 store: content-addressed, session-scoped
+    /// full-fidelity text recoverable via `POST /v1/expand` and the
+    /// `axiom_expand` MCP tool. Root overridable via `AXIOM_CVM_DIR`
+    /// (default `checkpoints/cvm`). See
+    /// docs/superpowers/plans/2026-07-10-cvm-cost-stack.md, step S2.
+    pub cvm_store: Arc<CvmStore>,
 }
 
 impl AppState {
@@ -348,12 +355,37 @@ impl AppState {
             swarm_matrix: Arc::new(LocalSwarmRouteMatrix::new()),
             heal_memory_path: Arc::new(None),
             awareness: AwarenessStore::new(),
+            cvm_store: Arc::new(Self::open_cvm_store()),
         }
+    }
+
+    /// Open the S2 CVM store, falling back to a scratch temp directory (and
+    /// logging why) if the configured/default root can't be created --
+    /// never panics the server over a missing/unwritable disk path.
+    fn open_cvm_store() -> CvmStore {
+        let root =
+            std::env::var("AXIOM_CVM_DIR").unwrap_or_else(|_| "checkpoints/cvm".to_string());
+        CvmStore::open(&root).unwrap_or_else(|e| {
+            eprintln!(
+                "[axiom-cvm] failed to open CVM store at {root}: {e} -- falling back to a scratch temp dir"
+            );
+            let fallback = std::env::temp_dir().join("axiom-cvm-fallback");
+            CvmStore::open(fallback).expect("temp dir CVM store open must succeed")
+        })
     }
 
     /// Enable the swarm-immunity endpoints against this heal-memory file.
     pub fn with_heal_memory_path(mut self, path: Option<std::path::PathBuf>) -> Self {
         self.heal_memory_path = Arc::new(path);
+        self
+    }
+
+    /// Override the S2 CVM store (tests: inject an isolated temp-dir-backed
+    /// store instead of the process-wide `AXIOM_CVM_DIR`/default path, which
+    /// would otherwise race across tests running in parallel in the same
+    /// binary -- the same hazard class as the S1 `AXIOM_CACHE_SAFE` race).
+    pub fn with_cvm_store(mut self, store: CvmStore) -> Self {
+        self.cvm_store = Arc::new(store);
         self
     }
 

@@ -52,6 +52,13 @@ async fn delete_session(
     if deleted {
         metrics::remove_session(&session_id);
         emit_savings_receipt(&state, &session_id);
+        // S2 (CVM cost stack): drop this session's L2 store file too, unless
+        // the operator opted into retention for post-mortem inspection.
+        if std::env::var("AXIOM_CVM_RETAIN").as_deref() != Ok("1") {
+            if let Err(e) = state.cvm_store.delete_session(&session_id) {
+                eprintln!("[axiom-cvm] failed to delete CVM store for session={session_id}: {e}");
+            }
+        }
         let mut sequence_versions = state
             .sequence_versions
             .write()
