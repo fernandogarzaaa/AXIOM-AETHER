@@ -69,6 +69,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/v1/swarm/matrix_state", get(swarm_matrix_state))
         .route("/v1/expand", post(expand_symbol_handler))
+        .route(
+            "/v1/prefix-diet/report/:session_id",
+            get(prefix_diet_report_handler),
+        )
         .route("/v1/verify", post(verify_grounding))
         .route("/v1/epistemic/validate", post(validate_epistemic_drift))
         .route("/v1/immunity", get(get_immunity))
@@ -156,6 +160,32 @@ async fn expand_symbol_handler(State(state): State<AppState>, Json(body): Json<V
                 "symbol": symbol,
                 "found": false,
                 "error": "symbol not found in stored source",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/prefix-diet/report/:session_id` — S4 (CVM cost stack) debug
+/// endpoint: the dedup stats for that session's last `/v1/messages`
+/// request. 404 if no prefix-diet run has happened for that session yet
+/// (feature disabled, or `AXIOM_PREFIX_DEDUP` isn't `1`).
+async fn prefix_diet_report_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    match state.prefix_diet_last_get(&session_id) {
+        Some(report) => Json(serde_json::json!({
+            "original_tokens": report.original_tokens,
+            "dedup_tokens": report.dedup_tokens,
+            "blocks_deduped": report.blocks_deduped,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no prefix-diet report for session_id (never ran, or AXIOM_PREFIX_DEDUP is not 1)",
+                "session_id": session_id,
             })),
         )
             .into_response(),

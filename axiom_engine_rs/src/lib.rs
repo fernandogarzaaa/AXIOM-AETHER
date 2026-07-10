@@ -49,6 +49,7 @@ pub mod pairs;
 pub mod patch_memory;
 pub mod poly_jit;
 pub mod predictive_tools;
+pub mod prefix_diet;
 pub mod prime;
 pub mod provenance;
 pub mod q_manifold;

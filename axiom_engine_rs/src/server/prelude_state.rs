@@ -290,6 +290,9 @@ pub struct AppState {
     /// rather than by making the pipeline itself pure. See
     /// docs/superpowers/plans/2026-07-10-cvm-cost-stack.md, step S1.
     cache_safety_memo: Arc<RwLock<HashMap<String, String>>>,
+    /// S4 (CVM cost stack) prefix-diet: the last request's dedup report per
+    /// session, served by `GET /v1/prefix-diet/report/:session_id`.
+    prefix_diet_last: Arc<RwLock<HashMap<String, crate::prefix_diet::DietReport>>>,
     /// Runtime-mutable compression controls + live counters. Lets a dashboard
     /// retune the threshold / on-off without a restart (`/v1/config`).
     pub controls: Arc<CompressionControls>,
@@ -344,6 +347,7 @@ impl AppState {
             source_store: Arc::new(RwLock::new(HashMap::new())),
             adapted_context_hashes: Arc::new(RwLock::new(HashMap::new())),
             cache_safety_memo: Arc::new(RwLock::new(HashMap::new())),
+            prefix_diet_last: Arc::new(RwLock::new(HashMap::new())),
             controls: Arc::new(CompressionControls::from_config(
                 &CompressorConfig::default(),
             )),
@@ -442,6 +446,33 @@ impl AppState {
                 map.clear();
             }
             map.insert(key, messages_json);
+        }
+    }
+
+    /// S4 prefix-diet: the last request's dedup report for `session_id`, if
+    /// any (`GET /v1/prefix-diet/report/:session_id`).
+    pub(crate) fn prefix_diet_last_get(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::prefix_diet::DietReport> {
+        self.prefix_diet_last
+            .read()
+            .ok()
+            .and_then(|map| map.get(session_id).copied())
+    }
+
+    /// S4 prefix-diet: record this request's dedup report as the session's
+    /// latest.
+    pub(crate) fn prefix_diet_last_set(
+        &self,
+        session_id: String,
+        report: crate::prefix_diet::DietReport,
+    ) {
+        if let Ok(mut map) = self.prefix_diet_last.write() {
+            if map.len() >= 512 {
+                map.clear();
+            }
+            map.insert(session_id, report);
         }
     }
 

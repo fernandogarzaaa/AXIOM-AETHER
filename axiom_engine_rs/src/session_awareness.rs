@@ -41,6 +41,10 @@ pub struct AwarenessState {
     cache_read_tokens: AtomicUsize,
     cost_output_tokens: AtomicUsize,
     cost_estimated: AtomicBool,
+    /// S4 (CVM cost stack): running total of prefix-diet tokens removed
+    /// (see `prefix_diet::DietReport`) -- the dedup tier's own contribution
+    /// to S0's uncached-equivalent counterfactual.
+    prefix_diet_tokens_removed: AtomicUsize,
 }
 
 /// A snapshot of a session's accumulated dollar-true cost, for `/metrics` and
@@ -58,6 +62,8 @@ pub struct CostSummary {
     pub output_tokens: u64,
     /// True if any accumulated turn used an estimated (non-table) price.
     pub estimated: bool,
+    /// S4: running total of tokens removed by prefix-diet dedup.
+    pub prefix_diet_tokens_removed: u64,
 }
 
 impl CostSummary {
@@ -92,6 +98,7 @@ impl Default for AwarenessState {
             cache_read_tokens: AtomicUsize::new(0),
             cost_output_tokens: AtomicUsize::new(0),
             cost_estimated: AtomicBool::new(false),
+            prefix_diet_tokens_removed: AtomicUsize::new(0),
         }
     }
 }
@@ -168,7 +175,15 @@ impl AwarenessState {
             cache_read_tokens: self.cache_read_tokens.load(Ordering::Relaxed) as u64,
             output_tokens: self.cost_output_tokens.load(Ordering::Relaxed) as u64,
             estimated: self.cost_estimated.load(Ordering::Relaxed),
+            prefix_diet_tokens_removed: self.prefix_diet_tokens_removed.load(Ordering::Relaxed)
+                as u64,
         }
+    }
+
+    /// Record one request's prefix-diet dedup savings (S4).
+    pub fn record_prefix_diet(&self, tokens_removed: usize) {
+        self.prefix_diet_tokens_removed
+            .fetch_add(tokens_removed, Ordering::Relaxed);
     }
 
     /// Current budget remaining, or `None` if the agent has not reported one.
