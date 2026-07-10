@@ -202,6 +202,17 @@ async fn identical_mutable_tail_produces_byte_identical_outbound_messages() {
     );
 }
 
+/// Removes `AXIOM_CACHE_SAFE` on drop, including on unwind -- so a panic
+/// inside the test body (e.g. a failed assertion or an awaited future that
+/// panics) can never leave the env var polluting other tests in this
+/// binary that read it under `env_lock()`.
+struct EnvVarGuard(&'static str);
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
 #[tokio::test]
 async fn cache_safe_disabled_falls_back_to_prior_behavior() {
     // AXIOM_CACHE_SAFE=0 must not change compression behavior at all --
@@ -209,6 +220,7 @@ async fn cache_safe_disabled_falls_back_to_prior_behavior() {
     // succeeds (regression guard for the escape hatch).
     let _guard = env_lock().lock().await;
     std::env::set_var("AXIOM_CACHE_SAFE", "0");
+    let _env_cleanup = EnvVarGuard("AXIOM_CACHE_SAFE");
     let (upstream, capture, _task) = start_capturing_upstream().await;
     let state = build_state(upstream).await;
     let app = create_router(state);
@@ -225,7 +237,6 @@ async fn cache_safe_disabled_falls_back_to_prior_behavior() {
         ],
     });
     let status = post_messages(&app, body).await;
-    std::env::remove_var("AXIOM_CACHE_SAFE");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(capture.requests.lock().unwrap().len(), 1);
 }
