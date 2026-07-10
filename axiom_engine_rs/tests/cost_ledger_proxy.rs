@@ -244,3 +244,57 @@ async fn streaming_messages_turn_scans_sse_usage_without_altering_the_stream() {
     assert_eq!(cost["output_tokens"], 500);
     assert!(cost["usd_total"].as_f64().unwrap() > 0.0);
 }
+
+#[tokio::test]
+async fn streaming_prices_with_upstream_resolved_model_not_the_request_model() {
+    // The request declares "claude-sonnet-5" but the mock's message_start
+    // resolves to "claude-sonnet-4-6" (the two now have genuinely different
+    // rates: $2 vs $3 input/MTok). Pricing must follow the upstream-resolved
+    // model, matching the non-streaming path's precedent (forwarded.model
+    // preferred over body.model), not silently price at the request's
+    // declared model.
+    let (upstream, _task) = start_mock_anthropic_streaming_upstream().await;
+    let pipeline = tokio::task::spawn_blocking(tiny_pipeline).await.unwrap();
+    let state = AppState::new(pipeline, "axiom-ttt-test".to_string())
+        .with_anthropic_forwarder(Some(AnthropicForwarder::new(None, Some(upstream))))
+        .with_compressor_config(CompressorConfig {
+            heavy_message_threshold_tokens: 512,
+            recall_top_k: 32,
+            enabled: true,
+        });
+    let app = create_router(state);
+
+    let session_id = "cost-stream-model-mismatch";
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("x-api-key", "sk-ant-test-key")
+        .body(Body::from(
+            json!({
+                "model": "claude-sonnet-5",
+                "max_tokens": 16,
+                "session_id": session_id,
+                "stream": true,
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+
+    let (_, awareness) = get_json(&app, &format!("/v1/awareness/{session_id}")).await;
+    let usd = awareness["cost"]["usd_total"].as_f64().unwrap();
+    // Legacy Sonnet 4.x rate ($3/$3.75/$0.30/$15), matching message_start's
+    // declared model -- NOT the request's "claude-sonnet-5" ($2/.../$10).
+    let expected_legacy = 1000.0 / 1e6 * 3.00
+        + 2000.0 / 1e6 * 3.75
+        + 77_000.0 / 1e6 * 0.30
+        + 500.0 / 1e6 * 15.00;
+    assert!(
+        (usd - expected_legacy).abs() < 1e-6,
+        "expected upstream-resolved (legacy Sonnet 4.6) pricing {expected_legacy}, got {usd}"
+    );
+}

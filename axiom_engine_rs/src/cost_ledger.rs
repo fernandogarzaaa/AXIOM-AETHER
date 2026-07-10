@@ -26,7 +26,18 @@ pub struct PriceTable {
 }
 
 impl PriceTable {
+    /// Current-era Sonnet pricing (Sonnet 5, verified 2026-07). Also the
+    /// fallback table for genuinely unrecognized model ids, since it is the
+    /// most likely tier for traffic this proxy actually serves.
     const SONNET: PriceTable = PriceTable {
+        input_per_mtok: 2.00,
+        cache_write_5m_per_mtok: 2.50,
+        cache_read_per_mtok: 0.20,
+        output_per_mtok: 10.00,
+    };
+    /// Legacy Sonnet 4.x family pricing -- genuinely different from Sonnet 5;
+    /// matched separately so the two are never silently conflated.
+    const SONNET_LEGACY: PriceTable = PriceTable {
         input_per_mtok: 3.00,
         cache_write_5m_per_mtok: 3.75,
         cache_read_per_mtok: 0.30,
@@ -45,18 +56,24 @@ impl PriceTable {
         output_per_mtok: 5.00,
     };
 
-    /// Look up pricing for a model id. Falls back to Sonnet-tier pricing with
-    /// `estimated = true` for unrecognized model ids (new/renamed models),
-    /// so a price-table gap degrades to an honest estimate, never a silent
-    /// zero-cost or a hard failure.
+    /// Look up pricing for a model id. Matches specific known versions (not
+    /// just a family keyword) so a genuinely new or unrecognized version
+    /// falls through to the estimated branch instead of silently inheriting
+    /// a possibly-stale sibling version's rate -- Sonnet 5 and the legacy
+    /// Sonnet 4.x family have real, different prices, which "contains
+    /// sonnet" alone cannot distinguish. Unrecognized ids fall back to the
+    /// current Sonnet rate with `estimated = true`: an honest guess, never a
+    /// silent zero-cost or a hard failure.
     pub fn for_model(model: &str) -> (PriceTable, bool) {
         let m = model.to_ascii_lowercase();
-        if m.contains("haiku") {
+        if m.contains("haiku-4") || m.contains("haiku-3") {
             (Self::HAIKU, false)
-        } else if m.contains("opus") {
+        } else if m.contains("opus-4") {
             (Self::OPUS, false)
-        } else if m.contains("sonnet") {
+        } else if m.contains("sonnet-5") {
             (Self::SONNET, false)
+        } else if m.contains("sonnet-4") {
+            (Self::SONNET_LEGACY, false)
         } else {
             (Self::SONNET, true)
         }
@@ -167,12 +184,37 @@ mod tests {
     }
 
     #[test]
-    fn turn_cost_unknown_model_falls_back_to_sonnet_and_flags_estimated() {
+    fn turn_cost_unknown_model_falls_back_to_current_sonnet_and_flags_estimated() {
         let usage = json!({ "input_tokens": 1000, "output_tokens": 100 });
         let tc = turn_cost("claude-super-6-hypothetical", &usage).unwrap();
         assert!(tc.estimated);
-        let expected = 1000.0 / 1e6 * 3.00 + 100.0 / 1e6 * 15.00;
+        // Falls back to the CURRENT-era Sonnet rate (Sonnet 5, $2/MTok), not a
+        // stale hardcoded family rate -- see PriceTable::SONNET.
+        let expected = 1000.0 / 1e6 * 2.00 + 100.0 / 1e6 * 10.00;
         assert!((tc.usd - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn for_model_distinguishes_sonnet_5_from_legacy_sonnet_4_pricing() {
+        // These two families have genuinely different real-world prices;
+        // conflating them under one "contains sonnet" match was the bug.
+        let (sonnet5, est5) = PriceTable::for_model("claude-sonnet-5");
+        assert!(!est5);
+        assert!((sonnet5.input_per_mtok - 2.00).abs() < 1e-9);
+
+        let (sonnet4, est4) = PriceTable::for_model("claude-sonnet-4-6");
+        assert!(!est4);
+        assert!((sonnet4.input_per_mtok - 3.00).abs() < 1e-9);
+
+        assert_ne!(sonnet5, sonnet4, "distinct model families must not share a price table");
+    }
+
+    #[test]
+    fn for_model_flags_a_genuinely_new_sonnet_version_as_estimated() {
+        // A hypothetical future version that isn't sonnet-5 or sonnet-4-x
+        // must not silently inherit either table's pricing.
+        let (_, estimated) = PriceTable::for_model("claude-sonnet-7");
+        assert!(estimated, "an unrecognized sonnet version must be flagged estimated");
     }
 
     #[test]

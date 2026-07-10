@@ -425,7 +425,11 @@ async fn compressed_messages_path(
         // sent to the client); worst case a turn's cost telemetry is missed.
         use futures::StreamExt;
         let awareness = state.awareness.get_or_create(&session_id);
-        let model_for_usage = body
+        // Seeded from the request; overwritten by message_start's
+        // message.model (the upstream-resolved model) the moment it arrives,
+        // matching the non-streaming path's precedent of preferring the
+        // response-declared model over the request's.
+        let mut model_for_usage = body
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or("claude-sonnet-4-6")
@@ -449,6 +453,13 @@ async fn compressed_messages_path(
                 };
                 match event.get("type").and_then(Value::as_str) {
                     Some("message_start") => {
+                        if let Some(m) = event
+                            .get("message")
+                            .and_then(|m| m.get("model"))
+                            .and_then(Value::as_str)
+                        {
+                            model_for_usage = m.to_string();
+                        }
                         if let Some(usage) = event
                             .get("message")
                             .and_then(|m| m.get("usage"))
