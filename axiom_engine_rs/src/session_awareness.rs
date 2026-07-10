@@ -41,6 +41,12 @@ pub struct AwarenessState {
     cache_read_tokens: AtomicUsize,
     cost_output_tokens: AtomicUsize,
     cost_estimated: AtomicBool,
+    /// S6 (CVM cost stack) actuarial keepalive: pings sent and their
+    /// estimated $ saved (a cache-read re-price avoided a full cache-write
+    /// re-price) -- always labeled `estimated` since the counterfactual it
+    /// avoided never actually happens when the ping works.
+    keepalive_pings_sent: AtomicUsize,
+    keepalive_estimated_usd_saved_micros: AtomicUsize,
 }
 
 /// A snapshot of a session's accumulated dollar-true cost, for `/metrics` and
@@ -58,6 +64,10 @@ pub struct CostSummary {
     pub output_tokens: u64,
     /// True if any accumulated turn used an estimated (non-table) price.
     pub estimated: bool,
+    /// S6: running total of keepalive pings sent this session.
+    pub keepalive_pings_sent: u64,
+    /// S6: estimated $ saved by those pings (always an estimate).
+    pub keepalive_estimated_usd_saved: f64,
 }
 
 impl CostSummary {
@@ -92,6 +102,8 @@ impl Default for AwarenessState {
             cache_read_tokens: AtomicUsize::new(0),
             cost_output_tokens: AtomicUsize::new(0),
             cost_estimated: AtomicBool::new(false),
+            keepalive_pings_sent: AtomicUsize::new(0),
+            keepalive_estimated_usd_saved_micros: AtomicUsize::new(0),
         }
     }
 }
@@ -168,7 +180,20 @@ impl AwarenessState {
             cache_read_tokens: self.cache_read_tokens.load(Ordering::Relaxed) as u64,
             output_tokens: self.cost_output_tokens.load(Ordering::Relaxed) as u64,
             estimated: self.cost_estimated.load(Ordering::Relaxed),
+            keepalive_pings_sent: self.keepalive_pings_sent.load(Ordering::Relaxed) as u64,
+            keepalive_estimated_usd_saved: self
+                .keepalive_estimated_usd_saved_micros
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
         }
+    }
+
+    /// Record one S6 keepalive ping and its estimated $ saved.
+    pub fn record_keepalive_ping(&self, estimated_usd_saved: f64) {
+        self.keepalive_pings_sent.fetch_add(1, Ordering::Relaxed);
+        let micros = (estimated_usd_saved.max(0.0) * 1_000_000.0).round() as usize;
+        self.keepalive_estimated_usd_saved_micros
+            .fetch_add(micros, Ordering::Relaxed);
     }
 
     /// Current budget remaining, or `None` if the agent has not reported one.

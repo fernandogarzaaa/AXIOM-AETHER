@@ -33,6 +33,7 @@ pub mod heal_memory;
 pub mod hindsight;
 pub mod inference;
 pub mod jit_streamer;
+pub mod keepalive;
 pub mod kernel;
 pub mod lsp;
 pub mod mcp_stdio;

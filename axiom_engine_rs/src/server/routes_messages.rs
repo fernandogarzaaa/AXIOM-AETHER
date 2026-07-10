@@ -470,6 +470,16 @@ async fn compressed_messages_path(
             }
         }
         let status = upstream.status();
+        // S6 (CVM cost stack): a real (streaming) request completed --
+        // record activity for the keepalive timer. No-op when disabled.
+        if status.is_success() && state.keepalive.is_enabled() {
+            state.keepalive.record_activity(
+                &session_id,
+                crate::keepalive::HeldHeaders::from_client_auth(client_auth),
+                outbound.clone(),
+                forwarder.clone(),
+            );
+        }
         // The body streams through untouched, so record the request plus a
         // streamed marker rather than a buffered body.
         record_proxy_exchange(
@@ -622,6 +632,19 @@ async fn compressed_messages_path(
                 .record_turn_cost(&tc, &prices);
             record_lifetime_cost(&tc, &prices);
         }
+    }
+
+    // S6 (CVM cost stack): a real request completed -- record activity so
+    // the keepalive timer (if AXIOM_KEEPALIVE=1) knows this session is
+    // alive and holds its auth headers for a possible future ping. No-op
+    // when keepalive is disabled (the default).
+    if state.keepalive.is_enabled() {
+        state.keepalive.record_activity(
+            &session_id,
+            crate::keepalive::HeldHeaders::from_client_auth(client_auth),
+            outbound.clone(),
+            forwarder.clone(),
+        );
     }
 
     // Self-correction (opt-in, AXIOM_GROUND_CORRECT=1): if the answer makes
