@@ -118,6 +118,11 @@ async fn expand_symbol_handler(State(state): State<AppState>, Json(body): Json<V
     // but check the shape anyway to avoid a wasted lookup for plain names.
     if crate::cvm_store::looks_like_page_id(symbol) {
         if let Some(text) = state.cvm_store.get(session_id, symbol) {
+            // S3 (CVM cost stack): every resolved page id is a "fault" --
+            // the model needed the full text back -- logged as S7's future
+            // prefetch training signal.
+            let turns_since_digest = state.digest_turns_since(session_id, symbol);
+            crate::digest::append_fault(session_id, symbol, turns_since_digest);
             return Json(serde_json::json!({
                 "session_id": session_id,
                 "symbol": symbol,
