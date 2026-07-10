@@ -107,6 +107,23 @@ async fn expand_symbol_handler(State(state): State<AppState>, Json(body): Json<V
             .into_response();
     }
 
+    // S2 (CVM cost stack): `symbol` may be a CvmStore page id rather than a
+    // skeleton symbol name (digest admission control, S3, stubs heavy
+    // content as `[AXIOM-PAGE <page_id> ...]`). Try that store first --
+    // page ids are content-addressed and never collide with symbol names,
+    // but check the shape anyway to avoid a wasted lookup for plain names.
+    if crate::cvm_store::looks_like_page_id(symbol) {
+        if let Some(text) = state.cvm_store.get(session_id, symbol) {
+            return Json(serde_json::json!({
+                "session_id": session_id,
+                "symbol": symbol,
+                "found": true,
+                "body": text,
+            }))
+            .into_response();
+        }
+    }
+
     let source = state
         .source_store
         .read()

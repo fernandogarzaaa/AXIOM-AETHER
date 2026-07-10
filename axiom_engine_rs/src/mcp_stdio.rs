@@ -330,7 +330,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "axiom_expand",
-                "description": "Retrieve the full source body of a symbol that Axiom's context compression dropped from a session digest. When you see an <axiom_context_digest> skeleton (signatures kept, bodies elided) and need a specific implementation, call this with the symbol name and the digest's session id to get the actual code back.",
+                "description": "Retrieve the full source body of a symbol that Axiom's context compression dropped from a session digest, or the full original text behind an [AXIOM-PAGE <page_id> ...] stub left by digest admission control. When you see an <axiom_context_digest> skeleton (signatures kept, bodies elided) or an AXIOM-PAGE stub and need the real content, call this with the symbol name or page id and the digest's session id to get it back.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
