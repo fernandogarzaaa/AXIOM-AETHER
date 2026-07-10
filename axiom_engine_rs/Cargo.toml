@@ -47,6 +47,11 @@ metal = ["candle-core/metal", "candle-nn/metal"]
 # the pip wheel, Docker, and release builds ship only the user-facing `axiom`
 # command â€” not the training toolchain. Build them with `--features tools`.
 tools = []
+# S5 (CVM cost stack) behavior eval gate: tests/cvm_eval.rs drives real
+# `claude -p` traffic through a live local proxy and bills the operator's
+# own Anthropic account. Off by default -- run explicitly via
+# `cargo test --features live-eval --test cvm_eval` (see scripts/cvm_eval.sh).
+live-eval = []
 
 # Dev/training/eval binaries, gated behind the `tools` feature (see above).
 [[bin]]
@@ -103,6 +108,14 @@ required-features = ["tools"]
 name = "train_tokenizer"
 path = "src/bin/train_tokenizer.rs"
 required-features = ["tools"]
+
+# S5 (CVM cost stack) behavior eval gate, gated behind the `live-eval`
+# feature (see above) -- `cargo test` never discovers or compiles it by
+# default, only `cargo test --features live-eval --test cvm_eval`.
+[[test]]
+name = "cvm_eval"
+path = "tests/cvm_eval.rs"
+required-features = ["live-eval"]
 
 [dependencies]
 candle-core = "0.10.2"
