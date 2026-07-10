@@ -31,6 +31,47 @@ pub struct AwarenessState {
     pub bytes_compressed_in: AtomicUsize,
     /// Running sum of bytes emitted by the compressor (numerator for ratio).
     pub bytes_compressed_out: AtomicUsize,
+    /// Dollar-true cost accounting (see `cost_ledger`). USD is stored as
+    /// micro-dollars (1e-6 USD) in an integer atomic so accumulation across
+    /// many turns stays exact instead of drifting under repeated f64 adds.
+    cost_usd_micros: AtomicUsize,
+    uncached_equivalent_usd_micros: AtomicUsize,
+    uncached_input_tokens: AtomicUsize,
+    cache_write_tokens: AtomicUsize,
+    cache_read_tokens: AtomicUsize,
+    cost_output_tokens: AtomicUsize,
+    cost_estimated: AtomicBool,
+}
+
+/// A snapshot of a session's accumulated dollar-true cost, for `/metrics` and
+/// `axiom_status`/`GET /v1/awareness/:id`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CostSummary {
+    pub usd_total: f64,
+    /// What the accumulated turns would have cost with zero caching (every
+    /// cached token billed as full-price input). The counterfactual that
+    /// makes "how much is caching/CVM saving" answerable in dollars.
+    pub usd_uncached_equivalent: f64,
+    pub uncached_input_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub output_tokens: u64,
+    /// True if any accumulated turn used an estimated (non-table) price.
+    pub estimated: bool,
+}
+
+impl CostSummary {
+    /// Fraction of input-side tokens served from cache (reads / (reads +
+    /// writes + uncached)). `None`-equivalent is 0.0 when there is no input
+    /// traffic yet, which is the correct "no signal" value for a ratio.
+    pub fn cache_hit_rate(&self) -> f64 {
+        let denom = self.cache_read_tokens + self.cache_write_tokens + self.uncached_input_tokens;
+        if denom == 0 {
+            0.0
+        } else {
+            self.cache_read_tokens as f64 / denom as f64
+        }
+    }
 }
 
 impl Default for AwarenessState {
@@ -44,6 +85,13 @@ impl Default for AwarenessState {
             expansion_calls: AtomicUsize::new(0),
             bytes_compressed_in: AtomicUsize::new(0),
             bytes_compressed_out: AtomicUsize::new(0),
+            cost_usd_micros: AtomicUsize::new(0),
+            uncached_equivalent_usd_micros: AtomicUsize::new(0),
+            uncached_input_tokens: AtomicUsize::new(0),
+            cache_write_tokens: AtomicUsize::new(0),
+            cache_read_tokens: AtomicUsize::new(0),
+            cost_output_tokens: AtomicUsize::new(0),
+            cost_estimated: AtomicBool::new(false),
         }
     }
 }
@@ -76,6 +124,51 @@ impl AwarenessState {
             .fetch_add(bytes_in, Ordering::Relaxed);
         self.bytes_compressed_out
             .fetch_add(bytes_out, Ordering::Relaxed);
+    }
+
+    /// Record one priced API turn (see `cost_ledger::turn_cost`) into the
+    /// session's running dollar total. `prices` is the price table the turn
+    /// was actually priced under (i.e. the same one `turn_cost` resolved for
+    /// this turn's model) -- passed in rather than re-resolved from a model
+    /// string so this function stays a pure accumulator.
+    pub fn record_turn_cost(
+        &self,
+        tc: &crate::cost_ledger::TurnCost,
+        prices: &crate::cost_ledger::PriceTable,
+    ) {
+        // usd is always >= 0 and bounded by realistic per-turn spend, so the
+        // micro-dollar conversion cannot meaningfully overflow a usize here.
+        let micros = (tc.usd * 1_000_000.0).round() as usize;
+        self.cost_usd_micros.fetch_add(micros, Ordering::Relaxed);
+        let uncached_micros = (tc.uncached_equivalent_usd(prices) * 1_000_000.0).round() as usize;
+        self.uncached_equivalent_usd_micros
+            .fetch_add(uncached_micros, Ordering::Relaxed);
+        self.uncached_input_tokens
+            .fetch_add(tc.uncached_in as usize, Ordering::Relaxed);
+        self.cache_write_tokens
+            .fetch_add(tc.cache_write as usize, Ordering::Relaxed);
+        self.cache_read_tokens
+            .fetch_add(tc.cache_read as usize, Ordering::Relaxed);
+        self.cost_output_tokens
+            .fetch_add(tc.output as usize, Ordering::Relaxed);
+        if tc.estimated {
+            self.cost_estimated.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Current dollar-true cost summary for this session.
+    pub fn cost_summary(&self) -> CostSummary {
+        CostSummary {
+            usd_total: self.cost_usd_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            usd_uncached_equivalent: self.uncached_equivalent_usd_micros.load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            uncached_input_tokens: self.uncached_input_tokens.load(Ordering::Relaxed) as u64,
+            cache_write_tokens: self.cache_write_tokens.load(Ordering::Relaxed) as u64,
+            cache_read_tokens: self.cache_read_tokens.load(Ordering::Relaxed) as u64,
+            output_tokens: self.cost_output_tokens.load(Ordering::Relaxed) as u64,
+            estimated: self.cost_estimated.load(Ordering::Relaxed),
+        }
     }
 
     /// Current budget remaining, or `None` if the agent has not reported one.
@@ -172,6 +265,91 @@ impl AwarenessStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_turn_cost_accumulates_usd_and_uncached_equivalent() {
+        let s = AwarenessState::default();
+        let tc1 = crate::cost_ledger::TurnCost {
+            uncached_in: 1000,
+            cache_write: 0,
+            cache_read: 0,
+            output: 500,
+            usd: 0.0105,
+            estimated: false,
+        };
+        let tc2 = crate::cost_ledger::TurnCost {
+            uncached_in: 0,
+            cache_write: 0,
+            cache_read: 80_000,
+            output: 300,
+            usd: 0.0285,
+            estimated: false,
+        };
+        let (prices, _) = crate::cost_ledger::PriceTable::for_model("claude-sonnet-4-6");
+        s.record_turn_cost(&tc1, &prices);
+        s.record_turn_cost(&tc2, &prices);
+        let summary = s.cost_summary();
+        assert!((summary.usd_total - (0.0105 + 0.0285)).abs() < 1e-9);
+        assert_eq!(summary.cache_read_tokens, 80_000);
+        assert_eq!(summary.uncached_input_tokens, 1000);
+        assert_eq!(summary.output_tokens, 800);
+        assert!(!summary.estimated, "no turn was estimated");
+    }
+
+    #[test]
+    fn record_turn_cost_marks_summary_estimated_if_any_turn_was() {
+        let s = AwarenessState::default();
+        let (prices, _) = crate::cost_ledger::PriceTable::for_model("claude-sonnet-4-6");
+        s.record_turn_cost(
+            &crate::cost_ledger::TurnCost {
+                estimated: true,
+                ..Default::default()
+            },
+            &prices,
+        );
+        assert!(s.cost_summary().estimated);
+    }
+
+    #[test]
+    fn cache_hit_rate_is_reads_over_reads_plus_writes_plus_uncached() {
+        let s = AwarenessState::default();
+        let (prices, _) = crate::cost_ledger::PriceTable::for_model("claude-sonnet-4-6");
+        s.record_turn_cost(
+            &crate::cost_ledger::TurnCost {
+                uncached_in: 100,
+                cache_write: 100,
+                cache_read: 800,
+                ..Default::default()
+            },
+            &prices,
+        );
+        let rate = s.cost_summary().cache_hit_rate();
+        assert!((rate - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_summary_uncached_equivalent_exceeds_actual_and_accumulates() {
+        let s = AwarenessState::default();
+        let (prices, _) = crate::cost_ledger::PriceTable::for_model("claude-sonnet-4-6");
+        let tc = crate::cost_ledger::TurnCost {
+            uncached_in: 1000,
+            cache_write: 2000,
+            cache_read: 77_000,
+            output: 500,
+            usd: 0.0, // irrelevant to this test, which only checks the counterfactual
+            estimated: false,
+        };
+        s.record_turn_cost(&tc, &prices);
+        let summary = s.cost_summary();
+        let expected_uncached = tc.uncached_equivalent_usd(&prices);
+        assert!(
+            (summary.usd_uncached_equivalent - expected_uncached).abs() < 1e-6,
+            "{} vs {}",
+            summary.usd_uncached_equivalent,
+            expected_uncached
+        );
+        assert!(summary.usd_uncached_equivalent > 0.0);
+    }
 
     #[test]
     fn budget_set_and_read() {

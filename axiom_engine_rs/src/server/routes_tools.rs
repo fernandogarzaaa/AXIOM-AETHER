@@ -290,6 +290,7 @@ async fn get_awareness(State(state): State<AppState>, Path(id): Path<String>) ->
             .into_response(),
         Some(a) => {
             let (requests, msgs, bytes_in, bytes_out) = state.controls.counters();
+            let cost = a.cost_summary();
             Json(serde_json::json!({
                 "session_id": id,
                 "budget_remaining": a.budget(),
@@ -301,6 +302,16 @@ async fn get_awareness(State(state): State<AppState>, Path(id): Path<String>) ->
                 "compression_target_tokens": a.compression_target_tokens(),
                 "is_tight": a.is_tight(),
                 "recommendation": a.recommendation(),
+                "cost": {
+                    "usd_total": cost.usd_total,
+                    "usd_uncached_equivalent": cost.usd_uncached_equivalent,
+                    "uncached_input_tokens": cost.uncached_input_tokens,
+                    "cache_write_tokens": cost.cache_write_tokens,
+                    "cache_read_tokens": cost.cache_read_tokens,
+                    "output_tokens": cost.output_tokens,
+                    "cache_hit_rate": cost.cache_hit_rate(),
+                    "estimated": cost.estimated,
+                },
                 "global_counters": {
                     "requests": requests,
                     "messages_compressed": msgs,

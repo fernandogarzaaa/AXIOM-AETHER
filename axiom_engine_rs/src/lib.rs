@@ -17,6 +17,7 @@ pub mod daemon;
 pub mod context_compressor;
 pub mod contrastive;
 pub mod corpus;
+pub mod cost_ledger;
 pub mod data_gen;
 pub mod dwe;
 pub mod embedder;
