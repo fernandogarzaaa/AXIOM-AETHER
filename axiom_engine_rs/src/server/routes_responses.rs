@@ -233,6 +233,38 @@ fn savings_receipt(bytes_in: u64, bytes_out: u64) -> String {
 static LIFETIME_SAVINGS_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LIFETIME_SAVINGS_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Lifetime dollar-true cost counters (S0, CVM cost stack). Same monotone
+/// rationale as the savings counters above: per-session `AwarenessState` is
+/// dropped when a session ends, so these are the only durable totals.
+/// USD stored in micro-dollars (1e-6 USD) so accumulation stays exact.
+pub(crate) static LIFETIME_COST_USD_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIFETIME_COST_UNCACHED_EQUIVALENT_USD_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIFETIME_CACHE_READ_TOKENS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIFETIME_CACHE_WRITE_TOKENS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIFETIME_UNCACHED_INPUT_TOKENS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record one priced API turn into the lifetime cost counters. Called
+/// alongside `AwarenessState::record_turn_cost` (the per-session view) so
+/// `/metrics` totals survive individual sessions dropping.
+pub(crate) fn record_lifetime_cost(
+    tc: &crate::cost_ledger::TurnCost,
+    prices: &crate::cost_ledger::PriceTable,
+) {
+    use std::sync::atomic::Ordering;
+    let micros = (tc.usd * 1_000_000.0).round() as u64;
+    let uncached_micros = (tc.uncached_equivalent_usd(prices) * 1_000_000.0).round() as u64;
+    LIFETIME_COST_USD_MICROS.fetch_add(micros, Ordering::Relaxed);
+    LIFETIME_COST_UNCACHED_EQUIVALENT_USD_MICROS.fetch_add(uncached_micros, Ordering::Relaxed);
+    LIFETIME_CACHE_READ_TOKENS.fetch_add(tc.cache_read, Ordering::Relaxed);
+    LIFETIME_CACHE_WRITE_TOKENS.fetch_add(tc.cache_write, Ordering::Relaxed);
+    LIFETIME_UNCACHED_INPUT_TOKENS.fetch_add(tc.uncached_in, Ordering::Relaxed);
+}
+
 /// Accumulate a compression event into the per-session savings ledger and the
 /// lifetime totals.
 fn record_savings(state: &AppState, session_id: &str, bytes_in: u64, bytes_out: u64) {

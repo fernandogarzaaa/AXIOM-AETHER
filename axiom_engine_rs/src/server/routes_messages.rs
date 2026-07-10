@@ -412,10 +412,77 @@ async fn compressed_messages_path(
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
             .unwrap_or_else(|| "text/event-stream".to_string());
+
+        // S0 (CVM cost stack): scan the SSE bytes for `message_start` (input
+        // side usage) and `message_delta` (output side usage) events as they
+        // pass through, without buffering, delaying, or reordering a single
+        // byte of the actual response -- `inspect` observes each chunk and
+        // forwards it downstream unmodified. `message_start.message.usage`
+        // and `message_delta.usage` are merged into one usage object and
+        // priced when `message_delta` (the terminal usage event) arrives. A
+        // chunk boundary that splits a multi-byte UTF-8 character can
+        // corrupt this best-effort internal parse (never the bytes actually
+        // sent to the client); worst case a turn's cost telemetry is missed.
+        use futures::StreamExt;
+        let awareness = state.awareness.get_or_create(&session_id);
+        let model_for_usage = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("claude-sonnet-4-6")
+            .to_string();
+        let mut sse_buffer = String::new();
+        let mut collected_usage = serde_json::Map::new();
+        let scanned = upstream.bytes_stream().inspect(move |chunk_result| {
+            let Ok(bytes) = chunk_result else { return };
+            sse_buffer.push_str(&String::from_utf8_lossy(bytes));
+            while let Some(nl) = sse_buffer.find('\n') {
+                let line: String = sse_buffer.drain(..=nl).collect();
+                let line = line.trim_end_matches(['\r', '\n']);
+                let Some(data) = line
+                    .strip_prefix("data: ")
+                    .or_else(|| line.strip_prefix("data:"))
+                else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_str::<Value>(data.trim()) else {
+                    continue;
+                };
+                match event.get("type").and_then(Value::as_str) {
+                    Some("message_start") => {
+                        if let Some(usage) = event
+                            .get("message")
+                            .and_then(|m| m.get("usage"))
+                            .and_then(Value::as_object)
+                        {
+                            for (k, v) in usage {
+                                collected_usage.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    Some("message_delta") => {
+                        if let Some(usage) = event.get("usage").and_then(Value::as_object) {
+                            for (k, v) in usage {
+                                collected_usage.insert(k.clone(), v.clone());
+                            }
+                        }
+                        let usage_val = Value::Object(collected_usage.clone());
+                        if let Some(tc) = crate::cost_ledger::turn_cost(&model_for_usage, &usage_val)
+                        {
+                            let (prices, _) =
+                                crate::cost_ledger::PriceTable::for_model(&model_for_usage);
+                            awareness.record_turn_cost(&tc, &prices);
+                            record_lifetime_cost(&tc, &prices);
+                        }
+                        collected_usage.clear();
+                    }
+                    _ => {}
+                }
+            }
+        });
         return Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, content_type)
-            .body(axum::body::Body::from_stream(upstream.bytes_stream()))
+            .body(axum::body::Body::from_stream(scanned))
             .map_err(|e| ApiError::Internal(format!("stream response build failed: {e}")));
     }
 
@@ -453,6 +520,25 @@ async fn compressed_messages_path(
             }
         }
     };
+
+    // S0 (CVM cost stack): record dollar-true cost from the real usage
+    // Anthropic just returned, before any opt-in follow-up call might
+    // replace `forwarded`. See docs/superpowers/plans/2026-07-10-cvm-cost-stack.md.
+    if let Some(usage) = forwarded.get("usage") {
+        let model = forwarded
+            .get("model")
+            .and_then(Value::as_str)
+            .or_else(|| body.get("model").and_then(Value::as_str))
+            .unwrap_or("claude-sonnet-4-6");
+        if let Some(tc) = crate::cost_ledger::turn_cost(model, usage) {
+            let (prices, _) = crate::cost_ledger::PriceTable::for_model(model);
+            state
+                .awareness
+                .get_or_create(&session_id)
+                .record_turn_cost(&tc, &prices);
+            record_lifetime_cost(&tc, &prices);
+        }
+    }
 
     // Self-correction (opt-in, AXIOM_GROUND_CORRECT=1): if the answer makes
     // claims unsupported by the absorbed context, send ONE bounded follow-up
