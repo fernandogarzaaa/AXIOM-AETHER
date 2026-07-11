@@ -454,6 +454,29 @@ async fn compressed_messages_path(
         }
     }
 
+    // P1 (Prolonged-Session Stack) L-A: tool deferral. Mark tools outside the
+    // recent working set with `defer_loading: true` so they drop out of the
+    // cached prefix (Anthropic loads them on demand as `tool_reference` blocks
+    // without breaking the cache). Only ever ADDS the flag -- names/order/count
+    // are unchanged -- so the tools array stays byte-stable turn-over-turn.
+    // Default off (AXIOM_TOOL_DEFER=on) until the live eval passes. See
+    // docs/superpowers/plans/2026-07-11-prolonged-session-stack.md, step P1.
+    if std::env::var("AXIOM_TOOL_DEFER").as_deref() == Ok("on") {
+        if let Some(tools) = outbound.get("tools").and_then(Value::as_array).cloned() {
+            let keep = crate::tool_defer::working_set(&messages, 8);
+            let (deferred_tools, deferred_count) = crate::tool_defer::mark_deferred(&tools, &keep);
+            if deferred_count > 0 {
+                outbound["tools"] = Value::Array(deferred_tools);
+                eprintln!(
+                    "[axiom-ttt] tool_defer: tools={} deferred={} kept={}",
+                    tools.len(),
+                    deferred_count,
+                    tools.len() - deferred_count,
+                );
+            }
+        }
+    }
+
     // Record live compression stats for the dashboard: original vs forwarded
     // payload size and how many heavy messages were absorbed this request.
     let bytes_in = serde_json::to_string(body)

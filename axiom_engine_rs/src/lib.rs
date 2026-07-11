@@ -72,6 +72,7 @@ pub mod swarm_route;
 pub mod swarm_router;
 pub mod task_board;
 pub mod test_time_adapter;
+pub mod tool_defer;
 pub mod train;
 pub mod trajectory_sampler;
 pub mod ttt_block;
