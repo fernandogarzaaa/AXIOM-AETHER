@@ -55,29 +55,89 @@ impl PriceTable {
         cache_read_per_mtok: 0.10,
         output_per_mtok: 5.00,
     };
+    /// Fable 5 (Mythos-class, above Opus). Real Anthropic list rate, verified
+    /// 2026-07 (platform.claude.com/docs pricing). Mythos 5 shares this rate.
+    const FABLE: PriceTable = PriceTable {
+        input_per_mtok: 10.00,
+        cache_write_5m_per_mtok: 12.50,
+        cache_read_per_mtok: 1.00,
+        output_per_mtok: 50.00,
+    };
+    /// Sonnet 5 list pricing from 2026-09-01 onward (Anthropic scheduled
+    /// increase; the introductory rate in `SONNET` applies before that date).
+    const SONNET5_POST_SEP2026: PriceTable = PriceTable {
+        input_per_mtok: 3.00,
+        cache_write_5m_per_mtok: 3.75,
+        cache_read_per_mtok: 0.30,
+        output_per_mtok: 15.00,
+    };
 
-    /// Look up pricing for a model id. Matches specific known versions (not
-    /// just a family keyword) so a genuinely new or unrecognized version
-    /// falls through to the estimated branch instead of silently inheriting
-    /// a possibly-stale sibling version's rate -- Sonnet 5 and the legacy
-    /// Sonnet 4.x family have real, different prices, which "contains
-    /// sonnet" alone cannot distinguish. Unrecognized ids fall back to the
-    /// current Sonnet rate with `estimated = true`: an honest guess, never a
-    /// silent zero-cost or a hard failure.
+    /// Unix seconds for 2026-09-01 00:00:00 UTC, when Sonnet-5 list pricing
+    /// rises from the introductory rate to the standard rate.
+    const SONNET5_PRICE_CHANGE_UNIX: u64 = 1_788_220_800;
+
+    /// Current-date pricing for a model id. Thin wrapper over
+    /// [`Self::for_model_at`] using the system clock, so the date-sensitive
+    /// branch (Sonnet 5's 2026-09-01 increase) stays testable without a clock
+    /// dependency.
     pub fn for_model(model: &str) -> (PriceTable, bool) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self::for_model_at(model, now)
+    }
+
+    /// Look up pricing for a model id as of `now_unix` (Unix seconds). Matches
+    /// specific known versions (not just a family keyword) so a genuinely new
+    /// or unrecognized version falls through to the estimated branch instead
+    /// of silently inheriting a possibly-stale sibling version's rate. Sonnet
+    /// 5 is date-aware: its list price rises on 2026-09-01. Unrecognized ids
+    /// fall back to the current (date-aware) Sonnet 5 rate with
+    /// `estimated = true` -- an honest guess, never a silent zero-cost or a
+    /// hard failure.
+    pub fn for_model_at(model: &str, now_unix: u64) -> (PriceTable, bool) {
         let m = model.to_ascii_lowercase();
+        let current_sonnet5 = || {
+            if now_unix >= Self::SONNET5_PRICE_CHANGE_UNIX {
+                Self::SONNET5_POST_SEP2026
+            } else {
+                Self::SONNET
+            }
+        };
         if m.contains("haiku-4") || m.contains("haiku-3") {
             (Self::HAIKU, false)
+        } else if m.contains("fable-5") || m.contains("mythos-5") {
+            (Self::FABLE, false)
         } else if m.contains("opus-4") {
             (Self::OPUS, false)
         } else if m.contains("sonnet-5") {
-            (Self::SONNET, false)
+            (current_sonnet5(), false)
         } else if m.contains("sonnet-4") {
             (Self::SONNET_LEGACY, false)
         } else {
-            (Self::SONNET, true)
+            (current_sonnet5(), true)
         }
     }
+}
+
+/// Normalization anchor for quota units: 1 unit == 1 Sonnet-5 uncached input
+/// token at the introductory ($2/MTok) rate. A FIXED unit definition, not the
+/// live price -- so post-2026-09-01 Sonnet-5 input (at $3) correctly costs 1.5
+/// quota units per token, reflecting its genuinely higher quota weight.
+const SONNET5_INPUT_ANCHOR_PER_MTOK: f64 = 2.00;
+
+/// Subscription "quota units" for a priced turn, normalized to the Sonnet-5
+/// input anchor. Anthropic's usage windows weight tokens roughly like price
+/// (cache reads cheap, output heaviest, higher tiers heavier), so we reuse the
+/// per-tier price ratios as quota weights. This is the subscription-side
+/// analogue of `TurnCost::usd` for the Prolonged-Session Stack.
+pub fn quota_units(tc: &TurnCost, prices: &PriceTable) -> f64 {
+    let w = |per_mtok: f64| per_mtok / SONNET5_INPUT_ANCHOR_PER_MTOK;
+    tc.uncached_in as f64 * w(prices.input_per_mtok)
+        + tc.cache_write as f64 * w(prices.cache_write_5m_per_mtok)
+        + tc.cache_read as f64 * w(prices.cache_read_per_mtok)
+        + tc.output as f64 * w(prices.output_per_mtok)
 }
 
 /// The token/dollar breakdown of a single API turn.
@@ -145,6 +205,95 @@ pub fn turn_cost(model: &str, usage: &Value) -> Option<TurnCost> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- P0 (Prolonged-Session Stack): pricing + quota ledger ------------
+
+    fn sonnet5_intro_table() -> PriceTable {
+        PriceTable {
+            input_per_mtok: 2.00,
+            cache_write_5m_per_mtok: 2.50,
+            cache_read_per_mtok: 0.20,
+            output_per_mtok: 10.00,
+        }
+    }
+
+    #[test]
+    fn fable_5_is_priced_first_class_not_estimated() {
+        let (p, estimated) = PriceTable::for_model("claude-fable-5");
+        assert!(!estimated, "fable-5 must be a known model, not an estimate");
+        assert!((p.input_per_mtok - 10.00).abs() < 1e-9);
+        assert!((p.output_per_mtok - 50.00).abs() < 1e-9);
+        assert!((p.cache_read_per_mtok - 1.00).abs() < 1e-9);
+        // mythos-5 shares Fable's rate
+        let (pm, em) = PriceTable::for_model("claude-mythos-5");
+        assert!(!em);
+        assert_eq!(pm, p);
+    }
+
+    #[test]
+    fn sonnet5_pricing_is_date_aware_across_the_sep_2026_change() {
+        // 2026-08-31 23:59:59 UTC vs 2026-09-01 00:00:00 UTC
+        let before = PriceTable::for_model_at("claude-sonnet-5", 1_788_220_799);
+        let after = PriceTable::for_model_at("claude-sonnet-5", 1_788_220_800);
+        assert!(!before.1 && !after.1, "sonnet-5 is a known model either side");
+        assert!((before.0.input_per_mtok - 2.00).abs() < 1e-9);
+        assert!((after.0.input_per_mtok - 3.00).abs() < 1e-9);
+        assert!((after.0.output_per_mtok - 15.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quota_units_normalize_sonnet5_anchor_input_to_one() {
+        // 1M Sonnet-5 (intro-rate) uncached input tokens == 1_000_000 units.
+        let tc = TurnCost {
+            uncached_in: 1_000_000,
+            cache_write: 0,
+            cache_read: 0,
+            output: 0,
+            usd: 0.0,
+            estimated: false,
+        };
+        let u = quota_units(&tc, &sonnet5_intro_table());
+        assert!((u - 1_000_000.0).abs() < 1e-6, "got {u}");
+    }
+
+    #[test]
+    fn quota_units_weight_output_heaviest() {
+        let s = sonnet5_intro_table();
+        let out = TurnCost {
+            uncached_in: 0,
+            cache_write: 0,
+            cache_read: 0,
+            output: 1000,
+            usd: 0.0,
+            estimated: false,
+        };
+        let inp = TurnCost {
+            uncached_in: 1000,
+            cache_write: 0,
+            cache_read: 0,
+            output: 0,
+            usd: 0.0,
+            estimated: false,
+        };
+        assert!(quota_units(&out, &s) > quota_units(&inp, &s));
+    }
+
+    #[test]
+    fn quota_units_post_sep_sonnet5_input_costs_one_and_a_half_units() {
+        // Post-Sep Sonnet-5 input is $3/MTok; against the fixed $2 anchor that
+        // is 1.5 units/token -- the higher real quota weight is preserved.
+        let (post, _) = PriceTable::for_model_at("claude-sonnet-5", 1_788_220_800);
+        let tc = TurnCost {
+            uncached_in: 1_000_000,
+            cache_write: 0,
+            cache_read: 0,
+            output: 0,
+            usd: 0.0,
+            estimated: false,
+        };
+        let u = quota_units(&tc, &post);
+        assert!((u - 1_500_000.0).abs() < 1e-6, "got {u}");
+    }
 
     #[test]
     fn turn_cost_prices_all_four_fields_sonnet() {

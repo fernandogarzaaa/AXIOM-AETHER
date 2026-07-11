@@ -59,6 +59,7 @@ async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiEr
         let cache_read = LIFETIME_CACHE_READ_TOKENS.load(Ordering::Relaxed);
         let cache_write = LIFETIME_CACHE_WRITE_TOKENS.load(Ordering::Relaxed);
         let uncached_in = LIFETIME_UNCACHED_INPUT_TOKENS.load(Ordering::Relaxed);
+        let quota_units = LIFETIME_QUOTA_UNITS_MICROS.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         rendered.push_str(&format!(
             "# HELP axiom_cost_usd_total Lifetime dollar-true cost of proxied API turns.\n\
              # TYPE axiom_cost_usd_total counter\naxiom_cost_usd_total {cost_usd:.6}\n\
@@ -66,7 +67,9 @@ async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiEr
              # TYPE axiom_cost_uncached_usd_total counter\naxiom_cost_uncached_usd_total {uncached_usd:.6}\n\
              # TYPE axiom_cache_read_tokens_total counter\naxiom_cache_read_tokens_total {cache_read}\n\
              # TYPE axiom_cache_write_tokens_total counter\naxiom_cache_write_tokens_total {cache_write}\n\
-             # TYPE axiom_uncached_input_tokens_total counter\naxiom_uncached_input_tokens_total {uncached_in}\n"
+             # TYPE axiom_uncached_input_tokens_total counter\naxiom_uncached_input_tokens_total {uncached_in}\n\
+             # HELP axiom_quota_units_total Lifetime subscription quota units (1 unit = 1 Sonnet-5 intro-rate uncached input token).\n\
+             # TYPE axiom_quota_units_total counter\naxiom_quota_units_total {quota_units:.6}\n"
         ));
     }
     Ok((
