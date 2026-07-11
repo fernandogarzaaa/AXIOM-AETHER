@@ -56,6 +56,7 @@ pub mod prime;
 pub mod provenance;
 pub mod q_manifold;
 pub mod quantization;
+pub mod rebase;
 pub mod responses_compressor;
 pub mod sandbox;
 pub mod search_ingest;
