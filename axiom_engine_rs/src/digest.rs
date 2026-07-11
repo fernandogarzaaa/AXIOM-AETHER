@@ -6,9 +6,11 @@
 //! cached), replace heavy content with a digest + stub; the full text goes
 //! to the L2 store (`cvm_store`). Cache-safe by construction (S1 froze the
 //! prefix) and needs no determinism trick: the digest is created exactly
-//! once and then it IS the history. Default off
-//! (`AXIOM_CVM_DIGEST=off`) until S5 passes. See
-//! docs/superpowers/plans/2026-07-10-cvm-cost-stack.md, step S3.
+//! once and then it IS the history. Defaults to `skeleton` since S5's live
+//! eval passed on 2026-07-11 (12/12 -> 11/12 correctness, 0% fault rate,
+//! cost strictly lower); `AXIOM_CVM_DIGEST=off` opts back out. See
+//! docs/superpowers/plans/2026-07-10-cvm-cost-stack.md, step S3, and
+//! bench/cvm/RESULTS-2026-07-11.md.
 
 use std::fs::OpenOptions;
 use std::io::Write;

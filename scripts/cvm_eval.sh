@@ -14,13 +14,16 @@
 #   ./scripts/cvm_eval.sh
 #
 # Requires: a release build of axiom_engine, the `claude` CLI on PATH and
-# already authenticated, jq. Never run this in CI or unattended -- it is a
-# human-gated, deliberately manual step.
+# already authenticated, curl. Never run this in CI or unattended -- it is
+# a human-gated, deliberately manual step.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE_DIR="$REPO/axiom_engine_rs"
-BIN="$ENGINE_DIR/target/release/axiom_engine"
+# AXIOM_EVAL_BIN lets an operator point at an alternate build (e.g. one in
+# an isolated CARGO_TARGET_DIR) instead of the default release path -- handy
+# when a live proxy process already holds that default binary open.
+BIN="${AXIOM_EVAL_BIN:-$ENGINE_DIR/target/release/axiom_engine}"
 DATE_TAG="$(date +%Y-%m-%d)"
 BENCH_DIR="$REPO/bench/cvm"
 REPORT="$BENCH_DIR/RESULTS-$DATE_TAG.md"
@@ -46,7 +49,7 @@ fi
 [ -x "$BIN" ] || { echo "no release binary at $BIN"; exit 1; }
 
 command -v claude >/dev/null 2>&1 || { echo "claude CLI not found on PATH"; exit 1; }
-command -v jq >/dev/null 2>&1 || { echo "jq not found on PATH"; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "curl not found on PATH"; exit 1; }
 
 mkdir -p "$BENCH_DIR"
 
