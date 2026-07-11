@@ -47,6 +47,10 @@ learn safely (`belief.rs`, `provenance.rs`, `/v1/immunity`).
 
 **Inference / compression:** `/v1/messages`, `/v1/responses`, `/v1/chat/completions`,
 `/v1/completions`, `/v1/models`, `/v1/adapt`, `/v1/expand`, `/v1/config`, `/metrics`.
+**CVM cost stack:** `/v1/awareness/:id` (dollar-true cost summary, cache hit rate),
+`/v1/prefix-diet/report/:session_id` (last request's dedup stats, `AXIOM_PREFIX_DEDUP=1`
+only). `/v1/expand` also resolves `AXIOM-PAGE` ids from digest admission control (S3),
+not just skeleton symbol names.
 **TTT sessions:** `/v1/sessions[/:id[/checkpoint]]`, `/v1/ttt/sessions[/:id]`, `/v1/ttt/feedback`.
 **Grounding:** `/v1/verify` (modes: lexical, `neural:true`, `expand:true`).
 **Swarm immunity / fleet:** `/v1/fleet/status`, `/v1/immunity` (signed export), `/v1/immunity/merge` (verify-before-trust), `/v1/cluster/sync`, `/v1/cluster/merge`; `/metrics` exports `axiom_dwe_sent`, `axiom_dwe_received`, `axiom_dwe_applied`, and `axiom_dwe_rejected`.
@@ -75,6 +79,13 @@ learn safely (`belief.rs`, `provenance.rs`, `/v1/immunity`).
 | `AXIOM_VERIFY_RESPONSES` | Opt-in auto grounding-verification of responses. |
 | `AXIOM_SWARM_LOCAL` + `AXIOM_OLLAMA_*` | Ollama-first local routing. |
 | `AXIOM_DRIFT_THRESHOLD` | Drift gate (auto-set by `eval_model`). |
+| `AXIOM_CACHE_SAFE` | CVM cache-safety hardening; `0` disables (default `1`). |
+| `AXIOM_CVM_DIGEST` | CVM digest admission control: `off` / `skeleton` (default) / `haiku`. |
+| `AXIOM_CVM_DIGEST_THRESHOLD_TOKENS` | Token threshold before a `tool_result` block is digested (default `4000`). |
+| `AXIOM_PREFIX_DEDUP` | CVM lossless system-prefix dedup; `1` enables (default `0` — measured 0% real gain so far). |
+| `AXIOM_CVM_DIR` | CVM L2 store root (default `checkpoints/cvm`). |
+| `AXIOM_CVM_RETAIN` | `1` keeps a session's CVM store file after session drop (default: deleted). |
+| `AXIOM_KEEPALIVE` | CVM actuarial cache-refresh pings; `1` enables. Default `0` forever unless explicitly opted in — replays your own credentials on a timer. |
 
 ---
 
@@ -85,6 +96,7 @@ learn safely (`belief.rs`, `provenance.rs`, `/v1/immunity`).
 - **SR-TTT** (`surprisal.rs`) — exact residual cache for high-surprisal identifiers (secrets/hashes).
 - **DWE** (`dwe.rs`, `server/routes_fleet.rs`) — binary `W̃`-delta exchange between peers, HMAC authenticated, replay guarded, and observable through live counters/status.
 - **AxiomBench** (`src/bin/axiombench/`) — reproducible cognition, trust, fleet, and live cost evidence; `RESULTS.md` carries the current headline table.
+- **CVM cost stack** (`cache_safety.rs`, `cvm_store.rs`, `digest.rs`, `prefix_diet.rs`, `keepalive.rs`, `cost_ledger.rs`) — dollar-true cost reduction for `/v1/messages` traffic: never rewrites bytes at/before a client cache breakpoint, digests heavy tool results into a recoverable content-addressed store, and tracks real USD cost (not byte counts) per session. Design + measured-vs-simulated status: [`docs/superpowers/plans/2026-07-10-cvm-cost-stack.md`](superpowers/plans/2026-07-10-cvm-cost-stack.md), README's [CVM Cost Stack](../README.md#cvm-cost-stack) section.
 - **Hypervisor** — Neural VFS (`vfs.rs`), Poly JIT source repair (`poly_jit.rs`) ranked by a Q-TTT simulator (`q_manifold.rs`, `hamiltonian.rs`), compile-check sandbox (`sandbox.rs`).
 - **Training** — `train_tokenizer`, `train_semantic` (early-stopping on held-out CE), `eval_model` (acceptance + drift-gate calibration); `scripts/train_cpu_quickstart.sh`.
 
