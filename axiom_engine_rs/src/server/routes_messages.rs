@@ -171,11 +171,43 @@ async fn compressed_messages_path(
     } else {
         0
     };
-    let (frozen_messages, mutable_messages): (Vec<Value>, Vec<Value>) = if frozen_len > 0 {
+    let (frozen_messages, mut mutable_messages): (Vec<Value>, Vec<Value>) = if frozen_len > 0 {
         (messages[..frozen_len].to_vec(), messages[frozen_len..].to_vec())
     } else {
         (Vec::new(), messages.clone())
     };
+    // P2 (PSS) R2 free-window rebasing. When the client's prompt cache is
+    // already broken this turn -- detected as a change in the frozen prefix vs
+    // the session's previous turn (compaction / session restructure) -- the
+    // whole prefix is re-written at the premium rate regardless. In exactly
+    // that window we restructure every OLD heavy `tool_result` into a stub + L2
+    // page at zero *marginal* cache cost, shrinking every FUTURE turn's re-read.
+    // Never proxy-initiated: it only piggybacks on a break the client caused.
+    // Default off (AXIOM_REBASE_ON_BREAK=on) until the live eval passes.
+    if std::env::var("AXIOM_REBASE_ON_BREAK").as_deref() == Ok("on") {
+        let frozen_hash = {
+            use sha2::{Digest, Sha256};
+            let bytes = serde_json::to_vec(&frozen_messages).unwrap_or_default();
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        if state.pss_detect_break(&session_id, &frozen_hash) && mutable_messages.len() > 1 {
+            let old_turns = mutable_messages.len() - 1;
+            // rebase_transcript does synchronous L2-store writes + digest work
+            // per old heavy turn, unbounded by transcript length -- offload it
+            // to a blocking thread so a break turn can't pin a Tokio worker.
+            let store = state.cvm_store.clone();
+            let sid = session_id.clone();
+            let msgs = std::mem::take(&mut mutable_messages);
+            mutable_messages = tokio::task::spawn_blocking(move || {
+                crate::rebase::rebase_transcript(&msgs, &store, &sid)
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("rebase task join failed: {e}")))?;
+            eprintln!(
+                "[axiom-pss] R2 rebase-on-break: session {session_id} restructured {old_turns} old turn(s)"
+            );
+        }
+    }
     // Freeze-on-first-send determinism: the TTT fingerprint pipeline is not
     // naturally deterministic across repeated calls (each call mutates live
     // session state -- confirmed empirically: identical input produces a
@@ -473,6 +505,27 @@ async fn compressed_messages_path(
                     deferred_count,
                     tools.len() - deferred_count,
                 );
+            }
+        }
+    }
+
+    // P2 (PSS) R3 adaptive cache TTL. Sessions with long thinking gaps keep
+    // losing the 5-minute prompt cache and re-paying the full write. Once a
+    // session's long-gap count crosses the threshold, elect Anthropic's 1-hour
+    // TTL (a one-time 2x write premium beats repeated 1.25x full re-writes) by
+    // annotating the newest `cache_control` breakpoint with `"ttl":"1h"`. This
+    // only ever ADDS a field to the final breakpoint block; it never reorders
+    // or removes content, so the cached prefix stays byte-stable. Default off
+    // (AXIOM_ADAPTIVE_TTL=on) until the live eval passes.
+    if std::env::var("AXIOM_ADAPTIVE_TTL").as_deref() == Ok("on") {
+        let count = state.pss_gap_tick(&session_id, unix_now(), 240);
+        if let Some(ttl) = crate::rebase::choose_ttl(count, 3) {
+            if let Some(msgs) = outbound.get_mut("messages").and_then(Value::as_array_mut) {
+                if crate::rebase::set_newest_cache_ttl(msgs, ttl) {
+                    eprintln!(
+                        "[axiom-pss] R3 adaptive-ttl: session {session_id} long_gaps={count} -> ttl={ttl}"
+                    );
+                }
             }
         }
     }
