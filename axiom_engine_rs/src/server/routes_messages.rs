@@ -192,8 +192,17 @@ async fn compressed_messages_path(
         };
         if state.pss_detect_break(&session_id, &frozen_hash) && mutable_messages.len() > 1 {
             let old_turns = mutable_messages.len() - 1;
-            mutable_messages =
-                crate::rebase::rebase_transcript(&mutable_messages, &state.cvm_store, &session_id);
+            // rebase_transcript does synchronous L2-store writes + digest work
+            // per old heavy turn, unbounded by transcript length -- offload it
+            // to a blocking thread so a break turn can't pin a Tokio worker.
+            let store = state.cvm_store.clone();
+            let sid = session_id.clone();
+            let msgs = std::mem::take(&mut mutable_messages);
+            mutable_messages = tokio::task::spawn_blocking(move || {
+                crate::rebase::rebase_transcript(&msgs, &store, &sid)
+            })
+            .await
+            .map_err(|e| ApiError::Internal(format!("rebase task join failed: {e}")))?;
             eprintln!(
                 "[axiom-pss] R2 rebase-on-break: session {session_id} restructured {old_turns} old turn(s)"
             );

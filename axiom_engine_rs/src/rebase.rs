@@ -79,8 +79,12 @@ fn tool_result_text(block: &Value) -> Option<String> {
             let text: String = parts
                 .iter()
                 .filter_map(|p| p.get("text").and_then(Value::as_str))
+                // Newline-separate parts so a multi-block content array (stdout
+                // + stderr, several file excerpts) keeps its boundaries: a bare
+                // join would run words together, corrupting both the token
+                // estimate and the "original" text persisted to the L2 store.
                 .collect::<Vec<_>>()
-                .join("");
+                .join("\n");
             (!text.is_empty()).then_some(text)
         }
         _ => None,
@@ -203,6 +207,19 @@ mod tests {
         assert_eq!(messages[1]["content"][1]["cache_control"]["ttl"], json!("1h"));
         // ...and the older breakpoint is left untouched.
         assert!(messages[0]["content"][0]["cache_control"].get("ttl").is_none());
+    }
+
+    #[test]
+    fn multipart_tool_result_is_joined_with_a_separator() {
+        // Two text parts whose words would run together under a bare join.
+        let block = json!({
+            "type":"tool_result","tool_use_id":"a",
+            "content":[{"type":"text","text":"alpha"},{"type":"text","text":"beta"}]
+        });
+        let text = tool_result_text(&block).unwrap();
+        assert_eq!(text, "alpha\nbeta", "parts keep a boundary");
+        // ...so the whitespace token estimate counts two tokens, not one.
+        assert_eq!(token_estimate(&text), 2);
     }
 
     #[test]
