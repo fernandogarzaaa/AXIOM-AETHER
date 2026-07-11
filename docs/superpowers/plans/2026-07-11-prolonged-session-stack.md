@@ -318,7 +318,7 @@ git add -A && git commit -m "feat(pss): P3 L-B local trivial-turn short-circuit"
 - Create: `axiom_engine_rs/src/model_router.rs`
 - Modify: `axiom_engine_rs/src/lib.rs` (`pub mod model_router;`)
 - Modify: `axiom_engine_rs/src/server/routes_messages.rs`
-- Modify: `axiom_engine_rs/src/session_awareness.rs` (`routed_turns`, `route_fallbacks`)
+- Modify: `axiom_engine_rs/src/session_awareness.rs` (`routed_turns`, `route_fallbacks`, `routed_quota_saved_units` — the quota units saved by each downgrade, = `quota_units(requested_tier) - quota_units(haiku)` for the turn; surfaced in `CostSummary` and the eval report so the live gate can attribute R1's contribution)
 - Test: `axiom_engine_rs/tests/model_router_proxy.rs` + inline
 
 **Interfaces:**
@@ -348,7 +348,7 @@ fn is_high_tier_matches_opus_and_fable_not_sonnet() {
 
 - [ ] **Step 2: Run to verify failure** — `cargo test --lib model_router 2>&1 | tail -20` → FAIL.
 
-- [ ] **Step 3: Implement.** `is_high_tier` = `m.contains("opus-4") || m.contains("fable-5") || m.contains("mythos-5")`. `route` returns `Some("claude-haiku-4-5")` only when `mechanical && cooldown==0 && model != haiku && (mode=="on" || (mode=="auto" && is_high_tier(model)))`; else `None`.
+- [ ] **Step 3: Implement.** First a Claude-provider guard: `is_claude(m) = m.contains("claude") || m.starts_with("opus-") || m.starts_with("sonnet-") || m.starts_with("haiku-") || m.starts_with("fable-") || m.starts_with("mythos-")` — the routable set is Anthropic Claude models ONLY, so an arbitrary id like `openai-fable-5` is never rewritten. `is_high_tier` = `is_claude(m) && (m.contains("opus-4") || m.contains("fable-5") || m.contains("mythos-5"))`. `route` returns `Some("claude-haiku-4-5")` only when `is_claude(model) && mechanical && cooldown==0 && !model.contains("haiku") && (mode=="on" || (mode=="auto" && is_high_tier(model)))`; else `None`. Add a test asserting `route("openai-fable-5", true, 0, "on") == None` (non-Claude never routed even in `on` mode).
 
 - [ ] **Step 4: Run to verify pass** — `cargo test --lib model_router` → PASS.
 

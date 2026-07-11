@@ -140,6 +140,16 @@ pub fn quota_units(tc: &TurnCost, prices: &PriceTable) -> f64 {
         + tc.output as f64 * w(prices.output_per_mtok)
 }
 
+/// Counterfactual quota units for a turn with zero caching: every cached token
+/// (read or write) is re-priced as a full uncached input token. The quota-side
+/// analogue of [`TurnCost::uncached_equivalent_usd`] -- the denominator for
+/// "how many quota units is caching / the CVM+PSS stack actually saving".
+pub fn quota_units_uncached(tc: &TurnCost, prices: &PriceTable) -> f64 {
+    let w = |per_mtok: f64| per_mtok / SONNET5_INPUT_ANCHOR_PER_MTOK;
+    let total_in = tc.uncached_in + tc.cache_write + tc.cache_read;
+    total_in as f64 * w(prices.input_per_mtok) + tc.output as f64 * w(prices.output_per_mtok)
+}
+
 /// The token/dollar breakdown of a single API turn.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TurnCost {
@@ -279,6 +289,24 @@ mod tests {
     }
 
     #[test]
+    fn quota_units_uncached_reprices_cached_tokens_as_full_input() {
+        let s = sonnet5_intro_table();
+        // 500k cache reads (cheap live) become full input in the counterfactual.
+        let tc = TurnCost {
+            uncached_in: 0,
+            cache_write: 0,
+            cache_read: 500_000,
+            output: 0,
+            usd: 0.0,
+            estimated: false,
+        };
+        // live: 500k * (0.20/2.00) = 50k units; uncached: 500k * (2.00/2.00) = 500k units.
+        assert!((quota_units(&tc, &s) - 50_000.0).abs() < 1e-6);
+        assert!((quota_units_uncached(&tc, &s) - 500_000.0).abs() < 1e-6);
+        assert!(quota_units_uncached(&tc, &s) > quota_units(&tc, &s));
+    }
+
+    #[test]
     fn quota_units_post_sep_sonnet5_input_costs_one_and_a_half_units() {
         // Post-Sep Sonnet-5 input is $3/MTok; against the fixed $2 anchor that
         // is 1.5 units/token -- the higher real quota weight is preserved.
@@ -337,9 +365,13 @@ mod tests {
         let usage = json!({ "input_tokens": 1000, "output_tokens": 100 });
         let tc = turn_cost("claude-super-6-hypothetical", &usage).unwrap();
         assert!(tc.estimated);
-        // Falls back to the CURRENT-era Sonnet rate (Sonnet 5, $2/MTok), not a
-        // stale hardcoded family rate -- see PriceTable::SONNET.
-        let expected = 1000.0 / 1e6 * 2.00 + 100.0 / 1e6 * 10.00;
+        // Falls back to the CURRENT-date Sonnet 5 rate (now date-aware across
+        // the 2026-09-01 change), so derive the expected cost from the same
+        // resolved table rather than hardcoding a rate that would break in CI
+        // after the price change.
+        let (prices, _) = PriceTable::for_model("claude-super-6-hypothetical");
+        let expected =
+            1000.0 / 1e6 * prices.input_per_mtok + 100.0 / 1e6 * prices.output_per_mtok;
         assert!((tc.usd - expected).abs() < 1e-9);
     }
 
@@ -347,7 +379,9 @@ mod tests {
     fn for_model_distinguishes_sonnet_5_from_legacy_sonnet_4_pricing() {
         // These two families have genuinely different real-world prices;
         // conflating them under one "contains sonnet" match was the bug.
-        let (sonnet5, est5) = PriceTable::for_model("claude-sonnet-5");
+        // Pin the date (epoch = pre-2026-09-01) so the intro-rate assertion
+        // stays deterministic after Sonnet 5's scheduled price change.
+        let (sonnet5, est5) = PriceTable::for_model_at("claude-sonnet-5", 0);
         assert!(!est5);
         assert!((sonnet5.input_per_mtok - 2.00).abs() < 1e-9);
 
