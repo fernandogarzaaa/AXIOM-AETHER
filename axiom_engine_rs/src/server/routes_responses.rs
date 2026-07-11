@@ -247,6 +247,14 @@ pub(crate) static LIFETIME_CACHE_WRITE_TOKENS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static LIFETIME_UNCACHED_INPUT_TOKENS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// P0 (Prolonged-Session Stack): lifetime subscription quota units consumed,
+/// stored as units x 1e6 so accumulation stays exact.
+pub(crate) static LIFETIME_QUOTA_UNITS_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// P0: lifetime counterfactual quota units with zero caching (the denominator
+/// for the stack's quota-savings ratio). Units x 1e6.
+pub(crate) static LIFETIME_QUOTA_UNITS_UNCACHED_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Record one priced API turn into the lifetime cost counters. Called
 /// alongside `AwarenessState::record_turn_cost` (the per-session view) so
@@ -258,11 +266,17 @@ pub(crate) fn record_lifetime_cost(
     use std::sync::atomic::Ordering;
     let micros = (tc.usd * 1_000_000.0).round() as u64;
     let uncached_micros = (tc.uncached_equivalent_usd(prices) * 1_000_000.0).round() as u64;
+    let quota_micros =
+        (crate::cost_ledger::quota_units(tc, prices) * 1_000_000.0).round() as u64;
+    let quota_uncached_micros =
+        (crate::cost_ledger::quota_units_uncached(tc, prices) * 1_000_000.0).round() as u64;
     LIFETIME_COST_USD_MICROS.fetch_add(micros, Ordering::Relaxed);
     LIFETIME_COST_UNCACHED_EQUIVALENT_USD_MICROS.fetch_add(uncached_micros, Ordering::Relaxed);
     LIFETIME_CACHE_READ_TOKENS.fetch_add(tc.cache_read, Ordering::Relaxed);
     LIFETIME_CACHE_WRITE_TOKENS.fetch_add(tc.cache_write, Ordering::Relaxed);
     LIFETIME_UNCACHED_INPUT_TOKENS.fetch_add(tc.uncached_in, Ordering::Relaxed);
+    LIFETIME_QUOTA_UNITS_MICROS.fetch_add(quota_micros, Ordering::Relaxed);
+    LIFETIME_QUOTA_UNITS_UNCACHED_MICROS.fetch_add(quota_uncached_micros, Ordering::Relaxed);
 }
 
 /// Accumulate a compression event into the per-session savings ledger and the

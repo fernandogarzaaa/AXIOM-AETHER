@@ -56,6 +56,11 @@ pub struct AwarenessState {
     digest_blocks: AtomicUsize,
     digest_bytes_in: AtomicUsize,
     digest_bytes_out: AtomicUsize,
+    /// P0 (Prolonged-Session Stack): subscription quota units consumed this
+    /// session (see `cost_ledger::quota_units`), stored as units x 1e6 in an
+    /// integer atomic so accumulation stays exact. The subscription-side
+    /// analogue of `cost_usd_micros`.
+    quota_units_micros: AtomicUsize,
 }
 
 /// A snapshot of a session's accumulated dollar-true cost, for `/metrics` and
@@ -85,6 +90,8 @@ pub struct CostSummary {
     pub digest_bytes_in: u64,
     /// S3: running total of bytes after digestion (stub + digest text).
     pub digest_bytes_out: u64,
+    /// P0 (PSS): subscription quota units consumed this session.
+    pub quota_units_total: f64,
 }
 
 impl CostSummary {
@@ -125,6 +132,7 @@ impl Default for AwarenessState {
             digest_blocks: AtomicUsize::new(0),
             digest_bytes_in: AtomicUsize::new(0),
             digest_bytes_out: AtomicUsize::new(0),
+            quota_units_micros: AtomicUsize::new(0),
         }
     }
 }
@@ -211,7 +219,17 @@ impl AwarenessState {
             digest_blocks: self.digest_blocks.load(Ordering::Relaxed) as u64,
             digest_bytes_in: self.digest_bytes_in.load(Ordering::Relaxed) as u64,
             digest_bytes_out: self.digest_bytes_out.load(Ordering::Relaxed) as u64,
+            quota_units_total: self.quota_units_micros.load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
         }
+    }
+
+    /// Record one priced turn's subscription quota units (P0/PSS). Pass the
+    /// value from `cost_ledger::quota_units` for this turn.
+    pub fn record_turn_quota(&self, units: f64) {
+        let micros = (units.max(0.0) * 1_000_000.0).round() as usize;
+        self.quota_units_micros
+            .fetch_add(micros, Ordering::Relaxed);
     }
 
     /// Record one request's prefix-diet dedup savings (S4).

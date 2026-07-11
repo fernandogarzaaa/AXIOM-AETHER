@@ -620,6 +620,7 @@ async fn compressed_messages_path(
                             let (prices, _) =
                                 crate::cost_ledger::PriceTable::for_model(&model_for_usage);
                             awareness.record_turn_cost(&tc, &prices);
+                            awareness.record_turn_quota(crate::cost_ledger::quota_units(&tc, &prices));
                             record_lifetime_cost(&tc, &prices);
                         }
                         collected_usage.clear();
@@ -681,10 +682,9 @@ async fn compressed_messages_path(
             .unwrap_or("claude-sonnet-4-6");
         if let Some(tc) = crate::cost_ledger::turn_cost(model, usage) {
             let (prices, _) = crate::cost_ledger::PriceTable::for_model(model);
-            state
-                .awareness
-                .get_or_create(&session_id)
-                .record_turn_cost(&tc, &prices);
+            let aware = state.awareness.get_or_create(&session_id);
+            aware.record_turn_cost(&tc, &prices);
+            aware.record_turn_quota(crate::cost_ledger::quota_units(&tc, &prices));
             record_lifetime_cost(&tc, &prices);
         }
     }
