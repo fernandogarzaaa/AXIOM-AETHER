@@ -191,7 +191,9 @@ async fn digest_replaces_heavy_tool_result_with_stub_and_original_is_expandable(
 #[tokio::test]
 async fn digest_flag_off_passes_bytes_through_unchanged() {
     let _guard = env_lock().lock().await;
-    std::env::remove_var("AXIOM_CVM_DIGEST"); // default: off
+    // AXIOM_CVM_DIGEST now defaults to "skeleton" (S5 passed 2026-07-11);
+    // "off" is an explicit opt-out, no longer the implicit unset state.
+    std::env::set_var("AXIOM_CVM_DIGEST", "off");
     let _cleanup = EnvVarGuard(&["AXIOM_CVM_DIGEST"]);
 
     let cvm_dir = cvm_tempdir("flag-off");
@@ -219,6 +221,43 @@ async fn digest_flag_off_passes_bytes_through_unchanged() {
         "flags off -> the original heavy tool_result must pass through unchanged"
     );
     assert!(!sent_str.contains("AXIOM-PAGE"));
+
+    let _ = fs::remove_dir_all(&cvm_dir);
+}
+
+#[tokio::test]
+async fn digest_default_unset_env_var_digests_since_skeleton_is_now_the_default() {
+    let _guard = env_lock().lock().await;
+    // No explicit AXIOM_CVM_DIGEST set -- must fall back to the new
+    // "skeleton" default (S5 passed 2026-07-11), not "off".
+    std::env::remove_var("AXIOM_CVM_DIGEST");
+    let _cleanup = EnvVarGuard(&["AXIOM_CVM_DIGEST"]);
+
+    let cvm_dir = cvm_tempdir("default-unset");
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream, &cvm_dir).await;
+    let app = create_router(state);
+
+    let heavy = heavy_tool_result_text();
+    let body = json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 16,
+        "session_id": "digest-default-unset",
+        "messages": [
+            {"role": "user", "content": "please read this file"},
+            tool_result_message(&heavy),
+        ],
+    });
+    let status = post_json(&app, "/v1/messages", body).await.0;
+    assert_eq!(status, StatusCode::OK);
+
+    let captured = capture.requests.lock().unwrap();
+    let sent_str = captured[0].to_string();
+    assert!(
+        !sent_str.contains("generated_function_1199"),
+        "default (unset AXIOM_CVM_DIGEST) must digest, not pass the original through"
+    );
+    assert!(sent_str.contains("AXIOM-PAGE"));
 
     let _ = fs::remove_dir_all(&cvm_dir);
 }

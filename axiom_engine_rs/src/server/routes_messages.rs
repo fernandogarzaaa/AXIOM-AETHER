@@ -402,10 +402,13 @@ async fn compressed_messages_path(
     // S3 (CVM cost stack) digest admission control: replace heavy
     // tool_result blocks in the newest turn (by definition after every
     // cache breakpoint, not yet cached) with a digest + stub; the full
-    // text goes to the L2 store. Default off (AXIOM_CVM_DIGEST=off) until
-    // S5 passes. See docs/superpowers/plans/2026-07-10-cvm-cost-stack.md.
+    // text goes to the L2 store. Default flipped to "skeleton" after S5's
+    // live eval passed on 2026-07-11 (12/12 -> 11/12 correctness, 0%
+    // fault rate, cost strictly lower) -- see
+    // docs/superpowers/plans/2026-07-10-cvm-cost-stack.md and
+    // bench/cvm/RESULTS-2026-07-11.md.
     let digest_mode =
-        std::env::var("AXIOM_CVM_DIGEST").unwrap_or_else(|_| "off".to_string());
+        std::env::var("AXIOM_CVM_DIGEST").unwrap_or_else(|_| "skeleton".to_string());
     if digest_mode != "off" {
         let threshold = std::env::var("AXIOM_CVM_DIGEST_THRESHOLD_TOKENS")
             .ok()
@@ -427,8 +430,14 @@ async fn compressed_messages_path(
     // prefix. Gated the same way as S1's compression -- only when the
     // client actually caches (dedup output is a pure function of input
     // bytes, so it stays byte-stable turn over turn, which is what makes it
-    // cache-safe without S1's determinism-memo mechanism). Default off
-    // (AXIOM_PREFIX_DEDUP=1 opt-in) until S5 flips it.
+    // cache-safe without S1's determinism-memo mechanism). Stays default
+    // off (AXIOM_PREFIX_DEDUP=1 opt-in) even after S5 passed (2026-07-11):
+    // S4 has its own, separate, already-measured abort criteria (0% real
+    // dedup gain on this machine's actual rule files, marked
+    // DONE-BUT-WEAK) that S5's generic correctness/safety pass does not
+    // override -- S5 is necessary but not sufficient for this specific
+    // flag. See docs/superpowers/plans/2026-07-10-cvm-cost-stack.md, S4's
+    // status annotation.
     if std::env::var("AXIOM_PREFIX_DEDUP").as_deref() == Ok("1") && uses_cache {
         if let Some(system) = outbound.get("system").cloned() {
             let (dieted, report) = crate::prefix_diet::diet_system_field(&system);

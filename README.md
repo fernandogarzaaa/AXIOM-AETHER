@@ -33,6 +33,7 @@ general answer-quality claims that are not proven by the repository.
 | Calibrated trust gate | `/v1/verify` ships a data-calibrated conformal threshold (calibrated on `bench/trust/claims.jsonl` at δ=0.10 for ≥90% coverage of genuinely supported claims), plus a neural contradiction-catch-rate benchmark. A `calibrate` request mode retunes it for your own labeled data. | `hallucination.rs`, `bench/trust/`, `server/routes_verify.rs` |
 | ChimeraLang DSL | In-tree Rust implementation of the [ChimeraLang](https://github.com/fernandogarzaaa/ChimeraLang) AI-cognition language: `belief/inquire/resolve/guard/evolve` programs run on the same `BetaBelief` + provenance substrate, with tamper-evident run certificates. | `chimera.rs`, CLI `axiom chimera`, `/v1/chimera/run` |
 | Search ingestion node | Scrapes web pages, ingests text through local TTT, and emits an Axiom fingerprint for downstream use. | `src/bin/search_node.rs`, `search_scrape.rs`, `search_ingest.rs` |
+| CVM cost stack | Reduces real dollar cost of proxied `/v1/messages` traffic: cache-safety hardening (never rewrites bytes at/before a client `cache_control` breakpoint), a content-addressed L2 store with recoverable stubs, and digest admission control for heavy tool results. **On by default** (`AXIOM_CVM_DIGEST=skeleton`); dollar-true cost telemetry via `/metrics` and `GET /v1/awareness/:id`. See [CVM Cost Stack](#cvm-cost-stack) below. | `cache_safety.rs`, `cvm_store.rs`, `digest.rs`, `cost_ledger.rs`, `server/routes_messages.rs` |
 
 For a compact index of surfaces, see [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md).
 For research upgrades and what is still planned, see [`docs/UPGRADES.md`](docs/UPGRADES.md).
@@ -77,6 +78,43 @@ supported by the context you provide. They do not prove external truth. The
 search node ingests live web text, but it is a local ingestion primitive, not a
 replacement for source review. Compression benchmarks report token savings and
 round-trip behavior; answer-quality gains require separate upstream evaluation.
+
+## CVM Cost Stack
+
+Context Virtual Memory (CVM) is the proxy's cost-reduction design: treat the
+provider's own prompt cache as L1 and Axiom's local content-addressed store as
+L2, and never pay to rewrite bytes the client has already cached. Full design
+notes and the construction blueprint live at
+[`docs/superpowers/plans/2026-07-10-cvm-cost-stack.md`](docs/superpowers/plans/2026-07-10-cvm-cost-stack.md).
+
+| Flag | Default | What it does |
+|---|---|---|
+| `AXIOM_CACHE_SAFE` | **1** | Never mutates message content at or before a client `cache_control` breakpoint. |
+| `AXIOM_CVM_DIGEST` | **`skeleton`** | Replaces heavy `tool_result` blocks in the newest turn with a code-aware digest + a recoverable stub (`axiom_expand`/`POST /v1/expand` returns the original verbatim). Set `off` to disable, `haiku` to summarize with a real Claude Haiku call (bills your account). |
+| `AXIOM_CVM_DIGEST_THRESHOLD_TOKENS` | **4000** | Minimum token estimate before a `tool_result` block is digested. |
+| `AXIOM_PREFIX_DEDUP` | **0** | Lossless dedup of byte-identical repeated blocks in the system prefix. Off by default: measured 0% real gain on this machine's actual rule files (see below) — shipped but not proven valuable yet. |
+| `AXIOM_KEEPALIVE` | **0** | Actuarial cache-refresh pings to survive the 5-minute cache TTL between turns. Off by default forever unless you opt in — it replays your own API credentials on a timer; read `axiom_engine_rs/src/keepalive.rs` before enabling. |
+
+**What is measured vs simulated.** The construction blueprint was derived from a
+4,000-session Monte-Carlo simulation projecting ≥70% cost reduction vs an
+uncached baseline. That number is a *simulation*, not a measurement. The only
+*real* measurements so far:
+
+- **S5 behavior eval** (`bench/cvm/RESULTS-2026-07-11.md`, 12 tasks, live
+  `claude -p --model claude-haiku-4-5` traffic): 12/12 → 11/12 correctness,
+  0% fault rate, cost \$0.931330 → \$0.874596 (~6% reduction). This is a small
+  correctness/safety gate, not a measurement of the full cost model — it ran
+  short single-fact lookups, not real Claude Code session traffic.
+- **S4 prefix-diet**, measured against this machine's actual `~/.claude` rule
+  files (30 distinct files, no natural duplication): 0% gain. The mechanism
+  itself is verified correct (32% reduction in a constructed
+  duplicate-injection scenario), but real yield depends on whether a given
+  setup actually duplicates content, which this machine's did not.
+
+The real, whole-system number (`1 − axiom_cost_usd_total / axiom_cost_uncached_usd_total`
+from `/metrics`, over a full week of real traffic) has not been published yet.
+Until it is, treat the 70%+ figure as the design target the simulation
+motivated, not a result.
 
 ## Quick Start
 

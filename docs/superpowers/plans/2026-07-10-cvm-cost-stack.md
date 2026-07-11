@@ -93,9 +93,9 @@ S5 and S7 want the strongest available model; S0–S4, S6, S8 are Sonnet-5 sized
 |---|---|---|---|
 | `AXIOM_COST_TELEMETRY` | 0/1 | **1** | — (always safe) |
 | `AXIOM_CACHE_SAFE` | 0/1 | **1** | — (S1; stops prefix-mutating compression for cache-bearing clients) |
-| `AXIOM_CVM_DIGEST` | `off`/`skeleton`/`haiku` | **off** | S5 pass → `skeleton` |
+| `AXIOM_CVM_DIGEST` | `off`/`skeleton`/`haiku` | **skeleton** | S5 pass (2026-07-11) → `skeleton` |
 | `AXIOM_CVM_DIGEST_THRESHOLD_TOKENS` | int | **4000** | — |
-| `AXIOM_PREFIX_DEDUP` | 0/1 | **0** | S5 pass → 1 |
+| `AXIOM_PREFIX_DEDUP` | 0/1 | **0** | S5 passed but did NOT flip this -- S4's own separate 0%-real-gain abort criteria still applies (S5 is necessary, not sufficient, for this flag) |
 | `AXIOM_KEEPALIVE` | 0/1 | **0** | never auto (security: S6) |
 | `AXIOM_CVM_PREFETCH` | 0/1 | **0** | S7's own eval |
 
@@ -365,6 +365,26 @@ cheap (Haiku).
 **Acceptance.** Harness runs end-to-end on this machine; report has real numbers;
 defaults flipped only on pass. On FAIL: file per-task issues, leave defaults off, mark
 S3/S4 "shipped, gated-off" here.
+
+### S5 status: PASS (2026-07-11)
+
+Live run against real Anthropic traffic (`claude -p --model claude-haiku-4-5`), 12 tasks,
+both conditions in fresh proxy processes. Full report: `bench/cvm/RESULTS-2026-07-11.md`.
+
+| Metric | Flags off | Flags on | Pass bar | Result |
+|---|---|---|---|---|
+| Correctness | 12/12 | 11/12 | flags-on ≥ flags-off − 1 | PASS |
+| Fault rate | — | 0.00% (0/56) | ≤ 5% | PASS |
+| Cost | \$0.931330 | \$0.874596 | flags-on strictly lower | PASS |
+
+`AXIOM_CVM_DIGEST` default flipped to `skeleton`. `AXIOM_PREFIX_DEDUP` default was
+**intentionally left at 0** despite this pass: S4 has its own separate, already-measured
+abort criteria (0% real dedup gain on this machine's actual rule files, marked
+DONE-BUT-WEAK) that this generic correctness/safety pass does not override — S5 is
+necessary but not sufficient for that specific flag. The 12-task eval's ~6% aggregate
+cost reduction is far below the 71.5% simulated figure; this eval measures
+correctness/safety at small scale, not the full cost model, which requires the
+"Verification of the whole" step after S8.
 
 ---
 
