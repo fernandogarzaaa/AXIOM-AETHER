@@ -307,6 +307,18 @@ pub struct AppState {
     /// S3: turn number at which each `(session_id, page_id)` was digested,
     /// for the `turns_since_digest` fault computation above.
     digest_page_turn: Arc<RwLock<HashMap<(String, String), u64>>>,
+    /// P2 (PSS) R2 break detection: last frozen-prefix hash per session. A
+    /// changed hash across turns means the client's prompt cache was already
+    /// invalidated this turn (compaction / session restructure) -- the free
+    /// window in which `rebase_transcript` restructures old turns at zero
+    /// marginal cache cost. See
+    /// docs/superpowers/plans/2026-07-11-prolonged-session-stack.md, step P2.
+    pss_prefix_hash: Arc<RwLock<HashMap<String, String>>>,
+    /// P2 (PSS) R3 adaptive TTL: `(last_turn_unix, long_gap_count)` per
+    /// session. A gap longer than the 5-minute cache TTL increments the count;
+    /// once it crosses a threshold, `rebase::choose_ttl` elects the 1-hour
+    /// cache TTL (a one-time write premium beats repeated full re-writes).
+    pss_gap: Arc<RwLock<HashMap<String, (u64, u32)>>>,
     /// Runtime-mutable compression controls + live counters. Lets a dashboard
     /// retune the threshold / on-off without a restart (`/v1/config`).
     pub controls: Arc<CompressionControls>,
@@ -370,6 +382,8 @@ impl AppState {
             prefix_diet_last: Arc::new(RwLock::new(HashMap::new())),
             digest_turn: Arc::new(RwLock::new(HashMap::new())),
             digest_page_turn: Arc::new(RwLock::new(HashMap::new())),
+            pss_prefix_hash: Arc::new(RwLock::new(HashMap::new())),
+            pss_gap: Arc::new(RwLock::new(HashMap::new())),
             controls: Arc::new(CompressionControls::from_config(
                 &CompressorConfig::default(),
             )),
@@ -547,6 +561,46 @@ impl AppState {
             .and_then(|m| m.get(session_id).copied())
             .unwrap_or(0);
         current_turn.saturating_sub(created_turn)
+    }
+
+    /// P2 (PSS) R2: returns `true` iff a cache break is detected for
+    /// `session_id` -- a previous frozen-prefix hash exists and differs from
+    /// `frozen_hash` (the client's prompt cache was already invalidated this
+    /// turn). Always records `frozen_hash` as the session's latest. The first
+    /// turn of a session is never a break (nothing older to rebase).
+    pub(crate) fn pss_detect_break(&self, session_id: &str, frozen_hash: &str) -> bool {
+        let Ok(mut map) = self.pss_prefix_hash.write() else {
+            return false;
+        };
+        if map.len() >= 512 {
+            map.clear();
+        }
+        let prev = map.insert(session_id.to_string(), frozen_hash.to_string());
+        matches!(prev, Some(p) if p != frozen_hash)
+    }
+
+    /// P2 (PSS) R3: record this turn's timestamp for `session_id` and return
+    /// the running long-gap count. A gap longer than `gap_threshold_secs` since
+    /// the previous turn (the 5-minute cache TTL window) increments the count.
+    /// The first turn seeds the timestamp without incrementing.
+    pub(crate) fn pss_gap_tick(
+        &self,
+        session_id: &str,
+        now_unix: u64,
+        gap_threshold_secs: u64,
+    ) -> u32 {
+        let Ok(mut map) = self.pss_gap.write() else {
+            return 0;
+        };
+        if map.len() >= 512 {
+            map.clear();
+        }
+        let entry = map.entry(session_id.to_string()).or_insert((now_unix, 0));
+        let (last_ts, count) = *entry;
+        let new_count =
+            crate::rebase::next_long_gap_count(last_ts, now_unix, count, gap_threshold_secs);
+        *entry = (now_unix, new_count);
+        new_count
     }
 
     async fn adapt_feedback_to_cache(

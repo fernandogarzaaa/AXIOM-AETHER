@@ -29,6 +29,44 @@ pub fn choose_ttl(long_gap_count: u32, threshold: u32) -> Option<&'static str> {
     (long_gap_count >= threshold).then_some("1h")
 }
 
+/// Given the previous turn's unix timestamp and running long-gap count, return
+/// the updated count after a turn at `now_unix`: a gap longer than
+/// `gap_threshold_secs` (the 5-minute cache window) increments it. A `last_ts`
+/// of `0` (an unseeded session) never counts as a gap.
+pub fn next_long_gap_count(
+    last_ts: u64,
+    now_unix: u64,
+    count: u32,
+    gap_threshold_secs: u64,
+) -> u32 {
+    if last_ts > 0 && now_unix.saturating_sub(last_ts) > gap_threshold_secs {
+        count + 1
+    } else {
+        count
+    }
+}
+
+/// Annotate the newest cache breakpoint with an explicit `ttl`. Walks
+/// `messages` from the end and, in the first message whose content array holds
+/// a block carrying a `cache_control` object, sets `cache_control.ttl = ttl` on
+/// the last such block. Returns `true` if a breakpoint was found and updated.
+/// Only ever ADDS a field -- content, order, and count are untouched -- so the
+/// cached prefix stays byte-stable.
+pub fn set_newest_cache_ttl(messages: &mut [Value], ttl: &str) -> bool {
+    for msg in messages.iter_mut().rev() {
+        let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content.iter_mut().rev() {
+            if let Some(cc) = block.get_mut("cache_control").and_then(Value::as_object_mut) {
+                cc.insert("ttl".to_string(), Value::String(ttl.to_string()));
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Flatten a `tool_result` block's own `content` (which is independently a
 /// string or an array of text blocks) to plain text.
 fn tool_result_text(block: &Value) -> Option<String> {
@@ -149,6 +187,40 @@ mod tests {
         assert_eq!(choose_ttl(2, 3), None);
         assert_eq!(choose_ttl(3, 3), Some("1h"));
         assert_eq!(choose_ttl(9, 3), Some("1h"));
+    }
+
+    #[test]
+    fn set_newest_cache_ttl_annotates_only_the_last_breakpoint() {
+        let mut messages = vec![
+            json!({"role":"user","content":[
+                {"type":"text","text":"old","cache_control":{"type":"ephemeral"}}]}),
+            json!({"role":"user","content":[
+                {"type":"text","text":"a"},
+                {"type":"text","text":"newest","cache_control":{"type":"ephemeral"}}]}),
+        ];
+        assert!(set_newest_cache_ttl(&mut messages, "1h"));
+        // newest breakpoint gets the ttl...
+        assert_eq!(messages[1]["content"][1]["cache_control"]["ttl"], json!("1h"));
+        // ...and the older breakpoint is left untouched.
+        assert!(messages[0]["content"][0]["cache_control"].get("ttl").is_none());
+    }
+
+    #[test]
+    fn next_long_gap_count_increments_only_past_the_window() {
+        // Unseeded session never counts, even with a huge apparent gap.
+        assert_eq!(next_long_gap_count(0, 10_000, 0, 240), 0);
+        // A short gap (< 240s) does not increment.
+        assert_eq!(next_long_gap_count(1_000, 1_100, 2, 240), 2);
+        // A gap over the window increments once.
+        assert_eq!(next_long_gap_count(1_000, 1_500, 2, 240), 3);
+        // Exactly at the boundary does not increment (strictly greater).
+        assert_eq!(next_long_gap_count(1_000, 1_240, 0, 240), 0);
+    }
+
+    #[test]
+    fn set_newest_cache_ttl_is_false_without_a_breakpoint() {
+        let mut messages = vec![json!({"role":"user","content":[{"type":"text","text":"no cc"}]})];
+        assert!(!set_newest_cache_ttl(&mut messages, "1h"));
     }
 
     #[test]
