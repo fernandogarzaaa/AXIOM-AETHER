@@ -39,8 +39,19 @@
 ```rust
 #[test]
 fn fable_5_is_priced_first_class_not_estimated() {
-    let (_, estimated) = PriceTable::for_model("claude-fable-5");
+    let (p, estimated) = PriceTable::for_model("claude-fable-5");
     assert!(!estimated, "fable-5 must be a known model, not an estimate");
+    assert_eq!(p.input_per_mtok, 10.00); // real Anthropic rate, verified 2026-07
+    assert_eq!(p.output_per_mtok, 50.00);
+}
+
+#[test]
+fn sonnet5_pricing_is_date_aware_across_the_sep_2026_change() {
+    use chrono::TimeZone; // or std date shim per repo convention
+    let before = PriceTable::for_model_at("claude-sonnet-5", date(2026, 8, 31));
+    let after  = PriceTable::for_model_at("claude-sonnet-5", date(2026, 9, 1));
+    assert_eq!(before.0.input_per_mtok, 2.00);
+    assert_eq!(after.0.input_per_mtok, 3.00);
 }
 
 #[test]
@@ -68,18 +79,27 @@ fn quota_units_weight_output_heaviest() {
 Run: `cargo test --lib cost_ledger 2>&1 | tail -20`
 Expected: FAIL — `for_model("claude-fable-5")` returns `estimated=true`; `quota_units` not defined.
 
-- [ ] **Step 3: Implement.** Add `FABLE` (Fable 5 is Mythos-class, above Opus; set to the real published Fable-5 per-MTok rate — confirm before merge, do not leave a placeholder) and extend `for_model` (fable arm BEFORE the opus/sonnet arms):
+- [ ] **Step 3: Implement.** Add `FABLE` with the **real** Anthropic-published rate (verified 2026-07 via deep-research: input $10, 5m-write $12.50, cache-read $1, output $50) and extend `for_model` (fable arm BEFORE the opus/sonnet arms):
 
 ```rust
 const FABLE: PriceTable = PriceTable {
-    input_per_mtok: 6.00, cache_write_5m_per_mtok: 7.50,
-    cache_read_per_mtok: 0.60, output_per_mtok: 30.00,
+    input_per_mtok: 10.00, cache_write_5m_per_mtok: 12.50,
+    cache_read_per_mtok: 1.00, output_per_mtok: 50.00,
 };
 // in for_model:
 } else if m.contains("fable-5") || m.contains("mythos-5") {
     (Self::FABLE, false)
 } else if m.contains("opus-4") {
     (Self::OPUS, false)
+```
+
+Also make Sonnet-5 **date-aware**: Anthropic raises Sonnet-5 pricing on 2026-09-01 (input $2→$3, 5m-write $2.50→$3.75, cache-read $0.20→$0.30, output $10→$15). Add a `SONNET5_POST_SEP2026` const and select it in `for_model` when the system clock is ≥ 2026-09-01 (UTC). Add a unit test that asserts the boundary both sides (mock the date via an injectable `now` param on a private `for_model_at(model, date)` so the public `for_model` stays a thin wrapper — keeps the test deterministic, no clock dependency in CI):
+
+```rust
+const SONNET5_POST_SEP2026: PriceTable = PriceTable {
+    input_per_mtok: 3.00, cache_write_5m_per_mtok: 3.75,
+    cache_read_per_mtok: 0.30, output_per_mtok: 15.00,
+};
 ```
 
 Module-level quota fn:
@@ -111,20 +131,21 @@ git add -A && git commit -m "feat(pss): P0 quota-units ledger + Fable-5/Opus-4.8
 
 ---
 
-### Task P1: L-A tool-schema elision (the anchor lever)
+### Task P1: L-A tool deferral via native `defer_loading` (the anchor lever)
+
+**Design note (from deep-research 2026-07-11):** Anthropic's tool-use docs describe a native mechanism that supersedes break-window elision. Marking a tool with `defer_loading: true` keeps it OUT of the cached `tools[]` prefix; when the model needs it, tool-search appends its schema as a `tool_reference` block in `messages` (after the breakpoint), so **the prefix cache is never broken, even mid-session.** This is strictly better than swapping the tools array (which invalidates the whole cache): higher gain, cache-safe by construction, no break-window constraint. `tools[]` order/contents must still be byte-stable, so the proxy only ever *sets `defer_loading`*, never adds/removes/reorders tools.
 
 **Files:**
-- Create: `axiom_engine_rs/src/tool_elision.rs`
-- Modify: `axiom_engine_rs/src/lib.rs` (`pub mod tool_elision;`, alphabetical)
-- Modify: `axiom_engine_rs/src/server/prelude_state.rs` (`AppState` field `tool_elide_frozen: Arc<RwLock<HashMap<String, Value>>>` — frozen `tools[]` per session; + `pub(crate)` get/set mirroring `cache_safety_memo`)
-- Modify: `axiom_engine_rs/src/server/routes_messages.rs` (`compressed_messages_path`: apply after the S1 frozen/mutable split, before forward)
-- Test: `axiom_engine_rs/tests/tool_elision_proxy.rs` + inline
+- Create: `axiom_engine_rs/src/tool_defer.rs`
+- Modify: `axiom_engine_rs/src/lib.rs` (`pub mod tool_defer;`, alphabetical)
+- Modify: `axiom_engine_rs/src/server/routes_messages.rs` (`compressed_messages_path`: apply before forward)
+- Test: `axiom_engine_rs/tests/tool_defer_proxy.rs` + inline
 
 **Interfaces:**
-- Consumes: S1 break detection (a prefix mismatch via `cache_safety_memo` signals a break), S2 `CvmStore` for stashing elided schemas, `body["tools"]` (array of `{"name":..}`) and `body["messages"]`.
-- Produces: `tool_elision::working_set(messages: &[Value], recent_k: usize) -> HashSet<String>`; `tool_elision::elide(tools: &[Value], keep: &HashSet<String>) -> (Vec<Value>, usize)` returning `(kept_plus_affordance, elided_count)`.
+- Consumes: `body["tools"]` (array of `{"name":..}`), `body["messages"]` (for the working set).
+- Produces: `tool_defer::working_set(messages: &[Value], recent_k: usize) -> HashSet<String>`; `tool_defer::mark_deferred(tools: &[Value], keep: &HashSet<String>) -> (Vec<Value>, usize)` returning `(tools_with_defer_loading_set, deferred_count)` — the array is the SAME tools in the SAME order, only with `"defer_loading": true` added to each tool not in `keep` (never removed/reordered, so the byte-stability rule holds while still shrinking the cached prefix, since deferred tools drop out of it).
 
-- [ ] **Step 1: Failing unit test** in `tool_elision.rs`:
+- [ ] **Step 1: Failing unit test** in `tool_defer.rs`:
 
 ```rust
 #[test]
@@ -137,36 +158,39 @@ fn working_set_keeps_recently_invoked_tools_plus_core() {
 }
 
 #[test]
-fn elide_drops_unused_tools_and_adds_affordance() {
+fn mark_deferred_sets_flag_on_unused_tools_preserving_order() {
     let tools = vec![json!({"name":"Read"}), json!({"name":"WebFetch"}),
                      json!({"name":"ObscureTool"})];
     let mut keep = std::collections::HashSet::new();
     keep.insert("Read".to_string());
-    let (kept, elided) = elide(&tools, &keep);
-    assert_eq!(elided, 2);
-    let names: Vec<_> = kept.iter()
-        .filter_map(|t| t.get("name").and_then(|v| v.as_str())).collect();
-    assert!(names.contains(&"Read"));
-    assert!(names.contains(&"axiom_load_tools"));
-    assert!(!names.contains(&"ObscureTool"));
+    let (out, deferred) = mark_deferred(&tools, &keep);
+    assert_eq!(deferred, 2);
+    // order + count unchanged (byte-stability rule): still 3 tools, same names, same order
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0]["name"], json!("Read"));
+    assert_eq!(out[2]["name"], json!("ObscureTool"));
+    // kept tool: no defer_loading; unused tools: defer_loading true
+    assert!(out[0].get("defer_loading").is_none());
+    assert_eq!(out[1]["defer_loading"], json!(true));
+    assert_eq!(out[2]["defer_loading"], json!(true));
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — `cargo test --lib tool_elision 2>&1 | tail -20` → FAIL.
+- [ ] **Step 2: Run to verify failure** — `cargo test --lib tool_defer 2>&1 | tail -20` → FAIL.
 
-- [ ] **Step 3: Implement `tool_elision.rs`.** `working_set` walks messages for `tool_use` blocks' `name` within the last `recent_k` turns, unions `const CORE: [&str; 6] = ["Read","Edit","Write","Bash","Glob","Grep"]`. `elide` filters `tools` to `keep`, appends the affordance `{"name":"axiom_load_tools","description":"Some tools were omitted to save context. If you need a tool not listed, state which and it will be provided.","input_schema":{"type":"object","properties":{}}}`, returns `(kept, elided_count)`.
+- [ ] **Step 3: Implement `tool_defer.rs`.** `working_set` walks messages for `tool_use` blocks' `name` within the last `recent_k` turns, unions `const CORE: [&str; 6] = ["Read","Edit","Write","Bash","Glob","Grep"]`. `mark_deferred` maps over `tools` preserving order: for each tool whose `name` is NOT in `keep`, clone it and insert `"defer_loading": true`; kept tools pass through unchanged. Returns `(out, deferred_count)`.
 
-- [ ] **Step 4: Run to verify pass** — `cargo test --lib tool_elision` → PASS.
+- [ ] **Step 4: Run to verify pass** — `cargo test --lib tool_defer` → PASS.
 
-- [ ] **Step 5: Wire break-window-only application** in `compressed_messages_path`, gated `AXIOM_TOOL_ELIDE == Ok("on")` AND `uses_cache`: if a frozen `tools[]` exists for the session and no break occurred → reuse it verbatim (byte-stable); if a break occurred (S1 memo mismatch) or none exists → recompute `working_set`+`elide`, stash the full original `tools[]` into `CvmStore` under `tools:<session>`, store the elided array in `tool_elide_frozen`. Splice the frozen elided array into `outbound["tools"]`. Record the prefix-token delta via P0's quota ledger.
+- [ ] **Step 5: Wire** in `compressed_messages_path`, gated `AXIOM_TOOL_DEFER == Ok("on")`: compute `working_set` from the full message history, `mark_deferred(body["tools"], keep)`, set `outbound["tools"]` to the result. Because only `defer_loading` flags are added (order/names identical), and deferred tools leave the cached prefix, the cached prefix SHRINKS while staying byte-stable turn-over-turn. Record the deferred-prefix-token delta via P0's quota ledger. No break-window logic needed — `defer_loading` is inherently cache-safe.
 
-- [ ] **Step 6: Integration test** `tests/tool_elision_proxy.rs` (mirror `digest_proxy.rs`'s mock upstream + `Capture` + env-lock/`EnvVarGuard`): (a) `AXIOM_TOOL_ELIDE=on`, 10 tools with 2 recently used → upstream receives ≤3 tools incl. `axiom_load_tools`; (b) two consecutive no-break turns → outbound `tools[]` byte-identical both (cache-safe); (c) flag unset → tools unchanged.
+- [ ] **Step 6: Integration test** `tests/tool_defer_proxy.rs` (mirror `digest_proxy.rs`'s mock upstream + `Capture` + env-lock/`EnvVarGuard`): (a) `AXIOM_TOOL_DEFER=on`, 10 tools with 2 recently used → upstream receives 10 tools but 8 carry `defer_loading:true`; (b) two consecutive turns with the same working set → outbound `tools[]` byte-identical both (cache-safe); (c) flag unset → tools unchanged (no `defer_loading` added).
 
 - [ ] **Step 7: Verify + clippy + commit**
 
-Run: `cargo test --lib && cargo test --test tool_elision_proxy && cargo clippy --lib --locked -- -D warnings && cargo clippy --test tool_elision_proxy --locked -- -D warnings`
+Run: `cargo test --lib && cargo test --test tool_defer_proxy && cargo clippy --lib --locked -- -D warnings && cargo clippy --test tool_defer_proxy --locked -- -D warnings`
 ```bash
-git add -A && git commit -m "feat(pss): P1 L-A tool-schema elision (break-window-only)"
+git add -A && git commit -m "feat(pss): P1 L-A tool deferral via native defer_loading (cache-safe)"
 ```
 
 ---
@@ -288,6 +312,8 @@ git add -A && git commit -m "feat(pss): P3 L-B local trivial-turn short-circuit"
 
 ### Task P4: R1 high-tier-gated model routing
 
+**Rationale (deep-research 2026-07-11):** subscription metering uses per-bucket utilization, and Opus has its OWN weekly bucket (`seven_day_opus`) that is far scarcer than Sonnet's (~15–35 vs ~140–280 hrs on Max 5x). Routing an Opus/Fable turn to Haiku therefore relieves the tightest bucket — value beyond raw token weight — which is exactly why routing is gated to high tiers and left off for Sonnet. Note: Anthropic's own guidance ("spawn a separate call rather than switching the main loop's model") endorses this pattern, and caches are model-scoped so a Haiku turn does not destroy the top-tier cache (it just can't read it).
+
 **Files:**
 - Create: `axiom_engine_rs/src/model_router.rs`
 - Modify: `axiom_engine_rs/src/lib.rs` (`pub mod model_router;`)
@@ -347,9 +373,11 @@ git add -A && git commit -m "feat(pss): P4 R1 high-tier-gated model routing"
 **Interfaces:**
 - Consumes: all P0–P4 flags; P0's quota ledger. Produces: `bench/cvm/PSS-RESULTS-<date>.md`.
 
-- [ ] **Step 1:** Extend `cvm_eval.sh` with a third proxy condition exporting all PSS flags on (`AXIOM_TOOL_ELIDE=on AXIOM_LOCAL_TRIVIAL=on AXIOM_REBASE_ON_BREAK=on AXIOM_ADAPTIVE_TTL=on AXIOM_MODEL_ROUTE=auto`) and long multi-turn task sequences (a dependent chain in ONE session so history grows and elision/rebase engage — e.g. "read file A" → "compare to B" → "summarize both" → 15+ follow-ups). Score: correctness parity (S5 rule), elision + local-continuity fault rate ≤5%, quota units (not just USD) strictly lower with PSS on, target ≥50% on the long-session tasks.
+**Agent SDK credit caveat (deep-research 2026-07-11):** since 2026-06-15, non-interactive `claude -p` usage draws from a SEPARATE monthly Agent-SDK credit pool ($20 Pro / $100 Max 5x / $200 Max 20x), not the main subscription window. The live eval's spend hits that pool; note this in `PSS-RESULTS-<date>.md` so the numbers aren't misread as main-window savings.
+
+- [ ] **Step 1:** Extend `cvm_eval.sh` with a third proxy condition exporting all PSS flags on (`AXIOM_TOOL_DEFER=on AXIOM_LOCAL_TRIVIAL=on AXIOM_REBASE_ON_BREAK=on AXIOM_ADAPTIVE_TTL=on AXIOM_MODEL_ROUTE=auto`) and long multi-turn task sequences (a dependent chain in ONE session so history grows and deferral/rebase engage — e.g. "read file A" → "compare to B" → "summarize both" → 15+ follow-ups). Score: correctness parity (S5 rule), deferral-fault (a deferred tool that had to be loaded) + local-continuity fault rate ≤5%, quota units (not just USD) strictly lower with PSS on, target ≥50% on the long-session tasks.
 - [ ] **Step 2:** Human runs `./scripts/cvm_eval.sh` deliberately (real credits). Capture `bench/cvm/PSS-RESULTS-<date>.md`.
-- [ ] **Step 3 (on PASS):** One PR flips the four lever defaults on + `AXIOM_MODEL_ROUTE` default `auto`; fix the tests that assumed unset==off (mirror the S5→flip `digest_proxy.rs` fix); update README/CAPABILITIES/this-plan-status with real measured quota numbers, honestly separated from the simulation's +56.8%/+66.4%.
+- [ ] **Step 3 (on PASS):** One PR flips the four lever defaults on (`AXIOM_TOOL_DEFER`, `AXIOM_LOCAL_TRIVIAL`, `AXIOM_REBASE_ON_BREAK`, `AXIOM_ADAPTIVE_TTL`) + `AXIOM_MODEL_ROUTE` default `auto`; fix the tests that assumed unset==off (mirror the S5→flip `digest_proxy.rs` fix); update README/CAPABILITIES/this-plan-status with real measured quota numbers, honestly separated from the simulation's +56.8% Sonnet / +66.4% Opus / +69.1% Fable.
 - [ ] **Step 3 (on FAIL):** Commit the results file, leave all defaults off, mark status "shipped, gated-off, live-eval FAILED — returned to brainstorming", report to the user.
 - [ ] **Step 4: Commit**
 ```bash

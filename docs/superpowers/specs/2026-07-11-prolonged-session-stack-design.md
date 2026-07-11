@@ -13,27 +13,30 @@ Date: 2026-07-11. Builds on `docs/superpowers/plans/2026-07-10-cvm-cost-stack.md
 A quota-units Monte-Carlo (`bench/cvm/pss_sim.py`, 4,000 sessions, mean 187
 turns) over CVM-v1-shipped baseline produced (reduction vs baseline):
 
-| Design | Sonnet-5 | Opus-4.x |
-|---|---|---|
-| R1+R2+R3 (first draft) | +31.1% | +48.0% |
-| **+ L-A tool elision** | **+55.3%** | +65.8% |
-| **+ L-A + L-B (PSS v2)** | **+56.8%** | **+66.4%** |
-| PSS v2 without R1 | +56.3% | +56.6% |
+| Design | Sonnet-5 | Opus-4.8 | Fable-5 |
+|---|---|---|---|
+| R1+R2+R3 (first draft) | +31.1% | +48.0% | +51.3% |
+| **+ L-A tool deferral** | **+55.3%** | +65.8% | +68.7% |
+| **+ L-A + L-B (PSS v2)** | **+56.8%** | **+66.4%** | **+69.1%** |
+| PSS v2 without R1 | +56.3% | +56.6% | +56.3% |
+
+*(Pricing corrected 2026-07-11 via deep-research: real Fable-5 = $10/$12.50/$1/$50 per MTok. Sonnet/Opus figures unchanged — they never depended on Fable's rate.)*
 
 Three findings drove the final design:
-1. **L-A tool-schema elision is the anchor** — it alone clears 50% on Sonnet-5.
-   The dominant prolonged-session cost is the ~80K static prefix (mostly
-   tool/MCP schemas) re-read every turn; shrink it at the root and the rest
+1. **L-A tool deferral is the anchor** — it alone clears 50% on Sonnet-5. The
+   dominant prolonged-session cost is the ~80K static prefix (mostly tool/MCP
+   schemas) re-read every turn; deferring the unused ones out of the cached
+   prefix (via native `defer_loading`) shrinks it at the root and the rest
    compounds.
 2. **R1 model-routing is dead weight on Sonnet** (+56.3% without it ≈ +56.8%
    with it) — Haiku's *own* prompt cache makes routing net-neutral once the
-   prefix is cheap. R1 earns its complexity only on Opus/Fable tier (+~10
+   prefix is cheap. R1 earns its complexity only on Opus/Fable tier (+~10–13
    points there), so it is **gated to high-tier requests only**.
-3. **PSS v2 clears ≥56% on both tiers**, past the 50% goal, with a simpler
-   design than the first draft.
+3. **PSS v2 clears ≥56% on all three tiers** (Sonnet/Opus/Fable), past the 50%
+   goal, with a simpler design than the first draft.
 
-The sim's L-A used a flat 30%-keep; the real gain depends on how safely tools
-can be elided, which only the live eval settles.
+The sim's L-A used a flat 30%-keep; the real gain depends on how many tools a
+session actually needs (the rest deferred), which only the live eval settles.
 
 ## Objective function (differs from CVM v1)
 
@@ -61,8 +64,13 @@ the single biggest lever in quota units.
 
 ### R0 — Quota ledger + Fable-5/Opus-4.8 pricing (foundation)
 
-- `cost_ledger.rs`: add `FABLE` price row (`fable-5` match) and an `opus-4-8`
-  match if its pricing differs from the OPUS row; keep `estimated` semantics.
+- `cost_ledger.rs`: add `FABLE` price row with the **real** Anthropic rate
+  (verified 2026-07 via deep-research: $10/$12.50/$1/$50 per MTok for
+  input/5m-write/cache-read/output; 1h-write $20). Opus-4.8 already matches the
+  existing `OPUS` row ($5/$6.25/$0.50/$25) — no change needed. Make Sonnet-5
+  **date-aware**: it stays at the current $2/$2.50/$0.20/$10 through
+  2026-08-31, then rises to $3/$3.75/$0.30/$15 on 2026-09-01 (Anthropic
+  scheduled change). Keep `estimated` semantics.
 - New `quota_units` accounting alongside USD: same per-tier token weights,
   normalized so 1 unit = 1 Sonnet-5 uncached input token. Surfaces in
   `AwarenessState`/`CostSummary`, `/metrics`
@@ -71,32 +79,31 @@ the single biggest lever in quota units.
 - Success: Fable traffic priced first-class (`estimated=false`); quota ledger
   visible end-to-end.
 
-### L-A — Tool-schema elision (THE ANCHOR LEVER, break-window-only)
+### L-A — Tool deferral via native `defer_loading` (THE ANCHOR LEVER)
 
-New `tool_elision.rs`, hooked into `compressed_messages_path`. Flag:
-`AXIOM_TOOL_ELIDE` = `off` (default until eval passes) / `on`.
+New `tool_defer.rs`, hooked into `compressed_messages_path`. Flag:
+`AXIOM_TOOL_DEFER` = `off` (default until eval passes) / `on`.
 The ~80K prefix is dominated by `tools[]` schemas (many connected MCP
-servers). Most turns use 2–3 tools. Present only the **working set** — tools
-actually invoked in the session's recent history — plus a compact
-`axiom_load_tools` affordance describing how to request the full set. Full
-schemas for elided tools go to the L2 store (S2 machinery); a request for an
-elided tool triggers exactly one reload.
+servers). Most turns use 2–3 tools.
 
-**Cache-safety is the binding constraint.** The `tools[]` array renders BEFORE
-system and messages in Anthropic's cache prefix, so changing it mid-session
-would break the entire cache (violating S1's whole premise). Therefore
-elision is **break-window-only**: the presented tool set is recomputed ONLY at
-a natural cache break (session start, compaction, TTL expiry — detected via the
-S1 memo, same trigger as R2), never mid-session. Between breaks the tool set
-is frozen and byte-stable. A needed-but-elided tool causes at most one extra
-break to reload, counted as an elision fault (telemetry, S7-style).
+**Mechanism (deep-research 2026-07-11 — supersedes the earlier break-window
+design).** Anthropic natively supports `defer_loading: true` on a tool
+definition: a deferred tool is NOT rendered into the cached `tools[]` prefix;
+when the model needs it, tool-search appends its schema as a `tool_reference`
+block in `messages` (after the breakpoint), so **the prefix cache is never
+broken, even mid-session.** The proxy marks every tool NOT in the working set
+with `defer_loading: true`, keeps the working set always-loaded. This shrinks
+the cached prefix while keeping `tools[]` byte-stable turn-over-turn (only a
+boolean flag is added; names/order/count are unchanged — the binding
+byte-stability rule holds). This is strictly better than swapping the array:
+no forced cache breaks, higher gain, simpler.
 
 - Working-set policy: union of (tools invoked in the last K turns) ∪ (a small
-  always-keep core: Read/Edit/Bash/Glob/Grep or their session analogues).
-- Determinism: the elided set is a pure function of the frozen recent-history
-  window, so the rendered prefix is identical across turns within a window.
-- Success: measured prefix-token reduction reported per session; elision-fault
-  rate (`AXIOM-LOAD-TOOLS` reload events / sessions) tracked.
+  always-keep core: Read/Edit/Write/Bash/Glob/Grep or their session analogues).
+- The proxy only ever ADDS `defer_loading`; it never adds/removes/reorders
+  tools (which would invalidate the whole cache).
+- Success: measured deferred-prefix-token reduction per session; deferral-fault
+  rate (deferred tools the model then had to load) tracked.
 
 ### L-B — Local trivial-turn short-circuit
 
@@ -189,7 +196,7 @@ Flag: `AXIOM_ADAPTIVE_TTL` = `off` default until eval passes.
    Report **quota units** (R0's ledger), not just dollars. Pass bar:
    correctness parity (same rule as S5), elision-fault + local-continuity
    faults ≤5%, and **quota units strictly lower with PSS on**, targeting ≥50%
-   reduction on the long-session tasks. On pass: flip `AXIOM_TOOL_ELIDE`,
+   reduction on the long-session tasks. On pass: flip `AXIOM_TOOL_DEFER`,
    `AXIOM_LOCAL_TRIVIAL`, `AXIOM_REBASE_ON_BREAK`, `AXIOM_ADAPTIVE_TTL`
    defaults, and set `AXIOM_MODEL_ROUTE=auto`. On fail: publish the numbers,
    leave defaults off, return to brainstorming (user-directed).
@@ -229,7 +236,7 @@ feature + explicit human run.
 
 - **P0** R0 quota ledger + Fable-5/Opus-4.8 pricing rows + committed
   `bench/cvm/pss_sim.py`. Foundation; no traffic change.
-- **P1** L-A tool elision (the anchor). Depends on P0 (measure in quota units)
+- **P1** L-A tool deferral via defer_loading (the anchor). Depends on P0 (measure in quota units)
   and reuses S2's L2 store for elided schemas.
 - **P2** R2 free-window rebasing + R3 adaptive TTL (both piggyback on the S1
   break-detection memo; grouped as they share that trigger).

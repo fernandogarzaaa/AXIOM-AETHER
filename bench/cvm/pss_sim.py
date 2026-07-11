@@ -20,6 +20,8 @@ def w(per_mtok):
 S_IN, S_W5, S_W1H, S_RD, S_OUT = w(2.00), w(2.50), w(4.00), w(0.20), w(10.00)
 H_IN, H_W5, H_RD, H_OUT = w(1.00), w(1.25), w(0.10), w(5.00)
 O_IN, O_W5, O_RD, O_OUT = w(5.00), w(6.25), w(0.50), w(25.00)
+# Fable 5 (corrected from Anthropic pricing docs, 2026-07): 10/12.50/20/1/50
+F_IN, F_W5, F_W1H, F_RD, F_OUT = w(10.00), w(12.50), w(20.00), w(1.00), w(50.00)
 
 PREFIX = 80_000
 OUT_T_HARD = 1_500
@@ -158,7 +160,8 @@ def run(levers, tier, sessions=4000, seed=0):
 if __name__ == "__main__":
     TIERS = {
         'Sonnet-5': (S_IN, S_W5, S_W1H, S_RD, S_OUT),
-        'Opus-4.x': (O_IN, O_W5, O_W5, O_RD, O_OUT),
+        'Opus-4.8': (O_IN, O_W5, O_W5, O_RD, O_OUT),
+        'Fable-5':  (F_IN, F_W5, F_W1H, F_RD, F_OUT),
     }
     for tname, tier in TIERS.items():
         base_q, _, _, tn = run(dict(R1=False, R2=False, R3=False), tier)
