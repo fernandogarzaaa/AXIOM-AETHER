@@ -307,13 +307,15 @@ pub struct AppState {
     /// S3: turn number at which each `(session_id, page_id)` was digested,
     /// for the `turns_since_digest` fault computation above.
     digest_page_turn: Arc<RwLock<HashMap<(String, String), u64>>>,
-    /// P2 (PSS) R2 break detection: last frozen-prefix hash per session. A
-    /// changed hash across turns means the client's prompt cache was already
-    /// invalidated this turn (compaction / session restructure) -- the free
+    /// P2 (PSS) R2 break detection: last frozen-prefix fingerprint
+    /// `(message count, hash)` per session. A GENUINE break is a non-append
+    /// change to the prefix (compaction / session restructure) -- the free
     /// window in which `rebase_transcript` restructures old turns at zero
-    /// marginal cache cost. See
+    /// marginal cache cost. Append-only growth (Anthropic's moving automatic
+    /// breakpoint) is normal cached operation and must NOT count (the
+    /// 2026-07-12 live-eval FAIL). See
     /// docs/superpowers/plans/2026-07-11-prolonged-session-stack.md, step P2.
-    pss_prefix_hash: Arc<RwLock<HashMap<String, String>>>,
+    pss_prefix_hash: Arc<RwLock<HashMap<String, (usize, String)>>>,
     /// P2 (PSS) R3 adaptive TTL: `(last_turn_unix, long_gap_count)` per
     /// session. A gap longer than the 5-minute cache TTL increments the count;
     /// once it crosses a threshold, `rebase::choose_ttl` elects the 1-hour
@@ -576,20 +578,29 @@ impl AppState {
         current_turn.saturating_sub(created_turn)
     }
 
-    /// P2 (PSS) R2: returns `true` iff a cache break is detected for
-    /// `session_id` -- a previous frozen-prefix hash exists and differs from
-    /// `frozen_hash` (the client's prompt cache was already invalidated this
-    /// turn). Always records `frozen_hash` as the session's latest. The first
-    /// turn of a session is never a break (nothing older to rebase).
-    pub(crate) fn pss_detect_break(&self, session_id: &str, frozen_hash: &str) -> bool {
+    /// P2 (PSS) R2: returns `true` iff a GENUINE cache break is detected for
+    /// `session_id` -- the frozen prefix changed in a NON-APPEND way vs the
+    /// previous turn (compaction / session restructure), meaning the client's
+    /// prompt cache was already invalidated this turn. Append-only growth
+    /// (Anthropic's moving automatic breakpoint) is normal cached operation
+    /// and returns `false` (see `rebase::is_genuine_break`). Always records
+    /// this turn's fingerprint as the session's latest. The first turn of a
+    /// session is never a break (nothing older to rebase).
+    pub(crate) fn pss_detect_break(&self, session_id: &str, frozen: &[Value]) -> bool {
         let Ok(mut map) = self.pss_prefix_hash.write() else {
             return false;
         };
         if map.len() >= 512 {
             map.clear();
         }
-        let prev = map.insert(session_id.to_string(), frozen_hash.to_string());
-        matches!(prev, Some(p) if p != frozen_hash)
+        let fingerprint = crate::rebase::frozen_fingerprint(frozen);
+        let prev = map.insert(session_id.to_string(), fingerprint);
+        match prev {
+            Some((prev_len, prev_hash)) => {
+                crate::rebase::is_genuine_break(prev_len, &prev_hash, frozen)
+            }
+            None => false,
+        }
     }
 
     /// P2 (PSS) R3: record this turn's timestamp for `session_id` and return

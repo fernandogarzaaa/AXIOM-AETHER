@@ -118,6 +118,53 @@ fn body_with_old_heavy(session_id: &str, prefix_text: &str) -> Value {
 }
 
 #[tokio::test]
+async fn growing_frozen_prefix_is_not_a_break_and_never_rebases() {
+    let _guard = env_lock().lock().await;
+    std::env::set_var("AXIOM_REBASE_ON_BREAK", "on");
+    let _cleanup = EnvVarGuard("AXIOM_REBASE_ON_BREAK");
+
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream).await;
+    let app = create_router(state);
+
+    let big = "x ".repeat(9000);
+    // Turn 1: frozen prefix = [P1]; heavy old block + newest in the tail.
+    let turn1 = json!({
+        "model":"claude-sonnet-5","max_tokens":16,"session_id":"rebase-grow",
+        "messages":[
+            {"role":"user","content":[
+                {"type":"text","text":"P1","cache_control":{"type":"ephemeral"}}]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"old","content": big.clone()}]},
+            {"role":"user","content":"newest turn one"},
+        ],
+    });
+    // Turn 2: the frozen prefix GREW to [P1, P2] -- P1 byte-identical, the
+    // breakpoint simply moved forward (Anthropic's automatic behavior). This
+    // is normal cached operation, NOT a break: nothing may be rebased.
+    let turn2 = json!({
+        "model":"claude-sonnet-5","max_tokens":16,"session_id":"rebase-grow",
+        "messages":[
+            {"role":"user","content":[
+                {"type":"text","text":"P1","cache_control":{"type":"ephemeral"}}]},
+            {"role":"user","content":[
+                {"type":"text","text":"P2","cache_control":{"type":"ephemeral"}}]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"old","content": big}]},
+            {"role":"user","content":"newest turn two"},
+        ],
+    });
+    assert_eq!(post_messages(&app, turn1).await, StatusCode::OK);
+    assert_eq!(post_messages(&app, turn2).await, StatusCode::OK);
+
+    let captured = capture.requests.lock().unwrap();
+    assert!(
+        !captured.iter().any(|r| r.to_string().contains("AXIOM-PAGE")),
+        "append-only prefix growth must never trigger a rebase (2026-07-12 live-eval regression)"
+    );
+}
+
+#[tokio::test]
 async fn rebase_restructures_old_heavy_on_a_detected_break() {
     let _guard = env_lock().lock().await;
     std::env::set_var("AXIOM_REBASE_ON_BREAK", "on");

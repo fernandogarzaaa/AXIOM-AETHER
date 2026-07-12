@@ -266,36 +266,34 @@ async fn compressed_messages_path(
     }
 
     // P2 (PSS) R2 free-window rebasing. When the client's prompt cache is
-    // already broken this turn -- detected as a change in the frozen prefix vs
-    // the session's previous turn (compaction / session restructure) -- the
-    // whole prefix is re-written at the premium rate regardless. In exactly
-    // that window we restructure every OLD heavy `tool_result` into a stub + L2
-    // page at zero *marginal* cache cost, shrinking every FUTURE turn's re-read.
-    // Never proxy-initiated: it only piggybacks on a break the client caused.
+    // already broken this turn -- detected as a NON-APPEND change in the frozen
+    // prefix vs the session's previous turn (compaction / session restructure;
+    // append-only growth from Anthropic's moving breakpoint is normal cached
+    // operation and does NOT count) -- the whole prefix is re-written at the
+    // premium rate regardless. In exactly that window we restructure every OLD
+    // heavy `tool_result` into a stub + L2 page at zero *marginal* cache cost,
+    // shrinking every FUTURE turn's re-read. Never proxy-initiated: it only
+    // piggybacks on a break the client caused.
     // Default off (AXIOM_REBASE_ON_BREAK=on) until the live eval passes.
-    if std::env::var("AXIOM_REBASE_ON_BREAK").as_deref() == Ok("on") {
-        let frozen_hash = {
-            use sha2::{Digest, Sha256};
-            let bytes = serde_json::to_vec(&frozen_messages).unwrap_or_default();
-            format!("{:x}", Sha256::digest(&bytes))
-        };
-        if state.pss_detect_break(&session_id, &frozen_hash) && mutable_messages.len() > 1 {
-            let old_turns = mutable_messages.len() - 1;
-            // rebase_transcript does synchronous L2-store writes + digest work
-            // per old heavy turn, unbounded by transcript length -- offload it
-            // to a blocking thread so a break turn can't pin a Tokio worker.
-            let store = state.cvm_store.clone();
-            let sid = session_id.clone();
-            let msgs = std::mem::take(&mut mutable_messages);
-            mutable_messages = tokio::task::spawn_blocking(move || {
-                crate::rebase::rebase_transcript(&msgs, &store, &sid)
-            })
-            .await
-            .map_err(|e| ApiError::Internal(format!("rebase task join failed: {e}")))?;
-            eprintln!(
-                "[axiom-pss] R2 rebase-on-break: session {session_id} restructured {old_turns} old turn(s)"
-            );
-        }
+    if std::env::var("AXIOM_REBASE_ON_BREAK").as_deref() == Ok("on")
+        && state.pss_detect_break(&session_id, &frozen_messages)
+        && mutable_messages.len() > 1
+    {
+        let old_turns = mutable_messages.len() - 1;
+        // rebase_transcript does synchronous L2-store writes + digest work
+        // per old heavy turn, unbounded by transcript length -- offload it
+        // to a blocking thread so a break turn can't pin a Tokio worker.
+        let store = state.cvm_store.clone();
+        let sid = session_id.clone();
+        let msgs = std::mem::take(&mut mutable_messages);
+        mutable_messages = tokio::task::spawn_blocking(move || {
+            crate::rebase::rebase_transcript(&msgs, &store, &sid)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("rebase task join failed: {e}")))?;
+        eprintln!(
+            "[axiom-pss] R2 rebase-on-break: session {session_id} restructured {old_turns} old turn(s)"
+        );
     }
     // Freeze-on-first-send determinism: the TTT fingerprint pipeline is not
     // naturally deterministic across repeated calls (each call mutates live
