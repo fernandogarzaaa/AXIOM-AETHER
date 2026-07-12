@@ -46,6 +46,31 @@ pub fn next_long_gap_count(
     }
 }
 
+/// Fingerprint a frozen prefix: `(message count, SHA-256 hex of the serialized
+/// slice)`. Stored per session so the next turn can tell append-only growth
+/// from a genuine break.
+pub fn frozen_fingerprint(frozen: &[Value]) -> (usize, String) {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(frozen).unwrap_or_default();
+    (frozen.len(), format!("{:x}", Sha256::digest(&bytes)))
+}
+
+/// Is this turn's frozen prefix a GENUINE cache break relative to the previous
+/// turn's fingerprint? Anthropic's automatic breakpoint moves forward as a
+/// session grows, so the frozen prefix EXTENDING turn-over-turn is normal
+/// cached operation -- calling that a break (as a whole-prefix hash compare
+/// does) fires the rebase every turn and destroys the model's working history
+/// (the 2026-07-12 live-eval FAIL). A genuine break is a NON-APPEND change:
+/// the prefix shrank (compaction / session restructure) or its leading
+/// `prev_len` messages are no longer byte-identical.
+pub fn is_genuine_break(prev_len: usize, prev_hash: &str, frozen: &[Value]) -> bool {
+    if frozen.len() < prev_len {
+        return true; // prefix shrank: the old cached prefix cannot survive
+    }
+    let (_, head_hash) = frozen_fingerprint(&frozen[..prev_len]);
+    head_hash != prev_hash
+}
+
 /// Annotate the newest cache breakpoint with an explicit `ttl`. Walks
 /// `messages` from the end and, in the first message whose content array holds
 /// a block carrying a `cache_control` object, sets `cache_control.ttl = ttl` on
@@ -207,6 +232,40 @@ mod tests {
         assert_eq!(messages[1]["content"][1]["cache_control"]["ttl"], json!("1h"));
         // ...and the older breakpoint is left untouched.
         assert!(messages[0]["content"][0]["cache_control"].get("ttl").is_none());
+    }
+
+    #[test]
+    fn appending_to_the_frozen_prefix_is_not_a_break() {
+        // The 2026-07-12 live-eval failure mode: Anthropic's automatic
+        // breakpoint moves forward every turn, so the frozen prefix GROWS
+        // turn-over-turn. That is normal cached operation, never a break.
+        let turn1 = vec![json!({"role":"user","content":"a"})];
+        let (len1, hash1) = frozen_fingerprint(&turn1);
+        let turn2 = vec![
+            json!({"role":"user","content":"a"}),
+            json!({"role":"assistant","content":"b"}),
+        ];
+        assert!(!is_genuine_break(len1, &hash1, &turn2), "append-only growth is not a break");
+        // And an identical prefix is not a break either.
+        assert!(!is_genuine_break(len1, &hash1, &turn1), "unchanged prefix is not a break");
+    }
+
+    #[test]
+    fn shrinking_or_mutating_the_frozen_prefix_is_a_break() {
+        let prev = vec![
+            json!({"role":"user","content":"a"}),
+            json!({"role":"assistant","content":"b"}),
+        ];
+        let (len, hash) = frozen_fingerprint(&prev);
+        // Compaction: the prefix shrank.
+        let shrunk = vec![json!({"role":"user","content":"summary of a+b"})];
+        assert!(is_genuine_break(len, &hash, &shrunk), "a shrunken prefix is a break");
+        // Restructure: same length, different leading content.
+        let mutated = vec![
+            json!({"role":"user","content":"a CHANGED"}),
+            json!({"role":"assistant","content":"b"}),
+        ];
+        assert!(is_genuine_break(len, &hash, &mutated), "a mutated prefix is a break");
     }
 
     #[test]
