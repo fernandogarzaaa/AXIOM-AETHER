@@ -63,6 +63,10 @@ async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiEr
         let quota_units_uncached =
             LIFETIME_QUOTA_UNITS_UNCACHED_MICROS.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         let local_answered = LIFETIME_LOCAL_ANSWERED_TURNS.load(Ordering::Relaxed);
+        let routed_turns = LIFETIME_ROUTED_TURNS.load(Ordering::Relaxed);
+        let route_fallbacks = LIFETIME_ROUTE_FALLBACKS.load(Ordering::Relaxed);
+        let routed_quota_saved =
+            LIFETIME_ROUTED_QUOTA_SAVED_MICROS.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         rendered.push_str(&format!(
             "# HELP axiom_cost_usd_total Lifetime dollar-true cost of proxied API turns.\n\
              # TYPE axiom_cost_usd_total counter\naxiom_cost_usd_total {cost_usd:.6}\n\
@@ -76,7 +80,13 @@ async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiEr
              # HELP axiom_quota_units_uncached_total Counterfactual quota units with zero caching.\n\
              # TYPE axiom_quota_units_uncached_total counter\naxiom_quota_units_uncached_total {quota_units_uncached:.6}\n\
              # HELP axiom_local_answered_turns_total Turns answered locally by the L-B short-circuit (never reached the network).\n\
-             # TYPE axiom_local_answered_turns_total counter\naxiom_local_answered_turns_total {local_answered}\n"
+             # TYPE axiom_local_answered_turns_total counter\naxiom_local_answered_turns_total {local_answered}\n\
+             # HELP axiom_routed_turns_total Turns downgraded to Haiku by R1 high-tier-gated routing.\n\
+             # TYPE axiom_routed_turns_total counter\naxiom_routed_turns_total {routed_turns}\n\
+             # HELP axiom_route_fallbacks_total Routed turns that fell back to the original tier after a 4xx.\n\
+             # TYPE axiom_route_fallbacks_total counter\naxiom_route_fallbacks_total {route_fallbacks}\n\
+             # HELP axiom_routed_quota_saved_units_total Subscription quota units saved by R1 routing downgrades.\n\
+             # TYPE axiom_routed_quota_saved_units_total counter\naxiom_routed_quota_saved_units_total {routed_quota_saved:.6}\n"
         ));
     }
     Ok((

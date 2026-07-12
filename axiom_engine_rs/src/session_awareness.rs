@@ -65,6 +65,14 @@ pub struct AwarenessState {
     /// L-B trivial-turn short-circuit (`local_trivial::is_trivial`), i.e. turns
     /// that never reached the network at all.
     local_answered_turns: AtomicUsize,
+    /// P4 (Prolonged-Session Stack) R1 routing: turns downgraded to Haiku, the
+    /// number of those that fell back to the original tier after an upstream
+    /// 4xx, and the subscription quota units saved by the downgrades
+    /// (`quota_units(requested_tier) - quota_units(haiku)`, x 1e6). The saved
+    /// figure lets the live eval attribute R1's contribution.
+    routed_turns: AtomicUsize,
+    route_fallbacks: AtomicUsize,
+    routed_quota_saved_micros: AtomicUsize,
 }
 
 /// A snapshot of a session's accumulated dollar-true cost, for `/metrics` and
@@ -98,6 +106,12 @@ pub struct CostSummary {
     pub quota_units_total: f64,
     /// P3 (PSS): turns answered locally by the L-B short-circuit (no network).
     pub local_answered_turns: u64,
+    /// P4 (PSS): turns downgraded to Haiku by R1 routing.
+    pub routed_turns: u64,
+    /// P4 (PSS): routed turns that fell back to the original tier after a 4xx.
+    pub route_fallbacks: u64,
+    /// P4 (PSS): subscription quota units saved by the downgrades this session.
+    pub routed_quota_saved_units: f64,
 }
 
 impl CostSummary {
@@ -140,6 +154,9 @@ impl Default for AwarenessState {
             digest_bytes_out: AtomicUsize::new(0),
             quota_units_micros: AtomicUsize::new(0),
             local_answered_turns: AtomicUsize::new(0),
+            routed_turns: AtomicUsize::new(0),
+            route_fallbacks: AtomicUsize::new(0),
+            routed_quota_saved_micros: AtomicUsize::new(0),
         }
     }
 }
@@ -229,7 +246,26 @@ impl AwarenessState {
             quota_units_total: self.quota_units_micros.load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
             local_answered_turns: self.local_answered_turns.load(Ordering::Relaxed) as u64,
+            routed_turns: self.routed_turns.load(Ordering::Relaxed) as u64,
+            route_fallbacks: self.route_fallbacks.load(Ordering::Relaxed) as u64,
+            routed_quota_saved_units: self.routed_quota_saved_micros.load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
         }
+    }
+
+    /// Record one turn downgraded by R1 routing (P4/PSS) and the quota units it
+    /// saved (`quota_units(requested_tier) - quota_units(haiku)` for the turn).
+    pub fn record_route(&self, units_saved: f64) {
+        self.routed_turns.fetch_add(1, Ordering::Relaxed);
+        let micros = (units_saved.max(0.0) * 1_000_000.0).round() as usize;
+        self.routed_quota_saved_micros
+            .fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// Record one routed turn that had to fall back to the original tier after
+    /// an upstream 4xx (P4/PSS).
+    pub fn record_route_fallback(&self) {
+        self.route_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one priced turn's subscription quota units (P0/PSS). Pass the
