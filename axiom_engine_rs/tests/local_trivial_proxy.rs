@@ -24,10 +24,31 @@ fn env_lock() -> &'static AsyncMutex<()> {
     LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
-struct EnvVarGuard(&'static str);
+/// Restores an env var to its prior value (or unset) on drop, so a test that
+/// sets `AXIOM_DRIFT_THRESHOLD` / `AXIOM_LOCAL_TRIVIAL` cannot leak that value
+/// into a later test or the ambient environment.
+struct EnvVarGuard {
+    key: &'static str,
+    prior: Option<String>,
+}
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, prior }
+    }
+    fn unset(key: &'static str) -> Self {
+        let prior = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, prior }
+    }
+}
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
-        std::env::remove_var(self.0);
+        match &self.prior {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
     }
 }
 
@@ -94,6 +115,28 @@ async fn post_messages(app: &Router, body: Value) -> (StatusCode, Value) {
     (status, val)
 }
 
+/// Like `post_messages` but returns the raw `(status, content_type, body_text)`
+/// so an SSE (`text/event-stream`) response can be inspected without JSON parse.
+async fn post_messages_raw(app: &Router, body: Value) -> (StatusCode, String, String) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("x-api-key", "sk-ant-test-key")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, ct, String::from_utf8_lossy(&bytes).to_string())
+}
+
 /// A newest turn that is a clean, small `tool_result` (a genuine mechanical
 /// ack). Multi-token so `mean_surprisal` returns a finite value.
 fn clean_mechanical(session_id: &str) -> Value {
@@ -129,12 +172,10 @@ fn error_bearing(session_id: &str) -> Value {
 #[tokio::test]
 async fn clean_mechanical_turn_is_answered_locally_without_upstream() {
     let _guard = env_lock().lock().await;
-    std::env::set_var("AXIOM_LOCAL_TRIVIAL", "on");
+    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "on");
     // Huge gate: any finite surprisal passes, so triviality reduces to the
     // deterministic structural checks (tool_result-only, error-free, small).
-    std::env::set_var("AXIOM_DRIFT_THRESHOLD", "1000000");
-    let _c1 = EnvVarGuard("AXIOM_LOCAL_TRIVIAL");
-    let _c2 = EnvVarGuard("AXIOM_DRIFT_THRESHOLD");
+    let _c2 = EnvVarGuard::set("AXIOM_DRIFT_THRESHOLD", "1000000");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
     let state = build_state(upstream).await;
@@ -152,12 +193,38 @@ async fn clean_mechanical_turn_is_answered_locally_without_upstream() {
 }
 
 #[tokio::test]
+async fn streaming_trivial_turn_gets_a_local_sse_stream() {
+    let _guard = env_lock().lock().await;
+    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "on");
+    let _c2 = EnvVarGuard::set("AXIOM_DRIFT_THRESHOLD", "1000000");
+
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream).await;
+    let app = create_router(state);
+
+    let mut body = clean_mechanical("lb-stream");
+    body["stream"] = json!(true);
+    let (status, content_type, text) = post_messages_raw(&app, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.contains("text/event-stream"),
+        "a streaming client must get SSE, not JSON (got {content_type})"
+    );
+    assert!(text.contains("event: message_start"), "valid SSE event sequence");
+    assert!(text.contains("event: message_stop"));
+    assert!(text.contains("axiom-local"), "answered locally");
+    assert_eq!(
+        capture.requests.lock().unwrap().len(),
+        0,
+        "a streaming trivial turn must never reach upstream"
+    );
+}
+
+#[tokio::test]
 async fn error_bearing_turn_is_forwarded_upstream() {
     let _guard = env_lock().lock().await;
-    std::env::set_var("AXIOM_LOCAL_TRIVIAL", "on");
-    std::env::set_var("AXIOM_DRIFT_THRESHOLD", "1000000");
-    let _c1 = EnvVarGuard("AXIOM_LOCAL_TRIVIAL");
-    let _c2 = EnvVarGuard("AXIOM_DRIFT_THRESHOLD");
+    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "on");
+    let _c2 = EnvVarGuard::set("AXIOM_DRIFT_THRESHOLD", "1000000");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
     let state = build_state(upstream).await;
@@ -176,8 +243,7 @@ async fn error_bearing_turn_is_forwarded_upstream() {
 #[tokio::test]
 async fn flag_off_always_forwards() {
     let _guard = env_lock().lock().await;
-    std::env::remove_var("AXIOM_LOCAL_TRIVIAL"); // default off
-    let _c1 = EnvVarGuard("AXIOM_LOCAL_TRIVIAL");
+    let _c1 = EnvVarGuard::unset("AXIOM_LOCAL_TRIVIAL"); // default off
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
     let state = build_state(upstream).await;

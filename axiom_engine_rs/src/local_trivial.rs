@@ -23,6 +23,17 @@ use serde_json::{json, Value};
 /// must actually reason about, so it is forwarded upstream.
 const TRIVIAL_MAX_TOKENS: usize = 200;
 
+/// A hard byte cap on a trivial turn, independent of the token count. A large
+/// minified JSON / base64 blob has almost no whitespace, so it would pass the
+/// token cap as "one token" -- the byte cap catches it. Callers also apply this
+/// bound *before* computing surprisal so a huge result never reaches the
+/// pipeline (the heavy-content fail-closed contract).
+pub const TRIVIAL_MAX_BYTES: usize = 2_000;
+
+/// The fixed acknowledgement text for a locally-answered trivial turn.
+const ACK_TEXT: &str =
+    "Acknowledged (answered locally by Axiom -- no upstream call was made for this mechanically trivial turn).";
+
 /// Substrings (matched case-insensitively) that mark a `tool_result` as
 /// carrying a failure the model must actually see -- never short-circuited.
 /// Shared with P4's routing gate.
@@ -36,20 +47,27 @@ pub fn has_error_signature(text: &str) -> bool {
 }
 
 /// Flatten a `tool_result` block's `content` (a string or an array of text
-/// blocks) to plain text, newline-separating parts.
+/// blocks) to plain text, newline-separating parts. Returns `None` -- meaning
+/// "not a plain-text tool_result, so never trivial" -- if the block is not a
+/// `tool_result` at all, or if any array part is non-text (an image, document,
+/// or unknown block the model may need to inspect). We must NOT silently drop
+/// non-text parts: a mixed image + "ok" result would otherwise be admitted on
+/// the "ok" alone.
 fn tool_result_text(block: &Value) -> Option<String> {
     if block.get("type").and_then(Value::as_str) != Some("tool_result") {
         return None;
     }
     match block.get("content") {
         Some(Value::String(s)) => Some(s.clone()),
-        Some(Value::Array(parts)) => Some(
-            parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
+        Some(Value::Array(parts)) => {
+            let mut texts = Vec::with_capacity(parts.len());
+            for p in parts {
+                // Any non-text part disqualifies the whole result.
+                let text = p.get("text").and_then(Value::as_str)?;
+                texts.push(text);
+            }
+            Some(texts.join("\n"))
+        }
         _ => None,
     }
 }
@@ -73,6 +91,12 @@ pub fn is_trivial(messages: &[Value], surprisal: Option<f32>, gate: f32) -> bool
     let Some(newest) = messages.last() else {
         return false;
     };
+    // The newest turn must be a genuine user-role tool-result turn. A client
+    // could otherwise submit an assistant-role `tool_result` and receive a
+    // synthetic success instead of the upstream API's normal validation.
+    if newest.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
     let Some(blocks) = newest.get("content").and_then(Value::as_array) else {
         // A bare-string content is fresh user prose, not a mechanical result.
         return false;
@@ -81,9 +105,11 @@ pub fn is_trivial(messages: &[Value], surprisal: Option<f32>, gate: f32) -> bool
         return false;
     }
     let mut total_tokens = 0usize;
+    let mut total_bytes = 0usize;
     for block in blocks {
-        // Every block must be a tool_result -- a single text block means the
-        // user actually said something and deserves a real answer.
+        // Every block must be a plain-text tool_result -- a single text block
+        // means the user actually said something and deserves a real answer,
+        // and a non-text (image/document) part means content to inspect.
         let Some(text) = tool_result_text(block) else {
             return false;
         };
@@ -91,11 +117,56 @@ pub fn is_trivial(messages: &[Value], surprisal: Option<f32>, gate: f32) -> bool
             return false;
         }
         total_tokens += token_estimate(&text);
-        if total_tokens > TRIVIAL_MAX_TOKENS {
+        total_bytes += text.len();
+        if total_tokens > TRIVIAL_MAX_TOKENS || total_bytes > TRIVIAL_MAX_BYTES {
             return false;
         }
     }
     true
+}
+
+/// The Anthropic streaming (`text/event-stream`) form of [`local_ack`], for a
+/// client that requested `"stream": true`. Emits the standard event sequence
+/// (`message_start` → `content_block_start` → one `content_block_delta` →
+/// `content_block_stop` → `message_delta` → `message_stop`) so a streaming
+/// client sees a normal, complete turn. Marked `model: "axiom-local"`.
+pub fn local_ack_sse() -> String {
+    let id = format!("msg_axiomlocal_{}", uuid::Uuid::new_v4().simple());
+    let start = json!({
+        "type": "message_start",
+        "message": {
+            "id": id, "type": "message", "role": "assistant", "model": "axiom-local",
+            "content": [], "stop_reason": null, "stop_sequence": null,
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        }
+    });
+    let block_start = json!({
+        "type": "content_block_start", "index": 0,
+        "content_block": {"type": "text", "text": ""}
+    });
+    let delta = json!({
+        "type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": ACK_TEXT}
+    });
+    let block_stop = json!({"type": "content_block_stop", "index": 0});
+    let msg_delta = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+        "usage": {"output_tokens": 0}
+    });
+    let stop = json!({"type": "message_stop"});
+    // Each SSE event: a named `event:` line + a `data:` line + a blank line.
+    [
+        ("message_start", start),
+        ("content_block_start", block_start),
+        ("content_block_delta", delta),
+        ("content_block_stop", block_stop),
+        ("message_delta", msg_delta),
+        ("message_stop", stop),
+    ]
+    .iter()
+    .map(|(name, payload)| format!("event: {name}\ndata: {payload}\n\n"))
+    .collect()
 }
 
 /// A locally-generated Anthropic-shaped acknowledgement for a trivial turn.
@@ -109,7 +180,7 @@ pub fn local_ack() -> Value {
         "model": "axiom-local",
         "content": [{
             "type": "text",
-            "text": "Acknowledged (answered locally by Axiom -- no upstream call was made for this mechanically trivial turn)."
+            "text": ACK_TEXT
         }],
         "stop_reason": "end_turn",
         "stop_sequence": null,
@@ -164,6 +235,50 @@ mod tests {
         let m = vec![json!({"role":"user","content":[
             {"type":"tool_result","tool_use_id":"x","content": big}]})];
         assert!(!is_trivial(&m, Some(1.0), 7.03), "a large result is forwarded");
+    }
+
+    #[test]
+    fn is_trivial_false_for_whitespace_free_blob_over_byte_cap() {
+        // A base64/minified blob: ~one whitespace token, but well over the byte
+        // cap -- must not slip through as "one small token".
+        let blob = "a".repeat(TRIVIAL_MAX_BYTES + 10);
+        let m = vec![json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"x","content": blob}]})];
+        assert!(!is_trivial(&m, Some(1.0), 7.03), "byte cap catches token-light blobs");
+    }
+
+    #[test]
+    fn is_trivial_false_for_non_user_role() {
+        let m = vec![json!({"role":"assistant","content":[
+            {"type":"tool_result","tool_use_id":"x","content":"ok"}]})];
+        assert!(!is_trivial(&m, Some(1.0), 7.03), "only a user-role turn may short-circuit");
+    }
+
+    #[test]
+    fn is_trivial_false_for_mixed_non_text_content() {
+        // An image part alongside "ok" -- the model may need to see the image.
+        let m = vec![json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"x","content":[
+                {"type":"text","text":"ok"},
+                {"type":"image","source":{"type":"base64","data":"..."}}]}]})];
+        assert!(!is_trivial(&m, Some(1.0), 7.03), "non-text part disqualifies the result");
+    }
+
+    #[test]
+    fn local_ack_sse_emits_the_anthropic_event_sequence() {
+        let sse = local_ack_sse();
+        for ev in [
+            "event: message_start",
+            "event: content_block_start",
+            "event: content_block_delta",
+            "event: content_block_stop",
+            "event: message_delta",
+            "event: message_stop",
+        ] {
+            assert!(sse.contains(ev), "missing {ev}");
+        }
+        assert!(sse.contains("axiom-local"), "marked as a local response");
+        assert!(sse.contains("text_delta"), "carries the ack text delta");
     }
 
     #[test]

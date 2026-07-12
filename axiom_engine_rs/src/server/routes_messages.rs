@@ -198,7 +198,13 @@ async fn compressed_messages_path(
                     .join("\n")
             })
             .unwrap_or_default();
-        let surprisal = if newest_text.is_empty() {
+        // Bound the text BEFORE the surprisal pass: a huge, whitespace-free
+        // blob would otherwise reach `mean_surprisal` (synchronous pipeline
+        // work) even though `is_trivial` will reject it by byte cap. Skipping
+        // it here honours the heavy-content fail-closed contract.
+        let surprisal = if newest_text.is_empty()
+            || newest_text.len() > crate::local_trivial::TRIVIAL_MAX_BYTES
+        {
             None
         } else {
             mean_surprisal(state, &newest_text)
@@ -218,6 +224,17 @@ async fn compressed_messages_path(
                 eprintln!(
                     "[axiom-pss] L-B local short-circuit: session {session_id} answered locally (surprisal {surprisal:?} < gate {gate})"
                 );
+                // Honour the client's transport: a streaming request must get a
+                // valid SSE turn, never a JSON body (which would break it).
+                let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+                if wants_stream {
+                    let resp = Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .body(axum::body::Body::from(crate::local_trivial::local_ack_sse()))
+                        .map_err(|e| ApiError::Internal(format!("local SSE build failed: {e}")))?;
+                    return Ok(resp);
+                }
                 return Ok(Json(crate::local_trivial::local_ack()).into_response());
             }
         }
