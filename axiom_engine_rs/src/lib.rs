@@ -37,6 +37,7 @@ pub mod inference;
 pub mod jit_streamer;
 pub mod keepalive;
 pub mod kernel;
+pub mod local_trivial;
 pub mod lsp;
 pub mod mcp_stdio;
 pub mod memory_pool;

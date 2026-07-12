@@ -255,6 +255,11 @@ pub(crate) static LIFETIME_QUOTA_UNITS_MICROS: std::sync::atomic::AtomicU64 =
 /// for the stack's quota-savings ratio). Units x 1e6.
 pub(crate) static LIFETIME_QUOTA_UNITS_UNCACHED_MICROS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// P3 (Prolonged-Session Stack): lifetime count of turns answered locally by
+/// the L-B trivial-turn short-circuit (turns that never reached the network).
+/// The headline signal for L-B's hit rate in the P5 live eval.
+pub(crate) static LIFETIME_LOCAL_ANSWERED_TURNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Record one priced API turn into the lifetime cost counters. Called
 /// alongside `AwarenessState::record_turn_cost` (the per-session view) so

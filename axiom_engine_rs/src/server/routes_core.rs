@@ -62,6 +62,7 @@ async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiEr
         let quota_units = LIFETIME_QUOTA_UNITS_MICROS.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         let quota_units_uncached =
             LIFETIME_QUOTA_UNITS_UNCACHED_MICROS.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        let local_answered = LIFETIME_LOCAL_ANSWERED_TURNS.load(Ordering::Relaxed);
         rendered.push_str(&format!(
             "# HELP axiom_cost_usd_total Lifetime dollar-true cost of proxied API turns.\n\
              # TYPE axiom_cost_usd_total counter\naxiom_cost_usd_total {cost_usd:.6}\n\
@@ -73,7 +74,9 @@ async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiEr
              # HELP axiom_quota_units_total Lifetime subscription quota units (1 unit = 1 Sonnet-5 intro-rate uncached input token).\n\
              # TYPE axiom_quota_units_total counter\naxiom_quota_units_total {quota_units:.6}\n\
              # HELP axiom_quota_units_uncached_total Counterfactual quota units with zero caching.\n\
-             # TYPE axiom_quota_units_uncached_total counter\naxiom_quota_units_uncached_total {quota_units_uncached:.6}\n"
+             # TYPE axiom_quota_units_uncached_total counter\naxiom_quota_units_uncached_total {quota_units_uncached:.6}\n\
+             # HELP axiom_local_answered_turns_total Turns answered locally by the L-B short-circuit (never reached the network).\n\
+             # TYPE axiom_local_answered_turns_total counter\naxiom_local_answered_turns_total {local_answered}\n"
         ));
     }
     Ok((

@@ -319,6 +319,11 @@ pub struct AppState {
     /// once it crosses a threshold, `rebase::choose_ttl` elects the 1-hour
     /// cache TTL (a one-time write premium beats repeated full re-writes).
     pss_gap: Arc<RwLock<HashMap<String, (u64, u32)>>>,
+    /// P3 (PSS) L-B retry guard: `(last_local_inbound_hash, unix_ts)` per
+    /// session. If the identical inbound arrives again within the cooldown, the
+    /// client retried -- it did not accept our local ack -- so that turn is
+    /// forwarded upstream instead of short-circuited again.
+    pss_local_last: Arc<RwLock<HashMap<String, (String, u64)>>>,
     /// Runtime-mutable compression controls + live counters. Lets a dashboard
     /// retune the threshold / on-off without a restart (`/v1/config`).
     pub controls: Arc<CompressionControls>,
@@ -384,6 +389,7 @@ impl AppState {
             digest_page_turn: Arc::new(RwLock::new(HashMap::new())),
             pss_prefix_hash: Arc::new(RwLock::new(HashMap::new())),
             pss_gap: Arc::new(RwLock::new(HashMap::new())),
+            pss_local_last: Arc::new(RwLock::new(HashMap::new())),
             controls: Arc::new(CompressionControls::from_config(
                 &CompressorConfig::default(),
             )),
@@ -601,6 +607,37 @@ impl AppState {
             crate::rebase::next_long_gap_count(last_ts, now_unix, count, gap_threshold_secs);
         *entry = (now_unix, new_count);
         new_count
+    }
+
+    /// P3 (PSS) L-B retry guard. Given this turn's `inbound_hash` and the
+    /// current time, decide whether the trivial turn may be answered locally.
+    /// Returns `false` (→ forward upstream) when the identical inbound was
+    /// already answered locally within `cooldown_secs` -- the client retried,
+    /// so it did not accept our local ack. Otherwise records this hash+time as
+    /// the session's last local answer and returns `true`. The timestamp is
+    /// refreshed on a retry too, so a burst of retries keeps forwarding.
+    pub(crate) fn pss_local_admit(
+        &self,
+        session_id: &str,
+        inbound_hash: &str,
+        now: u64,
+        cooldown_secs: u64,
+    ) -> bool {
+        let Ok(mut map) = self.pss_local_last.write() else {
+            return false;
+        };
+        let prior = map.get(session_id).cloned();
+        if let Some((h, ts)) = prior {
+            if h == inbound_hash && now.saturating_sub(ts) < cooldown_secs {
+                map.insert(session_id.to_string(), (inbound_hash.to_string(), now));
+                return false;
+            }
+        }
+        if map.len() >= 512 {
+            map.clear();
+        }
+        map.insert(session_id.to_string(), (inbound_hash.to_string(), now));
+        true
     }
 
     async fn adapt_feedback_to_cache(

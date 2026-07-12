@@ -61,6 +61,10 @@ pub struct AwarenessState {
     /// integer atomic so accumulation stays exact. The subscription-side
     /// analogue of `cost_usd_micros`.
     quota_units_micros: AtomicUsize,
+    /// P3 (Prolonged-Session Stack): count of turns answered locally by the
+    /// L-B trivial-turn short-circuit (`local_trivial::is_trivial`), i.e. turns
+    /// that never reached the network at all.
+    local_answered_turns: AtomicUsize,
 }
 
 /// A snapshot of a session's accumulated dollar-true cost, for `/metrics` and
@@ -92,6 +96,8 @@ pub struct CostSummary {
     pub digest_bytes_out: u64,
     /// P0 (PSS): subscription quota units consumed this session.
     pub quota_units_total: f64,
+    /// P3 (PSS): turns answered locally by the L-B short-circuit (no network).
+    pub local_answered_turns: u64,
 }
 
 impl CostSummary {
@@ -133,6 +139,7 @@ impl Default for AwarenessState {
             digest_bytes_in: AtomicUsize::new(0),
             digest_bytes_out: AtomicUsize::new(0),
             quota_units_micros: AtomicUsize::new(0),
+            local_answered_turns: AtomicUsize::new(0),
         }
     }
 }
@@ -221,6 +228,7 @@ impl AwarenessState {
             digest_bytes_out: self.digest_bytes_out.load(Ordering::Relaxed) as u64,
             quota_units_total: self.quota_units_micros.load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
+            local_answered_turns: self.local_answered_turns.load(Ordering::Relaxed) as u64,
         }
     }
 
@@ -230,6 +238,12 @@ impl AwarenessState {
         let micros = (units.max(0.0) * 1_000_000.0).round() as usize;
         self.quota_units_micros
             .fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// Record one turn answered locally by the L-B short-circuit (P3/PSS) --
+    /// a turn that never reached the network.
+    pub fn record_local_answer(&self) {
+        self.local_answered_turns.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one request's prefix-diet dedup savings (S4).

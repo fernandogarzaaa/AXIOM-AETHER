@@ -176,6 +176,70 @@ async fn compressed_messages_path(
     } else {
         (Vec::new(), messages.clone())
     };
+
+    // P3 (PSS) L-B local trivial-turn short-circuit. A mechanically trivial
+    // newest turn -- a small, clean, low-surprisal `tool_result` -- is answered
+    // locally with a fixed acknowledgement, skipping the network entirely (no
+    // cached-prefix re-read, no output tokens). `is_trivial` is fail-closed, so
+    // anything ambiguous falls through and is forwarded. A client retry of the
+    // same inbound within a cooldown means it did not accept our ack -> forward.
+    // Runs before any rebase/partition work so a trivial turn skips all of it.
+    // Default off (AXIOM_LOCAL_TRIVIAL=on) until the live eval passes.
+    if std::env::var("AXIOM_LOCAL_TRIVIAL").as_deref() == Ok("on") {
+        let newest_text = mutable_messages
+            .last()
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(tool_result_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        // Bound the text BEFORE the surprisal pass: a huge, whitespace-free
+        // blob would otherwise reach `mean_surprisal` (synchronous pipeline
+        // work) even though `is_trivial` will reject it by byte cap. Skipping
+        // it here honours the heavy-content fail-closed contract.
+        let surprisal = if newest_text.is_empty()
+            || newest_text.len() > crate::local_trivial::TRIVIAL_MAX_BYTES
+        {
+            None
+        } else {
+            mean_surprisal(state, &newest_text)
+        };
+        let gate = std::env::var("AXIOM_DRIFT_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(7.03);
+        if crate::local_trivial::is_trivial(&mutable_messages, surprisal, gate) {
+            let inbound_hash = {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(serde_json::to_vec(body).unwrap_or_default()))
+            };
+            if state.pss_local_admit(&session_id, &inbound_hash, unix_now(), 120) {
+                state.awareness.get_or_create(&session_id).record_local_answer();
+                LIFETIME_LOCAL_ANSWERED_TURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "[axiom-pss] L-B local short-circuit: session {session_id} answered locally (surprisal {surprisal:?} < gate {gate})"
+                );
+                // Honour the client's transport: a streaming request must get a
+                // valid SSE turn, never a JSON body (which would break it).
+                let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+                if wants_stream {
+                    let resp = Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .body(axum::body::Body::from(crate::local_trivial::local_ack_sse()))
+                        .map_err(|e| ApiError::Internal(format!("local SSE build failed: {e}")))?;
+                    return Ok(resp);
+                }
+                return Ok(Json(crate::local_trivial::local_ack()).into_response());
+            }
+        }
+    }
+
     // P2 (PSS) R2 free-window rebasing. When the client's prompt cache is
     // already broken this turn -- detected as a change in the frozen prefix vs
     // the session's previous turn (compaction / session restructure) -- the
