@@ -1,5 +1,7 @@
 # Prolonged-Session Stack (PSS v2) Implementation Plan
 
+> **Status (2026-07-12):** P0–P4 shipped and merged to `main` — quota ledger + Fable/Opus pricing (#118), L-A tool deferral (#120), R2 rebasing + R3 adaptive TTL (#121), L-B local short-circuit (#122), R1 high-tier routing (#123). **Every lever ships behind its env flag, default OFF.** P5 Step 1 (the live-eval harness — `scripts/pss_eval.sh` + `bench/cvm/pss-eval-tasks.tsv`) has landed. **P5 Step 2 (the live run) and Step 3 (default flips) are pending a deliberate human `./scripts/pss_eval.sh` run** — the flips are gated on a real PASS and must not be made autonomously.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Cut subscription quota burn ≥50% for prolonged (100+ turn) Claude Code sessions, on top of the shipped CVM cost stack (v0.4.0), validated by a live eval before any default flips.
