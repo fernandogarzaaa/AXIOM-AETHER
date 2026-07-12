@@ -324,6 +324,12 @@ pub struct AppState {
     /// client retried -- it did not accept our local ack -- so that turn is
     /// forwarded upstream instead of short-circuited again.
     pss_local_last: Arc<RwLock<HashMap<String, (String, u64)>>>,
+    /// P4 (PSS) R1 routing sticky escalation: remaining cooldown turns per
+    /// session. An error signature on a tool_result sets it to 3; each
+    /// subsequent turn decrements it. While it is non-zero, routing is
+    /// suppressed -- the session stays on its strong tier through the rough
+    /// patch rather than being downgraded mid-debug.
+    pss_route_cooldown: Arc<RwLock<HashMap<String, u32>>>,
     /// Runtime-mutable compression controls + live counters. Lets a dashboard
     /// retune the threshold / on-off without a restart (`/v1/config`).
     pub controls: Arc<CompressionControls>,
@@ -390,6 +396,7 @@ impl AppState {
             pss_prefix_hash: Arc::new(RwLock::new(HashMap::new())),
             pss_gap: Arc::new(RwLock::new(HashMap::new())),
             pss_local_last: Arc::new(RwLock::new(HashMap::new())),
+            pss_route_cooldown: Arc::new(RwLock::new(HashMap::new())),
             controls: Arc::new(CompressionControls::from_config(
                 &CompressorConfig::default(),
             )),
@@ -638,6 +645,27 @@ impl AppState {
         }
         map.insert(session_id.to_string(), (inbound_hash.to_string(), now));
         true
+    }
+
+    /// P4 (PSS) R1 routing sticky escalation. Advance `session_id`'s cooldown
+    /// for this turn and return the remaining count. An error signature this
+    /// turn (`had_error`) escalates to a fresh 3-turn cooldown; otherwise the
+    /// counter decays by one. While the returned value is non-zero, `route`
+    /// suppresses downgrades.
+    pub(crate) fn pss_route_cooldown_tick(&self, session_id: &str, had_error: bool) -> u32 {
+        let Ok(mut map) = self.pss_route_cooldown.write() else {
+            return 0;
+        };
+        if map.len() >= 512 {
+            map.clear();
+        }
+        let entry = map.entry(session_id.to_string()).or_insert(0);
+        if had_error {
+            *entry = 3;
+        } else if *entry > 0 {
+            *entry -= 1;
+        }
+        *entry
     }
 
     async fn adapt_feedback_to_cache(

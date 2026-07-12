@@ -260,6 +260,16 @@ pub(crate) static LIFETIME_QUOTA_UNITS_UNCACHED_MICROS: std::sync::atomic::Atomi
 /// The headline signal for L-B's hit rate in the P5 live eval.
 pub(crate) static LIFETIME_LOCAL_ANSWERED_TURNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// P4 (Prolonged-Session Stack): lifetime R1 routing counters -- turns
+/// downgraded to Haiku, routed turns that fell back after a 4xx, and the
+/// subscription quota units saved by the downgrades (x 1e6). R1's live-eval
+/// attribution.
+pub(crate) static LIFETIME_ROUTED_TURNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIFETIME_ROUTE_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIFETIME_ROUTED_QUOTA_SAVED_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Record one priced API turn into the lifetime cost counters. Called
 /// alongside `AwarenessState::record_turn_cost` (the per-session view) so

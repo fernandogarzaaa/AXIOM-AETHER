@@ -122,6 +122,31 @@ fn local_messages_path(
     }))
 }
 
+/// P4 (PSS) R1 routing: attribute the subscription quota units saved by a
+/// downgrade. `routed_from` is the ORIGINAL tier (only `Some` when the turn
+/// actually ran on the routed Haiku model -- cleared on a fallback), and
+/// `routed_prices` is the price table the turn was billed under (Haiku).
+/// Saved units = `quota_units(original) - quota_units(haiku)` for this turn.
+fn record_route_savings(
+    aware: &crate::session_awareness::AwarenessState,
+    routed_from: Option<&str>,
+    tc: &crate::cost_ledger::TurnCost,
+    routed_prices: &crate::cost_ledger::PriceTable,
+) {
+    let Some(orig) = routed_from else {
+        return;
+    };
+    let (orig_prices, _) = crate::cost_ledger::PriceTable::for_model(orig);
+    let saved = (crate::cost_ledger::quota_units(tc, &orig_prices)
+        - crate::cost_ledger::quota_units(tc, routed_prices))
+    .max(0.0);
+    aware.record_route(saved);
+    use std::sync::atomic::Ordering;
+    LIFETIME_ROUTED_TURNS.fetch_add(1, Ordering::Relaxed);
+    LIFETIME_ROUTED_QUOTA_SAVED_MICROS
+        .fetch_add((saved * 1_000_000.0).round() as u64, Ordering::Relaxed);
+}
+
 /// Active-compression code path: partition → adapt → recall → forward.
 async fn compressed_messages_path(
     state: &AppState,
@@ -594,6 +619,57 @@ async fn compressed_messages_path(
         }
     }
 
+    // P4 (PSS) R1 high-tier-gated model routing. On a mechanical follow-up turn
+    // (the agent feeding back clean tool results, no error), downgrade a scarce
+    // high tier (Opus/Fable) to Haiku to relieve its tight weekly bucket. Caches
+    // are model-scoped, so this never harms the top-tier cache. An error
+    // signature arms a sticky 3-turn cooldown so a debugging stretch stays on
+    // the strong model. Gated AXIOM_MODEL_ROUTE in {off(default),auto,on}. When
+    // routed, `routed_from` carries the original tier for the fallback + savings
+    // attribution below.
+    let route_mode = std::env::var("AXIOM_MODEL_ROUTE").unwrap_or_else(|_| "off".to_string());
+    let mut routed_from: Option<String> = None;
+    if route_mode != "off" {
+        let newest_blocks = mutable_messages
+            .last()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|m| m.get("content").and_then(Value::as_array));
+        let newest_texts: Vec<String> = newest_blocks
+            .map(|blocks| blocks.iter().filter_map(tool_result_text).collect())
+            .unwrap_or_default();
+        // Mechanical = the newest turn is composed entirely of tool_result
+        // blocks (a pure feedback turn, no fresh user prose) and carries no
+        // error signature.
+        let all_tool_results = newest_blocks
+            .map(|blocks| {
+                !blocks.is_empty()
+                    && blocks
+                        .iter()
+                        .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
+            .unwrap_or(false);
+        let had_error = newest_texts
+            .iter()
+            .any(|t| crate::local_trivial::has_error_signature(t));
+        let mechanical = all_tool_results && !had_error;
+        let cooldown = state.pss_route_cooldown_tick(&session_id, had_error);
+        let original_model = outbound
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Some(target) = crate::model_router::route(&original_model, mechanical, cooldown, &route_mode)
+        {
+            if let Some(obj) = outbound.as_object_mut() {
+                obj.insert("model".to_string(), Value::String(target.to_string()));
+            }
+            eprintln!(
+                "[axiom-pss] R1 route: {original_model} -> {target} (session {session_id}, mode {route_mode})"
+            );
+            routed_from = Some(original_model);
+        }
+    }
+
     // Record live compression stats for the dashboard: original vs forwarded
     // payload size and how many heavy messages were absorbed this request.
     let bytes_in = serde_json::to_string(body)
@@ -645,17 +721,26 @@ async fn compressed_messages_path(
         // Status/headers arrive before the body, so we can still retry ONCE with
         // the uncompressed payload on a 4xx/5xx that compression may have caused,
         // before streaming anything to the client.
+        // Retry-once on a 4xx/5xx that our own transform may have caused: a
+        // compressed payload OR a P4-routed (downgraded) model. The fallback
+        // body is the untouched client body, so it carries the ORIGINAL model
+        // -- reverting the route -- as well as the uncompressed context.
         let did_compress = log_heavy_count > 0;
-        if did_compress
+        if (did_compress || routed_from.is_some())
             && (upstream.status() == StatusCode::BAD_REQUEST
                 || upstream.status().is_server_error())
         {
             eprintln!(
-                "[axiom-ttt] compressed stream forward returned {}; retrying once with \
+                "[axiom-ttt] compressed/routed stream forward returned {}; retrying once with \
                  original uncompressed payload (session={session_id})",
                 upstream.status()
             );
             state.controls.record_degraded_fallback();
+            if routed_from.is_some() {
+                state.awareness.get_or_create(&session_id).record_route_fallback();
+                LIFETIME_ROUTE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                routed_from = None; // ran on the original tier -> no saving to attribute
+            }
             let mut fallback = body.clone();
             if let Some(obj) = fallback.as_object_mut() {
                 obj.remove("session_id");
@@ -703,6 +788,9 @@ async fn compressed_messages_path(
         // sent to the client); worst case a turn's cost telemetry is missed.
         use futures::StreamExt;
         let awareness = state.awareness.get_or_create(&session_id);
+        // P4: the original tier for savings attribution, moved into the scan
+        // closure below. `None` here (a fallback cleared it) => no attribution.
+        let routed_orig = routed_from.clone();
         // Seeded from the request; overwritten by message_start's
         // message.model (the upstream-resolved model) the moment it arrives,
         // matching the non-streaming path's precedent of preferring the
@@ -762,6 +850,7 @@ async fn compressed_messages_path(
                             awareness.record_turn_cost(&tc, &prices);
                             awareness.record_turn_quota(crate::cost_ledger::quota_units(&tc, &prices));
                             record_lifetime_cost(&tc, &prices);
+                            record_route_savings(&awareness, routed_orig.as_deref(), &tc, &prices);
                         }
                         collected_usage.clear();
                     }
@@ -790,13 +879,19 @@ async fn compressed_messages_path(
             // session already absorbed the heavy context above, so this only
             // forgoes the token *savings* for this one request — never the answer.
             let did_compress = log_heavy_count > 0;
-            if did_compress && should_retry_uncompressed(&err) {
+            if (did_compress || routed_from.is_some()) && should_retry_uncompressed(&err) {
                 eprintln!(
-                    "[axiom-ttt] compressed forward failed ({err}); retrying once with original \
-                     uncompressed payload (session={session_id})"
+                    "[axiom-ttt] compressed/routed forward failed ({err}); retrying once with \
+                     original uncompressed payload (session={session_id})"
                 );
                 state.controls.record_degraded_fallback();
-                // The untouched client body, minus Axiom-only extensions.
+                if routed_from.is_some() {
+                    state.awareness.get_or_create(&session_id).record_route_fallback();
+                    LIFETIME_ROUTE_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    routed_from = None; // ran on the original tier -> no saving to attribute
+                }
+                // The untouched client body (original model + full context),
+                // minus Axiom-only extensions.
                 let mut fallback = body.clone();
                 if let Some(obj) = fallback.as_object_mut() {
                     obj.remove("session_id");
@@ -826,6 +921,7 @@ async fn compressed_messages_path(
             aware.record_turn_cost(&tc, &prices);
             aware.record_turn_quota(crate::cost_ledger::quota_units(&tc, &prices));
             record_lifetime_cost(&tc, &prices);
+            record_route_savings(&aware, routed_from.as_deref(), &tc, &prices);
         }
     }
 
