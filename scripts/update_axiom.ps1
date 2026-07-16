@@ -69,6 +69,20 @@ for ($attempt = 1; $attempt -le 5; $attempt++) {
     }
 }
 if (-not $copied) { throw "could not replace $exeDest after 5 attempts (binary still locked)" }
+# Refresh the stable MCP entrypoint. Claude Desktop/Code spawn bin\axiom_engine_mcp.exe
+# (NOT the volatile build artifact above, which cargo relinks and this script swaps --
+# spawning that path mid-swap caused Desktop's 'spawn UNKNOWN' disconnects). If a
+# running MCP client holds the copy, rename it aside first: Windows allows renaming a
+# running exe, and the client keeps its old handle until its next restart.
+$mcpDir = Join-Path $Root 'bin'
+New-Item -ItemType Directory -Force -Path $mcpDir | Out-Null
+$mcpDest = Join-Path $mcpDir 'axiom_engine_mcp.exe'
+try { Copy-Item -Force $newExe.FullName $mcpDest -ErrorAction Stop }
+catch {
+    Remove-Item -Force ($mcpDest + '.old') -ErrorAction SilentlyContinue
+    Move-Item -Force $mcpDest ($mcpDest + '.old') -ErrorAction SilentlyContinue
+    Copy-Item -Force $newExe.FullName $mcpDest
+}
 Copy-Item -Force (Join-Path $tmp 'axiom_bpe.json') (Join-Path $Root 'checkpoints\axiom_bpe.json')
 Copy-Item -Force (Join-Path $tmp 'axiom_production_bpe.bin') (Join-Path $Root 'checkpoints\axiom_production_bpe.bin')
 Copy-Item -Force (Join-Path $tmp 'axiom_production_bpe.meta.json') (Join-Path $Root 'checkpoints\axiom_production_bpe.meta.json')
