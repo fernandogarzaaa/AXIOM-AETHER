@@ -270,6 +270,22 @@ pub fn partition_messages(
             .unwrap_or("user")
             .to_string();
 
+        // A `role: "system"` entry in the messages array (distinct from the
+        // top-level `system` field) is positionally significant: Anthropic
+        // requires it to either precede an assistant message or end the
+        // array, EXCEPT the directive-only form (`content: []` plus an
+        // `output_config`), which is valid at any position. Extracting its
+        // content as "heavy" or dropping it for having empty content -- both
+        // of which this function does for every other role -- removes it
+        // from the array and can leave a DIFFERENT system message no longer
+        // immediately before an assistant turn / at the end, producing a 400
+        // from Anthropic. System messages are therefore always passed
+        // through byte-identical: never a compression candidate.
+        if role == "system" {
+            surviving.push(raw.clone());
+            continue;
+        }
+
         let content_value = raw.get("content").cloned().unwrap_or(Value::Null);
         let (kept_content, mut extracted) =
             split_content(&role, &content_value, threshold_tokens, &token_counter);
@@ -606,6 +622,40 @@ mod tests {
         assert_eq!(part.surviving.len(), 1);
         assert_eq!(part.surviving[0]["content"], "short ping");
         assert_eq!(part.target_user_index, Some(0));
+    }
+
+    #[test]
+    fn partition_passes_directive_only_system_message_through_untouched() {
+        // A role:"system" message with content:[] (Anthropic's directive-only
+        // form) must never be dropped as "entirely empty" -- removing it from
+        // the array can leave a DIFFERENT system message no longer
+        // immediately before an assistant turn, producing a 400 upstream.
+        let messages = vec![
+            json!({"role": "system", "content": [], "output_config": {"effort": "low"}}),
+            json!({"role": "assistant", "content": "ok"}),
+            json!({"role": "user", "content": "hello"}),
+        ];
+        let part = partition_messages(&messages, 100, ws);
+        assert_eq!(part.surviving.len(), 3, "the directive-only system message is kept");
+        assert_eq!(part.surviving[0]["role"], "system");
+        assert_eq!(part.surviving[0]["content"], json!([]));
+        assert_eq!(part.surviving[0]["output_config"], json!({"effort": "low"}));
+    }
+
+    #[test]
+    fn partition_never_extracts_heavy_content_from_a_system_message() {
+        // Even a large, genuinely heavy system-role message must pass through
+        // byte-identical: it is positionally significant and never a
+        // compression candidate.
+        let big_text = (0..400).map(|i| format!("tok{i}")).collect::<Vec<_>>().join(" ");
+        let messages = vec![
+            json!({"role": "system", "content": big_text.clone()}),
+            json!({"role": "assistant", "content": "ok"}),
+        ];
+        let part = partition_messages(&messages, 100, ws);
+        assert!(part.heavy_context.is_empty(), "system content is never extracted");
+        assert_eq!(part.surviving.len(), 2);
+        assert_eq!(part.surviving[0]["content"], json!(big_text));
     }
 
     #[test]
