@@ -38,6 +38,10 @@ BENCH_DIR="$REPO/bench/cvm"
 TASKS_FILE="$BENCH_DIR/pss-eval-tasks.tsv"
 REPORT="$BENCH_DIR/PSS-RESULTS-$DATE_TAG.md"
 TMP="$(mktemp -d)"
+# Per-task transcripts + proxy logs must SURVIVE the run: the 2026-07-12
+# eval-2 anomaly (baseline collapsed 10/13 -> 1/13) was undiagnosable because
+# they lived in $TMP and died with the cleanup trap.
+LOG_DIR="$BENCH_DIR/pss-eval-logs-$DATE_TAG"
 PORT_OFF=8941
 PORT_ON=8942
 # Target from the design sim: +56.8% Sonnet / +66.4% Opus / +69.1% Fable.
@@ -66,24 +70,39 @@ TASK_COUNT=$(wc -l < "$TASKS_FILE")
 SCORED_COUNT=$(awk -F'\t' '$2!="SKIP"' "$TASKS_FILE" | wc -l)
 
 # Run the dependent chain in ONE session against $1=base_url, writing per-task
-# pass/fail (scored turns only) into $2=results_file. The first turn starts a
+# pass/fail (scored turns only) into $2=results_file, and per-task transcripts
+# into $LOG_DIR/$3 (a run label, e.g. "off"/"on"). The first turn starts a
 # fresh conversation; every later turn uses `--continue` so the session history
 # grows across the whole chain -- which is what makes the levers engage.
+#
+# `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` disables the operator's user-scoped
+# MCP servers for the headless children: the axiom MCP server would otherwise
+# spawn its own axiom_engine.exe per call (32 spawns per eval -- latency,
+# nondeterminism, and a file lock on the release binary), and the eval needs
+# only the built-in Read tool.
 run_chain() {
-    local base_url="$1" results_file="$2"
+    local base_url="$1" results_file="$2" label="$3"
+    local run_log_dir="$LOG_DIR/$label"
+    mkdir -p "$run_log_dir"
     : > "$results_file"
     local i=0
     while IFS=$'\t' read -r prompt pattern; do
+        # Tolerate a CRLF checkout (core.autocrlf smudges the TSV): the last
+        # field would otherwise carry a trailing \r that silently breaks both
+        # the SKIP compare and every grep (the 2026-07-16 eval-6 lesson).
+        pattern="${pattern%$'\r'}"
         i=$((i + 1))
         local out
         if [ "$i" -eq 1 ]; then
             out=$(ANTHROPIC_BASE_URL="$base_url" claude -p "$prompt" \
-                --model claude-haiku-4-5 2>"$TMP/t_${i}_err.log")
+                --model claude-haiku-4-5 \
+                --strict-mcp-config --mcp-config '{"mcpServers":{}}' </dev/null 2>"$run_log_dir/t_${i}_err.log")
         else
             out=$(ANTHROPIC_BASE_URL="$base_url" claude -p --continue "$prompt" \
-                --model claude-haiku-4-5 2>"$TMP/t_${i}_err.log")
+                --model claude-haiku-4-5 \
+                --strict-mcp-config --mcp-config '{"mcpServers":{}}' </dev/null 2>"$run_log_dir/t_${i}_err.log")
         fi
-        echo "$out" > "$TMP/t_${i}_out.log"
+        echo "$out" > "$run_log_dir/t_${i}_out.log"
         [ "$pattern" = "SKIP" ] && continue
         if echo "$out" | grep -qiE "$pattern"; then
             echo -e "${i}\tpass" >> "$results_file"
@@ -121,21 +140,35 @@ metric() {
 
 # --- Run 1: flags OFF (baseline) --------------------------------------------
 step "run 1/2: flags OFF (baseline)"
-PID_OFF=$(start_proxy "$PORT_OFF" "" "$TMP/proxy_off.log")
+mkdir -p "$LOG_DIR"
+PID_OFF=$(start_proxy "$PORT_OFF" "" "$LOG_DIR/proxy_off.log")
 wait_for_proxy "$PORT_OFF" || { echo "proxy (off) failed to start"; exit 1; }
-run_chain "http://127.0.0.1:$PORT_OFF" "$TMP/results_off.tsv"
+run_chain "http://127.0.0.1:$PORT_OFF" "$TMP/results_off.tsv" "off"
 quota_off=$(metric "$PORT_OFF" axiom_quota_units_total)
 cost_off=$(metric "$PORT_OFF" axiom_cost_usd_total)
 kill "$PID_OFF" 2>/dev/null; wait "$PID_OFF" 2>/dev/null; PID_OFF=""
+
+# Environment sanity gate: the baseline exercises NO Axiom lever, so a low
+# baseline score means the ENVIRONMENT is broken (rate limits, credit-pool
+# exhaustion, CLI faults) -- not the stack. Abort before spending run 2's
+# credits on a measurement that cannot be interpreted (the 2026-07-12 eval-2
+# lesson: off=1/13 made "parity" meaningless).
+pass_off_early=$(awk -F'\t' '$2=="pass"' "$TMP/results_off.tsv" | wc -l)
+if [ "$pass_off_early" -lt 8 ]; then
+    bad "baseline sanity: only $pass_off_early/$SCORED_COUNT correct with all flags OFF"
+    echo "The environment (not the stack) is unhealthy -- inspect $LOG_DIR/off/."
+    echo "No PSS-on run was attempted; no report written."
+    exit 2
+fi
 
 # --- Run 2: all PSS flags ON -------------------------------------------------
 step "run 2/2: PSS flags ON"
 rm -f "$ENGINE_DIR/checkpoints/cvm/faults.jsonl"
 PID_ON=$(start_proxy "$PORT_ON" \
     "export AXIOM_TOOL_DEFER=on; export AXIOM_LOCAL_TRIVIAL=on; export AXIOM_REBASE_ON_BREAK=on; export AXIOM_ADAPTIVE_TTL=on; export AXIOM_MODEL_ROUTE=auto" \
-    "$TMP/proxy_on.log")
+    "$LOG_DIR/proxy_on.log")
 wait_for_proxy "$PORT_ON" || { echo "proxy (on) failed to start"; exit 1; }
-run_chain "http://127.0.0.1:$PORT_ON" "$TMP/results_on.tsv"
+run_chain "http://127.0.0.1:$PORT_ON" "$TMP/results_on.tsv" "on"
 quota_on=$(metric "$PORT_ON" axiom_quota_units_total)
 cost_on=$(metric "$PORT_ON" axiom_cost_usd_total)
 local_answered=$(metric "$PORT_ON" axiom_local_answered_turns_total)

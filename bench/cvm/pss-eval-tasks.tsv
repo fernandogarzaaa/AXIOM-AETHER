@@ -1,5 +1,5 @@
 read axiom_engine_rs/src/model_router.rs and tell me the exact string value of the ROUTE_TARGET constant. Answer with just the value.	claude-haiku-4-5
-in that same file, does is_high_tier return true for "claude-sonnet-5"? Answer yes or no.	(?i)no
+in that same file, does is_high_tier return true for "claude-sonnet-5"? Answer yes or no.	\bno\b
 now read axiom_engine_rs/src/local_trivial.rs and tell me the exact value of TRIVIAL_MAX_BYTES. Answer with just the number.	2000
 in that same file, how many entries does the ERROR_SIGNATURES array have? Answer with just the number.	5
 good. now read axiom_engine_rs/src/rebase.rs and tell me what TTL string choose_ttl returns once the long-gap threshold is reached. Answer with just the value.	1h
@@ -11,6 +11,6 @@ in that same file, what is the FABLE input price per million tokens? Answer with
 briefly, how does quota_units weight a token relative to that anchor? One sentence.	SKIP
 read axiom_engine_rs/src/session_awareness.rs and tell me the name of the counter field that tracks turns answered locally by L-B. Answer with just the field name.	local_answered_turns
 in that same file, what does record_route record besides incrementing routed_turns? One phrase.	SKIP
-now read docs/superpowers/specs/2026-07-11-prolonged-session-stack-design.md and tell me which single lever the simulation found is the anchor (largest standalone saving).	(?i)tool|defer|L-A
-based on everything you have read this session, which PSS lever answers a trivial turn without any upstream call? Name it.	(?i)L-B|local
+now read docs/superpowers/specs/2026-07-11-prolonged-session-stack-design.md and tell me which single lever the simulation found is the anchor (largest standalone saving).	tool|defer|L-A
+based on everything you have read this session, which PSS lever answers a trivial turn without any upstream call? Name it.	L-B|local
 final: list, in one line, the five env flags that gate the PSS levers.	AXIOM_TOOL_DEFER

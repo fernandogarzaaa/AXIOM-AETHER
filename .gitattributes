@@ -1,0 +1,2 @@
+bench/cvm/pss-eval-tasks.tsv text eol=lf
+scripts/*.sh text eol=lf
