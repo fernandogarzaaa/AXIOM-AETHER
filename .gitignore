@@ -29,3 +29,4 @@ bench/results/*.json
 tmp_*.txt
 bench/cvm/pss-eval-logs-*/
 C*WINDOWSTEMP*
+bin/
