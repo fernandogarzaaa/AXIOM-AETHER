@@ -122,7 +122,12 @@ fn body_with_tools(session_id: &str) -> Value {
 async fn defer_marks_unused_tools_when_enabled() {
     let _guard = env_lock().lock().await;
     std::env::set_var("AXIOM_TOOL_DEFER", "on");
+    // This suite's newest turn is a small, clean tool_result -- exactly what
+    // L-B (default ON since the 2026-07-16 flip) short-circuits. Pin it off so
+    // the request actually reaches the mock upstream under test.
+    std::env::set_var("AXIOM_LOCAL_TRIVIAL", "off");
     let _cleanup = EnvVarGuard("AXIOM_TOOL_DEFER");
+    let _cleanup2 = EnvVarGuard("AXIOM_LOCAL_TRIVIAL");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
     let state = build_state(upstream).await;
@@ -151,7 +156,9 @@ async fn defer_marks_unused_tools_when_enabled() {
 async fn defer_output_is_byte_stable_across_two_turns() {
     let _guard = env_lock().lock().await;
     std::env::set_var("AXIOM_TOOL_DEFER", "on");
+    std::env::set_var("AXIOM_LOCAL_TRIVIAL", "off"); // see note in the first test
     let _cleanup = EnvVarGuard("AXIOM_TOOL_DEFER");
+    let _cleanup2 = EnvVarGuard("AXIOM_LOCAL_TRIVIAL");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
     let state = build_state(upstream).await;
@@ -170,8 +177,12 @@ async fn defer_output_is_byte_stable_across_two_turns() {
 #[tokio::test]
 async fn defer_off_passes_tools_through_unchanged() {
     let _guard = env_lock().lock().await;
-    std::env::remove_var("AXIOM_TOOL_DEFER"); // default off
+    // Default is ON since the 2026-07-16 flip -- opting out takes an explicit
+    // "off" now.
+    std::env::set_var("AXIOM_TOOL_DEFER", "off");
+    std::env::set_var("AXIOM_LOCAL_TRIVIAL", "off"); // see note in the first test
     let _cleanup = EnvVarGuard("AXIOM_TOOL_DEFER");
+    let _cleanup2 = EnvVarGuard("AXIOM_LOCAL_TRIVIAL");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
     let state = build_state(upstream).await;

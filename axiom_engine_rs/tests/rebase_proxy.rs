@@ -201,7 +201,9 @@ async fn rebase_restructures_old_heavy_on_a_detected_break() {
 #[tokio::test]
 async fn rebase_off_leaves_the_transcript_untouched() {
     let _guard = env_lock().lock().await;
-    std::env::remove_var("AXIOM_REBASE_ON_BREAK"); // default off
+    // Default is ON since the 2026-07-16 flip -- opting out takes an explicit
+    // "off" now.
+    std::env::set_var("AXIOM_REBASE_ON_BREAK", "off");
     let _cleanup = EnvVarGuard("AXIOM_REBASE_ON_BREAK");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;

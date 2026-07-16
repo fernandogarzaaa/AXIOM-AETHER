@@ -28,3 +28,4 @@ bench/results/*.json
 # Temp files from CI debugging
 tmp_*.txt
 bench/cvm/pss-eval-logs-*/
+C*WINDOWSTEMP*
