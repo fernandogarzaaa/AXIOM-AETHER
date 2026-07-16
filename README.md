@@ -127,7 +127,7 @@ input token), the subscription-side analogue of dollars.
 | Flag | Default | Lever |
 |---|---|---|
 | `AXIOM_TOOL_DEFER` | **on** | L-A: marks tools outside the recent working set `defer_loading: true` so they leave the cached prefix; Anthropic loads them on demand without a cache break. Set `off` to disable. |
-| `AXIOM_LOCAL_TRIVIAL` | **on** | L-B: answers provably trivial turns (small, clean, tool_result-only, low-surprisal) locally with zero upstream calls. Fail-closed; `off` to disable. |
+| `AXIOM_LOCAL_TRIVIAL` | **on** | L-B: answers provably trivial turns (small, clean, tool_result-only, low-surprisal) locally with zero upstream calls. The *classifier* is fail-closed (anything ambiguous is forwarded upstream); the *gate itself* is enabled unless set to exactly `off`. |
 | `AXIOM_REBASE_ON_BREAK` | **on** | R2: when the client's cache is *already* broken (a non-append prefix change: compaction/restructure), restructures old heavy tool_results into recoverable L2 stubs at zero marginal cache cost. Never proxy-initiated. |
 | `AXIOM_ADAPTIVE_TTL` | **on** | R3: after repeated >4-minute inter-turn gaps, annotates the newest cache breakpoint `ttl: 1h` (one 2× write beats repeated re-writes). |
 | `AXIOM_MODEL_ROUTE` | **auto** | R1: downgrades mechanical follow-up turns on scarce high tiers (Opus/Fable) to Haiku; error signatures arm a 3-turn cooldown; upstream 4xx falls back to the original tier once. `off` disables; `on` extends to all Claude tiers. |
