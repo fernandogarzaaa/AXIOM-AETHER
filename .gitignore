@@ -28,8 +28,5 @@ bench/results/*.json
 # Temp files from CI debugging
 tmp_*.txt
 bench/cvm/pss-eval-logs-*/
-<<<<<<< Updated upstream
-=======
-C\xef\x80\xbaWINDOWSTEMP*
+C*WINDOWSTEMP*
 bin/
->>>>>>> Stashed changes

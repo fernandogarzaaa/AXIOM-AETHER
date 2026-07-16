@@ -243,7 +243,9 @@ async fn error_bearing_turn_is_forwarded_upstream() {
 #[tokio::test]
 async fn flag_off_always_forwards() {
     let _guard = env_lock().lock().await;
-    let _c1 = EnvVarGuard::unset("AXIOM_LOCAL_TRIVIAL"); // default off
+    // Default is ON since the 2026-07-16 flip -- opting out now takes an
+    // explicit "off".
+    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "off");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
     let state = build_state(upstream).await;

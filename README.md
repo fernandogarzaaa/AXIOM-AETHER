@@ -116,6 +116,38 @@ from `/metrics`, over a full week of real traffic) has not been published yet.
 Until it is, treat the 70%+ figure as the design target the simulation
 motivated, not a result.
 
+## Prolonged-Session Stack (PSS v2)
+
+Five levers on top of the CVM stack, aimed specifically at multi-hour, 100+
+turn sessions where the cached-prefix re-read dominates cost. Design and plan:
+[`docs/superpowers/specs/2026-07-11-prolonged-session-stack-design.md`](docs/superpowers/specs/2026-07-11-prolonged-session-stack-design.md).
+Costs are measured in **quota units** (1 unit = 1 Sonnet-5 intro-rate uncached
+input token), the subscription-side analogue of dollars.
+
+| Flag | Default | Lever |
+|---|---|---|
+| `AXIOM_TOOL_DEFER` | **on** | L-A: marks tools outside the recent working set `defer_loading: true` so they leave the cached prefix; Anthropic loads them on demand without a cache break. Set `off` to disable. |
+| `AXIOM_LOCAL_TRIVIAL` | **on** | L-B: answers provably trivial turns (small, clean, tool_result-only, low-surprisal) locally with zero upstream calls. The *classifier* is fail-closed (anything ambiguous is forwarded upstream); the *gate itself* is enabled unless set to exactly `off`. |
+| `AXIOM_REBASE_ON_BREAK` | **on** | R2: when the client's cache is *already* broken (a non-append prefix change: compaction/restructure), restructures old heavy tool_results into recoverable L2 stubs at zero marginal cache cost. Never proxy-initiated. |
+| `AXIOM_ADAPTIVE_TTL` | **on** | R3: after repeated >4-minute inter-turn gaps, annotates the newest cache breakpoint `ttl: 1h` (one 2× write beats repeated re-writes). |
+| `AXIOM_MODEL_ROUTE` | **auto** | R1: downgrades mechanical follow-up turns on scarce high tiers (Opus/Fable) to Haiku; error signatures arm a 3-turn cooldown; upstream 4xx falls back to the original tier once. `off` disables; `on` extends to all Claude tiers. |
+
+**What is measured vs simulated.** The design simulation
+(`bench/cvm/pss_sim.py`, 4,000×187-turn sessions) projects +56.8% (Sonnet) /
++66.4% (Opus) / +69.1% (Fable) quota savings — *simulations*. The real
+measurements (`bench/cvm/PSS-RESULTS-*.md`):
+
+- **2026-07-12 (FAIL, pre-fix):** the original R2 break detector treated the
+  provider's moving cache breakpoint as a break every turn, destroying working
+  history (80.9% savings, correctness 10/13 → 2/13). Fixed in
+  `rebase::is_genuine_break`; regression-tested.
+- **2026-07-16 (first valid run):** correctness parity 12/13 = 12/13, 0%
+  faults, **11.0% quota savings** on a 16-turn headless chain. Only L-A could
+  activate in that harness shape (L-B needs tool_result-only turns, R1 needs
+  Opus/Fable traffic, R2 correctly saw zero genuine breaks). The 50%+ target
+  remains unproven on real long-session traffic; defaults were flipped on the
+  strength of correctness parity + zero faults, not the target.
+
 ## Quick Start
 
 ### Install
