@@ -1,0 +1,21 @@
+[package]
+name = "axiom_swarm"
+description = "Axiom Prime: non-blocking FSM orchestrator over the Kinetic Neural Mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "axiom_swarm"
+path = "src/main.rs"
+
+[dependencies]
+axiom_core = { path = "../axiom_core" }
+axiom_mcp = { path = "../axiom_mcp" }
+ndarray = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
