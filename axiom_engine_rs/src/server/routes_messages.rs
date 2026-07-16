@@ -209,8 +209,9 @@ async fn compressed_messages_path(
     // anything ambiguous falls through and is forwarded. A client retry of the
     // same inbound within a cooldown means it did not accept our ack -> forward.
     // Runs before any rebase/partition work so a trivial turn skips all of it.
-    // Default off (AXIOM_LOCAL_TRIVIAL=on) until the live eval passes.
-    if std::env::var("AXIOM_LOCAL_TRIVIAL").as_deref() == Ok("on") {
+    // Default ON since the 2026-07-16 live eval (correctness parity 12/13 =
+    // 12/13, 0% faults); opt out with AXIOM_LOCAL_TRIVIAL=off.
+    if std::env::var("AXIOM_LOCAL_TRIVIAL").as_deref() != Ok("off") {
         let newest_text = mutable_messages
             .last()
             .and_then(|m| m.get("content"))
@@ -274,8 +275,9 @@ async fn compressed_messages_path(
     // heavy `tool_result` into a stub + L2 page at zero *marginal* cache cost,
     // shrinking every FUTURE turn's re-read. Never proxy-initiated: it only
     // piggybacks on a break the client caused.
-    // Default off (AXIOM_REBASE_ON_BREAK=on) until the live eval passes.
-    if std::env::var("AXIOM_REBASE_ON_BREAK").as_deref() == Ok("on")
+    // Default ON since the 2026-07-16 live eval; opt out with
+    // AXIOM_REBASE_ON_BREAK=off.
+    if std::env::var("AXIOM_REBASE_ON_BREAK").as_deref() != Ok("off")
         && state.pss_detect_break(&session_id, &frozen_messages)
         && mutable_messages.len() > 1
     {
@@ -578,9 +580,11 @@ async fn compressed_messages_path(
     // cached prefix (Anthropic loads them on demand as `tool_reference` blocks
     // without breaking the cache). Only ever ADDS the flag -- names/order/count
     // are unchanged -- so the tools array stays byte-stable turn-over-turn.
-    // Default off (AXIOM_TOOL_DEFER=on) until the live eval passes. See
+    // Default ON since the 2026-07-16 live eval (the one lever with a measured
+    // saving in that harness: 11.0% quota, parity-clean); opt out with
+    // AXIOM_TOOL_DEFER=off. See
     // docs/superpowers/plans/2026-07-11-prolonged-session-stack.md, step P1.
-    if std::env::var("AXIOM_TOOL_DEFER").as_deref() == Ok("on") {
+    if std::env::var("AXIOM_TOOL_DEFER").as_deref() != Ok("off") {
         if let Some(tools) = outbound.get("tools").and_then(Value::as_array).cloned() {
             let keep = crate::tool_defer::working_set(&messages, 8);
             let (deferred_tools, deferred_count) = crate::tool_defer::mark_deferred(&tools, &keep);
@@ -603,8 +607,9 @@ async fn compressed_messages_path(
     // annotating the newest `cache_control` breakpoint with `"ttl":"1h"`. This
     // only ever ADDS a field to the final breakpoint block; it never reorders
     // or removes content, so the cached prefix stays byte-stable. Default off
-    // (AXIOM_ADAPTIVE_TTL=on) until the live eval passes.
-    if std::env::var("AXIOM_ADAPTIVE_TTL").as_deref() == Ok("on") {
+    // Default ON since the 2026-07-16 live eval; opt out with
+    // AXIOM_ADAPTIVE_TTL=off.
+    if std::env::var("AXIOM_ADAPTIVE_TTL").as_deref() != Ok("off") {
         let count = state.pss_gap_tick(&session_id, unix_now(), 240);
         if let Some(ttl) = crate::rebase::choose_ttl(count, 3) {
             if let Some(msgs) = outbound.get_mut("messages").and_then(Value::as_array_mut) {
@@ -622,10 +627,10 @@ async fn compressed_messages_path(
     // high tier (Opus/Fable) to Haiku to relieve its tight weekly bucket. Caches
     // are model-scoped, so this never harms the top-tier cache. An error
     // signature arms a sticky 3-turn cooldown so a debugging stretch stays on
-    // the strong model. Gated AXIOM_MODEL_ROUTE in {off(default),auto,on}. When
-    // routed, `routed_from` carries the original tier for the fallback + savings
-    // attribution below.
-    let route_mode = std::env::var("AXIOM_MODEL_ROUTE").unwrap_or_else(|_| "off".to_string());
+    // the strong model. Gated AXIOM_MODEL_ROUTE in {off,auto(default),on} --
+    // default auto since the 2026-07-16 live eval. When routed, `routed_from`
+    // carries the original tier for the fallback + savings attribution below.
+    let route_mode = std::env::var("AXIOM_MODEL_ROUTE").unwrap_or_else(|_| "auto".to_string());
     let mut routed_from: Option<String> = None;
     if route_mode != "off" {
         let newest_blocks = mutable_messages

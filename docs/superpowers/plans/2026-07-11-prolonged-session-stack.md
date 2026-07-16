@@ -1,6 +1,6 @@
 # Prolonged-Session Stack (PSS v2) Implementation Plan
 
-> **Status (2026-07-12):** P0–P4 shipped and merged to `main` — quota ledger + Fable/Opus pricing (#118), L-A tool deferral (#120), R2 rebasing + R3 adaptive TTL (#121), L-B local short-circuit (#122), R1 high-tier routing (#123). **Every lever ships behind its env flag, default OFF.** P5 Step 1 (the live-eval harness — `scripts/pss_eval.sh` + `bench/cvm/pss-eval-tasks.tsv`) has landed. **P5 Step 2 (the live run) and Step 3 (default flips) are pending a deliberate human `./scripts/pss_eval.sh` run** — the flips are gated on a real PASS and must not be made autonomously.
+> **Status (2026-07-16, COMPLETE):** P0–P5 all shipped. P0–P4 merged as #118/#120/#121/#122/#123; live-eval harness #124/#127; R2 break-detection root-cause fix #125 (the 2026-07-12 FAIL); **defaults flipped ON by explicit user decision** after the first valid measurement (2026-07-16: parity 12/13 = 12/13, 0% faults, 11.0% quota savings — L-A only could fire in that harness shape; the ≥50% target remains unproven on real long-session traffic). Opt out per-lever: `AXIOM_TOOL_DEFER/LOCAL_TRIVIAL/REBASE_ON_BREAK/ADAPTIVE_TTL=off`, `AXIOM_MODEL_ROUTE=off`. Real measurements in `bench/cvm/PSS-RESULTS-*.md`; README + docs/CAPABILITIES.md updated.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

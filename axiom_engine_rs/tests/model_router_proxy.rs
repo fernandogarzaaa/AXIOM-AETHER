@@ -138,6 +138,10 @@ fn mechanical_turn(model: &str, session_id: &str) -> Value {
 async fn auto_mode_downgrades_a_mechanical_opus_turn_to_haiku() {
     let _guard = env_lock().lock().await;
     let _c = EnvVarGuard::set("AXIOM_MODEL_ROUTE", "auto");
+    // mechanical_turn's newest message is a small, clean tool_result -- L-B
+    // (default ON since the 2026-07-16 flip) would answer it locally before
+    // routing ever runs. Pin it off so the routed request reaches the mock.
+    let _c2 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "off");
 
     let (upstream, capture, _task) = start_upstream(false).await;
     let state = build_state(upstream).await;
@@ -159,6 +163,10 @@ async fn auto_mode_downgrades_a_mechanical_opus_turn_to_haiku() {
 async fn auto_mode_leaves_sonnet_untouched() {
     let _guard = env_lock().lock().await;
     let _c = EnvVarGuard::set("AXIOM_MODEL_ROUTE", "auto");
+    // mechanical_turn's newest message is a small, clean tool_result -- L-B
+    // (default ON since the 2026-07-16 flip) would answer it locally before
+    // routing ever runs. Pin it off so the routed request reaches the mock.
+    let _c2 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "off");
 
     let (upstream, capture, _task) = start_upstream(false).await;
     let state = build_state(upstream).await;
@@ -180,6 +188,10 @@ async fn auto_mode_leaves_sonnet_untouched() {
 async fn routed_turn_that_4xxs_falls_back_once_to_the_original_model() {
     let _guard = env_lock().lock().await;
     let _c = EnvVarGuard::set("AXIOM_MODEL_ROUTE", "auto");
+    // mechanical_turn's newest message is a small, clean tool_result -- L-B
+    // (default ON since the 2026-07-16 flip) would answer it locally before
+    // routing ever runs. Pin it off so the routed request reaches the mock.
+    let _c2 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "off");
 
     // The mock 400s the routed Haiku attempt, forcing a single fallback retry
     // with the original Opus model.
