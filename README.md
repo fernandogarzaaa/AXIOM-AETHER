@@ -152,8 +152,9 @@ measurements (`bench/cvm/PSS-RESULTS-*.md`):
   (`1 − quota_units_total / quota_units_uncached_total` over the session's
   delta): a multi-file exploratory walkthrough (8 file reads + a repo-wide
   grep) measured **65.1% quota savings**; a smaller 3-file isolated task
-  measured **41.4%**. Both exceed the design target and were driven by native
-  Anthropic prompt caching (kept intact by S1) plus L-A tool deferral plus S3
+  measured **41.4%**. The larger session exceeded the 50% design target; the
+  smaller one fell short of it. Both were driven by native Anthropic prompt
+  caching (kept intact by S1) plus L-A tool deferral plus S3
   digest — L-B and R1 fired zero times in either session (their trigger
   shapes, trivial tool-only turns and Opus/Fable traffic, don't occur in
   ordinary coding-agent use). Caveat: `/metrics` counters are process-global,
