@@ -162,6 +162,12 @@ impl CvmStore {
             .write()
             .map_err(|_| std::io::Error::other("cvm store index lock poisoned"))?;
         let rows = idx.entry(session_id.to_string()).or_default();
+        // Page ids are content hashes: the same text paged again (e.g. a
+        // repeated break-window rebase over an unchanged transcript) must be
+        // a no-op, not a duplicate row + file rewrite.
+        if rows.iter().any(|r| r.page_id == page_id) {
+            return Ok(page_id);
+        }
         rows.push(row);
 
         let mut total: usize = rows.iter().map(|r| r.bytes).sum();

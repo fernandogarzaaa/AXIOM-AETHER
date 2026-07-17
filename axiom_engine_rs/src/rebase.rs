@@ -93,8 +93,11 @@ pub fn set_newest_cache_ttl(messages: &mut [Value], ttl: &str) -> bool {
 }
 
 /// Flatten a `tool_result` block's own `content` (which is independently a
-/// string or an array of text blocks) to plain text.
-fn tool_result_text(block: &Value) -> Option<String> {
+/// string or an array of text blocks) to plain text. Shared with
+/// [`crate::anthropic_forwarder`]'s S0 heavy-content partitioning, which
+/// classifies `tool_result` blocks the same way this module's `tool_result`
+/// digestion does.
+pub(crate) fn tool_result_text(block: &Value) -> Option<String> {
     if block.get("type").and_then(Value::as_str) != Some("tool_result") {
         return None;
     }
@@ -120,6 +123,64 @@ fn token_estimate(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+/// Build the deterministic replacement string for a paged `tool_result`.
+/// MUST be a pure function of `text`: [`reapply_stubs`] regenerates it on
+/// every later turn and the bytes have to match what [`rebase_transcript`]
+/// forwarded (and Anthropic cached) at the break turn exactly.
+fn stub_replacement(page_id: &str, text: &str) -> String {
+    let orig_tokens = token_estimate(text);
+    let budget = ((orig_tokens as f64) * 0.15).round() as usize;
+    let stub = build_stub(page_id, orig_tokens, "tool_result", text);
+    let digest = SkeletonDigestor.digest(text, budget);
+    format!("{stub}\n{digest}\n[AXIOM-PAGE-END expand with axiom_expand(\"{page_id}\")]")
+}
+
+/// A block whose text is itself a stub must never be paged again (a
+/// stub-of-stub would orphan the real page id).
+fn is_already_stubbed(text: &str) -> bool {
+    text.trim_start().starts_with("[AXIOM-PAGE ")
+}
+
+/// Rewrite the heavy `tool_result` blocks of one message via `replace`,
+/// which maps block text to its replacement (or `None` to keep the block).
+fn rewrite_heavy_blocks(msg: &Value, replace: &mut dyn FnMut(&str) -> Option<String>) -> Value {
+    let Some(content) = msg.get("content").and_then(Value::as_array) else {
+        return msg.clone();
+    };
+    let mut changed = false;
+    let new_content: Vec<Value> = content
+        .iter()
+        .map(|block| match tool_result_text(block) {
+            Some(text)
+                if token_estimate(&text) >= DEFAULT_DIGEST_THRESHOLD_TOKENS
+                    && !is_already_stubbed(&text) =>
+            {
+                match replace(&text) {
+                    Some(replacement) => {
+                        let mut b = block.clone();
+                        if let Some(obj) = b.as_object_mut() {
+                            obj.insert("content".to_string(), Value::String(replacement));
+                        }
+                        changed = true;
+                        b
+                    }
+                    None => block.clone(),
+                }
+            }
+            _ => block.clone(),
+        })
+        .collect();
+    if changed {
+        let mut m = msg.clone();
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert("content".to_string(), Value::Array(new_content));
+        }
+        m
+    } else {
+        msg.clone()
+    }
+}
+
 /// Rebase the transcript: digest every heavy `tool_result` block in every
 /// message EXCEPT the newest turn (the last message), storing the full
 /// original in `store` and replacing the block's content with a
@@ -131,7 +192,6 @@ pub fn rebase_transcript(messages: &[Value], store: &CvmStore, session_id: &str)
         return messages.to_vec();
     }
     let newest_idx = messages.len() - 1;
-    let digestor = SkeletonDigestor;
 
     messages
         .iter()
@@ -140,54 +200,55 @@ pub fn rebase_transcript(messages: &[Value], store: &CvmStore, session_id: &str)
             if i == newest_idx {
                 return msg.clone(); // never touch the newest turn
             }
-            let Some(content) = msg.get("content").and_then(Value::as_array) else {
-                return msg.clone();
-            };
-            let mut changed = false;
-            let new_content: Vec<Value> = content
-                .iter()
-                .map(|block| {
-                    match tool_result_text(block) {
-                        Some(text) if token_estimate(&text) >= DEFAULT_DIGEST_THRESHOLD_TOKENS => {
-                            let orig_tokens = token_estimate(&text);
-                            match store.put(session_id, "tool_result", &text) {
-                                Ok(page_id) => {
-                                    let budget = ((orig_tokens as f64) * 0.15).round() as usize;
-                                    let stub =
-                                        build_stub(&page_id, orig_tokens, "tool_result", &text);
-                                    let digest = digestor.digest(&text, budget);
-                                    let replacement = format!(
-                                        "{stub}\n{digest}\n[AXIOM-PAGE-END expand with axiom_expand(\"{page_id}\")]"
-                                    );
-                                    let mut b = block.clone();
-                                    if let Some(obj) = b.as_object_mut() {
-                                        obj.insert(
-                                            "content".to_string(),
-                                            Value::String(replacement),
-                                        );
-                                    }
-                                    changed = true;
-                                    b
-                                }
-                                Err(e) => {
-                                    eprintln!("[axiom-pss] rebase store.put failed: {e}");
-                                    block.clone()
-                                }
-                            }
-                        }
-                        _ => block.clone(),
-                    }
-                })
-                .collect();
-            if changed {
-                let mut m = msg.clone();
-                if let Some(obj) = m.as_object_mut() {
-                    obj.insert("content".to_string(), Value::Array(new_content));
+            rewrite_heavy_blocks(msg, &mut |text| match store
+                .put(session_id, "tool_result", text)
+            {
+                Ok(page_id) => Some(stub_replacement(&page_id, text)),
+                Err(e) => {
+                    eprintln!("[axiom-pss] rebase store.put failed: {e}");
+                    None
                 }
-                m
-            } else {
-                msg.clone()
+            })
+        })
+        .collect()
+}
+
+/// Deterministically re-apply existing stubs to a transcript slice WITHOUT
+/// ever writing to the store. A heavy `tool_result` block is replaced only
+/// when its content hash already has a page in `store` (i.e. an earlier
+/// break-window [`rebase_transcript`] paged this exact text). Because both
+/// the page id and the replacement string are pure functions of the block's
+/// bytes, applying this every turn keeps the forwarded frozen prefix
+/// byte-identical to what was cached after the break -- the mechanism that
+/// makes rebasing the frozen prefix cache-safe on subsequent turns.
+///
+/// `protect_last` must be true when the slice's last message is the newest
+/// turn of the whole request (i.e. the mutable tail is empty), preserving
+/// rebase's never-touch-the-newest-turn contract.
+pub fn reapply_stubs(
+    messages: &[Value],
+    store: &CvmStore,
+    session_id: &str,
+    protect_last: bool,
+) -> Vec<Value> {
+    let protected_idx = if protect_last && !messages.is_empty() {
+        Some(messages.len() - 1)
+    } else {
+        None
+    };
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            if Some(i) == protected_idx {
+                return msg.clone();
             }
+            rewrite_heavy_blocks(msg, &mut |text| {
+                let page_id = CvmStore::page_id_for(text);
+                store
+                    .get(session_id, &page_id)
+                    .map(|_| stub_replacement(&page_id, text))
+            })
         })
         .collect()
 }
@@ -355,6 +416,103 @@ mod tests {
             {"type":"tool_result","tool_use_id":"a","content": big}]})];
         let out = rebase_transcript(&messages, &store, "s1");
         assert_eq!(out, messages, "a lone newest turn is never rebased");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_stubs_reproduces_rebase_transcript_byte_for_byte() {
+        // The whole point of reapply_stubs: re-sending the ORIGINAL (unstubbed)
+        // transcript on a later turn must transform into the EXACT bytes the
+        // break-window rebase forwarded (and Anthropic cached), or the "frozen"
+        // prefix silently diverges from the cached one.
+        let dir = tempdir("reapply-parity");
+        let store = CvmStore::open(&dir).unwrap();
+        let big = "p ".repeat(9000);
+        let original = vec![
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"a","content": big.clone()}]}),
+            json!({"role":"assistant","content":"ack"}),
+        ];
+        let rebased = rebase_transcript(&original, &store, "s1");
+        // A later turn resends the client's ORIGINAL (unstubbed) bytes for the
+        // now-old messages; protect_last=false since these aren't the newest
+        // turn of the later request.
+        let replayed = reapply_stubs(&original, &store, "s1", false);
+        assert_eq!(replayed, rebased, "reapply must match the original rebase exactly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_stubs_never_touches_an_unpaged_block() {
+        // No prior rebase_transcript call happened for this text, so no page
+        // exists -- reapply_stubs must leave it byte-identical rather than
+        // writing a new page (that's rebase_transcript's job, gated on a
+        // genuine break, not reapply's).
+        let dir = tempdir("reapply-unpaged");
+        let store = CvmStore::open(&dir).unwrap();
+        let big = "q ".repeat(9000);
+        let messages = vec![json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"a","content": big.clone()}]})];
+        let out = reapply_stubs(&messages, &store, "s1", false);
+        assert_eq!(out, messages, "unpaged heavy block is left untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_stubs_protects_the_last_message_when_requested() {
+        let dir = tempdir("reapply-protect-last");
+        let store = CvmStore::open(&dir).unwrap();
+        let big = "r ".repeat(9000);
+        let original = vec![json!({"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"a","content": big.clone()}]})];
+        // Page it via a two-message rebase first so a page exists for `big`.
+        let mut two = original.clone();
+        two.push(json!({"role":"assistant","content":"ack"}));
+        let _ = rebase_transcript(&two, &store, "s1");
+        // Now `original` (the paged block IS the last message) with
+        // protect_last=true must stay untouched even though a page exists.
+        let out = reapply_stubs(&original, &store, "s1", true);
+        assert_eq!(out, original, "protect_last shields the final message");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_stubs_is_idempotent_on_an_already_stubbed_transcript() {
+        // Feeding the OUTPUT of a prior reapply back in must not double-stub
+        // (is_already_stubbed guards this) or attempt a second page write.
+        let dir = tempdir("reapply-idempotent");
+        let store = CvmStore::open(&dir).unwrap();
+        let big = "s ".repeat(9000);
+        let original = vec![
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"a","content": big.clone()}]}),
+            json!({"role":"assistant","content":"ack"}),
+        ];
+        let once = reapply_stubs(&rebase_transcript(&original, &store, "s1"), &store, "s1", false);
+        let twice = reapply_stubs(&once, &store, "s1", false);
+        assert_eq!(once, twice, "reapplying to an already-stubbed transcript is a no-op");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rebase_transcript_paging_the_same_text_twice_does_not_duplicate_store_rows() {
+        // A break-window rebase can legitimately re-run over content it
+        // already paged (e.g. two genuine breaks before the old turn ages
+        // out). CvmStore::put must treat the identical content-hash page as
+        // a no-op rather than growing the session file unboundedly.
+        let dir = tempdir("no-dup-rows");
+        let store = CvmStore::open(&dir).unwrap();
+        let big = "t ".repeat(9000);
+        let messages = vec![
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"a","content": big.clone()}]}),
+            json!({"role":"assistant","content":"ack"}),
+        ];
+        let first = rebase_transcript(&messages, &store, "s1");
+        let second = rebase_transcript(&messages, &store, "s1");
+        assert_eq!(first, second, "re-paging identical content is deterministic");
+        let page_id = CvmStore::page_id_for(&big);
+        assert_eq!(store.get("s1", &page_id), Some(big));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

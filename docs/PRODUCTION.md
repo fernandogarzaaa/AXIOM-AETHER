@@ -6,6 +6,37 @@ verifier-gated code-repair nodes. Pairs with the engine survey/roadmap in
 
 ## Build & run
 
+**⚠️ The port-3000 proxy is a live, shared, supervised process — multiple
+agent sessions on this machine may route through it concurrently. Killing or
+overwriting the running `axiom_engine.exe` drops everyone's connection
+(including your own, if `ANTHROPIC_BASE_URL` points at it) and can race with
+another session's rebuild.**
+
+- **Never `taskkill` / `Stop-Process` the running proxy directly** to "force"
+  a rebuild. `cargo build` will fail with `Access is denied` while the binary
+  is running (Windows file locking) — that failure is expected and is not a
+  reason to kill the process.
+- **To restart** (same binary, e.g. after an env var or checkpoint change),
+  use the supervised script — it stops only the port-3000 instance (never
+  MCP stdio or ChatGPT-connector instances) and relaunches it:
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File D:\AXIOM-AETHER\scripts\restart_proxy.ps1
+  ```
+- **To deploy a rebuilt binary** (source changed), the running `.exe` is
+  locked — rename it aside first so `cargo build` can write a fresh one,
+  *then* restart:
+  ```bash
+  mv axiom_engine_rs/target/release/axiom_engine.exe \
+     axiom_engine_rs/target/release/axiom_engine.old.exe
+  cd axiom_engine_rs && cargo build --release --locked && cd ..
+  ```
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File D:\AXIOM-AETHER\scripts\restart_proxy.ps1
+  ```
+- If your own requests start failing with connection-refused after any of
+  the above, the proxy is mid-restart or another session's — retry in a few
+  seconds rather than intervening again.
+
 ```bash
 # Release binary (the CI gate: cargo build --release --locked)
 cd axiom_engine_rs

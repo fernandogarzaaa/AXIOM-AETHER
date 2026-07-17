@@ -196,7 +196,7 @@ async fn compressed_messages_path(
     } else {
         0
     };
-    let (frozen_messages, mut mutable_messages): (Vec<Value>, Vec<Value>) = if frozen_len > 0 {
+    let (mut frozen_messages, mut mutable_messages): (Vec<Value>, Vec<Value>) = if frozen_len > 0 {
         (messages[..frozen_len].to_vec(), messages[frozen_len..].to_vec())
     } else {
         (Vec::new(), messages.clone())
@@ -266,6 +266,32 @@ async fn compressed_messages_path(
         }
     }
 
+    // P2 (PSS) R2 canonicalization: deterministically re-apply existing L2
+    // stubs to the frozen prefix BEFORE break detection. A break-window
+    // rebase (below) replaces heavy old `tool_result`s with content-hashed
+    // stubs; on every later turn the client resends the ORIGINAL bytes, so
+    // the frozen prefix must be re-transformed into the exact same stubbed
+    // form or the forwarded prefix would diverge from what Anthropic cached.
+    // `reapply_stubs` is a pure function of (block bytes, existing pages) --
+    // it never writes to the store -- so the output is byte-stable
+    // turn-over-turn. No-op until a break-window rebase has paged something.
+    if std::env::var("AXIOM_REBASE_ON_BREAK").as_deref() != Ok("off")
+        && !frozen_messages.is_empty()
+    {
+        let store = state.cvm_store.clone();
+        let sid = session_id.clone();
+        let msgs = std::mem::take(&mut frozen_messages);
+        // The request's newest turn lives at the end of the frozen prefix
+        // whenever the mutable tail is empty (Claude Code pins its cache
+        // breakpoint on the last message) -- honour never-touch-the-newest.
+        let protect_last = mutable_messages.is_empty();
+        frozen_messages = tokio::task::spawn_blocking(move || {
+            crate::rebase::reapply_stubs(&msgs, &store, &sid, protect_last)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("stub reapply task join failed: {e}")))?;
+    }
+
     // P2 (PSS) R2 free-window rebasing. When the client's prompt cache is
     // already broken this turn -- detected as a NON-APPEND change in the frozen
     // prefix vs the session's previous turn (compaction / session restructure;
@@ -274,25 +300,37 @@ async fn compressed_messages_path(
     // premium rate regardless. In exactly that window we restructure every OLD
     // heavy `tool_result` into a stub + L2 page at zero *marginal* cache cost,
     // shrinking every FUTURE turn's re-read. Never proxy-initiated: it only
-    // piggybacks on a break the client caused.
+    // piggybacks on a break the client caused. Runs over the FULL transcript
+    // (frozen prefix included): a genuine break means the cached prefix is
+    // already dead, and with Claude Code pinning its breakpoint on the last
+    // message the mutable tail is empty -- the old heavy turns this pass
+    // exists to shrink all live in the frozen prefix.
     // Default ON since the 2026-07-16 live eval; opt out with
     // AXIOM_REBASE_ON_BREAK=off.
     if std::env::var("AXIOM_REBASE_ON_BREAK").as_deref() != Ok("off")
         && state.pss_detect_break(&session_id, &frozen_messages)
-        && mutable_messages.len() > 1
+        && frozen_messages.len() + mutable_messages.len() > 1
     {
-        let old_turns = mutable_messages.len() - 1;
+        let old_turns = frozen_messages.len() + mutable_messages.len() - 1;
         // rebase_transcript does synchronous L2-store writes + digest work
         // per old heavy turn, unbounded by transcript length -- offload it
         // to a blocking thread so a break turn can't pin a Tokio worker.
         let store = state.cvm_store.clone();
         let sid = session_id.clone();
-        let msgs = std::mem::take(&mut mutable_messages);
-        mutable_messages = tokio::task::spawn_blocking(move || {
-            crate::rebase::rebase_transcript(&msgs, &store, &sid)
+        let frozen_count = frozen_messages.len();
+        let mut all = std::mem::take(&mut frozen_messages);
+        all.append(&mut mutable_messages);
+        let mut rebased = tokio::task::spawn_blocking(move || {
+            crate::rebase::rebase_transcript(&all, &store, &sid)
         })
         .await
         .map_err(|e| ApiError::Internal(format!("rebase task join failed: {e}")))?;
+        mutable_messages = rebased.split_off(frozen_count);
+        frozen_messages = rebased;
+        // Re-fingerprint on the transformed prefix so next turn's detection
+        // compares against what was actually forwarded (the canonical form),
+        // not the pre-rebase bytes.
+        state.pss_note_prefix(&session_id, &frozen_messages);
         eprintln!(
             "[axiom-pss] R2 rebase-on-break: session {session_id} restructured {old_turns} old turn(s)"
         );
