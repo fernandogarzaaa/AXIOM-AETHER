@@ -97,6 +97,12 @@ pub fn set_newest_cache_ttl(messages: &mut [Value], ttl: &str) -> bool {
 /// [`crate::anthropic_forwarder`]'s S0 heavy-content partitioning, which
 /// classifies `tool_result` blocks the same way this module's `tool_result`
 /// digestion does.
+///
+/// Returns `None` for a mixed-content array (any block whose `type` isn't
+/// `"text"` — e.g. `image`/`document`): every caller replaces the entire
+/// `content` field with the extracted string, which would silently drop
+/// non-text entries. Paging is skipped rather than losing data; only
+/// pure-text `tool_result`s are eligible for digestion/extraction.
 pub(crate) fn tool_result_text(block: &Value) -> Option<String> {
     if block.get("type").and_then(Value::as_str) != Some("tool_result") {
         return None;
@@ -104,6 +110,12 @@ pub(crate) fn tool_result_text(block: &Value) -> Option<String> {
     match block.get("content") {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         Some(Value::Array(parts)) => {
+            if parts
+                .iter()
+                .any(|p| p.get("type").and_then(Value::as_str) != Some("text"))
+            {
+                return None;
+            }
             let text: String = parts
                 .iter()
                 .filter_map(|p| p.get("text").and_then(Value::as_str))
@@ -513,6 +525,16 @@ mod tests {
         assert_eq!(first, second, "re-paging identical content is deterministic");
         let page_id = CvmStore::page_id_for(&big);
         assert_eq!(store.get("s1", &page_id), Some(big));
+        // Assert the underlying JSONL file directly: `first == second` and
+        // `get` returning the right text would both still pass even if
+        // `put` silently appended a duplicate row on the second call --
+        // this is what actually catches that regression.
+        let row_count = std::fs::read_to_string(store.session_path_for_test("s1"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert_eq!(row_count, 1, "identical content paged twice must add exactly one row");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

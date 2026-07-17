@@ -23,16 +23,34 @@ another session's rebuild.**
   powershell -NoProfile -ExecutionPolicy Bypass -File D:\AXIOM-AETHER\scripts\restart_proxy.ps1
   ```
 - **To deploy a rebuilt binary** (source changed), the running `.exe` is
-  locked — rename it aside first so `cargo build` can write a fresh one,
-  *then* restart:
+  locked — rename it aside to a **unique, timestamped** path first (never a
+  fixed name like `axiom_engine.old.exe`: two concurrent sessions doing this
+  at once will rename or overwrite each other's staged binary, potentially
+  leaving neither a valid target to restart), then build and restart:
+
+  Git Bash:
   ```bash
+  STAMP=$(date +%Y%m%d-%H%M%S)
   mv axiom_engine_rs/target/release/axiom_engine.exe \
-     axiom_engine_rs/target/release/axiom_engine.old.exe
+     "axiom_engine_rs/target/release/axiom_engine.$STAMP.exe"
   cd axiom_engine_rs && cargo build --release --locked && cd ..
   ```
+
+  PowerShell:
+  ```powershell
+  $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  Move-Item axiom_engine_rs\target\release\axiom_engine.exe `
+            "axiom_engine_rs\target\release\axiom_engine.$Stamp.exe"
+  Push-Location axiom_engine_rs; cargo build --release --locked; Pop-Location
+  ```
+
+  Then restart the same way regardless of which shell built it:
   ```powershell
   powershell -NoProfile -ExecutionPolicy Bypass -File D:\AXIOM-AETHER\scripts\restart_proxy.ps1
   ```
+  If `cargo build` fails because the source path was already moved by another
+  session, someone else's deploy is in flight — wait and retry rather than
+  re-renaming.
 - If your own requests start failing with connection-refused after any of
   the above, the proxy is mid-restart or another session's — retry in a few
   seconds rather than intervening again.
