@@ -616,9 +616,8 @@ async fn compressed_messages_path(
     // TTL (a one-time 2x write premium beats repeated 1.25x full re-writes) by
     // annotating the newest `cache_control` breakpoint with `"ttl":"1h"`. This
     // only ever ADDS a field to the final breakpoint block; it never reorders
-    // or removes content, so the cached prefix stays byte-stable. Default off
-    // Default ON since the 2026-07-16 live eval; opt out with
-    // AXIOM_ADAPTIVE_TTL=off.
+    // or removes content, so the cached prefix stays byte-stable. Default ON
+    // since the 2026-07-16 live eval; opt out with AXIOM_ADAPTIVE_TTL=off.
     if std::env::var("AXIOM_ADAPTIVE_TTL").as_deref() != Ok("off") {
         let count = state.pss_gap_tick(&session_id, unix_now(), 240);
         if let Some(ttl) = crate::rebase::choose_ttl(count, 3) {
@@ -764,12 +763,15 @@ async fn compressed_messages_path(
         }
         let status = upstream.status();
         // S6 (CVM cost stack): a real (streaming) request completed --
-        // record activity for the keepalive timer. No-op when disabled.
+        // record activity for the keepalive timer. No-op when disabled. The
+        // held payload restores a P4-routed model to the ORIGINAL tier:
+        // caches are model-scoped, so a ping replayed against the routed
+        // Haiku payload would refresh the wrong cache.
         if status.is_success() && state.keepalive.is_enabled() {
             state.keepalive.record_activity(
                 &session_id,
                 crate::keepalive::HeldHeaders::from_client_auth(client_auth),
-                outbound.clone(),
+                crate::keepalive::restore_original_model(&outbound, routed_from.as_deref()),
                 forwarder.clone(),
             );
         }
@@ -943,10 +945,12 @@ async fn compressed_messages_path(
     // alive and holds its auth headers for a possible future ping. No-op
     // when keepalive is disabled (the default).
     if state.keepalive.is_enabled() {
+        // Held payload restores a P4-routed model to the original tier -- see
+        // the streaming-path note above.
         state.keepalive.record_activity(
             &session_id,
             crate::keepalive::HeldHeaders::from_client_auth(client_auth),
-            outbound.clone(),
+            crate::keepalive::restore_original_model(&outbound, routed_from.as_deref()),
             forwarder.clone(),
         );
     }

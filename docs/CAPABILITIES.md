@@ -58,10 +58,16 @@ not just skeleton symbol names.
 
 ## MCP tools (`--mode mcp`)
 
-`axiom_compress_path`, `axiom_evaluate_drift`, `axiom_expand`,
+20 tools: `axiom_compress_path`, `axiom_evaluate_drift`, `axiom_expand`,
 `axiom_remember` / `axiom_recall` / `axiom_forget` (persistent memory),
 `axiom_immunity` (what Axiom has learned about a command),
-`axiom_verify` (grounding-check a response against evidence).
+`axiom_verify` (grounding-check a response against evidence),
+`axiom_validate_epistemic`, `axiom_status` (session awareness),
+`axiom_post_task` / `axiom_claim_task` / `axiom_task_result` /
+`axiom_list_tasks` / `axiom_channels` (inter-agent task board; set
+`AXIOM_TASK_DIR` to an absolute path — MCP hosts may spawn the server from a
+read-only cwd), `axiom_align_generation` / `axiom_predict_states` /
+`axiom_sample_trajectories` (predictive engine), `search`, `fetch`.
 
 ---
 
