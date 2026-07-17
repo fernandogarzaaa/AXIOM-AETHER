@@ -496,11 +496,28 @@ pub fn build_compressed_payload(
                 prepend_to_user_content(msg, &fingerprint_block);
             }
         }
-        None => {
+        None if !partitioned.heavy_context.is_empty() => {
+            // All surviving messages were extracted as heavy: synthesize a
+            // carrier turn for the fingerprint, since there is genuine
+            // compressed content that needs a home.
             messages.push(json!({
                 "role": "user",
                 "content": fingerprint_block,
             }));
+        }
+        None => {
+            // Nothing was extracted AND nothing survived: the mutable tail
+            // this function was given was already empty (e.g. the entire
+            // conversation is the frozen/cached prefix, with nothing new this
+            // turn). There is no fingerprint worth reporting, so `messages`
+            // stays empty rather than gaining a phantom "absorbed 0 tokens"
+            // turn. The caller splices this onto the untouched frozen prefix,
+            // so an empty result here reconstitutes the original array
+            // exactly. Synthesizing a turn here was observed live to corrupt
+            // an already-valid frozen prefix ending in a positionally
+            // significant role:"system" message into an invalid one
+            // (2026-07-17: Claude Code 400 "role 'system' must precede an
+            // assistant message or end the array").
         }
     }
 
@@ -757,6 +774,42 @@ mod tests {
         assert!(content.starts_with("<axiom_context_fingerprint "));
         assert!(content.contains("</axiom_context_fingerprint>"));
         assert!(content.contains("summarise the diff please"));
+    }
+
+    #[test]
+    fn build_compressed_payload_stays_empty_when_input_was_already_empty() {
+        // Nothing to partition (an empty mutable tail -- e.g. the whole
+        // conversation is the frozen prefix, nothing new this turn): no
+        // synthetic carrier turn should appear. The caller splices this
+        // result onto the untouched frozen prefix, so a spurious turn here
+        // would corrupt an already-valid array (2026-07-17 regression: a
+        // frozen [user, system] prefix, valid because system ends the array,
+        // became [user, system, <synthetic user>] and Anthropic rejected it).
+        let original = json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 64,
+            "messages": [],
+        });
+        let partitioned = partition_messages(&[], 50, ws);
+        assert!(partitioned.surviving.is_empty());
+        assert!(partitioned.heavy_context.is_empty());
+        let fp = MemoryFingerprint {
+            schema: "axiom-ttt-context-fingerprint/v2".into(),
+            session_id: "sess-empty".into(),
+            context_tokens_processed: 0,
+            n_layers: 1,
+            d_model: 4,
+            state_hash: "sha256:0000".into(),
+            layer_frobenius_norms: vec![0.0],
+            recall_norm: 0.0,
+            recall_l1: 0.0,
+            recall_top_k_indices: vec![],
+            recall_top_k_decoded: "".into(),
+            elapsed_ms: 0,
+        };
+        let payload = build_compressed_payload(&original, &fp, &partitioned);
+        let messages = payload["messages"].as_array().unwrap();
+        assert!(messages.is_empty(), "no phantom carrier turn when there was nothing to compress");
     }
 
     #[test]

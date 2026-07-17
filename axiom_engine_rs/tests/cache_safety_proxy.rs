@@ -161,6 +161,48 @@ async fn frozen_prefix_content_is_never_compressed_mutable_tail_is() {
 }
 
 #[tokio::test]
+async fn empty_mutable_tail_never_gains_a_phantom_carrier_turn() {
+    // Regression (2026-07-17): a real Claude Code request shaped
+    // [user, system] where the LAST message (system) carries the
+    // cache_control marker -- the whole array (both messages) is classified
+    // frozen, leaving the mutable tail EMPTY. That original [user, system]
+    // shape is valid per Anthropic (a role:"system" message may end the
+    // array). The proxy must reconstitute it exactly: it must NOT append a
+    // synthetic carrier turn after the frozen prefix, which would push the
+    // system message out of the "ends the array" position and produce a
+    // live 400 ("role 'system' must precede an assistant message or end the
+    // array").
+    let _guard = env_lock().lock().await;
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream).await;
+    let app = create_router(state);
+
+    let body = json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 16,
+        "session_id": "cache-safety-empty-tail",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "system", "content": [],
+             "output_config": {"effort": "low"},
+             "cache_control": {"type": "ephemeral"}},
+        ],
+    });
+
+    let status = post_messages(&app, body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let captured = capture.requests.lock().unwrap();
+    let sent_messages = captured[0]["messages"].as_array().unwrap();
+    assert_eq!(
+        sent_messages.len(), 2,
+        "no phantom carrier turn: exactly the original 2 messages, got {sent_messages:?}"
+    );
+    assert_eq!(sent_messages[0]["role"], json!("user"));
+    assert_eq!(sent_messages[1]["role"], json!("system"), "system message must end the array");
+}
+
+#[tokio::test]
 async fn identical_mutable_tail_produces_byte_identical_outbound_messages() {
     // Two back-to-back requests with byte-identical bodies (same session,
     // same messages, same cache_control placement). The mutable tail's
