@@ -147,6 +147,21 @@ measurements (`bench/cvm/PSS-RESULTS-*.md`):
   Opus/Fable traffic, R2 correctly saw zero genuine breaks). The 50%+ target
   remains unproven on real long-session traffic; defaults were flipped on the
   strength of correctness parity + zero faults, not the target.
+- **2026-07-17 (real Claude Code sessions, post-flip):** two live sessions on
+  the operator's own machine, measured via `/metrics`
+  (`1 − quota_units_total / quota_units_uncached_total` over the session's
+  delta): a multi-file exploratory walkthrough (8 file reads + a repo-wide
+  grep) measured **65.1% quota savings**; a smaller 3-file isolated task
+  measured **41.4%**. Both exceed the design target and were driven by native
+  Anthropic prompt caching (kept intact by S1) plus L-A tool deferral plus S3
+  digest — L-B and R1 fired zero times in either session (their trigger
+  shapes, trivial tool-only turns and Opus/Fable traffic, don't occur in
+  ordinary coding-agent use). Caveat: `/metrics` counters are process-global,
+  not session-scoped, so these numbers include any concurrent traffic on the
+  same machine during the measurement window and are not a clean isolation of
+  PSS's marginal contribution from the underlying CVM cache stack's — they
+  confirm the system is real, stable, and beneficial in practice, not a
+  precise attribution of which lever contributed how much.
 
 ## Quick Start
 
