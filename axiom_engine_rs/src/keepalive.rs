@@ -105,6 +105,26 @@ pub fn should_ping(belief: &BetaBelief, pings_remaining: usize) -> bool {
 
 /// Build the keepalive ping body from the last real payload actually sent
 /// upstream for this session, per the blueprint's exact recipe:
+/// The payload held for keepalive pings must carry the tier the session
+/// actually lives on. When P4/R1 routed a turn to Haiku, `outbound["model"]`
+/// is the ROUTED model -- but Anthropic caches are model-scoped, so a ping
+/// replayed against Haiku would refresh Haiku's cache, not the original
+/// tier's cache the ping exists to keep warm. Restore the pre-route model
+/// (when there was one) for the held copy only; the actual turn still goes
+/// out routed.
+pub fn restore_original_model(payload: &Value, original_model: Option<&str>) -> Value {
+    match original_model {
+        Some(orig) => {
+            let mut p = payload.clone();
+            if let Some(obj) = p.as_object_mut() {
+                obj.insert("model".to_string(), Value::String(orig.to_string()));
+            }
+            p
+        }
+        None => payload.clone(),
+    }
+}
+
 /// - keep `model`, `tools`, `system` untouched
 /// - truncate `messages` to the frozen prefix (everything at or before the
 ///   last `cache_control` breakpoint -- reusing S1's exact definition of
@@ -438,6 +458,22 @@ impl KeepaliveManager {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- restore_original_model ------------------------------------------
+
+    #[test]
+    fn restore_original_model_undoes_a_route_for_the_held_copy_only() {
+        // A P4/R1-routed payload carries the Haiku model; the keepalive-held
+        // copy must be restored to the original tier (model-scoped caches),
+        // while an unrouted payload passes through unchanged.
+        let routed = json!({"model": "claude-haiku-4-5", "max_tokens": 16});
+        let held = restore_original_model(&routed, Some("claude-opus-4-8"));
+        assert_eq!(held["model"], json!("claude-opus-4-8"));
+        assert_eq!(routed["model"], json!("claude-haiku-4-5"), "input untouched");
+
+        let unrouted = json!({"model": "claude-sonnet-5"});
+        assert_eq!(restore_original_model(&unrouted, None), unrouted);
+    }
 
     // ---- should_ping / pings_planned -------------------------------------
 
