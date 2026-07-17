@@ -49,9 +49,28 @@ fn collect_tool_use_names(content: Option<&Value>, out: &mut HashSet<String>) {
     }
 }
 
+/// Does this request's `tools[]` overlap the working set at all? When it
+/// does not -- not even the always-keep CORE builtins are present -- the
+/// request is not the coding-agent main loop L-A was designed for (observed
+/// live 2026-07-17: Claude Code's one-shot background utility calls carry a
+/// bespoke tool catalog with zero CORE/recent overlap). On such a request
+/// the working-set heuristic has no signal, and deferring 100% of a
+/// bespoke toolset risks hiding schemas the call was built around. Zero
+/// overlap => the caller must skip deferral entirely (fail closed).
+pub fn has_working_set_overlap(tools: &[Value], keep: &HashSet<String>) -> bool {
+    tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .any(|n| keep.contains(n))
+}
+
 /// Mark every tool whose `name` is NOT in `keep` with `defer_loading: true`,
 /// preserving order and count (only a boolean flag is added, so the `tools[]`
-/// bytes stay stable modulo the flag). Returns `(tools, deferred_count)`.
+/// bytes stay stable modulo the flag). Returns `(tools, deferred_count)`,
+/// where the count covers only tools THIS call newly flagged -- a tool the
+/// client already sent with `defer_loading: true` passes through
+/// byte-identical and is not counted (the count feeds telemetry and must
+/// reflect proxy-added deferrals only).
 ///
 /// A tool that already carries a `cache_control` breakpoint keeps it; a tool
 /// with no `name` is passed through untouched (defensive: never corrupt an
@@ -64,6 +83,9 @@ pub fn mark_deferred(tools: &[Value], keep: &HashSet<String>) -> (Vec<Value>, us
             let name = tool.get("name").and_then(Value::as_str);
             match name {
                 Some(n) if !keep.contains(n) => {
+                    if tool.get("defer_loading") == Some(&Value::Bool(true)) {
+                        return tool.clone(); // client already deferred it
+                    }
                     let mut t = tool.clone();
                     if let Some(obj) = t.as_object_mut() {
                         obj.insert("defer_loading".to_string(), Value::Bool(true));
@@ -82,6 +104,43 @@ pub fn mark_deferred(tools: &[Value], keep: &HashSet<String>) -> (Vec<Value>, us
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn no_overlap_means_not_a_main_loop_request_and_no_deferral() {
+        // Live regression (2026-07-17): Claude Code's background utility
+        // calls (one-shot, msgs=1, model=sonnet-4-6) carry a bespoke 81-tool
+        // catalog with NO overlap with CORE or any recent tool_use. The
+        // working-set heuristic has zero signal on such a request; deferring
+        // 100% of its tools risks hiding schemas the call was built around.
+        // Zero overlap => leave the request alone entirely.
+        let keep = working_set(&[], 8); // CORE only
+        let bespoke = vec![
+            json!({"name":"CronCreate"}),
+            json!({"name":"Monitor"}),
+            json!({"name":"SendMessage"}),
+        ];
+        assert!(!has_working_set_overlap(&bespoke, &keep), "no overlap -> skip deferral");
+        // The main-loop shape (builtins present) DOES overlap.
+        let main_loop = vec![json!({"name":"Read"}), json!({"name":"ObscureTool"})];
+        assert!(has_working_set_overlap(&main_loop, &keep), "core overlap -> defer eligible");
+    }
+
+    #[test]
+    fn mark_deferred_does_not_count_tools_already_deferred_by_the_client() {
+        // A client-side pre-deferred tool keeps its flag (byte-identical) and
+        // is not counted as OUR deferral -- the count feeds telemetry/logs
+        // and must reflect proxy-added flags only.
+        let keep: HashSet<String> = ["Read"].iter().map(|s| s.to_string()).collect();
+        let tools = vec![
+            json!({"name":"Read"}),
+            json!({"name":"AlreadyDeferred", "defer_loading": true}),
+            json!({"name":"FreshlyDeferred"}),
+        ];
+        let (out, count) = mark_deferred(&tools, &keep);
+        assert_eq!(count, 1, "only the freshly-flagged tool counts");
+        assert_eq!(out[1]["defer_loading"], json!(true), "pre-deferred flag preserved");
+        assert_eq!(out[2]["defer_loading"], json!(true), "unused tool freshly deferred");
+    }
 
     #[test]
     fn working_set_keeps_recently_invoked_tools_plus_core() {

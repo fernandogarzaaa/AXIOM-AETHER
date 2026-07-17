@@ -587,15 +587,25 @@ async fn compressed_messages_path(
     if std::env::var("AXIOM_TOOL_DEFER").as_deref() != Ok("off") {
         if let Some(tools) = outbound.get("tools").and_then(Value::as_array).cloned() {
             let keep = crate::tool_defer::working_set(&messages, 8);
-            let (deferred_tools, deferred_count) = crate::tool_defer::mark_deferred(&tools, &keep);
-            if deferred_count > 0 {
-                outbound["tools"] = Value::Array(deferred_tools);
-                eprintln!(
-                    "[axiom-ttt] tool_defer: tools={} deferred={} kept={}",
-                    tools.len(),
-                    deferred_count,
-                    tools.len() - deferred_count,
-                );
+            // Zero working-set overlap (not even the CORE builtins are in this
+            // request's toolset) means this is NOT the coding-agent main loop
+            // -- observed live 2026-07-17 as Claude Code's one-shot background
+            // utility calls carrying a bespoke tool catalog. The heuristic has
+            // no signal there; deferring 100% of a bespoke toolset risks
+            // hiding schemas the call was built around. Fail closed: pass the
+            // request through untouched.
+            if crate::tool_defer::has_working_set_overlap(&tools, &keep) {
+                let (deferred_tools, deferred_count) =
+                    crate::tool_defer::mark_deferred(&tools, &keep);
+                if deferred_count > 0 {
+                    outbound["tools"] = Value::Array(deferred_tools);
+                    eprintln!(
+                        "[axiom-ttt] tool_defer: tools={} deferred={} kept={}",
+                        tools.len(),
+                        deferred_count,
+                        tools.len() - deferred_count,
+                    );
+                }
             }
         }
     }

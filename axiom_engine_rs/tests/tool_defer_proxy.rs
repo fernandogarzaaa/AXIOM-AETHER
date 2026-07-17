@@ -175,6 +175,46 @@ async fn defer_output_is_byte_stable_across_two_turns() {
 }
 
 #[tokio::test]
+async fn bespoke_toolset_with_no_working_set_overlap_is_never_deferred() {
+    // Regression (2026-07-17): Claude Code's background utility calls are
+    // one-shot requests (msgs=1) carrying a bespoke tool catalog with zero
+    // overlap with CORE or any recent tool_use. The working-set heuristic has
+    // no signal on such requests, so the proxy must pass them through
+    // untouched instead of deferring 100% of the toolset.
+    let _guard = env_lock().lock().await;
+    std::env::set_var("AXIOM_TOOL_DEFER", "on");
+    std::env::set_var("AXIOM_LOCAL_TRIVIAL", "off"); // see note in the first test
+    let _cleanup = EnvVarGuard("AXIOM_TOOL_DEFER");
+    let _cleanup2 = EnvVarGuard("AXIOM_LOCAL_TRIVIAL");
+
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream).await;
+    let app = create_router(state);
+
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 16,
+        "session_id": "tool-defer-bespoke",
+        "tools": [
+            {"name": "CronCreate"}, {"name": "Monitor"}, {"name": "SendMessage"}
+        ],
+        "messages": [
+            {"role": "user", "content": "one-shot utility call"}
+        ],
+    });
+    let status = post_messages(&app, body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let captured = capture.requests.lock().unwrap();
+    let sent_tools = captured[0]["tools"].as_array().unwrap();
+    assert_eq!(sent_tools.len(), 3);
+    assert!(
+        sent_tools.iter().all(|t| t.get("defer_loading").is_none()),
+        "zero working-set overlap -> no tool may be deferred, got {sent_tools:?}"
+    );
+}
+
+#[tokio::test]
 async fn defer_off_passes_tools_through_unchanged() {
     let _guard = env_lock().lock().await;
     // Default is ON since the 2026-07-16 flip -- opting out takes an explicit
