@@ -12,27 +12,35 @@ builds standalone:
 ```bash
 cd axiom_swarm_rs
 cargo test
-cargo run --bin axiom_swarm   # closed-loop demo with simulated workers
+cargo run --bin axiom_swarm   # closed-loop demo — real stdio-transport workers
 ```
+
+See [`docs/RESEARCH_BLUEPRINT.md`](docs/RESEARCH_BLUEPRINT.md) for the
+research pass behind the fault-tolerance, annealing, and backpressure
+mechanisms below, plus what's queued for a design decision before it gets
+built.
 
 ## Architecture
 
 ```text
                         ┌─────────────────────────────┐
                         │   axiom_swarm (Axiom Prime)  │
-                        │  non-blocking FSM runner     │
+                        │  non-blocking FSM + health   │
                         │  Idle → Sensing → Routing →  │
                         │  AwaitingWorkers → Converged │
+                        │  NodeHealth: quarantine on   │
+                        │  repeated dispatch failure   │
                         └──────┬───────────────▲───────┘
               commands         │               │ events (async task
        (route, dispatch)       ▼               │  completions)
                         ┌─────────────────────────────┐
                         │        axiom_core            │
                         │  KNM: gravitational field →  │
-                        │  hard Gumbel-Softmax adhesion│
-                        │  → sparse activation         │
+                        │  annealed hard Gumbel-Softmax│
+                        │  → sparse, backpressured     │
+                        │  activation                  │
                         │  IDC: fuse → residual →      │
-                        │  CorrectionVector            │
+                        │  CorrectionVector             │
                         └──────┬───────────────────────┘
                                │ Arc<str> payloads (zero-copy)
               ┌────────────────┼────────────────┐
@@ -40,8 +48,9 @@ cargo run --bin axiom_swarm   # closed-loop demo with simulated workers
       ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
       │  axiom_mcp   │ │  axiom_mcp   │ │  axiom_mcp   │
       │ Mini Aether  │ │ Mini Aether  │ │ Mini Aether  │
-      │  sidecar     │ │  sidecar     │ │  sidecar     │
-      │ scrub+comprs │ │ scrub+comprs │ │ scrub+comprs │
+      │ sidecar +    │ │ sidecar +    │ │ sidecar +    │
+      │ StdioTransport│ │ StdioTransport│ │ (mock, demo)│
+      │ (timeout)    │ │ (timeout)    │ │              │
       └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
              ▼                ▼                ▼
            Codex            Claude           Gemini
@@ -58,7 +67,7 @@ spine** (sequences the loop without ever blocking on a worker).
 
 | Module | Contents |
 |---|---|
-| `mesh` | `KineticNeuralMesh`: node registry, runtime topology reconfiguration (`add_node`/`remove_node` rebuild the affinity matrix), gravitational-field computation (`A·p + bias`, optionally residual-modulated), and the `forward` pass returning an `Adhesion` (weights + sparse active set). |
+| `mesh` | `KineticNeuralMesh`: node registry, runtime topology reconfiguration (`add_node`/`remove_node` rebuild the affinity matrix), gravitational-field computation (`A·p + bias`, residual-modulated, plus opt-in capacity backpressure via `mark_active`/`mark_idle`), residual-adaptive Gumbel-Softmax temperature annealing (`tau_gain`), and the `forward` pass returning an `Adhesion` (weights + sparse active set). |
 | `gumbel` | `gumbel_softmax`: hard-variant Gumbel-Softmax for discrete topology routing, plus the relaxed distribution for telemetry. Seedable and deterministic under a fixed RNG. |
 | `node` | `WorkerNode` / `NodeId` / `NodeKind`: affinity embedding + routing bias per worker. |
 | `residual` | `StateVector` and `Residual` (`goal − current`), norms, convergence predicate. |
@@ -69,7 +78,8 @@ spine** (sequences the loop without ever blocking on a worker).
 | Module | Contents |
 |---|---|
 | `fsm` | `SwarmFsm`: a pure, non-blocking transition function `(state, event) → commands`. No I/O, no payloads — only control state. Late/duplicate events are no-ops. |
-| `main` | The async runner: executes FSM commands, spawns worker calls as tokio tasks (an in-flight LLM call is just a future `WorkerDone` event), shares payloads via `Arc<str>`, and drives the demo loop to convergence. |
+| `health` | `NodeHealth`: counts consecutive dispatch failures per node and reports quarantine at a threshold — the orchestrator's cue to call `mesh.remove_node` on a worker that keeps failing. |
+| `main` | The async runner: executes FSM commands, dispatches to real `StdioTransport` workers as tokio tasks (an in-flight LLM call is just a future `WorkerDone` event), tracks in-flight/health per node, and drives the demo loop to convergence — routing around a quarantined node if one goes down. |
 
 ### `axiom_mcp` — Mini Aether sidecars (library)
 
@@ -78,6 +88,9 @@ spine** (sequences the loop without ever blocking on a worker).
 | `filter` | `TokenScrubber`: deterministic, regex-free line rules — drop orchestrator-internal markers, redact credential-shaped assignments, strip control characters. Same input, same output, always. |
 | `compress` | `compress_context`: strips conversational filler, keeps code fences verbatim, collapses prose whitespace; returns `CompressionStats` for cost accounting. |
 | `sidecar` | `MiniAetherSidecar`: the per-worker pipeline (scrub → compress) emitting an `Arc<str>` `SidecarPayload`. |
+| `protocol` | Line-delimited JSON-RPC 2.0 `aether/dispatch` request/response types — the Mini Aether wire protocol. |
+| `transport` | `WorkerTransport` (dyn-safe async dispatch trait), `StdioTransport` (real child-process transport with a per-call timeout), `MockTransport` (tests/demos). |
+| `bin/aether_worker` | Reference worker process speaking the wire protocol over stdio — what `StdioTransport` spawns. |
 
 ## Design decisions
 
@@ -101,10 +114,25 @@ spine** (sequences the loop without ever blocking on a worker).
 * **The FSM owns nothing but control state.** LLM calls are tokio tasks;
   their completions come back as events. Axiom Prime never blocks on a
   worker, and a slow backend can't stall routing for the rest of the mesh.
+* **A wedged worker can't stall the swarm.** Every `StdioTransport` call is
+  bounded by a timeout, and `NodeHealth` quarantines (removes from the
+  mesh) a worker after repeated consecutive failures — the FSM keeps
+  converging on whatever nodes remain rather than hanging in
+  `AwaitingWorkers` forever.
+* **Routing anneals and backs off, opt-in.** `MeshConfig::tau_gain` scales
+  Gumbel-Softmax temperature with the residual (explore far from the goal,
+  sharpen near it); `MeshConfig::capacity_penalty` applies soft
+  backpressure against nodes with dispatches already in flight. Both
+  default to `0.0` (disabled) so existing behavior is unchanged unless
+  opted into.
 
 ## Status
 
-Skeleton + first vertical slice. Real worker transports (the sidecar's MCP
-wire protocol), learned affinity updates, and ROCm-accelerated batch routing
-are intentionally not implemented yet — the demo binary simulates workers to
-exercise the full closed loop end to end.
+First vertical slice plus a fault-tolerance pass: real worker transports
+(JSON-RPC over stdio, with timeout + quarantine) are implemented and wired
+into the demo binary. Learned affinity updates (bandit-style bias from
+observed outcomes), Kalman/EMA sensor smoothing, expert-choice batch
+dispatch, hierarchical topology, and ROCm-accelerated batch routing are
+deliberately not implemented — see
+[`docs/RESEARCH_BLUEPRINT.md`](docs/RESEARCH_BLUEPRINT.md) for why each is
+queued for a decision rather than built.

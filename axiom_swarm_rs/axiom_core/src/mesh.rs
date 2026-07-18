@@ -51,7 +51,8 @@ pub struct Adhesion {
 pub struct MeshConfig {
     /// Embedding dimension shared by payloads and node affinities.
     pub dim: usize,
-    /// Gumbel-Softmax temperature.
+    /// Gumbel-Softmax temperature used when `tau_gain == 0.0` (annealing
+    /// disabled) or no residual is available for a call.
     pub tau: f32,
     /// Hard (discrete one-hot) routing. The KNM spec requires the hard
     /// variant; soft is kept for diagnostics.
@@ -61,11 +62,38 @@ pub struct MeshConfig {
     /// Gain applied to residual alignment when a residual is provided.
     /// 0.0 disables residual modulation.
     pub residual_gain: f32,
+    /// Residual-adaptive temperature: when a residual is supplied and this
+    /// gain is nonzero, `tau_effective = clamp(tau_gain * |residual|,
+    /// tau_min, tau_max)` — routing explores more while far from the goal
+    /// and sharpens toward argmax as the controller converges, mirroring
+    /// the explore-then-exploit anneal used in simulated annealing and in
+    /// entropy-regularized routing (ReinMax). 0.0 (default) disables this
+    /// and keeps the fixed `tau` above, so existing callers are unaffected.
+    pub tau_gain: f32,
+    /// Lower clamp for the annealed temperature.
+    pub tau_min: f32,
+    /// Upper clamp for the annealed temperature.
+    pub tau_max: f32,
+    /// Backpressure: logit penalty per in-flight dispatch already active on
+    /// a node (see [`KineticNeuralMesh::mark_active`]), analogous to
+    /// per-expert capacity constraints in sparse MoE routing. 0.0 (default)
+    /// disables this.
+    pub capacity_penalty: f32,
 }
 
 impl Default for MeshConfig {
     fn default() -> Self {
-        Self { dim: 64, tau: 0.5, hard: true, fan_out: 1, residual_gain: 1.0 }
+        Self {
+            dim: 64,
+            tau: 0.5,
+            hard: true,
+            fan_out: 1,
+            residual_gain: 1.0,
+            tau_gain: 0.0,
+            tau_min: 0.05,
+            tau_max: 1.0,
+            capacity_penalty: 0.0,
+        }
     }
 }
 
@@ -77,6 +105,10 @@ pub struct KineticNeuralMesh {
     /// change so the forward pass is a single matrix-vector product.
     affinity: Array2<f32>,
     bias: Array1<f32>,
+    /// In-flight dispatch count per node, index-aligned with `nodes`. Reset
+    /// on topology change (see `rebuild`); tracked via `mark_active` /
+    /// `mark_idle` and fed into `field()` as backpressure.
+    in_flight: Vec<u32>,
 }
 
 impl KineticNeuralMesh {
@@ -85,7 +117,24 @@ impl KineticNeuralMesh {
             affinity: Array2::zeros((0, config.dim)),
             bias: Array1::zeros(0),
             nodes: Vec::new(),
+            in_flight: Vec::new(),
             config,
+        }
+    }
+
+    /// Record a dispatch starting on `id`, so subsequent routing decisions
+    /// apply capacity backpressure against it (see `MeshConfig::capacity_penalty`).
+    /// A no-op if `id` isn't currently in the mesh.
+    pub fn mark_active(&mut self, id: NodeId) {
+        if let Some(idx) = self.nodes.iter().position(|n| n.id == id) {
+            self.in_flight[idx] += 1;
+        }
+    }
+
+    /// Record a dispatch completing (success or failure) on `id`.
+    pub fn mark_idle(&mut self, id: NodeId) {
+        if let Some(idx) = self.nodes.iter().position(|n| n.id == id) {
+            self.in_flight[idx] = self.in_flight[idx].saturating_sub(1);
         }
     }
 
@@ -129,11 +178,17 @@ impl KineticNeuralMesh {
         }
         self.affinity = affinity;
         self.bias = bias;
+        // Topology changed the index<->node mapping, so any prior in-flight
+        // counts are no longer attributable to the right node; resetting is
+        // the safe default (a removed node's calls will still `mark_idle`
+        // into a no-op once it's gone, see above).
+        self.in_flight = vec![0; n];
     }
 
     /// Compute the gravitational field a payload projects over the mesh:
     /// affinity dot-products plus per-node bias, plus (optionally) a term
-    /// rewarding nodes aligned with the current residual direction.
+    /// rewarding nodes aligned with the current residual direction, minus
+    /// capacity backpressure for nodes already busy.
     fn field(&self, payload: &Array1<f32>, residual: Option<&Residual>) -> Array1<f32> {
         let mut logits = self.affinity.dot(payload) + &self.bias;
         if let Some(r) = residual {
@@ -142,7 +197,24 @@ impl KineticNeuralMesh {
                 logits = logits + self.config.residual_gain * self.affinity.dot(&direction);
             }
         }
+        if self.config.capacity_penalty != 0.0 {
+            for (i, &n) in self.in_flight.iter().enumerate() {
+                logits[i] -= self.config.capacity_penalty * n as f32;
+            }
+        }
         logits
+    }
+
+    /// Effective Gumbel-Softmax temperature for this call: the residual-
+    /// adaptive anneal when enabled and a residual is available, else the
+    /// static `config.tau`.
+    fn effective_tau(&self, residual: Option<&Residual>) -> f32 {
+        match residual {
+            Some(r) if self.config.tau_gain > 0.0 => {
+                (self.config.tau_gain * r.norm()).clamp(self.config.tau_min, self.config.tau_max)
+            }
+            _ => self.config.tau,
+        }
     }
 
     /// Forward pass: snap a payload embedding onto the mesh.
@@ -165,6 +237,7 @@ impl KineticNeuralMesh {
 
         let field = self.field(payload, residual);
         let fan_out = self.config.fan_out.min(self.nodes.len()).max(1);
+        let tau = self.effective_tau(residual);
 
         // Top-k discrete routing: draw a hard Gumbel-Softmax winner, mask
         // it out, and redraw — each slot is an independent discrete snap,
@@ -173,7 +246,7 @@ impl KineticNeuralMesh {
         let mut active: Vec<NodeId> = Vec::with_capacity(fan_out);
         let mut masked = field.clone();
         for _ in 0..fan_out {
-            let sample = gumbel_softmax(&masked, self.config.tau, self.config.hard, rng);
+            let sample = gumbel_softmax(&masked, tau, self.config.hard, rng);
             let w = sample.winner;
             weights[w] = if self.config.hard { 1.0 } else { sample.adhesion[w] };
             active.push(self.nodes[w].id);
@@ -276,5 +349,69 @@ mod tests {
         let mesh = KineticNeuralMesh::new(MeshConfig { dim: 2, ..Default::default() });
         let mut rng = StdRng::seed_from_u64(0);
         assert!(matches!(mesh.forward(&array![1.0, 0.0], None, &mut rng), Err(MeshError::Empty)));
+    }
+
+    #[test]
+    fn tau_annealing_is_disabled_by_default() {
+        let mesh = mesh3();
+        assert_eq!(mesh.effective_tau(None), mesh.config.tau);
+        let goal = StateVector(array![0.0, 0.0, 10.0]);
+        let residual = Residual::between(&goal, &StateVector::zeros(3));
+        // tau_gain defaults to 0.0, so a residual must not change tau.
+        assert_eq!(mesh.effective_tau(Some(&residual)), mesh.config.tau);
+    }
+
+    #[test]
+    fn tau_annealing_scales_with_residual_and_clamps() {
+        let mut mesh = mesh3();
+        mesh.config.tau_gain = 1.0;
+        mesh.config.tau_min = 0.05;
+        mesh.config.tau_max = 2.0;
+
+        let far = Residual::between(&StateVector(array![0.0, 0.0, 100.0]), &StateVector::zeros(3));
+        assert_eq!(mesh.effective_tau(Some(&far)), 2.0, "large residual must clamp to tau_max");
+
+        let near = Residual::between(&StateVector(array![0.0, 0.0, 0.1]), &StateVector::zeros(3));
+        assert!(
+            (mesh.effective_tau(Some(&near)) - 0.1).abs() < 1e-5,
+            "small residual should scale down, not clamp"
+        );
+    }
+
+    #[test]
+    fn capacity_backpressure_routes_around_a_busy_node() {
+        // Two nodes with identical, tied affinity toward the payload.
+        let mut mesh = KineticNeuralMesh::new(MeshConfig {
+            dim: 2,
+            tau: 0.05,
+            capacity_penalty: 100.0, // large enough to dominate the tie
+            ..Default::default()
+        });
+        mesh.add_node(WorkerNode::new(0, "a", NodeKind::Llm("a".into()), vec![1.0, 0.0])).unwrap();
+        mesh.add_node(WorkerNode::new(1, "b", NodeKind::Llm("b".into()), vec![1.0, 0.0])).unwrap();
+
+        mesh.mark_active(NodeId(0));
+        mesh.mark_active(NodeId(0));
+
+        let mut rng = StdRng::seed_from_u64(1);
+        let adhesion = mesh.forward(&array![1.0, 0.0], None, &mut rng).unwrap();
+        assert_eq!(adhesion.active, vec![NodeId(1)], "busy node 0 must lose the tie to idle node 1");
+
+        mesh.mark_idle(NodeId(0));
+        mesh.mark_idle(NodeId(0));
+        let adhesion = mesh.forward(&array![1.0, 0.0], None, &mut rng).unwrap();
+        // Once idle again, node 0 is back on equal footing (no assertion on
+        // which wins — just that the penalty no longer forces node 1).
+        assert!(adhesion.active == vec![NodeId(0)] || adhesion.active == vec![NodeId(1)]);
+    }
+
+    #[test]
+    fn topology_change_resets_in_flight_counts() {
+        let mut mesh = mesh3();
+        mesh.mark_active(NodeId(1));
+        mesh.add_node(axis_node(3, "extra", 3, 0)).unwrap();
+        // Rebuild must not panic on stale indices and must reset counts.
+        mesh.mark_idle(NodeId(1)); // no-op after reset, must not underflow/panic
+        assert_eq!(mesh.in_flight, vec![0, 0, 0, 0]);
     }
 }

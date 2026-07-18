@@ -10,12 +10,19 @@ use std::future::Future;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use crate::protocol::{DispatchParams, DispatchResult, RpcRequest, RpcResponse};
+
+/// Default per-request timeout for [`StdioTransport::spawn`]. A worker that
+/// wedges (crashes without exiting, deadlocks, gets stuck on its own I/O)
+/// would otherwise hold the orchestrator's `AwaitingWorkers` state forever —
+/// the FSM has no other way to notice a stalled call.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -27,6 +34,8 @@ pub enum TransportError {
     Closed,
     #[error("worker error {code}: {message}")]
     Worker { code: i64, message: String },
+    #[error("worker dispatch timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 pub type DispatchFuture<'a> =
@@ -44,13 +53,21 @@ pub struct StdioTransport {
     next_id: AtomicU64,
     io: Mutex<(ChildStdin, Lines<BufReader<ChildStdout>>)>,
     _child: Child,
+    request_timeout: Duration,
 }
 
 impl StdioTransport {
-    /// Spawn a worker process and take ownership of its stdio.
-    pub fn spawn(
+    /// Spawn a worker process with [`DEFAULT_REQUEST_TIMEOUT`] per call.
+    pub fn spawn(program: impl AsRef<OsStr>, args: &[&str]) -> Result<Self, TransportError> {
+        Self::spawn_with_timeout(program, args, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Spawn a worker process and take ownership of its stdio, bounding every
+    /// `dispatch` call to `request_timeout`.
+    pub fn spawn_with_timeout(
         program: impl AsRef<OsStr>,
         args: &[&str],
+        request_timeout: Duration,
     ) -> Result<Self, TransportError> {
         let mut child = Command::new(program)
             .args(args)
@@ -61,40 +78,60 @@ impl StdioTransport {
             .spawn()?;
         let stdin = child.stdin.take().ok_or(TransportError::Closed)?;
         let stdout = BufReader::new(child.stdout.take().ok_or(TransportError::Closed)?).lines();
-        Ok(Self { next_id: AtomicU64::new(1), io: Mutex::new((stdin, stdout)), _child: child })
+        Ok(Self {
+            next_id: AtomicU64::new(1),
+            io: Mutex::new((stdin, stdout)),
+            _child: child,
+            request_timeout,
+        })
+    }
+
+    async fn dispatch_inner(
+        &self,
+        params: DispatchParams,
+    ) -> Result<DispatchResult, TransportError> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let line = serde_json::to_string(&RpcRequest::dispatch(id, &params))?;
+
+        // One in-flight request per worker at a time: the lock spans
+        // write → matching response, which also serializes callers.
+        let mut io = self.io.lock().await;
+        io.0.write_all(line.as_bytes()).await?;
+        io.0.write_all(b"\n").await?;
+        io.0.flush().await?;
+
+        loop {
+            let Some(line) = io.1.next_line().await? else {
+                return Err(TransportError::Closed);
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Non-protocol noise on stdout is skipped, not fatal.
+            let Ok(resp) = serde_json::from_str::<RpcResponse>(&line) else { continue };
+            if resp.id != id {
+                continue; // stale response from a previous, timed-out call
+            }
+            if let Some(err) = resp.error {
+                return Err(TransportError::Worker { code: err.code, message: err.message });
+            }
+            let result = resp.result.ok_or(TransportError::Closed)?;
+            return Ok(serde_json::from_value(result)?);
+        }
     }
 }
 
 impl WorkerTransport for StdioTransport {
     fn dispatch(&self, params: DispatchParams) -> DispatchFuture<'_> {
         Box::pin(async move {
-            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-            let line = serde_json::to_string(&RpcRequest::dispatch(id, &params))?;
-
-            // One in-flight request per worker at a time: the lock spans
-            // write → matching response, which also serializes callers.
-            let mut io = self.io.lock().await;
-            io.0.write_all(line.as_bytes()).await?;
-            io.0.write_all(b"\n").await?;
-            io.0.flush().await?;
-
-            loop {
-                let Some(line) = io.1.next_line().await? else {
-                    return Err(TransportError::Closed);
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                // Non-protocol noise on stdout is skipped, not fatal.
-                let Ok(resp) = serde_json::from_str::<RpcResponse>(&line) else { continue };
-                if resp.id != id {
-                    continue; // stale response from a previous, timed-out call
-                }
-                if let Some(err) = resp.error {
-                    return Err(TransportError::Worker { code: err.code, message: err.message });
-                }
-                let result = resp.result.ok_or(TransportError::Closed)?;
-                return Ok(serde_json::from_value(result)?);
+            // On timeout the mutex guard inside `dispatch_inner` is dropped
+            // (the future is cancelled), not held — a later call can still
+            // acquire it. Its eventual, late response is simply skipped by
+            // the `resp.id != id` check above, so no special recovery is
+            // needed here beyond surfacing the timeout to the caller.
+            match tokio::time::timeout(self.request_timeout, self.dispatch_inner(params)).await {
+                Ok(result) => result,
+                Err(_) => Err(TransportError::Timeout(self.request_timeout)),
             }
         })
     }
@@ -153,5 +190,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, TransportError::Worker { .. }));
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_times_out_on_a_wedged_worker() {
+        // `sleep 5` never reads stdin or writes stdout — the closest
+        // portable stand-in for a worker process that has hung. A short
+        // request_timeout must surface Timeout rather than hang the test.
+        let t = StdioTransport::spawn_with_timeout("sleep", &["5"], Duration::from_millis(200))
+            .expect("spawn sleep");
+        let err = t
+            .dispatch(DispatchParams { worker: "wedged".into(), payload: "x".into(), residual_norm: 0.0 })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransportError::Timeout(_)), "got: {err:?}");
     }
 }
