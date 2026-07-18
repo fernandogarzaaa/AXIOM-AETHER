@@ -15,8 +15,12 @@
 
 pub mod compress;
 pub mod filter;
+pub mod protocol;
 pub mod sidecar;
+pub mod transport;
 
 pub use compress::{compress_context, CompressionStats};
 pub use filter::{FilterRule, TokenScrubber};
+pub use protocol::{DispatchParams, DispatchResult};
 pub use sidecar::{MiniAetherSidecar, SidecarPayload};
+pub use transport::{MockTransport, StdioTransport, TransportError, WorkerTransport};
