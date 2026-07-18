@@ -162,21 +162,43 @@ impl CvmStore {
             .write()
             .map_err(|_| std::io::Error::other("cvm store index lock poisoned"))?;
         let rows = idx.entry(session_id.to_string()).or_default();
-        rows.push(row);
+        // Page ids are content hashes: the same text paged again (e.g. a
+        // repeated break-window rebase over an unchanged transcript) must be
+        // a no-op, not a duplicate row + file rewrite.
+        if rows.iter().any(|r| r.page_id == page_id) {
+            return Ok(page_id);
+        }
 
+        // Mutate in place, but roll back on a failed write: cloning the
+        // whole row set on every call to keep a separate "candidate" would
+        // make put() O(session size) instead of O(1) amortized, which is
+        // ruinous for a session approaching the 64 MiB cap. Rolling back
+        // the specific push/evictions this call made is just as safe --
+        // the in-memory index still exactly matches disk on error, so a
+        // retry's dedup check above never finds a phantom row -- without
+        // paying to copy bytes that didn't change.
+        rows.push(row);
+        let mut evicted: Vec<CvmPage> = Vec::new();
         let mut total: usize = rows.iter().map(|r| r.bytes).sum();
-        let mut evicted = 0usize;
         while total > MAX_SESSION_BYTES && rows.len() > 1 {
             let removed = rows.remove(0);
             total -= removed.bytes;
-            evicted += 1;
+            evicted.push(removed);
         }
-        if evicted > 0 {
+        if !evicted.is_empty() {
             eprintln!(
-                "[axiom-cvm] evicted {evicted} page(s) from session={session_id} (over {MAX_SESSION_BYTES}-byte cap)"
+                "[axiom-cvm] evicted {} page(s) from session={session_id} (over {MAX_SESSION_BYTES}-byte cap)",
+                evicted.len()
             );
         }
-        self.rewrite_session_file(session_id, rows)?;
+
+        if let Err(e) = self.rewrite_session_file(session_id, rows) {
+            rows.pop(); // undo the push
+            for r in evicted.into_iter().rev() {
+                rows.insert(0, r); // restore evictions, oldest-first
+            }
+            return Err(e);
+        }
         Ok(page_id)
     }
 
@@ -207,7 +229,7 @@ impl CvmStore {
     }
 
     #[cfg(test)]
-    fn session_path_for_test(&self, session_id: &str) -> PathBuf {
+    pub(crate) fn session_path_for_test(&self, session_id: &str) -> PathBuf {
         self.session_path(session_id)
     }
 }

@@ -603,6 +603,21 @@ impl AppState {
         }
     }
 
+    /// P2 (PSS) R2: overwrite the session's stored prefix fingerprint with
+    /// `frozen` as forwarded. Called after a break-window rebase mutates the
+    /// frozen prefix, so the next turn's `pss_detect_break` compares against
+    /// the transformed (stubbed) prefix that was actually sent upstream --
+    /// otherwise the deterministic stub re-application would register as a
+    /// spurious second break every following turn.
+    pub(crate) fn pss_note_prefix(&self, session_id: &str, frozen: &[Value]) {
+        if let Ok(mut map) = self.pss_prefix_hash.write() {
+            map.insert(
+                session_id.to_string(),
+                crate::rebase::frozen_fingerprint(frozen),
+            );
+        }
+    }
+
     /// P2 (PSS) R3: record this turn's timestamp for `session_id` and return
     /// the running long-gap count. A gap longer than `gap_threshold_secs` since
     /// the previous turn (the 5-minute cache TTL window) increments the count.

@@ -296,8 +296,18 @@ pub(crate) fn record_lifetime_cost(
 
 /// Accumulate a compression event into the per-session savings ledger and the
 /// lifetime totals.
+///
+/// A no-op turn (no heavy context found, fingerprint/manifest overhead
+/// exceeding whatever was stripped) must never count as "savings" — the
+/// `/v1/messages` call site records unconditionally on every turn, so
+/// without this guard `LIFETIME_SAVINGS_OUT` silently exceeds
+/// `LIFETIME_SAVINGS_IN` in aggregate and `axiom_savings_ratio` floor-clamps
+/// to 0 instead of surfacing that the pipeline is net-inflating payloads.
 fn record_savings(state: &AppState, session_id: &str, bytes_in: u64, bytes_out: u64) {
     use std::sync::atomic::Ordering;
+    if bytes_out >= bytes_in {
+        return;
+    }
     LIFETIME_SAVINGS_IN.fetch_add(bytes_in, Ordering::Relaxed);
     LIFETIME_SAVINGS_OUT.fetch_add(bytes_out, Ordering::Relaxed);
     if let Ok(mut ledger) = state.savings.lock() {

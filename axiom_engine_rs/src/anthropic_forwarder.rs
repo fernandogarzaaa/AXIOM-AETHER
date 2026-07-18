@@ -262,8 +262,9 @@ pub fn partition_messages(
     let mut heavy_context: Vec<ExtractedContent> = Vec::new();
     let mut surviving: Vec<Value> = Vec::with_capacity(raw_messages.len());
     let mut target_user_index: Option<usize> = None;
+    let newest_idx = raw_messages.len().checked_sub(1);
 
-    for raw in raw_messages {
+    for (i, raw) in raw_messages.iter().enumerate() {
         let role = raw
             .get("role")
             .and_then(|v| v.as_str())
@@ -287,8 +288,9 @@ pub fn partition_messages(
         }
 
         let content_value = raw.get("content").cloned().unwrap_or(Value::Null);
+        let is_newest = newest_idx == Some(i);
         let (kept_content, mut extracted) =
-            split_content(&role, &content_value, threshold_tokens, &token_counter);
+            split_content(&role, &content_value, threshold_tokens, is_newest, &token_counter);
 
         heavy_context.append(&mut extracted);
 
@@ -359,6 +361,7 @@ fn split_content(
     role: &str,
     content: &Value,
     threshold_tokens: usize,
+    is_newest: bool,
     token_counter: &impl Fn(&str) -> usize,
 ) -> (Value, Vec<ExtractedContent>) {
     match content {
@@ -418,6 +421,57 @@ fn split_content(
                                 kept_block["text"] = Value::String(reminders.join("\n\n"));
                                 kept.push(kept_block);
                             }
+                            continue;
+                        }
+                    }
+                }
+                // `tool_result` is the dominant heavy-content shape in real
+                // Claude Code traffic (Read/Grep/Bash output) -- distinct
+                // from `text` blocks, which are mostly short user prose. It
+                // was previously invisible to this threshold check entirely,
+                // so the S0 heavy-extraction pipeline never fired against
+                // real tool-use transcripts. `content` here is a nested
+                // string-or-block-array, so it's flattened the same way
+                // `rebase::tool_result_text` flattens it for S1/P2 digestion.
+                //
+                // Never the newest message: S3 (`apply_digest_admission` in
+                // routes_messages.rs) already owns heavy `tool_result`
+                // blocks in the newest turn specifically -- a dedicated
+                // digest+stub+L2-store mechanism. Extracting here too would
+                // have S0 consume the same block first (replacing it with a
+                // short marker before S3 ever sees it, or racing S3's own
+                // digest into the same fingerprint payload), silently
+                // double-processing one block through two different
+                // compression paths.
+                if block_type == "tool_result" && !is_newest {
+                    if let Some(text) = crate::rebase::tool_result_text(block) {
+                        let (remainder, reminders) = split_system_reminders(&text);
+                        let count = token_counter(&remainder);
+                        if count >= threshold_tokens {
+                            extracted.push(ExtractedContent {
+                                role: role.to_string(),
+                                text: remainder,
+                                token_count: count,
+                            });
+                            let mut kept_block = block.clone();
+                            // Never leave `content` empty: a `tool_result` is
+                            // required 1:1 pairing with a preceding
+                            // `tool_use` id, so (unlike a `text` block) it
+                            // can't just be dropped from the array, and an
+                            // empty string risks upstream validation
+                            // rejecting the block outright. Leave a marker
+                            // instead of the stripped text.
+                            const ABSORBED: &str =
+                                "[axiom-ttt: heavy tool_result absorbed into session fingerprint]";
+                            let replacement = if reminders.is_empty() {
+                                Value::String(ABSORBED.to_string())
+                            } else {
+                                Value::String(format!("{ABSORBED}\n\n{}", reminders.join("\n\n")))
+                            };
+                            if let Some(obj) = kept_block.as_object_mut() {
+                                obj.insert("content".to_string(), replacement);
+                            }
+                            kept.push(kept_block);
                             continue;
                         }
                     }
@@ -898,5 +952,149 @@ pub fn run() -> usize {
         // #2: even with top-k indices present on the fingerprint, the structural
         // block must not forward them — only the readable skeleton goes upstream.
         assert!(!content.contains("recall_top_k_indices"));
+    }
+
+    #[test]
+    fn partition_extracts_heavy_tool_result_string_content() {
+        // The dominant heavy-content shape in real Claude Code traffic:
+        // Read/Grep/Bash output riding in a `tool_result` block, not a
+        // `text` block. Before this fix `split_content`'s Array branch only
+        // ever inspected `block_type == "text"`, so this never fired.
+        // Not the newest message -- S3 (`apply_digest_admission`) owns the
+        // newest turn's heavy tool_result exclusively; see
+        // `partition_never_extracts_heavy_tool_result_from_the_newest_turn`.
+        let big = (0..400).map(|i| format!("line{i}")).collect::<Vec<_>>().join(" ");
+        let messages = vec![
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": big.clone()}
+                ]
+            }),
+            json!({"role": "assistant", "content": "ok"}),
+        ];
+        let part = partition_messages(&messages, 100, ws);
+        assert_eq!(part.heavy_context.len(), 1, "heavy tool_result must be extracted");
+        assert_eq!(part.heavy_context[0].text, big);
+        let blocks = part.surviving[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "the tool_result block itself is never dropped");
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "t1", "tool_use pairing is preserved");
+        assert_ne!(blocks[0]["content"], json!(big), "raw text removed from the wire payload");
+        assert!(
+            blocks[0]["content"].as_str().unwrap().contains("absorbed"),
+            "a marker is left so the block is never blank"
+        );
+    }
+
+    #[test]
+    fn partition_extracts_heavy_tool_result_array_content() {
+        // tool_result content can also be an array of {type:"text", text}
+        // parts (e.g. stdout + stderr) -- must flatten the same way
+        // rebase::tool_result_text does for S1/P2 digestion.
+        let stdout = (0..250).map(|i| format!("out{i}")).collect::<Vec<_>>().join(" ");
+        let stderr = (0..250).map(|i| format!("err{i}")).collect::<Vec<_>>().join(" ");
+        let messages = vec![
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t2", "content": [
+                        {"type": "text", "text": stdout},
+                        {"type": "text", "text": stderr},
+                    ]}
+                ]
+            }),
+            json!({"role": "assistant", "content": "ok"}),
+        ];
+        let part = partition_messages(&messages, 100, ws);
+        assert_eq!(part.heavy_context.len(), 1);
+        assert!(part.heavy_context[0].text.contains("out0"));
+        assert!(part.heavy_context[0].text.contains("err0"));
+    }
+
+    #[test]
+    fn partition_leaves_light_tool_results_alone() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t3", "content": "exit 0"}]
+        })];
+        let part = partition_messages(&messages, 100, ws);
+        assert!(part.heavy_context.is_empty());
+        assert_eq!(part.surviving[0]["content"][0]["content"], "exit 0");
+    }
+
+    #[test]
+    fn partition_never_extracts_heavy_tool_result_from_a_system_message() {
+        // Same positional-safety contract as text content: system messages
+        // are never a compression candidate regardless of block type.
+        let big = (0..400).map(|i| format!("tok{i}")).collect::<Vec<_>>().join(" ");
+        let messages = vec![
+            json!({"role": "system", "content": [
+                {"type": "tool_result", "tool_use_id": "t4", "content": big.clone()}
+            ]}),
+            json!({"role": "assistant", "content": "ok"}),
+        ];
+        let part = partition_messages(&messages, 100, ws);
+        assert!(part.heavy_context.is_empty());
+        assert_eq!(part.surviving[0]["content"][0]["content"], json!(big));
+    }
+
+    #[test]
+    fn partition_extracts_heavy_tool_result_alongside_a_light_text_block() {
+        // A realistic Claude Code turn: a short assistant-facing note plus a
+        // heavy tool_result in the same (non-newest) message. Only the
+        // tool_result block is extracted; the message survives with both
+        // blocks present.
+        let big = (0..400).map(|i| format!("row{i}")).collect::<Vec<_>>().join(" ");
+        let messages = vec![
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "continue"},
+                    {"type": "tool_result", "tool_use_id": "t5", "content": big.clone()},
+                ]
+            }),
+            json!({"role": "assistant", "content": "ok"}),
+        ];
+        let part = partition_messages(&messages, 100, ws);
+        assert_eq!(part.heavy_context.len(), 1);
+        assert_eq!(part.heavy_context[0].text, big);
+        let blocks = part.surviving[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "both blocks remain, light text untouched");
+        assert_eq!(blocks[0]["text"], "continue");
+        assert_eq!(blocks[1]["type"], "tool_result");
+    }
+
+    #[test]
+    fn partition_never_extracts_heavy_tool_result_from_the_newest_turn() {
+        // S3 (`apply_digest_admission` in routes_messages.rs) owns heavy
+        // `tool_result` blocks in the newest turn exclusively -- a
+        // dedicated digest+stub+L2-store mechanism. If S0 also extracted
+        // here, it would consume the block first (replacing it with a
+        // marker before S3 ever sees it), silently double-processing one
+        // block through two different compression paths and leaking S0's
+        // own structural-digest signatures where S3's tests expect none.
+        let big = (0..400).map(|i| format!("line{i}")).collect::<Vec<_>>().join(" ");
+        let messages = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t6", "content": big.clone()}
+            ]
+        })];
+        let part = partition_messages(&messages, 100, ws);
+        assert!(part.heavy_context.is_empty(), "newest-turn tool_result is left for S3");
+        assert_eq!(part.surviving[0]["content"][0]["content"], json!(big));
+    }
+
+    #[test]
+    fn partition_still_extracts_heavy_text_from_the_newest_turn() {
+        // The newest-turn exclusion is `tool_result`-specific (S3's scope);
+        // `text` block extraction on the newest turn is unaffected and
+        // stays covered by `partition_extracts_heavy_string_content`.
+        let big = (0..400).map(|i| format!("tok{i}")).collect::<Vec<_>>().join(" ");
+        let messages = vec![json!({"role": "user", "content": big.clone()})];
+        let part = partition_messages(&messages, 100, ws);
+        assert_eq!(part.heavy_context.len(), 1);
+        assert_eq!(part.heavy_context[0].text, big);
     }
 }
