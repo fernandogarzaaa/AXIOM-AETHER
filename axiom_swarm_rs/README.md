@@ -67,7 +67,7 @@ spine** (sequences the loop without ever blocking on a worker).
 
 | Module | Contents |
 |---|---|
-| `mesh` | `KineticNeuralMesh`: node registry, runtime topology reconfiguration (`add_node`/`remove_node` rebuild the affinity matrix), gravitational-field computation (`A·p + bias`, residual-modulated, plus opt-in capacity backpressure via `mark_active`/`mark_idle`), residual-adaptive Gumbel-Softmax temperature annealing (`tau_gain`), and the `forward` pass returning an `Adhesion` (weights + sparse active set). |
+| `mesh` | `KineticNeuralMesh`: node registry, runtime topology reconfiguration (`add_node`/`remove_node` rebuild the affinity matrix), gravitational-field computation (`A·p + bias`, residual-modulated, plus opt-in capacity backpressure via `mark_active`/`mark_idle` and opt-in bandit-learned quality/exploration via `record_outcome`), residual-adaptive Gumbel-Softmax temperature annealing (`tau_gain`), and the `forward` pass returning an `Adhesion` (weights + sparse active set). |
 | `gumbel` | `gumbel_softmax`: hard-variant Gumbel-Softmax for discrete topology routing, plus the relaxed distribution for telemetry. Seedable and deterministic under a fixed RNG. |
 | `node` | `WorkerNode` / `NodeId` / `NodeKind`: affinity embedding + routing bias per worker. |
 | `residual` | `StateVector` and `Residual` (`goal − current`), norms, convergence predicate. |
@@ -125,14 +125,21 @@ spine** (sequences the loop without ever blocking on a worker).
   backpressure against nodes with dispatches already in flight. Both
   default to `0.0` (disabled) so existing behavior is unchanged unless
   opted into.
+* **Routing learns from outcomes, opt-in.** `KineticNeuralMesh::record_outcome`
+  feeds each dispatch's actual residual-reduction into a running-mean
+  quality estimate per node; `MeshConfig::bandit_gain` weights it into
+  routing and `MeshConfig::bandit_exploration` adds a UCB1-style bonus for
+  under-sampled nodes. Kept separate from the static, user-set
+  `WorkerNode.bias` — declared preference and learned quality are
+  orthogonal. Defaults to `0.0` (disabled).
 
 ## Status
 
-First vertical slice plus a fault-tolerance pass: real worker transports
-(JSON-RPC over stdio, with timeout + quarantine) are implemented and wired
-into the demo binary. Learned affinity updates (bandit-style bias from
-observed outcomes), Kalman/EMA sensor smoothing, expert-choice batch
-dispatch, hierarchical topology, and ROCm-accelerated batch routing are
-deliberately not implemented — see
+First vertical slice plus a fault-tolerance and online-learning pass: real
+worker transports (JSON-RPC over stdio, with timeout + quarantine) and
+bandit-learned routing bias are implemented and wired into the demo
+binary. Kalman/EMA sensor smoothing, expert-choice batch dispatch,
+hierarchical topology, and ROCm-accelerated batch routing are deliberately
+not implemented — see
 [`docs/RESEARCH_BLUEPRINT.md`](docs/RESEARCH_BLUEPRINT.md) for why each is
 queued for a decision rather than built.

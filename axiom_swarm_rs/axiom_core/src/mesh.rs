@@ -79,6 +79,18 @@ pub struct MeshConfig {
     /// per-expert capacity constraints in sparse MoE routing. 0.0 (default)
     /// disables this.
     pub capacity_penalty: f32,
+    /// Weight applied to each node's online-learned routing quality — a
+    /// running mean of the reward reported through
+    /// [`KineticNeuralMesh::record_outcome`] — in the gravitational field.
+    /// 0.0 (default) disables bandit-learned routing and leaves `field()`
+    /// driven purely by affinity/bias/residual/capacity.
+    pub bandit_gain: f32,
+    /// UCB1 exploration coefficient: added on top of the quality term as
+    /// `bandit_exploration * sqrt(ln(total_visits) / node_visits)`, biasing
+    /// routing toward under-sampled nodes. Independent of `bandit_gain` —
+    /// set this alone for pure exploration before any quality signal
+    /// exists. 0.0 (default) disables the bonus.
+    pub bandit_exploration: f32,
 }
 
 impl Default for MeshConfig {
@@ -93,6 +105,8 @@ impl Default for MeshConfig {
             tau_min: 0.05,
             tau_max: 1.0,
             capacity_penalty: 0.0,
+            bandit_gain: 0.0,
+            bandit_exploration: 0.0,
         }
     }
 }
@@ -109,6 +123,12 @@ pub struct KineticNeuralMesh {
     /// on topology change (see `rebuild`); tracked via `mark_active` /
     /// `mark_idle` and fed into `field()` as backpressure.
     in_flight: Vec<u32>,
+    /// Running-mean observed reward per node (see `record_outcome`), reset
+    /// on topology change.
+    reward_mean: Vec<f32>,
+    /// Observation count per node, backing both the running mean above and
+    /// the UCB1 exploration bonus.
+    visits: Vec<u32>,
 }
 
 impl KineticNeuralMesh {
@@ -118,6 +138,8 @@ impl KineticNeuralMesh {
             bias: Array1::zeros(0),
             nodes: Vec::new(),
             in_flight: Vec::new(),
+            reward_mean: Vec::new(),
+            visits: Vec::new(),
             config,
         }
     }
@@ -135,6 +157,28 @@ impl KineticNeuralMesh {
     pub fn mark_idle(&mut self, id: NodeId) {
         if let Some(idx) = self.nodes.iter().position(|n| n.id == id) {
             self.in_flight[idx] = self.in_flight[idx].saturating_sub(1);
+        }
+    }
+
+    /// Feed back the outcome of a completed dispatch: `reward` should be
+    /// the residual-norm improvement attributable to this node's action
+    /// (positive = it helped shrink the gap toward the goal; negative or
+    /// zero = it didn't). Updates a running-mean quality estimate that
+    /// `field()` consumes when `MeshConfig::bandit_gain != 0.0`.
+    ///
+    /// Because reward is measured against the state *at the moment this
+    /// dispatch resolves* (not at the moment it was sent), this remains a
+    /// reasonable marginal-credit signal even with `fan_out > 1` and
+    /// overlapping in-flight dispatches — each completion is scored
+    /// against whatever the environment looks like when it lands, not
+    /// against a stale snapshot from dispatch time.
+    ///
+    /// A no-op if `id` isn't currently in the mesh (e.g. it was quarantined
+    /// while its dispatch was still in flight).
+    pub fn record_outcome(&mut self, id: NodeId, reward: f32) {
+        if let Some(idx) = self.nodes.iter().position(|n| n.id == id) {
+            self.visits[idx] += 1;
+            self.reward_mean[idx] += (reward - self.reward_mean[idx]) / self.visits[idx] as f32;
         }
     }
 
@@ -179,16 +223,20 @@ impl KineticNeuralMesh {
         self.affinity = affinity;
         self.bias = bias;
         // Topology changed the index<->node mapping, so any prior in-flight
-        // counts are no longer attributable to the right node; resetting is
-        // the safe default (a removed node's calls will still `mark_idle`
-        // into a no-op once it's gone, see above).
+        // counts and learned reward estimates are no longer attributable to
+        // the right node; resetting is the safe default (a removed node's
+        // calls will still `mark_idle`/`record_outcome` into a no-op once
+        // it's gone, see above).
         self.in_flight = vec![0; n];
+        self.reward_mean = vec![0.0; n];
+        self.visits = vec![0; n];
     }
 
     /// Compute the gravitational field a payload projects over the mesh:
     /// affinity dot-products plus per-node bias, plus (optionally) a term
     /// rewarding nodes aligned with the current residual direction, minus
-    /// capacity backpressure for nodes already busy.
+    /// capacity backpressure for nodes already busy, plus (optionally) an
+    /// online-learned quality/exploration term from `record_outcome`.
     fn field(&self, payload: &Array1<f32>, residual: Option<&Residual>) -> Array1<f32> {
         let mut logits = self.affinity.dot(payload) + &self.bias;
         if let Some(r) = residual {
@@ -200,6 +248,23 @@ impl KineticNeuralMesh {
         if self.config.capacity_penalty != 0.0 {
             for (i, &n) in self.in_flight.iter().enumerate() {
                 logits[i] -= self.config.capacity_penalty * n as f32;
+            }
+        }
+        if self.config.bandit_gain != 0.0 || self.config.bandit_exploration != 0.0 {
+            // UCB1-style: total_visits/node_visits are floored at 1 rather
+            // than special-cased at 0, an "optimistic initialization"
+            // simplification that avoids infinities (which would poison
+            // the softmax in gumbel_softmax with NaNs) while still giving
+            // never-visited nodes a strong, bounded exploration bonus.
+            let total_visits = (self.visits.iter().sum::<u32>().max(1)) as f32;
+            for i in 0..logits.len() {
+                if self.config.bandit_gain != 0.0 {
+                    logits[i] += self.config.bandit_gain * self.reward_mean[i];
+                }
+                if self.config.bandit_exploration != 0.0 {
+                    let n_i = self.visits[i].max(1) as f32;
+                    logits[i] += self.config.bandit_exploration * (total_visits.ln().max(0.0) / n_i).sqrt();
+                }
             }
         }
         logits
@@ -413,5 +478,77 @@ mod tests {
         // Rebuild must not panic on stale indices and must reset counts.
         mesh.mark_idle(NodeId(1)); // no-op after reset, must not underflow/panic
         assert_eq!(mesh.in_flight, vec![0, 0, 0, 0]);
+    }
+
+    fn tied_two_node_mesh(bandit_gain: f32, bandit_exploration: f32) -> KineticNeuralMesh {
+        let mut mesh = KineticNeuralMesh::new(MeshConfig {
+            dim: 2,
+            tau: 0.05,
+            bandit_gain,
+            bandit_exploration,
+            ..Default::default()
+        });
+        mesh.add_node(WorkerNode::new(0, "a", NodeKind::Llm("a".into()), vec![1.0, 0.0])).unwrap();
+        mesh.add_node(WorkerNode::new(1, "b", NodeKind::Llm("b".into()), vec![1.0, 0.0])).unwrap();
+        mesh
+    }
+
+    #[test]
+    fn record_outcome_tracks_a_running_mean() {
+        let mut mesh = tied_two_node_mesh(0.0, 0.0);
+        mesh.record_outcome(NodeId(0), 1.0);
+        mesh.record_outcome(NodeId(0), 0.0);
+        assert!((mesh.reward_mean[0] - 0.5).abs() < 1e-6);
+        mesh.record_outcome(NodeId(0), -1.5);
+        assert!((mesh.reward_mean[0] - (1.0 + 0.0 - 1.5) / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn record_outcome_on_unknown_node_is_a_no_op() {
+        let mut mesh = tied_two_node_mesh(0.0, 0.0);
+        mesh.record_outcome(NodeId(99), 1.0); // must not panic
+        assert_eq!(mesh.visits, vec![0, 0]);
+    }
+
+    #[test]
+    fn bandit_gain_disabled_by_default_leaves_a_tie_a_tie() {
+        // With no learned signal and identical affinity, only Gumbel noise
+        // decides — confirm the disabled path doesn't inject a bias either
+        // way by checking the field itself is untouched by past outcomes.
+        let mut mesh = tied_two_node_mesh(0.0, 0.0);
+        let field_before = mesh.field(&array![1.0, 0.0], None);
+        mesh.record_outcome(NodeId(0), 100.0); // would matter a lot if enabled
+        let field_after = mesh.field(&array![1.0, 0.0], None);
+        assert_eq!(field_before, field_after);
+    }
+
+    #[test]
+    fn bandit_gain_learns_toward_the_higher_reward_node() {
+        let mut mesh = tied_two_node_mesh(10.0, 0.0);
+        for _ in 0..5 {
+            mesh.record_outcome(NodeId(0), 1.0);
+        }
+        mesh.record_outcome(NodeId(1), -1.0);
+
+        let mut rng = StdRng::seed_from_u64(1);
+        let adhesion = mesh.forward(&array![1.0, 0.0], None, &mut rng).unwrap();
+        assert_eq!(adhesion.active, vec![NodeId(0)], "higher observed reward must win the tie");
+    }
+
+    #[test]
+    fn bandit_exploration_prioritizes_an_under_sampled_node() {
+        let mut mesh = tied_two_node_mesh(0.0, 5.0);
+        // Node 0 heavily sampled with a neutral reward; node 1 untouched.
+        for _ in 0..100 {
+            mesh.record_outcome(NodeId(0), 0.0);
+        }
+
+        let mut rng = StdRng::seed_from_u64(1);
+        let adhesion = mesh.forward(&array![1.0, 0.0], None, &mut rng).unwrap();
+        assert_eq!(
+            adhesion.active,
+            vec![NodeId(1)],
+            "the never-sampled node must win on the exploration bonus alone"
+        );
     }
 }

@@ -62,6 +62,12 @@ fn build_mesh(rng: &mut StdRng) -> KineticNeuralMesh {
         // becomes less attractive to new ones (mirrors MoE expert-capacity
         // constraints).
         capacity_penalty: 0.5,
+        // Online-learned routing: nodes that empirically shrink the
+        // residual more get preferred over time, tempered by a UCB1
+        // exploration bonus so a quarantined-then-recovered or newly
+        // added node still gets tried.
+        bandit_gain: 0.6,
+        bandit_exploration: 0.3,
         ..Default::default()
     });
     for (i, name) in ["codex", "claude", "gemini"].iter().enumerate() {
@@ -169,8 +175,15 @@ async fn main() {
                 DispatchOutcome::Success { output } => {
                     println!("    [prime] worker {} -> {output}", node.0);
                     health.record_success(node);
+                    let before_norm = controller.residual(&env.current).norm();
                     let delta = &controller.residual(&env.current).vector * 0.4;
                     env.current = StateVector(&env.current.0 + &delta);
+                    let after_norm = controller.residual(&env.current).norm();
+                    // Marginal credit: reward is the shrinkage attributable
+                    // to this dispatch, measured at the moment it landed —
+                    // see KineticNeuralMesh::record_outcome for why this
+                    // stays a fair signal even under concurrent fan-out.
+                    mesh.record_outcome(node, before_norm - after_norm);
                 }
                 DispatchOutcome::Failure { reason } => {
                     eprintln!("    [prime] worker {} failed: {reason}", node.0);
