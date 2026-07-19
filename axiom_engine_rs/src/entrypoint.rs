@@ -1,7 +1,7 @@
 use crate::{
     agentic, agentic_eval, bench, bootstrap, chimera, claude_backend, cli, config, daemon,
     fault_locate, hardware, heal_memory, inference, lsp, mcp_stdio, meta_train, patch_memory,
-    prime, provenance, self_heal, server, solve, train, vibe_memory,
+    prime, provenance, self_heal, server, solve, train, tui, vibe_memory,
 };
 
 use std::env;
@@ -1113,6 +1113,9 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     }
                 }
             }
+        }
+        AxiomCommand::Tui => {
+            tui::run().map_err(|e| candle_core::Error::Msg(format!("tui failed: {e}")))?;
         }
         AxiomCommand::Swarm { command } => match command {
             SwarmCommand::Connect { ip } => {

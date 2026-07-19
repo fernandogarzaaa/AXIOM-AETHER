@@ -45,6 +45,15 @@ pub fn start() -> io::Result<DaemonStatus> {
             cfg.runtime.max_context_tokens.to_string(),
         )
         .env("AXIOM_DWE_PEERS", cfg.swarm.peers.join(","))
+        .env("AXIOM_TTT_COMPRESS", bool_flag(cfg.features.ttt_compress))
+        .env(
+            "AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS",
+            cfg.features.ttt_compress_threshold_tokens.to_string(),
+        )
+        .env("AXIOM_SWARM_LOCAL", bool_flag(cfg.features.swarm_local))
+        .env("AXIOM_MESH_ROUTING", bool_flag(cfg.features.mesh_routing))
+        .env("AXIOM_OLLAMA_URL", &cfg.features.ollama_url)
+        .env("AXIOM_OLLAMA_MODELS", cfg.features.ollama_models.join(","))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err));
@@ -138,6 +147,14 @@ fn status_from_paths(paths: &AxiomPaths, cfg: &UserConfig) -> io::Result<Option<
 
 fn endpoint(cfg: &UserConfig) -> String {
     format!("http://{}:{}", cfg.runtime.host, cfg.runtime.port)
+}
+
+fn bool_flag(v: bool) -> &'static str {
+    if v {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 #[cfg(windows)]

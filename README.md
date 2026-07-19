@@ -443,8 +443,14 @@ axiom chimera prove {file} [--out PATH]
 axiom chimera verify {cert}
 axiom daemon start|stop|status
 axiom mount {dir}
+axiom tui
 ```
 
+- Running `axiom` with no arguments in an interactive terminal opens the same
+  menu as `axiom tui` — a `ratatui`-based settings/status/actions UI over
+  `~/.axiom/config.toml` (device, context/compression settings, local-model
+  routing, daemon control). Piped or redirected invocations (scripts, CI) keep
+  today's behavior — bare `axiom` there still prints help, exactly as before.
 - `axiom task` is goal-directed autonomous coding (an LLM backend is required —
   set `ANTHROPIC_API_KEY` or another supported provider key; see
   [`docs/AGENTIC_CORE.md`](docs/AGENTIC_CORE.md)). `axiom run`/`axiom solve`
