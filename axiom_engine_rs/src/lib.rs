@@ -72,6 +72,7 @@ pub mod skeleton;
 pub mod state_predictor;
 pub mod surprisal;
 pub mod swarm_route;
+pub mod mesh_router;
 pub mod swarm_router;
 pub mod task_board;
 pub mod test_time_adapter;

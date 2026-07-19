@@ -186,6 +186,18 @@ not" — nothing is left in an open-ended queued state. ROCm-accelerated
 batch routing remains out of scope (this workspace has no GPU-backed
 compute path at all yet, on any hardware).
 
+A third pass integrated `axiom_core` into the actual shipped product:
+`axiom_engine_rs` now depends on it directly (as a cross-workspace path
+dependency — Cargo resolves this cleanly even though `axiom_engine_rs`
+isn't a member of this workspace) to power `axiom_engine_rs`'s
+`mesh_router` module, an opt-in (`AXIOM_MESH_ROUTING=1`) replacement for
+its local-Ollama model selector's static "first available candidate"
+logic. Building that integration surfaced a real gap in `forward` itself
+— no way to say "route among only these currently-eligible nodes without
+losing what the mesh has already learned about the excluded ones" — which
+is now `KineticNeuralMesh::forward_restricted`. See
+`axiom_engine_rs/src/mesh_router.rs` for the consumer.
+
 ```bash
 cd axiom_mesh_rs                                    # this workspace is standalone — commands below won't find a Cargo.toml from the repo root
 cargo test --workspace                             # 69 tests: unit + integration + property-based

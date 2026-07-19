@@ -332,6 +332,108 @@ Property-based tests (`proptest`, for the FSM/mesh invariants this
 document's counter-review step implies) and EMA sensor smoothing were also
 on this list from an earlier pass; both are implemented above.
 
+## Third pass: integration into the shipped product
+
+Everything above was built and tested in isolation. This pass integrated
+`axiom_core` into `axiom_engine_rs` for real — the first time any of this
+has been consumed by code outside this workspace — specifically to
+replace `swarm_router::select_model`'s static "first available candidate"
+local-Ollama model selection with the mesh's bandit-learned routing (opt-in
+via `AXIOM_MESH_ROUTING=1`; see `axiom_engine_rs/src/mesh_router.rs`).
+Two real things fell out of actually doing this rather than just designing
+for it hypothetically:
+
+**A genuine library gap:** there was no way to express "route among only
+these currently-eligible nodes" without either rebuilding the mesh (which
+resets every node's learned state, including nodes *not* being removed —
+see `rebuild`'s doc comment) or permanently removing a node the moment it's
+briefly unavailable. Neither is right for "one local model is down right
+now but might come back." Added `KineticNeuralMesh::forward_restricted`:
+identical to `forward`, but masks ineligible nodes' logits to `-inf` for
+that call only, leaving `bias`/`reward_mean`/`visits` untouched for
+everyone, including the excluded nodes. A fixed-seed unit test
+(`forward_restricted_never_picks_an_ineligible_node`, sweeping 30 seeds —
+not a `proptest!`-generated property test) and a second unit test
+specifically pin down that excluded nodes keep their learned state across
+exclusion.
+
+**A real reward-calibration bug**, found by testing the integration
+end-to-end against a real local mock HTTP server (not just unit-level
+mocks) rather than trusting the design: `MeshModelSelector`'s first
+version rewarded a successful call with `1000.0 / latency_ms`, calibrated
+assuming latency in the hundreds-to-thousands of milliseconds (real LLM
+inference). Tested against a fast mock server, sub-millisecond responses
+produced rewards in the hundreds — which, combined with a `bias` gap sized
+for a *static* priority ordering, meant a repeatedly-failing top-priority
+candidate could still win a two-digit number of consecutive routing draws
+before the alternative got a fair look. Exactly backwards from the whole
+point of adding learned routing. Root cause was two compounding
+miscalibrations, not one: the reward was unbounded and unit-dependent, and
+the static bias step was sized on the assumption that overturning it
+should be hard, when the actual goal was the opposite — one clear failure
+should be enough. Fixed by bounding reward to a fixed `(-1.0, 1.0]` range
+regardless of latency's absolute scale, shrinking the bias step
+accordingly, and lowering `tau` to compensate (recall
+`gumbel_softmax` computes `logits/tau + noise`, so a smaller `bias` gap
+needs a smaller `tau` to stay reliably above Gumbel noise — this is the
+same signal-to-noise mechanism documented on `gumbel_softmax` itself, just
+tuned for a much smaller gap than the demo binary uses). An end-to-end
+integration test (`axiom_engine_rs/tests/mesh_router_proxy.rs`) now pins
+"recovers within ~1-2 calls of a clean failure," stress-tested over 20+
+repeated runs with no flakes after the fix — it flaked on roughly half of
+runs before it.
+
+The honest caveat this pass can't remove: none of this has been verified
+against a real, live Ollama instance, only a hand-rolled mock server
+speaking the same wire format. The mock proves the wiring and the routing
+logic are correct; it can't prove anything about real Ollama's actual
+latency distribution or failure modes.
+
+## Fourth pass: live end-to-end run and a real demo-binary bug
+
+Verification so far had stopped at `cargo test`. Running the actual
+release binaries — the real `axiom` server against a real (if mocked)
+Ollama HTTP endpoint, and `axiom_prime` standalone — surfaced one more
+real bug, this time in `axiom_prime`, not in the integration code itself.
+
+**`axiom_prime` panicked on a clean `--release` run.** `worker_binary_path`
+resolves the sibling `aether_worker` sidecar next to its own executable
+and, if missing, builds it on demand with `cargo build --bin
+aether_worker` — but that command has no `--release` flag, so it always
+places the binary in `target/debug/` regardless of which profile
+`axiom_prime` itself is running under. Under `--release`, the path lookup
+was `target/release/aether_worker`, the on-demand build silently populated
+`target/debug/aether_worker` instead, and the subsequent
+`StdioTransport::spawn_with_timeout` failed with `NotFound` — a working
+`cargo run --bin axiom_prime` (dev profile) masked this the whole time,
+since dev-profile lookup and dev-profile build agree. Fixed by adding
+`--release` to the on-demand build whenever `!cfg!(debug_assertions)`, so
+the build profile always matches the one `axiom_prime` is already running
+under.
+
+With that fixed, a live run against a real local mock Ollama server (a
+hand-rolled Python `http.server`, not the Rust test harness) confirmed the
+mesh-routing integration end to end: the real `axiom` server binary,
+started with `AXIOM_MESH_ROUTING=1` and pointed at the mock, tried the
+top-priority model on its very first request (matching the naive
+selector's cold-start default), got a real HTTP 500, and every subsequent
+request in the run routed straight to the healthy model — recovering
+within exactly one call, as `mesh_router_proxy.rs`'s tests already
+asserted. A second real server, started with `AXIOM_MESH_ROUTING` unset
+against an identically-configured mock, kept sending every single request
+to the failing model for the whole run — the regression-guard behavior
+the test suite pins, now also confirmed outside the test harness.
+
+This pass also fixed the three findings from CodeRabbit's review of the
+third pass's PR: deriving `mesh_router.rs`'s node-affinity and routing-
+payload literals from `DIM` instead of a coincidentally-matching hardcoded
+length 1, extracting the top-k sampling loop `forward` and
+`forward_restricted` had duplicated verbatim into a shared
+`route_topk` helper, and correcting this document's own claim that a
+proptest-generated property test covers `forward_restricted` (it doesn't —
+`forward_restricted_never_picks_an_ineligible_node` is a fixed-seed unit
+test sweeping 30 seeds, not a `proptest!` block).
+
 ## Sources
 
 - [Mixture-of-experts with expert choice routing (Google Research)](https://research.google/blog/mixture-of-experts-with-expert-choice-routing/)
