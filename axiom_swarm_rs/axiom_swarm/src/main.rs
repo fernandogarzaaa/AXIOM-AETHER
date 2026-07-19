@@ -182,6 +182,10 @@ async fn main() {
     let (tx, mut rx) = mpsc::channel::<(NodeId, DispatchOutcome)>(16);
 
     println!("axiom_swarm: IDC control loop starting (dim={DIM}, epsilon={EPSILON})");
+    println!(
+        "axiom_swarm: worker names (codex/claude/gemini) are illustrative labels on a stub \
+         echo process (aether_worker) — no real LLM API is called by this demo."
+    );
     let mut queue = machine.step(SwarmEvent::GoalLoaded);
     let mut tick = 0usize;
 

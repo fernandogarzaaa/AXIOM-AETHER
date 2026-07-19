@@ -180,6 +180,7 @@ batch routing remains out of scope (this workspace has no GPU-backed
 compute path at all yet, on any hardware).
 
 ```bash
+cd axiom_swarm_rs                                   # this workspace is standalone — commands below won't find a Cargo.toml from the repo root
 cargo test --workspace                             # 69 tests: unit + integration + property-based
 cargo run --bin axiom_swarm                         # closed-loop demo
 cargo run -p axiom_core --example batch_dispatch    # expert-choice batch dispatch demo
