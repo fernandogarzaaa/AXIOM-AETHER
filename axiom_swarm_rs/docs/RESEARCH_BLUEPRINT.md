@@ -4,7 +4,14 @@ This document records a deliberate research + brainstorming pass over the
 Axiom Swarm architecture: what the current literature on sparse routing,
 multi-agent orchestration, and control theory suggests we're missing, what
 was implemented as a direct result, and what's queued for a follow-up
-decision rather than built unilaterally.
+decision rather than built unilaterally. A second pass completed the two
+items that had been queued as "explicitly deferred" — expert-choice batch
+dispatch and hierarchical topology — and, in the process of building real
+tests for them, found and fixed a genuine correctness bug in a
+previously-shipped feature (`MeshConfig::tau_gain` annealing). Every item
+originally raised by the research pass is now either implemented or has an
+explicit, reasoned "not yet, and here's specifically why" — nothing is
+still sitting in an open-ended "queued" state.
 
 ## Methodology
 
@@ -31,6 +38,64 @@ Sinkhorn/optimal-transport alternatives for discrete routing, multi-agent
 LLM orchestration + control-theory framings, AMD MI300X/ROCm inference
 optimization, Kalman-filter sensor fusion, Rust actor-model supervision
 trees, and bandit algorithms for cost-aware model routing.
+
+## Correctness fix found while completing the roadmap
+
+Completing the two remaining roadmap items surfaced a real bug in an
+already-shipped, already-documented feature — worth recording plainly
+rather than folding into the "implemented" list below as if it were new
+work, since the honest story is "a previous pass got this wrong."
+
+**What was wrong:** `gumbel_softmax`'s hard (discrete) decision was
+computed as `argmax(softmax((logits + gumbel_noise) / tau))`. Softmax and
+division by a positive scalar are both order-preserving, so this reduces
+to `argmax(logits + gumbel_noise)` for *every* `tau > 0` — the hard
+decision is provably invariant to temperature. That's not a coding
+mistake; it's a known, correct property of the textbook Gumbel-max trick.
+The mistake was building `MeshConfig::tau_gain` ("residual-adaptive
+temperature annealing," documented as making routing "explore more while
+far from goal, sharpen as it converges") on top of that function and
+assuming it would affect routing decisions. It provably couldn't — the
+computed `tau` was real, `effective_tau()`'s own unit tests passed
+correctly, but nothing downstream of it in hard-routing mode ever changed
+behavior as a result.
+
+**Why it went undetected:** the existing test for temperature sensitivity
+(`low_temperature_tracks_dominant_logit`) used a logit gap (10) so large
+that `argmax(logits + noise)` wins reliably on its own, with or without
+any temperature scaling — the test validated that a dominant logit wins,
+not that `tau` had anything to do with it.
+
+**How it surfaced:** a new hierarchical-topology test
+(`select_region_picks_the_best_affinity_region`, described below) used a
+*modest* logit gap and a low `tau`, expecting temperature to make the
+decision reliable. It failed on a specific seed — the failure was the
+signal that led to this analysis rather than a seed swap.
+
+**The fix:** changed the perturbation to `logits / tau + gumbel_noise`
+(unscaled noise) instead of `(logits + gumbel_noise) / tau`. Now `tau`
+sets the real signal-to-noise ratio of the discrete decision — low `tau`
+amplifies genuine affinity gaps over fixed-scale noise, high `tau` lets
+noise dominate — which is what `tau_gain` annealing actually needs to do
+its job. This is a deliberate, documented departure from the textbook
+Concrete-distribution formula, not an attempt to reproduce it more
+faithfully; see the docstring on `gumbel_softmax` for the full reasoning.
+A new test, `tau_genuinely_changes_the_hard_decision`, checks the property
+the old test couldn't: a modest gap is won reliably at low `tau` and
+becomes close to a coin flip at high `tau`.
+
+**Knock-on effects, both fixed:** the demo's `MockTransport`-backed
+"gemini always fails" quarantine path had been relying on Gumbel noise
+occasionally routing to it under the old (temperature-invariant) formula —
+a coincidence, not a design. Under the corrected formula, with the demo's
+existing tuning, routing became sharp enough that gemini stopped being
+selected at all, silently breaking the quarantine demonstration. Fixed by
+giving the three demo workers fixed, purpose-chosen affinities (`gemini`
+tracks the goal direction closely, guaranteeing it wins the first routing
+decision and gets quarantined deterministically) instead of the
+previously random per-run ones — the demo's narrative no longer depends on
+which way any RNG happens to break a tie, matching the standard this
+project already holds itself to for reproducible test seeds.
 
 ## Implemented this pass
 
@@ -177,16 +242,95 @@ tested, and exported as a composable primitive (same category as
 into the demo) ready to sit in front of a real, noisy `fuse()` call once
 one exists.
 
-## Explicitly deferred (still not built, and why)
+### 6. Expert-choice batch dispatch
 
-| Idea | Why it's promising | Why it's still not implemented |
-|---|---|---|
-| **Expert-choice batch dispatch** — for the future case of routing *many* payloads to *few* workers at once (not today's one-payload-at-a-time loop), let workers choose their top payloads by affinity instead of payloads choosing workers, which is what actually solves load imbalance in MoE. | Directly cited as the highest-leverage 2025-2026 MoE improvement over naive top-1 routing. | No real batch-dispatch use case exists in this codebase yet — the FSM dispatches one payload per tick. Building the mechanism ahead of a caller that needs it is exactly the kind of speculative abstraction this project's own engineering conventions rule out. Revisit when a real multi-payload workload shows up. |
-| **Hierarchical/decentralized topology** — sub-swarms with their own Axiom Prime, per the centralized/decentralized/hierarchical + dynamic-adaptive taxonomy from the 2025-2026 multi-agent orchestration survey. | Matches how production multi-agent systems (LangGraph, AutoGen v0.4's actor-model rewrite) scale past a single controller. | Scale-driven; today's single-loop FSM has shown no evidence of being a bottleneck. Don't build ahead of the need — there's nothing to test it against yet, so it'd ship unvalidated. |
+**Finding:** MoE load-balancing research consistently identifies the same
+fix for pileup on popular experts: flip the direction of choice. Instead
+of each token picking its best expert (which is what `forward` already
+does — one payload choosing among nodes), each expert independently ranks
+*all* tokens and claims its best ones up to a capacity. A popular node
+can't be swamped, because it's capacity-bounded regardless of how many
+payloads want it.
+
+**Originally deferred on:** "no real batch-dispatch use case exists in
+this codebase yet... revisit when a real multi-payload workload shows
+up." That's still true of Axiom Prime's own control loop — it dispatches
+one payload per tick by design, and this pass didn't change that.
+
+**What shipped instead:** `KineticNeuralMesh::forward_batch(payloads,
+capacity, residual)` as a standalone library capability, deliberately not
+wired into the FSM's single-payload loop. Assignment is a deterministic
+greedy global match: every `(payload, node)` pair is scored via the same
+gravitational field `forward` uses, sorted best-first with a fully
+deterministic tie-break, and walked once — a payload is claimed by the
+first node in that order with room left. No Gumbel-Softmax draw: with
+`capacity` doing the real work of preventing pileup, a deterministic
+best-match walk is simpler than a stochastic one and no less principled,
+and this runtime has no autograd tape to keep differentiable either way.
+A payload no node has room for by the time its turn comes is dropped —
+the same fate real capacity-constrained MoE routing gives overflow
+tokens, rather than forcing an imbalanced assignment.
+
+Demonstrated (not just unit-tested) via `axiom_core/examples/batch_dispatch.rs`
+(`cargo run -p axiom_core --example batch_dispatch`): a worker that's
+genuinely the better fit for every payload in a burst — naive per-payload
+routing isn't "wrong" about any single choice, it just has no way to
+notice it's already full — floods that worker 6/0 under naive routing,
+vs. a clean 3/3 split under capacity-bounded batch dispatch.
+
+**Counter-review:** a real multi-payload use case in Axiom Prime's own
+loop still doesn't exist, so the honest scope here is "a tested,
+demonstrated library capability," not "wired into the swarm end to end."
+Building the FSM-level caller for it remains deferred until a workload
+that actually needs it shows up — adding one speculatively now would be
+exactly the kind of premature abstraction this project's conventions rule
+out, even though the underlying mechanism itself is no longer premature.
+
+### 7. Hierarchical/decentralized topology
+
+**Finding:** the centralized/decentralized/hierarchical (+ dynamic-
+adaptive) taxonomy from the 2025-2026 multi-agent orchestration survey
+matches how production multi-agent systems scale past a single
+controller — "sub-swarms with their own Axiom Prime."
+
+**Originally deferred on:** "scale-driven; today's single-loop FSM has
+shown no evidence of being a bottleneck... there's nothing to test it
+against yet, so it'd ship unvalidated." The "unvalidated" half of that
+concern is what this pass addressed — a design can be implemented and
+thoroughly tested without needing to prove a real scale bottleneck first,
+as long as it's built from primitives already proven at the leaf level
+rather than a parallel new architecture guessed at from a taxonomy.
+
+**What shipped:** `axiom_swarm::hierarchy::SwarmSupervisor` — a mesh over
+*regions*, where each region is a whole `KineticNeuralMesh` (the same
+type `forward` already uses for leaf routing) rather than a new recursive
+node type. The supervisor's job is deliberately narrow: given a payload
+and residual, pick a region via the exact same gravitational-field +
+Gumbel-Softmax adhesion a leaf mesh uses to pick a worker, one level up.
+What a region does once selected — its own mesh routing, its own
+`SwarmFsm` loop — is exactly the machinery `main.rs` already runs for the
+flat case; a `#[test]` (`regions_run_independent_swarm_fsm_loops`)
+demonstrates two regions each driven by their own independent `SwarmFsm`
+instance, orchestrated only by which region a `SwarmSupervisor` selects.
+
+**Counter-review:** this composition approach was chosen specifically to
+avoid the alternative — making `NodeKind` recursive (`SubSwarm(Box<KineticNeuralMesh>)`)
+directly inside `axiom_core`. That would have required new `Clone`/serde
+derives on a mesh type containing `ndarray` buffers, a guard against a
+region containing itself, and conflating "leaf worker descriptor" with
+"recursive routing structure" throughout `WorkerNode`'s existing simple
+role. Composing two ordinary, unmodified `KineticNeuralMesh` instances
+gets the same hierarchical routing behavior with none of that risk.
+Real limitation, stated rather than hidden: `SwarmSupervisor` has no
+`remove_region` — region indices are assumed stable for the supervisor's
+lifetime, which holds today because nothing removes one. Dynamic region
+retirement would need to keep the supervisor's region-selection mesh and
+its `regions()` vector in sync, a real design question left for when a
+caller actually needs to retire a region at runtime.
 
 Property-based tests (`proptest`, for the FSM/mesh invariants this
 document's counter-review step implies) and EMA sensor smoothing were also
-on this list; both are now implemented above.
+on this list from an earlier pass; both are implemented above.
 
 ## Sources
 

@@ -48,12 +48,28 @@ pub struct GumbelSample {
 /// * `hard` — when true, returns a one-hot adhesion vector (the discrete
 ///   topology snap the KNM requires); when false, returns the relaxed
 ///   distribution.
+///
+/// Deliberate departure from the textbook Concrete-distribution formula
+/// (`softmax((logits + g) / tau)`): dividing the *sum* of logits and noise
+/// by tau cancels out of the hard argmax entirely — softmax and division
+/// by a positive scalar are both order-preserving, so `argmax((logits + g)
+/// / tau) == argmax(logits + g)` for every tau > 0. That makes the
+/// textbook hard sample provably temperature-invariant (a known property
+/// of the Gumbel-max trick, not a bug in the textbook formula — it's just
+/// not useful for a temperature *anneal* on the discrete decision, which
+/// is what this router needs). Scaling the logits by `1/tau` *before*
+/// adding unscaled Gumbel(0,1) noise keeps the signal and noise on
+/// different scales, so tau genuinely sets their ratio: low tau amplifies
+/// real affinity gaps over fixed-scale noise (exploitative), high tau lets
+/// noise dominate (explorative). `soft` is derived from this same
+/// perturbed vector, so it stays consistent with `winner` rather than
+/// describing a different draw.
 pub fn gumbel_softmax(logits: &Array1<f32>, tau: f32, hard: bool, rng: &mut impl Rng) -> GumbelSample {
     assert!(tau > 0.0, "gumbel_softmax: tau must be positive, got {tau}");
     assert!(!logits.is_empty(), "gumbel_softmax: empty logits");
 
     let g = sample_gumbel(logits.len(), rng);
-    let perturbed = (logits + &g) / tau;
+    let perturbed = logits / tau + &g;
     let soft = softmax(&perturbed);
 
     let winner = soft
@@ -115,5 +131,24 @@ mod tests {
             .filter(|_| gumbel_softmax(&logits, 0.1, true, &mut rng).winner == 0)
             .count();
         assert!(wins >= 198, "dominant logit won only {wins}/200 draws");
+    }
+
+    #[test]
+    fn tau_genuinely_changes_the_hard_decision() {
+        // A *modest* gap (unlike the huge one above, which wins on raw
+        // logit margin regardless of tau and so can't distinguish "tau
+        // matters" from "tau is a no-op"). Low tau should track the true
+        // winner reliably; high tau should be close to a coin flip.
+        let logits = array![1.0, 0.0];
+        let mut rng = StdRng::seed_from_u64(11);
+        let low_tau_wins = (0..300).filter(|_| gumbel_softmax(&logits, 0.05, true, &mut rng).winner == 0).count();
+        let high_tau_wins =
+            (0..300).filter(|_| gumbel_softmax(&logits, 20.0, true, &mut rng).winner == 0).count();
+
+        assert!(low_tau_wins >= 295, "low tau should track the true winner nearly always, got {low_tau_wins}/300");
+        assert!(
+            (100..200).contains(&high_tau_wins),
+            "high tau should wash out the gap toward a coin flip, got {high_tau_wins}/300"
+        );
     }
 }

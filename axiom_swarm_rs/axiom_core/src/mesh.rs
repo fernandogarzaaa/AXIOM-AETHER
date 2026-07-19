@@ -46,6 +46,17 @@ pub struct Adhesion {
     pub field: Array1<f32>,
 }
 
+/// Result of an expert-choice batch dispatch (see
+/// [`KineticNeuralMesh::forward_batch`]).
+#[derive(Debug, Clone)]
+pub struct BatchAdhesion {
+    /// `(node, payload indices)` for every node that claimed at least one
+    /// payload. A payload index appears in at most one node's list.
+    pub assignments: Vec<(NodeId, Vec<usize>)>,
+    /// Payload indices no node had capacity left for.
+    pub dropped: Vec<usize>,
+}
+
 /// Configuration for the mesh's routing behavior.
 #[derive(Debug, Clone)]
 pub struct MeshConfig {
@@ -321,6 +332,80 @@ impl KineticNeuralMesh {
         Ok(Adhesion { weights, active, field })
     }
 
+    /// Expert-choice batch dispatch: instead of each payload picking its
+    /// best node (`forward`'s model — one payload choosing among nodes),
+    /// every node independently ranks *all* payloads and claims its best
+    /// ones up to `capacity`. That flip — nodes choosing payloads rather
+    /// than the reverse — is what actually solves load imbalance in
+    /// sparse MoE routing (see docs/RESEARCH_BLUEPRINT.md): a popular
+    /// node can't be swamped, because it's capacity-bounded regardless of
+    /// how many payloads want it.
+    ///
+    /// Assignment is a deterministic greedy global match: every
+    /// (payload, node) pair is scored via the same gravitational field
+    /// `forward` uses, sorted best-first (ties broken by payload then node
+    /// index so the result never depends on sort-stability quirks), and
+    /// walked once — a payload is claimed by the first node in that order
+    /// that still has room. There's no Gumbel-Softmax draw here: with
+    /// `capacity` doing the real work of preventing pileup, a
+    /// deterministic best-match walk is simpler than a stochastic one and
+    /// no less principled — this runtime has no autograd tape either way,
+    /// so nothing about the discrete decision needs to stay differentiable.
+    ///
+    /// A payload no node has room left for by the time its turn comes is
+    /// dropped, matching real capacity-constrained MoE routing (which
+    /// drops or pads overflow tokens rather than forcing an imbalanced
+    /// assignment).
+    pub fn forward_batch(
+        &self,
+        payloads: &[Array1<f32>],
+        capacity: usize,
+        residual: Option<&Residual>,
+    ) -> Result<BatchAdhesion, MeshError> {
+        if self.nodes.is_empty() {
+            return Err(MeshError::Empty);
+        }
+        for p in payloads {
+            if p.len() != self.config.dim {
+                return Err(MeshError::DimMismatch { payload: p.len(), mesh: self.config.dim });
+            }
+        }
+        let capacity = capacity.max(1);
+
+        let mut scored: Vec<(f32, usize, usize)> =
+            Vec::with_capacity(payloads.len() * self.nodes.len());
+        for (p_idx, payload) in payloads.iter().enumerate() {
+            let field = self.field(payload, residual);
+            for (n_idx, &score) in field.iter().enumerate() {
+                scored.push((score, p_idx, n_idx));
+            }
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+        let mut node_slots = vec![0usize; self.nodes.len()];
+        let mut payload_claimed = vec![false; payloads.len()];
+        let mut per_node: Vec<Vec<usize>> = vec![Vec::new(); self.nodes.len()];
+
+        for (_, p_idx, n_idx) in scored {
+            if payload_claimed[p_idx] || node_slots[n_idx] >= capacity {
+                continue;
+            }
+            payload_claimed[p_idx] = true;
+            node_slots[n_idx] += 1;
+            per_node[n_idx].push(p_idx);
+        }
+
+        let assignments = per_node
+            .into_iter()
+            .enumerate()
+            .filter(|(_, ps)| !ps.is_empty())
+            .map(|(n_idx, ps)| (self.nodes[n_idx].id, ps))
+            .collect();
+        let dropped = (0..payloads.len()).filter(|&p| !payload_claimed[p]).collect();
+
+        Ok(BatchAdhesion { assignments, dropped })
+    }
+
     /// Mean row of the affinity matrix — a cheap mesh "center of mass",
     /// useful for drift telemetry.
     pub fn center_of_mass(&self) -> Option<Array1<f32>> {
@@ -552,6 +637,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn batch_dispatch_assigns_each_payload_to_its_clear_best_node() {
+        let mesh = mesh3(); // axis-aligned nodes: codex=axis0, claude=axis1, gemini=axis2
+        let payloads = vec![array![1.0, 0.0, 0.0], array![0.0, 1.0, 0.0], array![0.0, 0.0, 1.0]];
+        let result = mesh.forward_batch(&payloads, 5, None).unwrap();
+        assert!(result.dropped.is_empty());
+        let mut by_node: Vec<_> = result.assignments;
+        by_node.sort_by_key(|(id, _)| id.0);
+        assert_eq!(by_node, vec![(NodeId(0), vec![0]), (NodeId(1), vec![1]), (NodeId(2), vec![2])]);
+    }
+
+    #[test]
+    fn batch_dispatch_respects_capacity_and_drops_overflow() {
+        // Two nodes tied toward the same direction; three payloads all
+        // pulling that way, capacity 1 each — only 2 of 3 can be served.
+        let mut mesh = KineticNeuralMesh::new(MeshConfig { dim: 2, ..Default::default() });
+        mesh.add_node(WorkerNode::new(0, "a", NodeKind::Llm("a".into()), vec![1.0, 0.0])).unwrap();
+        mesh.add_node(WorkerNode::new(1, "b", NodeKind::Llm("b".into()), vec![1.0, 0.0])).unwrap();
+
+        let payloads = vec![array![1.0, 0.0], array![1.0, 0.0], array![1.0, 0.0]];
+        let result = mesh.forward_batch(&payloads, 1, None).unwrap();
+
+        let assigned_total: usize = result.assignments.iter().map(|(_, ps)| ps.len()).sum();
+        assert_eq!(assigned_total, 2, "capacity 1 x 2 nodes must serve exactly 2 of 3 payloads");
+        assert_eq!(result.dropped.len(), 1);
+        for (_, ps) in &result.assignments {
+            assert_eq!(ps.len(), 1, "no node may exceed its capacity");
+        }
+    }
+
+    #[test]
+    fn batch_dispatch_is_deterministic() {
+        let mesh = mesh3();
+        let payloads = vec![array![0.5, 0.5, 0.0], array![0.0, 0.5, 0.5], array![0.5, 0.0, 0.5]];
+        let a = mesh.forward_batch(&payloads, 1, None).unwrap();
+        let b = mesh.forward_batch(&payloads, 1, None).unwrap();
+        let sorted = |r: &BatchAdhesion| {
+            let mut v = r.assignments.clone();
+            v.sort_by_key(|(id, _)| id.0);
+            v
+        };
+        assert_eq!(sorted(&a), sorted(&b));
+        assert_eq!(a.dropped, b.dropped);
+    }
+
+    #[test]
+    fn batch_dispatch_dimension_mismatch_is_an_error() {
+        let mesh = mesh3();
+        assert!(matches!(
+            mesh.forward_batch(&[array![1.0, 2.0]], 1, None),
+            Err(MeshError::DimMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn batch_dispatch_on_empty_mesh_is_an_error() {
+        let mesh = KineticNeuralMesh::new(MeshConfig { dim: 2, ..Default::default() });
+        assert!(matches!(mesh.forward_batch(&[array![1.0, 0.0]], 1, None), Err(MeshError::Empty)));
+    }
+
+    #[test]
+    fn batch_dispatch_with_no_payloads_assigns_nothing() {
+        let mesh = mesh3();
+        let result = mesh.forward_batch(&[], 3, None).unwrap();
+        assert!(result.assignments.is_empty());
+        assert!(result.dropped.is_empty());
+    }
+
     // --- Property-based tests -------------------------------------------
     //
     // The hand-written tests above pin down specific scenarios; these sweep
@@ -660,6 +813,36 @@ mod tests {
                 let payload = Array1::zeros(PDIM);
                 let mut rng = StdRng::seed_from_u64(0);
                 prop_assert!(mesh.forward(&payload, None, &mut rng).is_ok());
+            }
+
+            #[test]
+            fn batch_dispatch_never_exceeds_capacity_and_partitions_payloads(
+                affinities in prop::collection::vec(affinity_strategy(), 1..=5),
+                payloads in prop::collection::vec(affinity_strategy(), 0..8),
+                capacity in 1usize..5,
+            ) {
+                let mesh = build(&affinities, MeshConfig { dim: PDIM, ..Default::default() });
+                let payload_arrs: Vec<Array1<f32>> = payloads.into_iter().map(Array1::from_vec).collect();
+                let result = mesh.forward_batch(&payload_arrs, capacity, None).unwrap();
+
+                for (_, ps) in &result.assignments {
+                    prop_assert!(!ps.is_empty());
+                    prop_assert!(ps.len() <= capacity);
+                }
+
+                // Every payload index appears in exactly one place: some
+                // node's assignment list, or dropped — never both, never
+                // neither, never twice.
+                let mut seen = vec![0u8; payload_arrs.len()];
+                for (_, ps) in &result.assignments {
+                    for &p in ps {
+                        seen[p] += 1;
+                    }
+                }
+                for &p in &result.dropped {
+                    seen[p] += 1;
+                }
+                prop_assert!(seen.iter().all(|&c| c == 1), "every payload must be covered exactly once");
             }
         }
     }

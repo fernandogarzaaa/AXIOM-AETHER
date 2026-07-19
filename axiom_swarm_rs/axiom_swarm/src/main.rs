@@ -17,9 +17,6 @@
 //! dynamics that move the state toward the goal are still simulated (a
 //! real backend would report actual command/test output instead).
 
-mod fsm;
-mod health;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,8 +32,8 @@ use axiom_core::residual::StateVector;
 use axiom_mcp::sidecar::MiniAetherSidecar;
 use axiom_mcp::{DispatchParams, MockTransport, StdioTransport, WorkerTransport};
 
-use fsm::{SwarmCommand, SwarmEvent, SwarmFsm};
-use health::NodeHealth;
+use axiom_swarm::fsm::{SwarmCommand, SwarmEvent, SwarmFsm};
+use axiom_swarm::health::NodeHealth;
 
 const DIM: usize = 8;
 const EPSILON: f32 = 0.05;
@@ -46,10 +43,26 @@ const QUARANTINE_THRESHOLD: u32 = 2;
 /// Per-dispatch timeout for the real stdio transport.
 const WORKER_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build a demo mesh with three LLM workers, each with a distinct affinity
-/// profile over the state space.
-fn build_mesh(rng: &mut StdRng) -> KineticNeuralMesh {
-    use rand::Rng;
+/// Build a demo mesh with three LLM workers, with fixed (not randomly
+/// drawn) affinities chosen to make the demo's narrative deterministic
+/// rather than a function of which way Gumbel noise happens to break ties
+/// this run. Randomly-drawn affinities were tried first; they made
+/// whether the quarantine path even fired a matter of luck — a coincidence
+/// this demo shouldn't depend on to demonstrate a feature it specifically
+/// exists to exercise.
+///
+/// `gemini`'s affinity is set to closely track `goal`'s own direction, so
+/// it wins the very first routing decision before any annealing/bandit
+/// learning has had a chance to shift things — and, since its dispatch
+/// always fails without changing the environment, the residual direction
+/// (and therefore the routing decision) stays essentially unchanged until
+/// it's quarantined. `claude`'s affinity tracks the same direction at
+/// lower magnitude, so it becomes the clear winner immediately afterward;
+/// `codex`'s affinity points at a state axis with zero weight in `goal`,
+/// so it's a legitimate option the mesh consistently has no reason to
+/// pick — not a mistake, just realistic "not every worker fits every
+/// task."
+fn build_mesh(goal: &Array1<f32>) -> KineticNeuralMesh {
     let mut mesh = KineticNeuralMesh::new(MeshConfig {
         dim: DIM,
         tau: 0.3,
@@ -70,9 +83,16 @@ fn build_mesh(rng: &mut StdRng) -> KineticNeuralMesh {
         bandit_exploration: 0.3,
         ..Default::default()
     });
-    for (i, name) in ["codex", "claude", "gemini"].iter().enumerate() {
-        let affinity: Vec<f32> = (0..DIM).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        mesh.add_node(WorkerNode::new(i, *name, NodeKind::Llm(name.to_string()), affinity))
+
+    let mut codex_affinity = vec![0.0; DIM];
+    codex_affinity[3] = 3.0; // goal[3] == 0.0: a real axis, deliberately not this task's
+
+    let claude_affinity: Vec<f32> = goal.iter().map(|g| g * 2.5).collect();
+    let gemini_affinity: Vec<f32> = goal.iter().map(|g| g * 3.0).collect();
+
+    let workers = [("codex", codex_affinity), ("claude", claude_affinity), ("gemini", gemini_affinity)];
+    for (i, (name, affinity)) in workers.into_iter().enumerate() {
+        mesh.add_node(WorkerNode::new(i, name, NodeKind::Llm(name.to_string()), affinity))
             .expect("affinity dim matches mesh dim");
     }
     mesh
@@ -129,7 +149,10 @@ async fn run_worker(
 async fn main() {
     let mut rng = StdRng::seed_from_u64(2026);
 
-    let mut mesh = build_mesh(&mut rng);
+    // Goal: an arbitrary target point in state space. In production this is
+    // the fused encoding of "tests green, diff applied, exit code 0".
+    let goal_vec = Array1::from_vec(vec![1.0, -0.5, 0.8, 0.0, 0.3, -0.2, 0.6, 0.1]);
+    let mut mesh = build_mesh(&goal_vec);
     let sidecars: Vec<MiniAetherSidecar> =
         mesh.nodes().iter().map(|n| MiniAetherSidecar::standard(n.name.clone())).collect();
 
@@ -151,10 +174,7 @@ async fn main() {
         })
         .collect();
 
-    // Goal: an arbitrary target point in state space. In production this is
-    // the fused encoding of "tests green, diff applied, exit code 0".
-    let goal = StateVector(Array1::from_vec(vec![1.0, -0.5, 0.8, 0.0, 0.3, -0.2, 0.6, 0.1]));
-    let controller = IdcController::new(goal, EPSILON);
+    let controller = IdcController::new(StateVector(goal_vec), EPSILON);
     let mut env = Environment { current: StateVector::zeros(DIM) };
     let mut health = NodeHealth::new(QUARANTINE_THRESHOLD);
 
@@ -266,9 +286,23 @@ mod tests {
 
     #[test]
     fn demo_mesh_has_three_workers() {
-        let mut rng = StdRng::seed_from_u64(2026);
-        let mesh = build_mesh(&mut rng);
+        let goal = Array1::from_elem(DIM, 1.0);
+        let mesh = build_mesh(&goal);
         assert_eq!(mesh.nodes().len(), 3);
+    }
+
+    #[test]
+    fn demo_mesh_routes_the_initial_residual_to_gemini_first() {
+        // Pins the deterministic-by-design narrative build_mesh documents:
+        // gemini's affinity tracks `goal` most closely, so it must win the
+        // very first routing decision, before any learning has occurred.
+        let goal = Array1::from_vec(vec![1.0, -0.5, 0.8, 0.0, 0.3, -0.2, 0.6, 0.1]);
+        let mesh = build_mesh(&goal);
+        let normalized = &goal / goal.mapv(|x: f32| x * x).sum().sqrt();
+        let mut rng = StdRng::seed_from_u64(2026);
+        let adhesion = mesh.forward(&normalized, None, &mut rng).unwrap();
+        let winner = mesh.node(adhesion.active[0]).unwrap();
+        assert_eq!(winner.name, "gemini");
     }
 
     #[test]

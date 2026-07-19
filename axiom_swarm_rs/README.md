@@ -7,18 +7,12 @@ system state and the goal state; workers are actuators reached through a
 sparse, dynamically re-shaped routing mesh.
 
 This workspace is independent of `axiom_engine_rs` (the TTT engine) and
-builds standalone:
-
-```bash
-cd axiom_swarm_rs
-cargo test
-cargo run --bin axiom_swarm   # closed-loop demo — real stdio-transport workers
-```
+builds standalone — see [Status](#status) below for the full command list.
 
 See [`docs/RESEARCH_BLUEPRINT.md`](docs/RESEARCH_BLUEPRINT.md) for the
-research pass behind the fault-tolerance, annealing, and backpressure
-mechanisms below, plus what's queued for a design decision before it gets
-built.
+research pass behind the fault-tolerance, annealing, backpressure,
+batch-dispatch, and hierarchy mechanisms described below, including a real
+correctness bug it found and fixed along the way.
 
 ## Architecture
 
@@ -67,18 +61,28 @@ spine** (sequences the loop without ever blocking on a worker).
 
 | Module | Contents |
 |---|---|
-| `mesh` | `KineticNeuralMesh`: node registry, runtime topology reconfiguration (`add_node`/`remove_node` rebuild the affinity matrix), gravitational-field computation (`A·p + bias`, residual-modulated, plus opt-in capacity backpressure via `mark_active`/`mark_idle` and opt-in bandit-learned quality/exploration via `record_outcome`), residual-adaptive Gumbel-Softmax temperature annealing (`tau_gain`), and the `forward` pass returning an `Adhesion` (weights + sparse active set). |
-| `gumbel` | `gumbel_softmax`: hard-variant Gumbel-Softmax for discrete topology routing, plus the relaxed distribution for telemetry. Seedable and deterministic under a fixed RNG. |
+| `mesh` | `KineticNeuralMesh`: node registry, runtime topology reconfiguration (`add_node`/`remove_node` rebuild the affinity matrix), gravitational-field computation (`A·p + bias`, residual-modulated, plus opt-in capacity backpressure via `mark_active`/`mark_idle` and opt-in bandit-learned quality/exploration via `record_outcome`), residual-adaptive Gumbel-Softmax temperature annealing (`tau_gain`), `forward` returning an `Adhesion` (weights + sparse active set), and `forward_batch` — deterministic expert-choice batch dispatch returning a `BatchAdhesion` (see `examples/batch_dispatch.rs`). |
+| `gumbel` | `gumbel_softmax`: hard-variant Gumbel-Softmax for discrete topology routing, plus the relaxed distribution for telemetry. Seedable and deterministic under a fixed RNG; `tau` is a deliberate departure from the textbook Concrete-distribution formula so it genuinely affects the hard decision (see the module docstring — the textbook version is provably temperature-invariant for its hard sample). |
 | `node` | `WorkerNode` / `NodeId` / `NodeKind`: affinity embedding + routing bias per worker. |
 | `residual` | `StateVector` and `Residual` (`goal − current`), norms, convergence predicate. |
 | `idc` | `SensorReading` (terminal / diff / test log), deterministic feature-hash `fuse` into state space, `IdcController` with `actuate` producing a `CorrectionVector` of `Actuation` commands — never conversational text — plus `StateSmoother`, a composable EMA pre-filter for noisy fused state. |
 
-### `axiom_swarm` — Axiom Prime orchestrator (binary)
+`examples/batch_dispatch.rs` (`cargo run -p axiom_core --example batch_dispatch`)
+demonstrates `forward_batch` against naive per-payload routing on a burst of
+similar work.
+
+### `axiom_swarm` — Axiom Prime orchestrator (lib + binary)
+
+A small library exposing the orchestration logic, plus a thin `main.rs`
+binary that wires it into an async runner. The split exists so the FSM,
+health tracking, and hierarchical composition below can be exercised by
+this package's own tests without needing to *be* the executable.
 
 | Module | Contents |
 |---|---|
-| `fsm` | `SwarmFsm`: a pure, non-blocking transition function `(state, event) → commands`. No I/O, no payloads — only control state. Late/duplicate events are no-ops. |
+| `fsm` | `SwarmFsm`: a pure, non-blocking transition function `(state, event) → commands`. No I/O, no payloads — only control state. Late/duplicate events are no-ops; `is_terminal()` is monotonic under any event sequence (property-tested). |
 | `health` | `NodeHealth`: counts consecutive dispatch failures per node and reports quarantine at a threshold — the orchestrator's cue to call `mesh.remove_node` on a worker that keeps failing. |
+| `hierarchy` | `SwarmSupervisor`: a mesh over *regions* (each a whole `KineticNeuralMesh`, composed rather than made recursive) — the hierarchical/decentralized topology leg. Picks a region the same way a leaf mesh picks a worker; what a region does once selected is the same `SwarmFsm`-driven machinery `main.rs` runs for the flat case (see its tests for a two-region demonstration). |
 | `main` | The async runner: executes FSM commands, dispatches to real `StdioTransport` workers as tokio tasks (an in-flight LLM call is just a future `WorkerDone` event), tracks in-flight/health per node, and drives the demo loop to convergence — routing around a quarantined node if one goes down. |
 
 ### `axiom_mcp` — Mini Aether sidecars (library)
@@ -132,21 +136,51 @@ spine** (sequences the loop without ever blocking on a worker).
   under-sampled nodes. Kept separate from the static, user-set
   `WorkerNode.bias` — declared preference and learned quality are
   orthogonal. Defaults to `0.0` (disabled).
+* **Batch dispatch flips the choice direction, deliberately not wired into
+  the FSM.** `forward_batch` lets nodes choose their best payloads
+  (capacity-bounded) instead of payloads choosing nodes — the actual fix
+  for MoE-style pileup on a popular node. It's a tested, demonstrated
+  library capability; Axiom Prime's own control loop stays one-payload-
+  per-tick because no real caller needs batching yet, and building one
+  speculatively would be exactly the premature abstraction these
+  conventions rule out.
+* **Hierarchy by composition, not recursion.** `SwarmSupervisor` routes to
+  *regions* using an ordinary, unmodified `KineticNeuralMesh` where each
+  node represents a whole region — not a recursive `NodeKind` variant
+  inside `axiom_core`. A region is free to run its own `SwarmFsm` exactly
+  like the flat demo does; hierarchy falls out of using the same proven
+  primitive twice rather than a parallel new architecture.
+* **Demo affinities are fixed, not randomly drawn.** The three demo
+  workers' affinities are chosen so the routing/failure/quarantine/
+  convergence story is deterministic by construction — not a function of
+  which way Gumbel noise happens to break a tie this run. A prior version
+  drew affinities randomly per seed, which meant whether the quarantine
+  path even fired was luck; that's not a property a demo whose job is to
+  demonstrate a feature should depend on.
 
 ## Status
 
-First vertical slice plus a fault-tolerance and online-learning pass: real
-worker transports (JSON-RPC over stdio, with timeout + quarantine),
-bandit-learned routing bias, EMA sensor-state smoothing, and property-based
-invariant tests (`proptest`, alongside the hand-written unit tests) are
-implemented — the first two wired into the demo binary; the smoother is a
-tested, composable primitive not force-fit into the demo's noise-free
-synthetic environment (see the blueprint for why). Expert-choice batch
-dispatch, hierarchical topology, and ROCm-accelerated batch routing remain
-deliberately unimplemented — see
-[`docs/RESEARCH_BLUEPRINT.md`](docs/RESEARCH_BLUEPRINT.md) for why each is
-still premature rather than queued for a design decision.
+Two passes: a first vertical slice plus fault-tolerance/online-learning
+pass, and a second pass that completed the remaining research-blueprint
+roadmap. Implemented: real worker transports (JSON-RPC over stdio, with
+timeout + quarantine), bandit-learned routing bias, EMA sensor-state
+smoothing, property-based invariant tests (`proptest`), expert-choice
+batch dispatch (`forward_batch`, demonstrated via
+`examples/batch_dispatch.rs`), and hierarchical topology
+(`SwarmSupervisor`, composed from unmodified leaf meshes). The second pass
+also found and fixed a real correctness bug in the temperature-annealing
+feature from the first pass — see
+[`docs/RESEARCH_BLUEPRINT.md`](docs/RESEARCH_BLUEPRINT.md) for the full
+account, including which mechanisms are wired into the demo binary versus
+implemented-and-tested-but-deliberately-not-forced-in (the sensor
+smoother; batch dispatch), and why. Every item the original research pass
+raised now has either an implementation or an explicit, reasoned "why
+not" — nothing is left in an open-ended queued state. ROCm-accelerated
+batch routing remains out of scope (this workspace has no GPU-backed
+compute path at all yet, on any hardware).
 
 ```bash
-cargo test --workspace   # 55 tests: unit + integration + property-based
+cargo test --workspace                             # 69 tests: unit + integration + property-based
+cargo run --bin axiom_swarm                         # closed-loop demo
+cargo run -p axiom_core --example batch_dispatch    # expert-choice batch dispatch demo
 ```
