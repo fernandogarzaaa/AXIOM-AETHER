@@ -1,10 +1,13 @@
 //! Local SLM routing through Ollama.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::mesh_router::MeshModelSelector;
 
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_MODELS: [&str; 4] = ["phi4:3.8b", "deepseek-r1:8b", "llama3.3:8b", "llama3.1:8b"];
@@ -14,6 +17,9 @@ const DEFAULT_NUM_CTX: u64 = 4096;
 pub struct SwarmRouter {
     config: SwarmRouterConfig,
     client: Client,
+    /// `Some` when `AXIOM_MESH_ROUTING=1` — see `mesh_router` module docs
+    /// for why this is opt-in rather than the new default.
+    mesh_selector: Option<Arc<MeshModelSelector>>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +29,10 @@ pub struct SwarmRouterConfig {
     pub model_candidates: Vec<String>,
     pub num_ctx: u64,
     pub timeout_ms: u64,
+    /// Route model selection through `axiom_core`'s online-learned mesh
+    /// instead of the static first-available-candidate order. Off by
+    /// default: see `mesh_router` module docs.
+    pub mesh_routing: bool,
 }
 
 #[derive(Debug)]
@@ -100,7 +110,10 @@ impl SwarmRouter {
             .timeout(Duration::from_millis(config.timeout_ms))
             .build()
             .expect("reqwest async client should construct");
-        Self { config, client }
+        let mesh_selector = config
+            .mesh_routing
+            .then(|| Arc::new(MeshModelSelector::new(&config.model_candidates)));
+        Self { config, client, mesh_selector }
     }
 
     pub fn config(&self) -> &SwarmRouterConfig {
@@ -116,13 +129,29 @@ impl SwarmRouter {
         }
 
         let available = self.available_models().await?;
-        let model = select_model(&self.config.model_candidates, &available).ok_or_else(|| {
-            SwarmRouteError::NoModel {
-                requested: self.config.model_candidates.clone(),
-                available: available.clone(),
-            }
+        let model = match &self.mesh_selector {
+            Some(selector) => selector.select(&available),
+            None => select_model(&self.config.model_candidates, &available),
+        }
+        .ok_or_else(|| SwarmRouteError::NoModel {
+            requested: self.config.model_candidates.clone(),
+            available: available.clone(),
         })?;
 
+        // Timed and outcome-recorded as one unit so the mesh selector (when
+        // enabled) learns from exactly what happened dispatching to this
+        // model — a pre-selection failure (no model available at all)
+        // never reaches here, since there's no model to credit or blame.
+        let started = Instant::now();
+        let result = self.dispatch_to_model(&model, payload).await;
+        if let Some(selector) = &self.mesh_selector {
+            selector.record_outcome(&model, result.is_ok(), started.elapsed().as_millis() as u64);
+        }
+        let content = result?;
+        Ok(SwarmChatResult { model, content })
+    }
+
+    async fn dispatch_to_model(&self, model: &str, payload: &Value) -> Result<String, SwarmRouteError> {
         let messages = translate_messages(payload);
         let request = json!({
             "model": model,
@@ -154,12 +183,7 @@ impl SwarmRouter {
         }
         let decoded: OllamaChatResponse =
             serde_json::from_str(&body).map_err(|e| SwarmRouteError::Decode(e.to_string()))?;
-        let content = decoded
-            .message
-            .map(|m| m.content)
-            .or(decoded.response)
-            .unwrap_or_default();
-        Ok(SwarmChatResult { model, content })
+        Ok(decoded.message.map(|m| m.content).or(decoded.response).unwrap_or_default())
     }
 
     async fn available_models(&self) -> Result<Vec<String>, SwarmRouteError> {
@@ -207,12 +231,14 @@ impl SwarmRouterConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(2_000);
+        let mesh_routing = env_truthy("AXIOM_MESH_ROUTING");
         Self {
             enabled,
             base_url,
             model_candidates,
             num_ctx,
             timeout_ms,
+            mesh_routing,
         }
     }
 }

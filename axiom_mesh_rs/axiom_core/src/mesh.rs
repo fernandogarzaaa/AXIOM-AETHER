@@ -332,6 +332,75 @@ impl KineticNeuralMesh {
         Ok(Adhesion { weights, active, field })
     }
 
+    /// Forward pass restricted to a caller-supplied eligible subset of
+    /// nodes — e.g. "only route among workers that are actually healthy
+    /// this call" — without touching any node's stored learned state.
+    ///
+    /// This exists because the natural way to express "some nodes are
+    /// temporarily unavailable" — `remove_node` then `add_node` them back
+    /// later — resets that node's `in_flight`/bandit `reward_mean`/`visits`
+    /// on every topology change (see `rebuild`). For a worker that flaps
+    /// in and out of availability, that would mean re-learning its
+    /// quality from scratch every time it comes back, which defeats the
+    /// point of online-learned routing. Masking eligibility per call
+    /// instead keeps every node's learned state intact regardless of how
+    /// often it's temporarily excluded.
+    ///
+    /// Uses the identical `NEG_INFINITY` masking `forward`'s own top-k
+    /// loop already relies on (ineligible logits go to `-inf`, survive
+    /// `logits/tau` unchanged, and softmax to exactly `0.0`), just applied
+    /// to the field before routing instead of to already-chosen winners.
+    ///
+    /// # Errors
+    /// `MeshError::Empty` if the mesh has no nodes, or if none of
+    /// `eligible` actually names a node still in the mesh — there is
+    /// nothing to route to either way.
+    pub fn forward_restricted(
+        &self,
+        payload: &Array1<f32>,
+        residual: Option<&Residual>,
+        eligible: &[NodeId],
+        rng: &mut impl Rng,
+    ) -> Result<Adhesion, MeshError> {
+        if self.nodes.is_empty() {
+            return Err(MeshError::Empty);
+        }
+        if payload.len() != self.config.dim {
+            return Err(MeshError::DimMismatch { payload: payload.len(), mesh: self.config.dim });
+        }
+
+        let eligible_idx: std::collections::HashSet<usize> = eligible
+            .iter()
+            .filter_map(|id| self.nodes.iter().position(|n| n.id == *id))
+            .collect();
+        if eligible_idx.is_empty() {
+            return Err(MeshError::Empty);
+        }
+
+        let mut field = self.field(payload, residual);
+        for (i, logit) in field.iter_mut().enumerate() {
+            if !eligible_idx.contains(&i) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+
+        let fan_out = self.config.fan_out.min(eligible_idx.len()).max(1);
+        let tau = self.effective_tau(residual);
+
+        let mut weights: Array1<f32> = Array1::zeros(self.nodes.len());
+        let mut active: Vec<NodeId> = Vec::with_capacity(fan_out);
+        let mut masked = field.clone();
+        for _ in 0..fan_out {
+            let sample = gumbel_softmax(&masked, tau, self.config.hard, rng);
+            let w = sample.winner;
+            weights[w] = if self.config.hard { 1.0 } else { sample.adhesion[w] };
+            active.push(self.nodes[w].id);
+            masked[w] = f32::NEG_INFINITY;
+        }
+
+        Ok(Adhesion { weights, active, field })
+    }
+
     /// Expert-choice batch dispatch: instead of each payload picking its
     /// best node (`forward`'s model — one payload choosing among nodes),
     /// every node independently ranks *all* payloads and claims its best
@@ -499,6 +568,49 @@ mod tests {
         let mesh = KineticNeuralMesh::new(MeshConfig { dim: 2, ..Default::default() });
         let mut rng = StdRng::seed_from_u64(0);
         assert!(matches!(mesh.forward(&array![1.0, 0.0], None, &mut rng), Err(MeshError::Empty)));
+    }
+
+    #[test]
+    fn forward_restricted_never_picks_an_ineligible_node() {
+        let mesh = mesh3(); // codex=axis0, claude=axis1, gemini=axis2
+        // Payload favors claude, but claude is excluded from this call —
+        // sweep several seeds since this is a stochastic draw.
+        for seed in 0..30 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let adhesion = mesh
+                .forward_restricted(&array![0.0, 1.0, 0.0], None, &[NodeId(0), NodeId(2)], &mut rng)
+                .unwrap();
+            assert!(!adhesion.active.contains(&NodeId(1)), "claude must never be chosen when excluded");
+        }
+    }
+
+    #[test]
+    fn forward_restricted_with_no_real_overlap_is_an_error() {
+        let mesh = mesh3();
+        let mut rng = StdRng::seed_from_u64(0);
+        // NodeId(99) doesn't exist in this mesh at all.
+        assert!(matches!(
+            mesh.forward_restricted(&array![1.0, 0.0, 0.0], None, &[NodeId(99)], &mut rng),
+            Err(MeshError::Empty)
+        ));
+    }
+
+    #[test]
+    fn forward_restricted_preserves_learned_state_for_excluded_nodes() {
+        // The whole point: a node temporarily excluded from eligibility
+        // must not lose its bandit-learned quality, unlike remove_node.
+        let mut mesh = tied_two_node_mesh(10.0, 0.0);
+        for _ in 0..5 {
+            mesh.record_outcome(NodeId(0), 1.0);
+        }
+        let mut rng = StdRng::seed_from_u64(1);
+        // Exclude node 0 for one call...
+        let adhesion = mesh.forward_restricted(&array![1.0, 0.0], None, &[NodeId(1)], &mut rng).unwrap();
+        assert_eq!(adhesion.active, vec![NodeId(1)]);
+        // ...then route unrestricted again: node 0's learned edge must
+        // still be there, not reset by having been excluded.
+        let adhesion = mesh.forward(&array![1.0, 0.0], None, &mut rng).unwrap();
+        assert_eq!(adhesion.active, vec![NodeId(0)], "node 0's learned quality must have survived exclusion");
     }
 
     #[test]

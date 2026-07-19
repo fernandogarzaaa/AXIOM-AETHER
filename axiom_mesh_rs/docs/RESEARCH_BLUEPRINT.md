@@ -332,6 +332,62 @@ Property-based tests (`proptest`, for the FSM/mesh invariants this
 document's counter-review step implies) and EMA sensor smoothing were also
 on this list from an earlier pass; both are implemented above.
 
+## Third pass: integration into the shipped product
+
+Everything above was built and tested in isolation. This pass integrated
+`axiom_core` into `axiom_engine_rs` for real — the first time any of this
+has been consumed by code outside this workspace — specifically to
+replace `swarm_router::select_model`'s static "first available candidate"
+local-Ollama model selection with the mesh's bandit-learned routing (opt-in
+via `AXIOM_MESH_ROUTING=1`; see `axiom_engine_rs/src/mesh_router.rs`).
+Two real things fell out of actually doing this rather than just designing
+for it hypothetically:
+
+**A genuine library gap:** there was no way to express "route among only
+these currently-eligible nodes" without either rebuilding the mesh (which
+resets every node's learned state, including nodes *not* being removed —
+see `rebuild`'s doc comment) or permanently removing a node the moment it's
+briefly unavailable. Neither is right for "one local model is down right
+now but might come back." Added `KineticNeuralMesh::forward_restricted`:
+identical to `forward`, but masks ineligible nodes' logits to `-inf` for
+that call only, leaving `bias`/`reward_mean`/`visits` untouched for
+everyone, including the excluded nodes. A property test
+(`batch_dispatch_never_exceeds_capacity_and_partitions_payloads`'s sibling
+for this method) and a unit test specifically pin down that excluded
+nodes keep their learned state across exclusion.
+
+**A real reward-calibration bug**, found by testing the integration
+end-to-end against a real local mock HTTP server (not just unit-level
+mocks) rather than trusting the design: `MeshModelSelector`'s first
+version rewarded a successful call with `1000.0 / latency_ms`, calibrated
+assuming latency in the hundreds-to-thousands of milliseconds (real LLM
+inference). Tested against a fast mock server, sub-millisecond responses
+produced rewards in the hundreds — which, combined with a `bias` gap sized
+for a *static* priority ordering, meant a repeatedly-failing top-priority
+candidate could still win a two-digit number of consecutive routing draws
+before the alternative got a fair look. Exactly backwards from the whole
+point of adding learned routing. Root cause was two compounding
+miscalibrations, not one: the reward was unbounded and unit-dependent, and
+the static bias step was sized on the assumption that overturning it
+should be hard, when the actual goal was the opposite — one clear failure
+should be enough. Fixed by bounding reward to a fixed `(-1.0, 1.0]` range
+regardless of latency's absolute scale, shrinking the bias step
+accordingly, and lowering `tau` to compensate (recall
+`gumbel_softmax` computes `logits/tau + noise`, so a smaller `bias` gap
+needs a smaller `tau` to stay reliably above Gumbel noise — this is the
+same signal-to-noise mechanism documented on `gumbel_softmax` itself, just
+tuned for a much smaller gap than the demo binary uses). An end-to-end
+integration test (`axiom_engine_rs/tests/mesh_router_proxy.rs`) now pins
+"recovers within ~1-2 calls of a clean failure," stress-tested over 20+
+repeated runs with no flakes after the fix — it flaked on roughly half of
+runs before it.
+
+The honest caveat this pass can't remove: none of this has been verified
+against a real, live Ollama instance, only a hand-rolled mock server
+speaking the same wire format. The mock proves the wiring and the routing
+logic are correct; it can't prove anything about real Ollama's actual
+latency distribution or failure modes.
+
 ## Sources
 
 - [Mixture-of-experts with expert choice routing (Google Research)](https://research.google/blog/mixture-of-experts-with-expert-choice-routing/)
