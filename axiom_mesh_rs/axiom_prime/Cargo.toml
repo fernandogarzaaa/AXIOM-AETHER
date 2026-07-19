@@ -1,5 +1,5 @@
 [package]
-name = "axiom_swarm"
+name = "axiom_prime"
 description = "Axiom Prime: non-blocking FSM orchestrator over the Kinetic Neural Mesh"
 version.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "axiom_swarm"
+name = "axiom_prime"
 path = "src/main.rs"
 
 [dependencies]

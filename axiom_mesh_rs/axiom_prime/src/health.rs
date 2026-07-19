@@ -3,7 +3,7 @@
 //!
 //! This is "one-for-one" supervision in spirit (the restart/isolate
 //! strategy from Erlang-style actor supervision trees), scoped down to
-//! what the swarm actually needs: a node's failure streak never affects
+//! what the orchestrator actually needs: a node's failure streak never affects
 //! its siblings' routing eligibility, and crossing the threshold is the
 //! caller's cue to call `mesh.remove_node` rather than keep routing to a
 //! backend that keeps failing.

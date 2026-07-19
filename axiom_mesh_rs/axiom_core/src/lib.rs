@@ -1,6 +1,6 @@
-//! # axiom_core — the "brain" of the Axiom Swarm
+//! # axiom_core — the "brain" of Axiom Mesh
 //!
-//! This crate owns the two load-bearing abstractions of the swarm:
+//! This crate owns the two load-bearing abstractions of the system:
 //!
 //! * **Kinetic Neural Mesh (KNM)** — a sparse, dynamic routing graph over
 //!   worker nodes. Every prompt payload projects a temporary "gravitational
@@ -15,7 +15,7 @@
 //!   rather than conversational text. See [`idc::IdcController`].
 //!
 //! Deliberately absent from this crate: process management, LLM transport,
-//! and token filtering. Those live in `axiom_swarm` (orchestrator FSM) and
+//! and token filtering. Those live in `axiom_prime` (orchestrator FSM) and
 //! `axiom_mcp` (Mini Aether sidecars) respectively — the brain computes
 //! *where* and *what*, the hands do the touching.
 

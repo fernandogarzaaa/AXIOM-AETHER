@@ -1,4 +1,4 @@
-//! Axiom Prime — the swarm orchestrator binary.
+//! Axiom Prime — the Axiom Mesh orchestrator binary.
 //!
 //! Wires the three layers together and runs a closed-loop demo tick:
 //!
@@ -32,8 +32,8 @@ use axiom_core::residual::StateVector;
 use axiom_mcp::sidecar::MiniAetherSidecar;
 use axiom_mcp::{DispatchParams, MockTransport, StdioTransport, WorkerTransport};
 
-use axiom_swarm::fsm::{SwarmCommand, SwarmEvent, SwarmFsm};
-use axiom_swarm::health::NodeHealth;
+use axiom_prime::fsm::{PrimeCommand, PrimeEvent, PrimeFsm};
+use axiom_prime::health::NodeHealth;
 
 const DIM: usize = 8;
 const EPSILON: f32 = 0.05;
@@ -99,14 +99,14 @@ fn build_mesh(goal: &Array1<f32>) -> KineticNeuralMesh {
 }
 
 /// Resolve the `aether_worker` binary as a sibling of the running
-/// `axiom_swarm` executable (both live in the same workspace `target/`
+/// `axiom_prime` executable (both live in the same workspace `target/`
 /// directory), building it on demand if this is a fresh checkout.
 fn worker_binary_path() -> PathBuf {
     let mut path = std::env::current_exe().expect("resolve current executable path");
     path.pop();
     path.push(if cfg!(windows) { "aether_worker.exe" } else { "aether_worker" });
     if !path.exists() {
-        println!("axiom_swarm: building aether_worker (first run)...");
+        println!("axiom_prime: building aether_worker (first run)...");
         let status = std::process::Command::new(env!("CARGO"))
             .args(["build", "--bin", "aether_worker"])
             .status()
@@ -178,15 +178,15 @@ async fn main() {
     let mut env = Environment { current: StateVector::zeros(DIM) };
     let mut health = NodeHealth::new(QUARANTINE_THRESHOLD);
 
-    let mut machine = SwarmFsm::new();
+    let mut machine = PrimeFsm::new();
     let (tx, mut rx) = mpsc::channel::<(NodeId, DispatchOutcome)>(16);
 
-    println!("axiom_swarm: IDC control loop starting (dim={DIM}, epsilon={EPSILON})");
+    println!("axiom_prime: IDC control loop starting (dim={DIM}, epsilon={EPSILON})");
     println!(
-        "axiom_swarm: worker names (codex/claude/gemini) are illustrative labels on a stub \
+        "axiom_prime: worker names (codex/claude/gemini) are illustrative labels on a stub \
          echo process (aether_worker) — no real LLM API is called by this demo."
     );
-    let mut queue = machine.step(SwarmEvent::GoalLoaded);
+    let mut queue = machine.step(PrimeEvent::GoalLoaded);
     let mut tick = 0usize;
 
     while !machine.is_terminal() {
@@ -220,20 +220,20 @@ async fn main() {
                     }
                 }
             }
-            queue.extend(machine.step(SwarmEvent::WorkerDone));
+            queue.extend(machine.step(PrimeEvent::WorkerDone));
             continue;
         };
 
         match command {
-            SwarmCommand::FuseSensors => {
+            PrimeCommand::FuseSensors => {
                 tick += 1;
                 let residual = controller.residual(&env.current);
                 println!("[tick {tick}] residual norm = {:.4}", residual.norm());
                 queue.extend(
-                    machine.step(SwarmEvent::Sensed { converged: residual.converged(EPSILON) }),
+                    machine.step(PrimeEvent::Sensed { converged: residual.converged(EPSILON) }),
                 );
             }
-            SwarmCommand::RouteResidual => {
+            PrimeCommand::RouteResidual => {
                 let residual = controller.residual(&env.current);
                 // Payload embedding: the residual direction itself — route
                 // toward whoever best matches the remaining gap.
@@ -241,7 +241,7 @@ async fn main() {
                 let adhesion = match mesh.forward(&payload_embedding, Some(&residual), &mut rng) {
                     Ok(a) => a,
                     Err(e) => {
-                        queue.extend(machine.step(SwarmEvent::Fault { reason: e.to_string() }));
+                        queue.extend(machine.step(PrimeEvent::Fault { reason: e.to_string() }));
                         continue;
                     }
                 };
@@ -251,9 +251,9 @@ async fn main() {
                     .filter_map(|id| mesh.node(*id).map(|n| n.name.as_str()))
                     .collect();
                 println!("    [mesh] payload snapped to {names:?}");
-                queue.extend(machine.step(SwarmEvent::Routed { nodes: adhesion.active }));
+                queue.extend(machine.step(PrimeEvent::Routed { nodes: adhesion.active }));
             }
-            SwarmCommand::Dispatch { nodes } => {
+            PrimeCommand::Dispatch { nodes } => {
                 let residual = controller.residual(&env.current);
                 let correction = controller.actuate(&residual, Some("cargo test"));
                 let raw = format!(
@@ -273,15 +273,15 @@ async fn main() {
                     tokio::spawn(run_worker(id, Arc::clone(&transports[id.0]), params, tx.clone()));
                 }
             }
-            SwarmCommand::AnnounceConverged => {
+            PrimeCommand::AnnounceConverged => {
                 println!("[done] converged in {tick} ticks — residual within epsilon");
             }
-            SwarmCommand::AnnounceHalt { reason } => {
+            PrimeCommand::AnnounceHalt { reason } => {
                 eprintln!("[halt] {reason}");
             }
         }
     }
-    println!("axiom_swarm: terminal state = {:?}", machine.state());
+    println!("axiom_prime: terminal state = {:?}", machine.state());
 }
 
 #[cfg(test)]

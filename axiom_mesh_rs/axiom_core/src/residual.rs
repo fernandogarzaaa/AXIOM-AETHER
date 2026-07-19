@@ -1,12 +1,12 @@
 //! State and residual vectors — the control-theoretic core of IDC.
 //!
-//! The swarm never asks "what should I say next"; it asks "how far is the
+//! The system never asks "what should I say next"; it asks "how far is the
 //! system from the goal state, and along which axes". `Residual` is that
 //! answer: `Goal − Current`, in a fixed-dimension state space.
 
 use ndarray::Array1;
 
-/// A point in the swarm's state space. Produced by sensor fusion
+/// A point in the system's state space. Produced by sensor fusion
 /// ([`crate::idc`]) and by goal encoding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateVector(pub Array1<f32>);

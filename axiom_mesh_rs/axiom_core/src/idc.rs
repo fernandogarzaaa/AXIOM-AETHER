@@ -22,7 +22,7 @@ use crate::residual::{Residual, StateVector};
 /// Raw sensor data flowing into the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SensorReading {
-    /// Terminal output from a command the swarm ran.
+    /// Terminal output from a command the system ran.
     Terminal { command: String, stdout: String, stderr: String, exit_code: i32 },
     /// A file changed on disk.
     FileDiff { path: String, lines_added: usize, lines_removed: usize },

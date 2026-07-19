@@ -1,14 +1,14 @@
 //! Hierarchical topology: a supervisor mesh over regions, each an
 //! independently-addressable `KineticNeuralMesh` — and, when driven the
-//! same way the flat demo drives its own mesh, its own `SwarmFsm` loop.
+//! same way the flat demo drives its own mesh, its own `PrimeFsm` loop.
 //! This is the "hierarchical" leg of the centralized/decentralized/
 //! hierarchical (+ dynamic-adaptive) taxonomy from the 2025-2026 multi-
 //! agent orchestration survey cited in docs/RESEARCH_BLUEPRINT.md.
 //!
-//! `SwarmSupervisor` deliberately owns only the region-*selection* layer:
+//! `MeshSupervisor` deliberately owns only the region-*selection* layer:
 //! given a payload and residual, which region's Axiom Prime should own
 //! this tick. What a region does once selected — its own mesh routing,
-//! its own `SwarmFsm` loop, its own workers — is exactly the machinery
+//! its own `PrimeFsm` loop, its own workers — is exactly the machinery
 //! `main.rs` already runs for the flat, single-region case. A region is
 //! not a new abstraction bolted onto `axiom_core`; it's a whole
 //! `KineticNeuralMesh`, the same type the flat demo uses, deployed as one
@@ -26,7 +26,7 @@ use ndarray::Array1;
 use rand::Rng;
 
 /// One region: a name plus its own leaf-worker mesh. Opaque to the
-/// supervisor beyond routing — a region is free to run its own `SwarmFsm`
+/// supervisor beyond routing — a region is free to run its own `PrimeFsm`
 /// over its own mesh exactly like the top-level demo does.
 pub struct Region {
     pub name: String,
@@ -39,14 +39,14 @@ pub struct Region {
 /// underlying region-selection mesh's `NodeId`s for the supervisor's
 /// lifetime (removal would need to keep the two in sync, a real design
 /// question left for when a caller actually needs to retire a region).
-pub struct SwarmSupervisor {
+pub struct MeshSupervisor {
     /// A mesh over regions: each "node" here is a whole region, its
     /// affinity summarizing what kind of work that region is good at.
     region_mesh: KineticNeuralMesh,
     regions: Vec<Region>,
 }
 
-impl SwarmSupervisor {
+impl MeshSupervisor {
     pub fn new(config: MeshConfig) -> Self {
         Self { region_mesh: KineticNeuralMesh::new(config), regions: Vec::new() }
     }
@@ -102,7 +102,7 @@ impl SwarmSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsm::{SwarmCommand, SwarmEvent, SwarmFsm};
+    use crate::fsm::{PrimeCommand, PrimeEvent, PrimeFsm};
     use axiom_core::residual::StateVector;
     use ndarray::array;
     use rand::{rngs::StdRng, SeedableRng};
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn select_region_picks_the_best_affinity_region() {
-        let mut supervisor = SwarmSupervisor::new(MeshConfig { dim: 2, tau: 0.05, ..Default::default() });
+        let mut supervisor = MeshSupervisor::new(MeshConfig { dim: 2, tau: 0.05, ..Default::default() });
         supervisor.add_region("codegen", vec![1.0, 0.0], leaf_mesh(3, &["codex-1", "codex-2"])).unwrap();
         supervisor.add_region("research", vec![0.0, 1.0], leaf_mesh(3, &["gemini-1"])).unwrap();
 
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn each_region_keeps_its_own_independently_addressable_mesh() {
-        let mut supervisor = SwarmSupervisor::new(MeshConfig { dim: 2, ..Default::default() });
+        let mut supervisor = MeshSupervisor::new(MeshConfig { dim: 2, ..Default::default() });
         supervisor.add_region("a", vec![1.0, 0.0], leaf_mesh(3, &["w1", "w2"])).unwrap();
         supervisor.add_region("b", vec![0.0, 1.0], leaf_mesh(3, &["w3"])).unwrap();
 
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn empty_supervisor_is_an_error() {
-        let supervisor = SwarmSupervisor::new(MeshConfig { dim: 2, ..Default::default() });
+        let supervisor = MeshSupervisor::new(MeshConfig { dim: 2, ..Default::default() });
         let mut rng = StdRng::seed_from_u64(0);
         assert!(matches!(
             supervisor.select_region(&array![1.0, 0.0], None, &mut rng),
@@ -156,14 +156,14 @@ mod tests {
         ));
     }
 
-    /// Demonstrates "sub-swarms with their own Axiom Prime": two regions,
-    /// each driven by its own independent `SwarmFsm` over its own mesh,
+    /// Demonstrates "sub-meshes with their own Axiom Prime": two regions,
+    /// each driven by its own independent `PrimeFsm` over its own mesh,
     /// with the supervisor only deciding which region owns an incoming
     /// tick — exactly the hierarchical composition this module targets,
     /// built from the unmodified flat-demo machinery run twice.
     #[test]
-    fn regions_run_independent_swarm_fsm_loops() {
-        let mut supervisor = SwarmSupervisor::new(MeshConfig { dim: 2, tau: 0.1, ..Default::default() });
+    fn regions_run_independent_prime_fsm_loops() {
+        let mut supervisor = MeshSupervisor::new(MeshConfig { dim: 2, tau: 0.1, ..Default::default() });
         supervisor.add_region("region-a", vec![1.0, 0.0], leaf_mesh(2, &["a-worker"])).unwrap();
         supervisor.add_region("region-b", vec![0.0, 1.0], leaf_mesh(2, &["b-worker"])).unwrap();
 
@@ -173,30 +173,30 @@ mod tests {
 
         // The selected region now runs its own Axiom Prime loop, entirely
         // independent of the supervisor and of the other region's FSM.
-        let mut region_fsm = SwarmFsm::new();
-        let mut cmds = region_fsm.step(SwarmEvent::GoalLoaded);
-        assert_eq!(cmds, vec![SwarmCommand::FuseSensors]);
+        let mut region_fsm = PrimeFsm::new();
+        let mut cmds = region_fsm.step(PrimeEvent::GoalLoaded);
+        assert_eq!(cmds, vec![PrimeCommand::FuseSensors]);
 
-        cmds = region_fsm.step(SwarmEvent::Sensed { converged: false });
-        assert_eq!(cmds, vec![SwarmCommand::RouteResidual]);
+        cmds = region_fsm.step(PrimeEvent::Sensed { converged: false });
+        assert_eq!(cmds, vec![PrimeCommand::RouteResidual]);
 
         let worker_mesh = &supervisor.region("region-a").unwrap().mesh;
         let goal = StateVector(array![0.0, 0.0]);
         let residual = Residual::between(&goal, &StateVector::zeros(2));
         let adhesion = worker_mesh.forward(&array![1.0, 0.0], Some(&residual), &mut rng).unwrap();
 
-        cmds = region_fsm.step(SwarmEvent::Routed { nodes: adhesion.active });
-        assert!(matches!(cmds[0], SwarmCommand::Dispatch { .. }));
+        cmds = region_fsm.step(PrimeEvent::Routed { nodes: adhesion.active });
+        assert!(matches!(cmds[0], PrimeCommand::Dispatch { .. }));
 
-        cmds = region_fsm.step(SwarmEvent::WorkerDone);
-        assert_eq!(cmds, vec![SwarmCommand::FuseSensors]);
-        cmds = region_fsm.step(SwarmEvent::Sensed { converged: true });
-        assert_eq!(cmds, vec![SwarmCommand::AnnounceConverged]);
+        cmds = region_fsm.step(PrimeEvent::WorkerDone);
+        assert_eq!(cmds, vec![PrimeCommand::FuseSensors]);
+        cmds = region_fsm.step(PrimeEvent::Sensed { converged: true });
+        assert_eq!(cmds, vec![PrimeCommand::AnnounceConverged]);
         assert!(region_fsm.is_terminal());
 
-        // A second, entirely separate SwarmFsm for region-b never touched
+        // A second, entirely separate PrimeFsm for region-b never touched
         // any of the above state — independence, not shared mutable state.
-        let region_b_fsm = SwarmFsm::new();
+        let region_b_fsm = PrimeFsm::new();
         assert!(!region_b_fsm.is_terminal());
     }
 
@@ -215,7 +215,7 @@ mod tests {
                 payload in affinity(3),
                 seed in any::<u64>(),
             ) {
-                let mut supervisor = SwarmSupervisor::new(MeshConfig { dim: 3, tau: 0.2, ..Default::default() });
+                let mut supervisor = MeshSupervisor::new(MeshConfig { dim: 3, tau: 0.2, ..Default::default() });
                 let names: Vec<String> = (0..region_affinities.len()).map(|i| format!("region-{i}")).collect();
                 for (name, aff) in names.iter().zip(region_affinities) {
                     supervisor.add_region(name.clone(), aff, leaf_mesh(2, &["leaf"])).unwrap();

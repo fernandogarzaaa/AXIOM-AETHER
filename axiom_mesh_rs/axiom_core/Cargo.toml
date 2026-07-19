@@ -1,6 +1,6 @@
 [package]
 name = "axiom_core"
-description = "Kinetic Neural Mesh (KNM) and Intent-Driven Convergence (IDC) primitives for the Axiom Swarm"
+description = "Kinetic Neural Mesh (KNM) and Intent-Driven Convergence (IDC) primitives for Axiom Mesh"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

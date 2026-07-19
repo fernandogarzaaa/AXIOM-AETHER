@@ -1,7 +1,7 @@
-# Axiom Swarm — Research-Backed Improvements & Blueprint
+# Axiom Mesh — Research-Backed Improvements & Blueprint
 
 This document records a deliberate research + brainstorming pass over the
-Axiom Swarm architecture: what the current literature on sparse routing,
+Axiom Mesh architecture: what the current literature on sparse routing,
 multi-agent orchestration, and control theory suggests we're missing, what
 was implemented as a direct result, and what's queued for a follow-up
 decision rather than built unilaterally. A second pass completed the two
@@ -114,7 +114,7 @@ crashed/stuck child must not silently stall its supervisor.
   `tokio::time::timeout`; `TransportError::Timeout` surfaces the failure
   instead of hanging. A late response to a timed-out call is safely
   discarded by the existing request-id correlation check.
-- `axiom_swarm::health::NodeHealth` — a small, pure, unit-tested tracker
+- `axiom_prime::health::NodeHealth` — a small, pure, unit-tested tracker
   that counts *consecutive* failures per node and reports quarantine at a
   configurable threshold. `main.rs` now calls `mesh.remove_node` when a
   node crosses it.
@@ -123,7 +123,7 @@ crashed/stuck child must not silently stall its supervisor.
   Phase 2) and wires the third to a transport that always fails, so the
   quarantine path is exercised end to end rather than only unit-tested.
   Observed demo output: `gemini` fails twice, gets quarantined, and the
-  swarm still converges on `codex`/`claude` alone — sparse activation and
+  orchestrator still converges on `codex`/`claude` alone — sparse activation and
   fault tolerance working together.
 
 **Counter-review:** a hard-coded timeout is a blunt instrument — a
@@ -280,7 +280,7 @@ vs. a clean 3/3 split under capacity-bounded batch dispatch.
 
 **Counter-review:** a real multi-payload use case in Axiom Prime's own
 loop still doesn't exist, so the honest scope here is "a tested,
-demonstrated library capability," not "wired into the swarm end to end."
+demonstrated library capability," not "wired into the orchestrator end to end."
 Building the FSM-level caller for it remains deferred until a workload
 that actually needs it shows up — adding one speculatively now would be
 exactly the kind of premature abstraction this project's conventions rule
@@ -291,7 +291,7 @@ out, even though the underlying mechanism itself is no longer premature.
 **Finding:** the centralized/decentralized/hierarchical (+ dynamic-
 adaptive) taxonomy from the 2025-2026 multi-agent orchestration survey
 matches how production multi-agent systems scale past a single
-controller — "sub-swarms with their own Axiom Prime."
+controller — "sub-meshes with their own Axiom Prime."
 
 **Originally deferred on:** "scale-driven; today's single-loop FSM has
 shown no evidence of being a bottleneck... there's nothing to test it
@@ -301,27 +301,27 @@ thoroughly tested without needing to prove a real scale bottleneck first,
 as long as it's built from primitives already proven at the leaf level
 rather than a parallel new architecture guessed at from a taxonomy.
 
-**What shipped:** `axiom_swarm::hierarchy::SwarmSupervisor` — a mesh over
+**What shipped:** `axiom_prime::hierarchy::MeshSupervisor` — a mesh over
 *regions*, where each region is a whole `KineticNeuralMesh` (the same
 type `forward` already uses for leaf routing) rather than a new recursive
 node type. The supervisor's job is deliberately narrow: given a payload
 and residual, pick a region via the exact same gravitational-field +
 Gumbel-Softmax adhesion a leaf mesh uses to pick a worker, one level up.
 What a region does once selected — its own mesh routing, its own
-`SwarmFsm` loop — is exactly the machinery `main.rs` already runs for the
-flat case; a `#[test]` (`regions_run_independent_swarm_fsm_loops`)
-demonstrates two regions each driven by their own independent `SwarmFsm`
-instance, orchestrated only by which region a `SwarmSupervisor` selects.
+`PrimeFsm` loop — is exactly the machinery `main.rs` already runs for the
+flat case; a `#[test]` (`regions_run_independent_prime_fsm_loops`)
+demonstrates two regions each driven by their own independent `PrimeFsm`
+instance, orchestrated only by which region a `MeshSupervisor` selects.
 
 **Counter-review:** this composition approach was chosen specifically to
-avoid the alternative — making `NodeKind` recursive (`SubSwarm(Box<KineticNeuralMesh>)`)
+avoid the alternative — making `NodeKind` recursive (`SubMesh(Box<KineticNeuralMesh>)`)
 directly inside `axiom_core`. That would have required new `Clone`/serde
 derives on a mesh type containing `ndarray` buffers, a guard against a
 region containing itself, and conflating "leaf worker descriptor" with
 "recursive routing structure" throughout `WorkerNode`'s existing simple
 role. Composing two ordinary, unmodified `KineticNeuralMesh` instances
 gets the same hierarchical routing behavior with none of that risk.
-Real limitation, stated rather than hidden: `SwarmSupervisor` has no
+Real limitation, stated rather than hidden: `MeshSupervisor` has no
 `remove_region` — region indices are assumed stable for the supervisor's
 lifetime, which holds today because nothing removes one. Dynamic region
 retirement would need to keep the supervisor's region-selection mesh and

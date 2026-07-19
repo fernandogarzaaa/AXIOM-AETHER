@@ -1,10 +1,17 @@
-# Axiom Swarm
+# Axiom Mesh
 
-An autonomous, control-theoretic AI orchestration engine. The swarm is a
+An autonomous, control-theoretic AI orchestration engine. Axiom Mesh is a
 closed-loop control system: terminal output, file diffs, and test logs are
 sensor data; the controller minimizes the **residual** between the current
 system state and the goal state; workers are actuators reached through a
 sparse, dynamically re-shaped routing mesh.
+
+> **Naming note:** this project is unrelated to the existing `axiom swarm
+> connect`/`axiom swarm immunity` CLI commands and `/v1/swarm/*` routes in
+> `axiom_engine_rs` (peer-to-peer immunity/fleet sharing). An earlier
+> version of this workspace was itself called "Axiom Swarm," which
+> collided with that unrelated feature — renamed to Axiom Mesh to remove
+> the ambiguity.
 
 This workspace is independent of `axiom_engine_rs` (the TTT engine) and
 builds standalone — see [Status](#status) below for the full command list.
@@ -18,7 +25,7 @@ correctness bug it found and fixed along the way.
 
 ```text
                         ┌─────────────────────────────┐
-                        │   axiom_swarm (Axiom Prime)  │
+                        │   axiom_prime (Axiom Prime)  │
                         │  non-blocking FSM + health   │
                         │  Idle → Sensing → Routing →  │
                         │  AwaitingWorkers → Converged │
@@ -52,7 +59,7 @@ correctness bug it found and fixed along the way.
 
 The separation is deliberate: **axiom_core is the brain** (decides *where*
 payloads go and *what* correction to apply), **axiom_mcp is the hands**
-(conditions what each worker actually receives), and **axiom_swarm is the
+(conditions what each worker actually receives), and **axiom_prime is the
 spine** (sequences the loop without ever blocking on a worker).
 
 ## Crates and modules
@@ -71,7 +78,7 @@ spine** (sequences the loop without ever blocking on a worker).
 demonstrates `forward_batch` against naive per-payload routing on a burst of
 similar work.
 
-### `axiom_swarm` — Axiom Prime orchestrator (lib + binary)
+### `axiom_prime` — Axiom Prime orchestrator (lib + binary)
 
 A small library exposing the orchestration logic, plus a thin `main.rs`
 binary that wires it into an async runner. The split exists so the FSM,
@@ -80,9 +87,9 @@ this package's own tests without needing to *be* the executable.
 
 | Module | Contents |
 |---|---|
-| `fsm` | `SwarmFsm`: a pure, non-blocking transition function `(state, event) → commands`. No I/O, no payloads — only control state. Late/duplicate events are no-ops; `is_terminal()` is monotonic under any event sequence (property-tested). |
+| `fsm` | `PrimeFsm`: a pure, non-blocking transition function `(state, event) → commands`. No I/O, no payloads — only control state. Late/duplicate events are no-ops; `is_terminal()` is monotonic under any event sequence (property-tested). |
 | `health` | `NodeHealth`: counts consecutive dispatch failures per node and reports quarantine at a threshold — the orchestrator's cue to call `mesh.remove_node` on a worker that keeps failing. |
-| `hierarchy` | `SwarmSupervisor`: a mesh over *regions* (each a whole `KineticNeuralMesh`, composed rather than made recursive) — the hierarchical/decentralized topology leg. Picks a region the same way a leaf mesh picks a worker; what a region does once selected is the same `SwarmFsm`-driven machinery `main.rs` runs for the flat case (see its tests for a two-region demonstration). |
+| `hierarchy` | `MeshSupervisor`: a mesh over *regions* (each a whole `KineticNeuralMesh`, composed rather than made recursive) — the hierarchical/decentralized topology leg. Picks a region the same way a leaf mesh picks a worker; what a region does once selected is the same `PrimeFsm`-driven machinery `main.rs` runs for the flat case (see its tests for a two-region demonstration). |
 | `main` | The async runner: executes FSM commands, dispatches to real `StdioTransport` workers as tokio tasks (an in-flight LLM call is just a future `WorkerDone` event), tracks in-flight/health per node, and drives the demo loop to convergence — routing around a quarantined node if one goes down. |
 
 ### `axiom_mcp` — Mini Aether sidecars (library)
@@ -118,7 +125,7 @@ this package's own tests without needing to *be* the executable.
 * **The FSM owns nothing but control state.** LLM calls are tokio tasks;
   their completions come back as events. Axiom Prime never blocks on a
   worker, and a slow backend can't stall routing for the rest of the mesh.
-* **A wedged worker can't stall the swarm.** Every `StdioTransport` call is
+* **A wedged worker can't stall the orchestrator.** Every `StdioTransport` call is
   bounded by a timeout, and `NodeHealth` quarantines (removes from the
   mesh) a worker after repeated consecutive failures — the FSM keeps
   converging on whatever nodes remain rather than hanging in
@@ -144,10 +151,10 @@ this package's own tests without needing to *be* the executable.
   per-tick because no real caller needs batching yet, and building one
   speculatively would be exactly the premature abstraction these
   conventions rule out.
-* **Hierarchy by composition, not recursion.** `SwarmSupervisor` routes to
+* **Hierarchy by composition, not recursion.** `MeshSupervisor` routes to
   *regions* using an ordinary, unmodified `KineticNeuralMesh` where each
   node represents a whole region — not a recursive `NodeKind` variant
-  inside `axiom_core`. A region is free to run its own `SwarmFsm` exactly
+  inside `axiom_core`. A region is free to run its own `PrimeFsm` exactly
   like the flat demo does; hierarchy falls out of using the same proven
   primitive twice rather than a parallel new architecture.
 * **Demo affinities are fixed, not randomly drawn.** The three demo
@@ -167,7 +174,7 @@ timeout + quarantine), bandit-learned routing bias, EMA sensor-state
 smoothing, property-based invariant tests (`proptest`), expert-choice
 batch dispatch (`forward_batch`, demonstrated via
 `examples/batch_dispatch.rs`), and hierarchical topology
-(`SwarmSupervisor`, composed from unmodified leaf meshes). The second pass
+(`MeshSupervisor`, composed from unmodified leaf meshes). The second pass
 also found and fixed a real correctness bug in the temperature-annealing
 feature from the first pass — see
 [`docs/RESEARCH_BLUEPRINT.md`](docs/RESEARCH_BLUEPRINT.md) for the full
@@ -180,8 +187,8 @@ batch routing remains out of scope (this workspace has no GPU-backed
 compute path at all yet, on any hardware).
 
 ```bash
-cd axiom_swarm_rs                                   # this workspace is standalone — commands below won't find a Cargo.toml from the repo root
+cd axiom_mesh_rs                                    # this workspace is standalone — commands below won't find a Cargo.toml from the repo root
 cargo test --workspace                             # 69 tests: unit + integration + property-based
-cargo run --bin axiom_swarm                         # closed-loop demo
+cargo run --bin axiom_prime                         # closed-loop demo
 cargo run -p axiom_core --example batch_dispatch    # expert-choice batch dispatch demo
 ```

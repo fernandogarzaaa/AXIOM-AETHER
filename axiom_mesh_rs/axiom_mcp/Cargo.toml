@@ -1,6 +1,6 @@
 [package]
 name = "axiom_mcp"
-description = "Mini Aether sidecars: deterministic token filtering and context compression for Axiom Swarm worker nodes"
+description = "Mini Aether sidecars: deterministic token filtering and context compression for Axiom Mesh worker nodes"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 //! Axiom Prime: a non-blocking finite state machine.
 //!
-//! The FSM never blocks and never performs I/O. [`SwarmFsm::step`] is a
+//! The FSM never blocks and never performs I/O. [`PrimeFsm::step`] is a
 //! pure transition function `(state, event) -> commands`; the async runner
 //! in `main.rs` executes commands (spawning LLM calls and sensor reads as
 //! tokio tasks) and feeds their completions back in as events. This keeps
@@ -10,7 +10,7 @@ use axiom_core::node::NodeId;
 
 /// The orchestrator's control states.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SwarmState {
+pub enum PrimeState {
     /// No goal loaded.
     Idle,
     /// Waiting for sensor fusion of the environment.
@@ -28,7 +28,7 @@ pub enum SwarmState {
 /// Everything that can happen to the FSM. Async task completions arrive
 /// here — an in-flight LLM call is just a future `WorkerDone` event.
 #[derive(Debug, Clone)]
-pub enum SwarmEvent {
+pub enum PrimeEvent {
     /// A goal state was loaded into the controller.
     GoalLoaded,
     /// Sensor fusion finished and the residual was measured. The fused
@@ -46,7 +46,7 @@ pub enum SwarmEvent {
 
 /// Side effects the runner must perform. The FSM only *requests* work.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SwarmCommand {
+pub enum PrimeCommand {
     /// Read sensors (terminal, diffs, tests) and fuse them.
     FuseSensors,
     /// Ask the mesh for a routing decision against the current residual.
@@ -62,64 +62,64 @@ pub enum SwarmCommand {
 /// The non-blocking FSM. Holds only control state — never sensor data,
 /// never payloads (those flow through the runner and the mesh).
 #[derive(Debug)]
-pub struct SwarmFsm {
-    state: SwarmState,
+pub struct PrimeFsm {
+    state: PrimeState,
 }
 
-impl Default for SwarmFsm {
+impl Default for PrimeFsm {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SwarmFsm {
+impl PrimeFsm {
     pub fn new() -> Self {
-        Self { state: SwarmState::Idle }
+        Self { state: PrimeState::Idle }
     }
 
-    pub fn state(&self) -> &SwarmState {
+    pub fn state(&self) -> &PrimeState {
         &self.state
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self.state, SwarmState::Converged | SwarmState::Halted { .. })
+        matches!(self.state, PrimeState::Converged | PrimeState::Halted { .. })
     }
 
     /// Pure transition: consume an event, emit commands. Unexpected events
     /// in a given state are ignored (returns no commands) rather than
     /// faulting — late worker completions after convergence are normal.
-    pub fn step(&mut self, event: SwarmEvent) -> Vec<SwarmCommand> {
-        use SwarmEvent as E;
-        use SwarmState as S;
+    pub fn step(&mut self, event: PrimeEvent) -> Vec<PrimeCommand> {
+        use PrimeEvent as E;
+        use PrimeState as S;
 
         match (&self.state, event) {
             (_, E::Fault { reason }) => {
                 self.state = S::Halted { reason: reason.clone() };
-                vec![SwarmCommand::AnnounceHalt { reason }]
+                vec![PrimeCommand::AnnounceHalt { reason }]
             }
             (S::Idle, E::GoalLoaded) => {
                 self.state = S::Sensing;
-                vec![SwarmCommand::FuseSensors]
+                vec![PrimeCommand::FuseSensors]
             }
             (S::Sensing, E::Sensed { converged, .. }) => {
                 if converged {
                     self.state = S::Converged;
-                    vec![SwarmCommand::AnnounceConverged]
+                    vec![PrimeCommand::AnnounceConverged]
                 } else {
                     self.state = S::Routing;
-                    vec![SwarmCommand::RouteResidual]
+                    vec![PrimeCommand::RouteResidual]
                 }
             }
             (S::Routing, E::Routed { nodes }) => {
                 self.state = S::AwaitingWorkers { pending: nodes.len() };
-                vec![SwarmCommand::Dispatch { nodes }]
+                vec![PrimeCommand::Dispatch { nodes }]
             }
             (S::AwaitingWorkers { pending }, E::WorkerDone) => {
                 let remaining = pending.saturating_sub(1);
                 if remaining == 0 {
                     // All workers landed: close the loop by re-sensing.
                     self.state = S::Sensing;
-                    vec![SwarmCommand::FuseSensors]
+                    vec![PrimeCommand::FuseSensors]
                 } else {
                     self.state = S::AwaitingWorkers { pending: remaining };
                     vec![]
@@ -135,49 +135,49 @@ impl SwarmFsm {
 mod tests {
     use super::*;
 
-    fn sensed(converged: bool) -> SwarmEvent {
-        SwarmEvent::Sensed { converged }
+    fn sensed(converged: bool) -> PrimeEvent {
+        PrimeEvent::Sensed { converged }
     }
 
     #[test]
     fn full_control_loop_reaches_convergence() {
-        let mut fsm = SwarmFsm::new();
-        assert_eq!(fsm.step(SwarmEvent::GoalLoaded), vec![SwarmCommand::FuseSensors]);
-        assert_eq!(fsm.step(sensed(false)), vec![SwarmCommand::RouteResidual]);
+        let mut fsm = PrimeFsm::new();
+        assert_eq!(fsm.step(PrimeEvent::GoalLoaded), vec![PrimeCommand::FuseSensors]);
+        assert_eq!(fsm.step(sensed(false)), vec![PrimeCommand::RouteResidual]);
 
         let nodes = vec![NodeId(0), NodeId(2)];
         assert_eq!(
-            fsm.step(SwarmEvent::Routed { nodes: nodes.clone() }),
-            vec![SwarmCommand::Dispatch { nodes }]
+            fsm.step(PrimeEvent::Routed { nodes: nodes.clone() }),
+            vec![PrimeCommand::Dispatch { nodes }]
         );
         // First worker done: still waiting, no commands.
-        assert!(fsm.step(SwarmEvent::WorkerDone).is_empty());
+        assert!(fsm.step(PrimeEvent::WorkerDone).is_empty());
         // Second worker done: loop closes with a re-sense.
         assert_eq!(
-            fsm.step(SwarmEvent::WorkerDone),
-            vec![SwarmCommand::FuseSensors]
+            fsm.step(PrimeEvent::WorkerDone),
+            vec![PrimeCommand::FuseSensors]
         );
         // Residual now within epsilon.
-        assert_eq!(fsm.step(sensed(true)), vec![SwarmCommand::AnnounceConverged]);
+        assert_eq!(fsm.step(sensed(true)), vec![PrimeCommand::AnnounceConverged]);
         assert!(fsm.is_terminal());
     }
 
     #[test]
     fn fault_halts_from_any_state() {
-        let mut fsm = SwarmFsm::new();
-        fsm.step(SwarmEvent::GoalLoaded);
-        let cmds = fsm.step(SwarmEvent::Fault { reason: "mesh empty".into() });
-        assert_eq!(cmds, vec![SwarmCommand::AnnounceHalt { reason: "mesh empty".into() }]);
+        let mut fsm = PrimeFsm::new();
+        fsm.step(PrimeEvent::GoalLoaded);
+        let cmds = fsm.step(PrimeEvent::Fault { reason: "mesh empty".into() });
+        assert_eq!(cmds, vec![PrimeCommand::AnnounceHalt { reason: "mesh empty".into() }]);
         assert!(fsm.is_terminal());
     }
 
     #[test]
     fn late_events_after_convergence_are_ignored() {
-        let mut fsm = SwarmFsm::new();
-        fsm.step(SwarmEvent::GoalLoaded);
+        let mut fsm = PrimeFsm::new();
+        fsm.step(PrimeEvent::GoalLoaded);
         fsm.step(sensed(true));
-        assert!(fsm.step(SwarmEvent::WorkerDone).is_empty());
-        assert_eq!(*fsm.state(), SwarmState::Converged);
+        assert!(fsm.step(PrimeEvent::WorkerDone).is_empty());
+        assert_eq!(*fsm.state(), PrimeState::Converged);
     }
 
     // --- Property-based test ---------------------------------------------
@@ -185,7 +185,7 @@ mod tests {
     // `fault_halts_from_any_state` and `late_events_after_convergence_are_
     // ignored` pin down two specific interleavings by hand; this sweeps
     // arbitrary event sequences to check the invariant they're both
-    // instances of: once the swarm reaches a terminal state, no sequence
+    // instances of: once Axiom Prime reaches a terminal state, no sequence
     // of further events — however it's shuffled — can pull it back into a
     // non-terminal one. (`Fault` can still turn `Converged` into `Halted`;
     // that's a terminal-to-terminal transition, not a violation.)
@@ -194,14 +194,14 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-        fn arbitrary_event() -> impl Strategy<Value = SwarmEvent> {
+        fn arbitrary_event() -> impl Strategy<Value = PrimeEvent> {
             prop_oneof![
-                Just(SwarmEvent::GoalLoaded),
-                any::<bool>().prop_map(|converged| SwarmEvent::Sensed { converged }),
+                Just(PrimeEvent::GoalLoaded),
+                any::<bool>().prop_map(|converged| PrimeEvent::Sensed { converged }),
                 prop::collection::vec(0usize..4, 0..3)
-                    .prop_map(|ids| SwarmEvent::Routed { nodes: ids.into_iter().map(NodeId).collect() }),
-                Just(SwarmEvent::WorkerDone),
-                "[a-z]{0,8}".prop_map(|reason| SwarmEvent::Fault { reason }),
+                    .prop_map(|ids| PrimeEvent::Routed { nodes: ids.into_iter().map(NodeId).collect() }),
+                Just(PrimeEvent::WorkerDone),
+                "[a-z]{0,8}".prop_map(|reason| PrimeEvent::Fault { reason }),
             ]
         }
 
@@ -210,7 +210,7 @@ mod tests {
             fn is_terminal_never_reverts_once_true(
                 events in prop::collection::vec(arbitrary_event(), 0..30)
             ) {
-                let mut fsm = SwarmFsm::new();
+                let mut fsm = PrimeFsm::new();
                 let mut was_terminal = false;
                 for event in events {
                     fsm.step(event);

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["axiom_core", "axiom_swarm", "axiom_mcp"]
+members = ["axiom_core", "axiom_prime", "axiom_mcp"]
 
 [workspace.package]
 version = "0.1.0"
