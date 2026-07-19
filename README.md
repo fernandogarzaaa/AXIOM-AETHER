@@ -290,13 +290,18 @@ GET    /v1/models
 POST   /v1/completions
 POST   /v1/chat/completions
 POST   /v1/messages
+POST   /v1/responses                        # Responses-input compression — on by default
+GET/POST /mcp                               # MCP server over HTTP — needs AXIOM_MCP_HTTP=1
 POST   /v1/adapt
 POST   /v1/expand
 POST   /v1/verify
+POST   /v1/epistemic/validate
 POST   /v1/sessions
 GET    /v1/sessions/{id}/checkpoint
 PUT    /v1/sessions/{id}/checkpoint
 DELETE /v1/sessions/{id}
+GET    /v1/awareness/{id}                   # per-session dollar-true cost telemetry (CVM cost stack)
+GET    /v1/budget
 GET    /v1/ttt/sessions
 DELETE /v1/ttt/sessions
 POST   /v1/ttt/feedback
@@ -304,15 +309,25 @@ POST   /v1/cluster/sync
 POST   /v1/cluster/merge
 GET    /v1/immunity
 POST   /v1/immunity/merge
+GET    /v1/patches
 POST   /v1/hypervisor/mount
 POST   /v1/hypervisor/read
 POST   /v1/hypervisor/jit_run
 GET    /v1/hypervisor/jit_status
+GET    /v1/hypervisor/list
+GET    /v1/hypervisor/stat
 GET    /v1/hypervisor/quantum_coherent_state
+POST   /v1/chimera/run
+GET    /v1/fleet/status
 GET    /v1/swarm/matrix_state
 GET    /v1/config
 POST   /v1/config
 ```
+
+This list is generated from the actual `.route(...)` registrations across
+`axiom_engine_rs/src/server/*.rs` — if you add or remove a route, update it
+here too; it had drifted out of sync with the code before (missing 9 real
+routes, several backing "on by default" features like `/v1/responses`).
 
 Example adaptation call:
 
@@ -416,12 +431,30 @@ axiom prime {dir}
 axiom bench {dir}
 axiom run [--dry-run] [--max-restarts N] -- {cmd}
 axiom solve [--source PATH] [--max-rounds N] -- {cmd}
+axiom task --goal "<desc>" [--file PATH]... [--max-attempts N] -- {cmd}
+axiom eval-agentic
 axiom immunity [query] [--prune]
 axiom swarm connect {peer}
 axiom swarm immunity {host:port}
+axiom fleet status [--offline] [--base-url URL]
+axiom fleet join {peer}
+axiom chimera check|run {file}
+axiom chimera prove {file} [--out PATH]
+axiom chimera verify {cert}
 axiom daemon start|stop|status
 axiom mount {dir}
 ```
+
+- `axiom task` is goal-directed autonomous coding (an LLM backend is required —
+  set `ANTHROPIC_API_KEY` or another supported provider key; see
+  [`docs/AGENTIC_CORE.md`](docs/AGENTIC_CORE.md)). `axiom run`/`axiom solve`
+  above need no API key at all — deterministic, local-only self-healing and
+  repair.
+- `axiom eval-agentic` measures the autonomous loop against built-in seeded
+  fixtures — deterministic, no LLM required.
+- `axiom chimera` runs the in-tree ChimeraLang DSL (`belief`/`inquire`/
+  `resolve`/`guard`/`evolve` programs) on the same belief/provenance substrate
+  as the engine itself.
 
 Useful environment variables:
 
@@ -440,7 +473,7 @@ Useful environment variables:
 | `AXIOM_FLEET_KEY_PREV` | Optional previous fleet key accepted during graceful key rotation; remove after all peers use `AXIOM_FLEET_KEY`. |
 | `AXIOM_VERIFY_RESPONSES` | Opt in to response grounding advisories. |
 | `AXIOM_ROUTER_CONSENSUS` | Set to `1` to enable consensus mode: the router asks two providers and fuses answers via `BetaBelief`. |
-| `AXIOM_CONFORMAL_THRESHOLD` | Pre-calibrated support threshold τ for the conformal factuality gate; replaces the hardcoded 0.60 cutoff. |
+| `AXIOM_CONFORMAL_THRESHOLD` | Pre-calibrated support threshold τ for the conformal factuality gate; replaces the shipped default of 0.75 (`SHIPPED_CONFORMAL_THRESHOLD` in `hallucination.rs`; 0.60 is a separate internal tier constant, `SUPPORT_HIGH`, not the default cutoff). |
 | `AXIOM_CONFORMAL_DELTA` | Coverage tolerance δ (default 0.10 → 90% coverage); pair with `AXIOM_CONFORMAL_THRESHOLD` or calibrate via `calibrate_conformal_threshold`. |
 
 ## Docker

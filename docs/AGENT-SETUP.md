@@ -132,10 +132,15 @@ the bridge â€” see the Codex prompt below.)
 ### Verify (always do this first)
 
 A `tools/list` round-trip is the smoke test. Through the tunnel it should return
-the Axiom tools; from a current build that's **10**:
+the Axiom tools; from a current build that's **20**:
 `search`, `fetch`, `axiom_compress_path`, `axiom_evaluate_drift`, `axiom_expand`,
 `axiom_remember`, `axiom_recall`, `axiom_forget`, `axiom_verify`,
-`axiom_immunity`.
+`axiom_validate_epistemic`, `axiom_immunity`, `axiom_status`,
+`axiom_post_task`, `axiom_claim_task`, `axiom_task_result`,
+`axiom_list_tasks`, `axiom_channels`, `axiom_predict_states`,
+`axiom_sample_trajectories`, `axiom_align_generation` (the last three are
+experimental, untrained predictive-reasoning tools). If you see fewer than
+that, you're on an older build — see the linker/rebuild guidance below.
 
 ---
 
