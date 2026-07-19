@@ -1,0 +1,17 @@
+[package]
+name = "axiom_core"
+description = "Kinetic Neural Mesh (KNM) and Intent-Driven Convergence (IDC) primitives for Axiom Mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ndarray = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

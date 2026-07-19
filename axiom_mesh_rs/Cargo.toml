@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["axiom_core", "axiom_prime", "axiom_mcp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
+authors = ["Fernando Garza <fernandogarzaaa@users.noreply.github.com>"]
+
+[workspace.dependencies]
+ndarray = "0.16"
+rand = "0.8.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["full"] }
+thiserror = "1"
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
