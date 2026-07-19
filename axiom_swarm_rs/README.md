@@ -71,7 +71,7 @@ spine** (sequences the loop without ever blocking on a worker).
 | `gumbel` | `gumbel_softmax`: hard-variant Gumbel-Softmax for discrete topology routing, plus the relaxed distribution for telemetry. Seedable and deterministic under a fixed RNG. |
 | `node` | `WorkerNode` / `NodeId` / `NodeKind`: affinity embedding + routing bias per worker. |
 | `residual` | `StateVector` and `Residual` (`goal − current`), norms, convergence predicate. |
-| `idc` | `SensorReading` (terminal / diff / test log), deterministic feature-hash `fuse` into state space, `IdcController` with `actuate` producing a `CorrectionVector` of `Actuation` commands — never conversational text. |
+| `idc` | `SensorReading` (terminal / diff / test log), deterministic feature-hash `fuse` into state space, `IdcController` with `actuate` producing a `CorrectionVector` of `Actuation` commands — never conversational text — plus `StateSmoother`, a composable EMA pre-filter for noisy fused state. |
 
 ### `axiom_swarm` — Axiom Prime orchestrator (binary)
 
@@ -136,10 +136,17 @@ spine** (sequences the loop without ever blocking on a worker).
 ## Status
 
 First vertical slice plus a fault-tolerance and online-learning pass: real
-worker transports (JSON-RPC over stdio, with timeout + quarantine) and
-bandit-learned routing bias are implemented and wired into the demo
-binary. Kalman/EMA sensor smoothing, expert-choice batch dispatch,
-hierarchical topology, and ROCm-accelerated batch routing are deliberately
-not implemented — see
+worker transports (JSON-RPC over stdio, with timeout + quarantine),
+bandit-learned routing bias, EMA sensor-state smoothing, and property-based
+invariant tests (`proptest`, alongside the hand-written unit tests) are
+implemented — the first two wired into the demo binary; the smoother is a
+tested, composable primitive not force-fit into the demo's noise-free
+synthetic environment (see the blueprint for why). Expert-choice batch
+dispatch, hierarchical topology, and ROCm-accelerated batch routing remain
+deliberately unimplemented — see
 [`docs/RESEARCH_BLUEPRINT.md`](docs/RESEARCH_BLUEPRINT.md) for why each is
-queued for a decision rather than built.
+still premature rather than queued for a design decision.
+
+```bash
+cargo test --workspace   # 55 tests: unit + integration + property-based
+```

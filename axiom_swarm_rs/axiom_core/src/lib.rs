@@ -26,7 +26,7 @@ pub mod node;
 pub mod residual;
 
 pub use gumbel::gumbel_softmax;
-pub use idc::{CorrectionVector, IdcController, SensorReading};
+pub use idc::{CorrectionVector, IdcController, SensorReading, StateSmoother};
 pub use mesh::{Adhesion, KineticNeuralMesh, MeshError};
 pub use node::{NodeId, WorkerNode};
 pub use residual::{Residual, StateVector};

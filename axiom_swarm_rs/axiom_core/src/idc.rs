@@ -98,6 +98,56 @@ pub fn fuse(readings: &[SensorReading], dim: usize) -> StateVector {
     StateVector(state)
 }
 
+/// Exponential moving average smoother for fused sensor state.
+///
+/// Raw per-tick `fuse()` output can chatter tick to tick under noisy
+/// sensors (a flaky test that passes/fails intermittently, jittery
+/// terminal timing) — feeding that straight into routing causes the mesh
+/// to flip its pick on noise rather than signal, a classic control-theory
+/// concern. `StateSmoother` is a composable pre-filter: call `update` with
+/// each raw fused state before computing the residual, in place of using
+/// the raw state directly.
+///
+/// This is deliberately a plain EMA rather than a full Kalman filter — no
+/// process/measurement noise covariance to tune, at the cost of not
+/// separately modeling sensor vs. process uncertainty. See
+/// `docs/RESEARCH_BLUEPRINT.md` for why the fuller filter stayed queued.
+pub struct StateSmoother {
+    /// Smoothing factor in `(0.0, 1.0]`. `1.0` means no smoothing (each
+    /// update replaces the estimate outright); smaller values weight
+    /// history more heavily and damp noise harder at the cost of lag.
+    alpha: f32,
+    estimate: Option<StateVector>,
+}
+
+impl StateSmoother {
+    /// # Panics
+    /// Panics if `alpha` isn't in `(0.0, 1.0]`.
+    pub fn new(alpha: f32) -> Self {
+        assert!(alpha > 0.0 && alpha <= 1.0, "StateSmoother: alpha must be in (0.0, 1.0], got {alpha}");
+        Self { alpha, estimate: None }
+    }
+
+    /// A smoother that performs no smoothing — every `update` returns the
+    /// raw reading unchanged. Useful as the default when a caller wants the
+    /// `StateSmoother` API without opting into the behavior yet.
+    pub fn disabled() -> Self {
+        Self::new(1.0)
+    }
+
+    /// Fold in a new raw reading and return the smoothed estimate. The
+    /// first call seeds the estimate with the raw reading verbatim (no
+    /// prior history to blend with).
+    pub fn update(&mut self, raw: StateVector) -> StateVector {
+        let smoothed = match &self.estimate {
+            None => raw,
+            Some(prev) => StateVector(&prev.0 * (1.0 - self.alpha) + &raw.0 * self.alpha),
+        };
+        self.estimate = Some(smoothed.clone());
+        smoothed
+    }
+}
+
 /// The IDC controller: holds the goal state and turns residuals into
 /// correction vectors.
 pub struct IdcController {
@@ -191,5 +241,56 @@ mod tests {
         assert!(cv.residual_norm > 0.0);
         assert!(matches!(cv.actions[0], Actuation::Dispatch { .. }));
         assert_eq!(cv.actions[1], Actuation::RunCommand { command: "cargo test".into() });
+    }
+
+    #[test]
+    fn disabled_smoother_passes_readings_through_unchanged() {
+        let mut smoother = StateSmoother::disabled();
+        let a = StateVector(Array1::from_vec(vec![1.0, -2.0]));
+        let b = StateVector(Array1::from_vec(vec![5.0, 5.0]));
+        assert_eq!(smoother.update(a.clone()), a);
+        assert_eq!(smoother.update(b.clone()), b);
+    }
+
+    #[test]
+    fn smoother_matches_hand_computed_ema() {
+        let mut smoother = StateSmoother::new(0.25);
+        let first = StateVector(Array1::from_vec(vec![0.0]));
+        let second = StateVector(Array1::from_vec(vec![4.0]));
+
+        // First call seeds the estimate verbatim.
+        assert_eq!(smoother.update(first), StateVector(Array1::from_vec(vec![0.0])));
+        // Second: 0.75*0.0 + 0.25*4.0 = 1.0.
+        let out = smoother.update(second);
+        assert!((out.0[0] - 1.0).abs() < 1e-6, "got {}", out.0[0]);
+    }
+
+    #[test]
+    fn smoother_reduces_variance_of_an_oscillating_signal() {
+        // A signal alternating far above/below its true mean (0.0) — the
+        // kind of tick-to-tick chatter a flaky sensor produces.
+        let raw: Vec<f32> = (0..40).map(|i| if i % 2 == 0 { 10.0 } else { -10.0 }).collect();
+
+        let mut smoother = StateSmoother::new(0.1);
+        let smoothed: Vec<f32> =
+            raw.iter().map(|&x| smoother.update(StateVector(Array1::from_vec(vec![x]))).0[0]).collect();
+
+        let variance = |xs: &[f32]| {
+            let mean = xs.iter().sum::<f32>() / xs.len() as f32;
+            xs.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / xs.len() as f32
+        };
+
+        assert!(
+            variance(&smoothed) < variance(&raw) * 0.1,
+            "smoothed variance {} should be far below raw variance {}",
+            variance(&smoothed),
+            variance(&raw)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "alpha must be in")]
+    fn smoother_rejects_out_of_range_alpha() {
+        StateSmoother::new(0.0);
     }
 }

@@ -551,4 +551,116 @@ mod tests {
             "the never-sampled node must win on the exploration bonus alone"
         );
     }
+
+    // --- Property-based tests -------------------------------------------
+    //
+    // The hand-written tests above pin down specific scenarios; these sweep
+    // the combinatorial config surface (residual/capacity/annealing/bandit
+    // knobs interact in `field()`) that hand-picked examples can't fully
+    // cover, per the counter-review step in docs/RESEARCH_BLUEPRINT.md.
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+
+        const PDIM: usize = 4;
+
+        fn affinity_strategy() -> impl Strategy<Value = Vec<f32>> {
+            prop::collection::vec(-5.0f32..5.0, PDIM)
+        }
+
+        fn build(affinities: &[Vec<f32>], config: MeshConfig) -> KineticNeuralMesh {
+            let mut mesh = KineticNeuralMesh::new(config);
+            for (i, affinity) in affinities.iter().enumerate() {
+                mesh.add_node(WorkerNode::new(
+                    i,
+                    format!("n{i}"),
+                    NodeKind::Llm("test".into()),
+                    affinity.clone(),
+                ))
+                .expect("dims match by construction");
+            }
+            mesh
+        }
+
+        proptest! {
+            #[test]
+            fn forward_always_activates_exactly_fan_out_distinct_nodes(
+                affinities in prop::collection::vec(affinity_strategy(), 1..=6),
+                payload in affinity_strategy(),
+                fan_out_raw in 1usize..=8,
+                tau in 0.01f32..2.0,
+                tau_gain in 0.0f32..2.0,
+                capacity_penalty in 0.0f32..5.0,
+                bandit_gain in -2.0f32..2.0,
+                bandit_exploration in 0.0f32..2.0,
+                use_residual in any::<bool>(),
+                goal_raw in affinity_strategy(),
+                seed in any::<u64>(),
+            ) {
+                let n_nodes = affinities.len();
+                let config = MeshConfig {
+                    dim: PDIM,
+                    tau,
+                    hard: true,
+                    fan_out: fan_out_raw,
+                    residual_gain: 1.0,
+                    tau_gain,
+                    tau_min: 0.05,
+                    tau_max: 2.0,
+                    capacity_penalty,
+                    bandit_gain,
+                    bandit_exploration,
+                };
+                let mesh = build(&affinities, config);
+                let payload_arr = Array1::from_vec(payload);
+                let residual = if use_residual {
+                    let goal = StateVector(Array1::from_vec(goal_raw));
+                    Some(Residual::between(&goal, &StateVector::zeros(PDIM)))
+                } else {
+                    None
+                };
+                let mut rng = StdRng::seed_from_u64(seed);
+                let adhesion = mesh.forward(&payload_arr, residual.as_ref(), &mut rng).unwrap();
+
+                let expected_active = fan_out_raw.min(n_nodes).max(1);
+                prop_assert_eq!(adhesion.active.len(), expected_active);
+
+                // No duplicate winners across fan-out slots.
+                let mut seen = HashSet::new();
+                for id in &adhesion.active {
+                    prop_assert!(seen.insert(*id), "duplicate winner {:?}", id);
+                }
+
+                // Hard routing: exactly `expected_active` weights are 1.0,
+                // every other weight is exactly 0.0.
+                let ones = adhesion.weights.iter().filter(|&&w| w == 1.0).count();
+                let zeros = adhesion.weights.iter().filter(|&&w| w == 0.0).count();
+                prop_assert_eq!(ones, expected_active);
+                prop_assert_eq!(ones + zeros, n_nodes);
+            }
+
+            #[test]
+            fn mark_and_record_sequences_never_panic_or_underflow(
+                affinities in prop::collection::vec(affinity_strategy(), 1..=4),
+                ops in prop::collection::vec((0usize..4, any::<bool>(), -3.0f32..3.0), 0..50),
+            ) {
+                let n_nodes = affinities.len();
+                let mut mesh = build(&affinities, MeshConfig { dim: PDIM, ..Default::default() });
+                for (idx, is_active, reward) in ops {
+                    let id = NodeId(idx % n_nodes);
+                    if is_active {
+                        mesh.mark_active(id);
+                    } else {
+                        mesh.mark_idle(id); // must be a no-op, never panic, even if not active
+                    }
+                    mesh.record_outcome(id, reward);
+                }
+                let payload = Array1::zeros(PDIM);
+                let mut rng = StdRng::seed_from_u64(0);
+                prop_assert!(mesh.forward(&payload, None, &mut rng).is_ok());
+            }
+        }
+    }
 }

@@ -148,18 +148,45 @@ removed and re-added starts its learned quality from scratch rather than
 carrying over a stale estimate — reasonable given the identity behind a
 given `NodeId` may have genuinely changed by the time it's re-added.
 
-## Queued for your call before building
+### 5. EMA sensor-state smoothing (composable, not demo-wired)
 
-These have more than one reasonable design, or are large enough that
-building the wrong one wastes real work — flagging for a decision rather
-than picking unilaterally.
+**Finding:** re-examining the "determinism trade-off" this was originally
+queued on — the objection conflated two different things. `fuse()` being a
+*pure function* (same readings in, same state out) is unaffected by
+adding an optional, separately-instantiated smoother the caller chooses to
+route raw state through; nothing about `fuse()` itself needs to change.
+The actual open question was only "is a stateful filter deterministic
+given a fixed input *sequence*?" — yes, trivially, an EMA recurrence has no
+randomness in it.
 
-| Idea | Why it's promising | The actual decision needed |
+**What shipped:** `axiom_core::idc::StateSmoother` — a plain exponential
+moving average (`estimate = (1-alpha)*prev + alpha*raw`), not a full
+Kalman filter (no process/measurement noise covariance to tune, at the
+cost of not separately modeling sensor vs. process uncertainty — a
+genuinely simpler tool for a genuinely simpler job). `StateSmoother::disabled()`
+(alpha=1.0) is a pure pass-through. Tested against hand-computed EMA
+values and a synthetic oscillating-signal case showing >90% variance
+reduction.
+
+**Deliberately not done:** *not* wired into the demo binary. The demo's
+"environment" is a synthetic vector with no noise in it — smoothing a
+noise-free signal only adds lag with nothing to show for it, which would
+misrepresent the mechanism rather than demonstrate it. It's implemented,
+tested, and exported as a composable primitive (same category as
+`KineticNeuralMesh::center_of_mass`, which also exists but isn't forced
+into the demo) ready to sit in front of a real, noisy `fuse()` call once
+one exists.
+
+## Explicitly deferred (still not built, and why)
+
+| Idea | Why it's promising | Why it's still not implemented |
 |---|---|---|
-| **Kalman/EMA smoothing on fused sensor state** — smooth `StateVector` across ticks before computing the residual, instead of raw per-tick fusion. | Classical control theory: unsmoothed sensor noise causes chattering actuation (routing flip-flopping tick to tick on noise, not signal). | **Determinism trade-off**: `fuse()` is deliberately deterministic/testable today. A stateful filter needs tuned process/measurement noise and changes what "same input → same output" means for the control loop. |
-| **Expert-choice batch dispatch** — for the future case of routing *many* payloads to *few* workers at once (not today's one-payload-at-a-time loop), let workers choose their top payloads by affinity instead of payloads choosing workers, which is what actually solves load imbalance in MoE. | Directly cited as the highest-leverage 2025-2026 MoE improvement over naive top-1 routing. | Only applies once there's a real batch-dispatch use case; premature before then. |
-| **Hierarchical/decentralized topology** — sub-swarms with their own Axiom Prime, per the centralized/decentralized/hierarchical + dynamic-adaptive taxonomy from the 2025-2026 multi-agent orchestration survey. | Matches how production multi-agent systems (LangGraph, AutoGen v0.4's actor-model rewrite) scale past a single controller. | Scale-driven; today's single-loop FSM has no evidence yet of being a bottleneck. Don't build ahead of the need. |
-| **Property-based tests** (e.g. `proptest`) for FSM/mesh invariants — "pending count never goes negative under any WorkerDone interleaving," "forward() always returns exactly `min(fan_out, n_nodes)` active nodes." | The counter-review step above is exactly what property tests automate — adversarial input generation instead of hand-picked examples. | New dev-dependency; repo doesn't use `proptest` elsewhere today. Worth it once the state space (FSM × mesh × health) gets bigger than hand-written cases can cover well. |
+| **Expert-choice batch dispatch** — for the future case of routing *many* payloads to *few* workers at once (not today's one-payload-at-a-time loop), let workers choose their top payloads by affinity instead of payloads choosing workers, which is what actually solves load imbalance in MoE. | Directly cited as the highest-leverage 2025-2026 MoE improvement over naive top-1 routing. | No real batch-dispatch use case exists in this codebase yet — the FSM dispatches one payload per tick. Building the mechanism ahead of a caller that needs it is exactly the kind of speculative abstraction this project's own engineering conventions rule out. Revisit when a real multi-payload workload shows up. |
+| **Hierarchical/decentralized topology** — sub-swarms with their own Axiom Prime, per the centralized/decentralized/hierarchical + dynamic-adaptive taxonomy from the 2025-2026 multi-agent orchestration survey. | Matches how production multi-agent systems (LangGraph, AutoGen v0.4's actor-model rewrite) scale past a single controller. | Scale-driven; today's single-loop FSM has shown no evidence of being a bottleneck. Don't build ahead of the need — there's nothing to test it against yet, so it'd ship unvalidated. |
+
+Property-based tests (`proptest`, for the FSM/mesh invariants this
+document's counter-review step implies) and EMA sensor smoothing were also
+on this list; both are now implemented above.
 
 ## Sources
 

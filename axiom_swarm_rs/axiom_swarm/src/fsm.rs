@@ -179,4 +179,47 @@ mod tests {
         assert!(fsm.step(SwarmEvent::WorkerDone).is_empty());
         assert_eq!(*fsm.state(), SwarmState::Converged);
     }
+
+    // --- Property-based test ---------------------------------------------
+    //
+    // `fault_halts_from_any_state` and `late_events_after_convergence_are_
+    // ignored` pin down two specific interleavings by hand; this sweeps
+    // arbitrary event sequences to check the invariant they're both
+    // instances of: once the swarm reaches a terminal state, no sequence
+    // of further events — however it's shuffled — can pull it back into a
+    // non-terminal one. (`Fault` can still turn `Converged` into `Halted`;
+    // that's a terminal-to-terminal transition, not a violation.)
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arbitrary_event() -> impl Strategy<Value = SwarmEvent> {
+            prop_oneof![
+                Just(SwarmEvent::GoalLoaded),
+                any::<bool>().prop_map(|converged| SwarmEvent::Sensed { converged }),
+                prop::collection::vec(0usize..4, 0..3)
+                    .prop_map(|ids| SwarmEvent::Routed { nodes: ids.into_iter().map(NodeId).collect() }),
+                Just(SwarmEvent::WorkerDone),
+                "[a-z]{0,8}".prop_map(|reason| SwarmEvent::Fault { reason }),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn is_terminal_never_reverts_once_true(
+                events in prop::collection::vec(arbitrary_event(), 0..30)
+            ) {
+                let mut fsm = SwarmFsm::new();
+                let mut was_terminal = false;
+                for event in events {
+                    fsm.step(event);
+                    if was_terminal {
+                        prop_assert!(fsm.is_terminal(), "left a terminal state: {:?}", fsm.state());
+                    }
+                    was_terminal |= fsm.is_terminal();
+                }
+            }
+        }
+    }
 }
