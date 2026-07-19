@@ -107,10 +107,18 @@ fn worker_binary_path() -> PathBuf {
     path.push(if cfg!(windows) { "aether_worker.exe" } else { "aether_worker" });
     if !path.exists() {
         println!("axiom_prime: building aether_worker (first run)...");
-        let status = std::process::Command::new(env!("CARGO"))
-            .args(["build", "--bin", "aether_worker"])
-            .status()
-            .expect("invoke cargo to build aether_worker");
+        // Must match whatever profile *this* binary was built under, since
+        // that's the `target/<profile>/` directory `path` above just
+        // resolved to (via `current_exe()`) -- `cargo build --bin` alone
+        // always outputs to `target/debug/`, so running `axiom_prime` in
+        // release mode would build the sidecar but keep looking for it next
+        // to itself in `target/release/` and never find it.
+        let mut cmd = std::process::Command::new(env!("CARGO"));
+        cmd.args(["build", "--bin", "aether_worker"]);
+        if !cfg!(debug_assertions) {
+            cmd.arg("--release");
+        }
+        let status = cmd.status().expect("invoke cargo to build aether_worker");
         assert!(status.success(), "cargo build --bin aether_worker failed");
     }
     path

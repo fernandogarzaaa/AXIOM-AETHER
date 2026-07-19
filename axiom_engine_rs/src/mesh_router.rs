@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use axiom_core::mesh::{KineticNeuralMesh, MeshConfig};
 use axiom_core::node::{NodeId, NodeKind, WorkerNode};
-use ndarray::array;
+use ndarray::Array1;
 use rand::{rngs::StdRng, SeedableRng};
 
 /// Constant payload/dim: see the module docs on why there's no real
@@ -74,7 +74,8 @@ impl MeshModelSelector {
             // to overturn — see record_outcome's doc comment for why that
             // was a real, measured problem at a bigger step size.
             let bias = (candidates.len() - i) as f32 * 0.3;
-            let node = WorkerNode::new(i, name.clone(), NodeKind::Llm(name.clone()), vec![1.0]).with_bias(bias);
+            let node =
+                WorkerNode::new(i, name.clone(), NodeKind::Llm(name.clone()), vec![1.0; DIM]).with_bias(bias);
             let id = mesh.add_node(node).expect("constant dim always matches");
             nodes.push((name.clone(), id));
         }
@@ -96,7 +97,7 @@ impl MeshModelSelector {
         if eligible.is_empty() {
             return None;
         }
-        let payload = array![1.0f32];
+        let payload = Array1::<f32>::ones(DIM);
         let mesh = self.mesh.lock().unwrap();
         let mut rng = self.rng.lock().unwrap();
         let adhesion = mesh.forward_restricted(&payload, None, &eligible, &mut *rng).ok()?;

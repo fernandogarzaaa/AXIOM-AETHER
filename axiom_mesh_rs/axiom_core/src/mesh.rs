@@ -315,9 +315,22 @@ impl KineticNeuralMesh {
         let fan_out = self.config.fan_out.min(self.nodes.len()).max(1);
         let tau = self.effective_tau(residual);
 
-        // Top-k discrete routing: draw a hard Gumbel-Softmax winner, mask
-        // it out, and redraw — each slot is an independent discrete snap,
-        // so fan_out=1 is exactly the classic hard Gumbel-Softmax.
+        let (weights, active) = self.route_topk(&field, fan_out, tau, rng);
+        Ok(Adhesion { weights, active, field })
+    }
+
+    /// Top-k discrete routing shared by `forward` and `forward_restricted`:
+    /// draw a hard Gumbel-Softmax winner, mask it out, and redraw — each
+    /// slot is an independent discrete snap, so fan_out=1 is exactly the
+    /// classic hard Gumbel-Softmax. `field` is expected to already have any
+    /// ineligible nodes masked to `-inf` by the caller.
+    fn route_topk(
+        &self,
+        field: &Array1<f32>,
+        fan_out: usize,
+        tau: f32,
+        rng: &mut impl Rng,
+    ) -> (Array1<f32>, Vec<NodeId>) {
         let mut weights: Array1<f32> = Array1::zeros(self.nodes.len());
         let mut active: Vec<NodeId> = Vec::with_capacity(fan_out);
         let mut masked = field.clone();
@@ -328,8 +341,7 @@ impl KineticNeuralMesh {
             active.push(self.nodes[w].id);
             masked[w] = f32::NEG_INFINITY;
         }
-
-        Ok(Adhesion { weights, active, field })
+        (weights, active)
     }
 
     /// Forward pass restricted to a caller-supplied eligible subset of
@@ -387,17 +399,7 @@ impl KineticNeuralMesh {
         let fan_out = self.config.fan_out.min(eligible_idx.len()).max(1);
         let tau = self.effective_tau(residual);
 
-        let mut weights: Array1<f32> = Array1::zeros(self.nodes.len());
-        let mut active: Vec<NodeId> = Vec::with_capacity(fan_out);
-        let mut masked = field.clone();
-        for _ in 0..fan_out {
-            let sample = gumbel_softmax(&masked, tau, self.config.hard, rng);
-            let w = sample.winner;
-            weights[w] = if self.config.hard { 1.0 } else { sample.adhesion[w] };
-            active.push(self.nodes[w].id);
-            masked[w] = f32::NEG_INFINITY;
-        }
-
+        let (weights, active) = self.route_topk(&field, fan_out, tau, rng);
         Ok(Adhesion { weights, active, field })
     }
 
