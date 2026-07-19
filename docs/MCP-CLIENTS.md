@@ -1,13 +1,19 @@
 ﻿# Running axiom as an MCP server (use it from Claude / ChatGPT / Cline)
 
-Axiom ships an MCP server that exposes **16 tools** -- `axiom_compress_path`,
+Axiom ships an MCP server that exposes **20 tools** -- `axiom_compress_path`,
 `axiom_evaluate_drift`, `axiom_expand`, `axiom_remember`, `axiom_recall`,
 `axiom_forget`, `axiom_verify`, `axiom_validate_epistemic`, `axiom_immunity`,
 `axiom_status`, `search`, `fetch`, `axiom_post_task`, `axiom_claim_task`,
-`axiom_task_result`, `axiom_list_tasks`, `axiom_channels` -- to an LLM host. In
-this mode **the host model is the brain and axiom is its toolkit**, which is the
-sanctioned, zero-API-cost way to combine your ChatGPT/Claude *subscription* with
-axiom (you drive your own app; it calls axiom's tools).
+`axiom_task_result`, `axiom_list_tasks`, `axiom_channels`, plus three
+experimental, untrained predictive-reasoning tools --
+`axiom_predict_states`, `axiom_sample_trajectories`,
+`axiom_align_generation` -- to an LLM host. In this mode **the host model is
+the brain and axiom is its toolkit**, which is the sanctioned,
+zero-API-cost way to combine your ChatGPT/Claude *subscription* with axiom
+(you drive your own app; it calls axiom's tools). The exact count is
+enforced by a test (`tools_list_exposes_tools_with_schemas` in
+`axiom_engine_rs/src/mcp_stdio.rs`), so it won't silently drift out of sync
+with this doc again.
 
 > **Want your AI agent to set this up for you?** See
 > [`AGENT-SETUP.md`](AGENT-SETUP.md) for copy-paste prompts that make **Codex**

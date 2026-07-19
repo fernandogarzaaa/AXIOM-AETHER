@@ -56,8 +56,11 @@ by an autoregressive decode (TTT weight update per token).
 
 ## TTT Layer Mathematics
 
-The core innovation lives in `ttt_layer.rs`.  Each `TTTLinearLayer` maintains a
-_dynamic weight matrix_ **W̃** ∈ ℝ^(H×D×D) (one per attention head).
+The core innovation lives in `ttt_block.rs` (renamed from `ttt_layer.rs`
+since this section was written — the math below is unchanged, only the
+file/type names are). Each `NativeTTTBlock` (formerly `TTTLinearLayer`)
+maintains a _dynamic weight matrix_ **W̃** ∈ ℝ^(H×D×D) (one per attention
+head).
 
 ### Prefill (parallel)
 
@@ -92,7 +95,13 @@ knowledge _without re-running retrieval or fine-tuning_.
 
 ### Logarithmic prefix scan
 
-When `use_log_scan = true`, the prefill phase compresses `T` timesteps into
+> **Status: not present in the current codebase, Rust or Python.**
+> Neither `use_log_scan` nor an associative-scan module exists anywhere in
+> `axiom_engine_rs/src` or `axiom_engine/` today (verified by grep) — this
+> subsection is kept as a record of a design that was never implemented
+> or was since removed, not as a description of current behavior.
+
+When `use_log_scan = true` (not implemented in either codebase today), the prefill phase compresses `T` timesteps into
 `O(log T)` parallel reduction depth using an associative merge operator:
 
 ```
@@ -129,8 +138,8 @@ base.
 | `main.rs` | CLI entry-point: `--mode train / generate / server`, `--device cpu/cuda/metal` |
 | `config.rs` | `AxiomConfig` (d_model, n_layers, num_heads, vocab_size, …) |
 | `kernel.rs` | `AxiomTTTEngine` (Embedding → N×AxiomBlock → RMSNorm → LM Head) |
-| `ttt_layer.rs` | `TTTLinearLayer` — prefill + decode + `forward_decode_with_loss` |
-| `log_scan.rs` | `LogosAssociativeScanner::parallel_prefix_reduce` |
+| `ttt_block.rs` | `NativeTTTBlock` — prefill + decode fast-weight update (formerly `ttt_layer.rs`/`TTTLinearLayer`) |
+| `ttt_mlp.rs`, `ttt_mlp_model.rs` | MLP-based TTT variant and its model wrapper |
 | `jit_streamer.rs` | Live context fetch, ranking, packing |
 | `inference.rs` | `InferencePipeline`: `generate`, `generate_with_session`, `adapt_on_corpus` |
 | `server.rs` | `axum`-based OpenAI-compatible HTTP API with TTT session management |
@@ -212,7 +221,8 @@ docker compose up
 ```bash
 cd axiom_engine_rs
 cargo fmt          # format
-cargo test         # unit + integration tests (5 server tests, 0 non-server tests)
+cargo test         # unit tests live in `#[cfg(test)] mod tests` across dozens
+                   # of src/ files, plus dedicated integration suites under tests/
 ```
 
 ### Python
@@ -257,7 +267,7 @@ pytest tests/
 └───────────────────────┘         └──────────┬───────────────┘
                                              │
                               ┌──────────────▼──────────────┐
-                              │  TTTLinearLayer (ttt_layer) │
+                              │  NativeTTTBlock (ttt_block) │
                               │  W̃ update per token         │
                               └─────────────────────────────┘
 ```

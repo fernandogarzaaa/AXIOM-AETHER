@@ -3,25 +3,40 @@
 ## Audit Date: 2026-07-09
 ## Environment: Windows 11, CPU-only, PowerShell, VS Code + Cline
 
+> **This is a dated, point-in-time snapshot, not a living status page.**
+> At least one item below (#1, Dockerfile) is now stale — verified
+> resolved on a later pass, see its note. If you're relying on this doc to
+> decide whether something is currently broken, re-verify against the
+> code/CI rather than trusting the item's label alone.
+
 ---
 
 ## Critical Issues (Fix Immediately)
 
-### 1. Dockerfile Corrupted
-**Severity:** Critical
-**Symptom:** `Dockerfile` contains binary/garbled content instead of valid Dockerfile syntax.
-**Impact:** Docker builds fail completely; CI Docker workflow cannot produce images.
-**Fix:** Regenerate the Dockerfile from the `docker-compose.yml` and the repo's known
-structure. The image should be a multi-stage Rust build that produces the `axiom` binary
-and serves it on port 8080.
+### 1. Dockerfile Corrupted (RESOLVED — verified stale on a later pass)
+**Severity:** Critical (at time of original audit)
+**Symptom (then):** `Dockerfile` contained binary/garbled content instead of valid Dockerfile syntax.
+**Current status:** verified by direct inspection — `Dockerfile` is now a valid,
+well-formed multi-stage build (`FROM rust:1.88-bookworm AS builder`, produces
+`axiom_engine`, matches `.github/workflows/docker.yml`'s linux/amd64 +
+linux/arm64 matrix). No further action needed; kept here only as history.
 
-### 2. Autostart Task Path Mismatch (FIXED)
+### 2. Autostart Task Path Mismatch (PARTIALLY FIXED — still not portable)
 **Severity:** High
 **Symptom:** `axiom_autostart_task.xml` pointed to `C:\Users\garza\AXIOM-AETHER` but the
 repo is at `D:\AXIOM-AETHER`.
 **Impact:** Autostart on login silently failed; proxy was never started automatically.
 **Fix Applied:** Updated XML to use `powershell.exe` with
 `D:\AXIOM-AETHER\scripts\start_axiom_proxy.ps1 -Watchdog`.
+**Still open (verified on a later pass):** this "fix" only replaced one
+hardcoded absolute path with a different one — `axiom_autostart_task.xml`
+still hardcodes `D:\AXIOM-AETHER` in its `<Arguments>` and
+`<WorkingDirectory>`. Anyone who clones elsewhere gets a task that silently
+does nothing, same failure mode as before, just at a different path. The
+file is UTF-16-encoded (standard Task Scheduler XML export), which is why
+this wasn't fixed generically in the same pass this note was added — edit
+both paths in the XML to match your actual clone location before importing
+it, there is no environment-variable substitution in Task Scheduler XML.
 
 ### 3. Vibe Memory Disabled in Proxy
 **Severity:** High
@@ -94,12 +109,15 @@ session start.
 
 ## Documentation Improvements (Partially Fixed)
 
-### 9. MCP Tool Count Mismatch (FIXED)
+### 9. MCP Tool Count Mismatch (FIXED — count corrected again on a later pass)
 **Severity:** Low
-**Symptom:** `AGENT-SETUP.md` says "10 tools" but `mcp_stdio.rs` exposes 16.
+**Symptom:** `AGENT-SETUP.md` said "10 tools" but `mcp_stdio.rs` exposed more.
 **Impact:** Users may expect fewer tools than available; setup verification fails.
-**Fix Applied:** Updated `MCP-CLIENTS.md` to list all 16 tools. `AGENT-SETUP.md` should
-also be updated to reflect the full count.
+**Fix Applied:** Updated `MCP-CLIENTS.md` and `AGENT-SETUP.md`. The authoritative
+count is **20** (enforced by a test, `tools_list_exposes_tools_with_schemas` in
+`axiom_engine_rs/src/mcp_stdio.rs`) — the 16 this entry originally cited had
+itself already drifted stale by the time this note was added; both docs now
+match the test-enforced 20.
 
 ### 10. No Cline-Specific Docs (FIXED)
 **Severity:** Low
@@ -195,7 +213,7 @@ directory) or integrate with the existing `.vibe_backups/` pattern.
 
 | Priority | Item | Effort | Impact |
 |---|---|---|---|
-| P0 | Fix Dockerfile | Medium | Docker CI broken |
+| ~~P0~~ | ~~Fix Dockerfile~~ (resolved, see #1) | — | — |
 | P0 | Enable vibe memory in proxy | Trivial | Context persistence |
 | P0 | Register watchdog in Task Scheduler | Trivial | Auto-recovery |
 | P1 | Fix log encoding | Low | Log readability |
