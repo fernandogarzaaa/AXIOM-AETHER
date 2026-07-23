@@ -73,6 +73,11 @@ pub enum Heal {
     /// Learned immunity: a directory this program needed in a past run,
     /// re-created prophylactically *before* the first attempt.
     Immunized(PathBuf),
+    /// Generalized immunity: a directory independently learned as needed by
+    /// multiple *other* programs (never this one before), re-created on the
+    /// theory that the gap is structural to the environment rather than
+    /// specific to any one program — see `heal_memory::structural_dirs`.
+    StructurallyImmunized(PathBuf, usize),
     /// A file the program tried to execute lacked the execute bit; `chmod +x`
     /// was applied (the file's contents are never touched).
     MadeExecutable(PathBuf),
@@ -87,6 +92,13 @@ impl std::fmt::Display for Heal {
             }
             Heal::Immunized(p) => {
                 write!(f, "immunity: pre-created remembered directory {}", p.display())
+            }
+            Heal::StructurallyImmunized(p, n) => {
+                write!(
+                    f,
+                    "structural immunity: pre-created directory {} (corroborated by {n} other program(s), never seen this one before)",
+                    p.display()
+                )
             }
             Heal::MadeExecutable(p) => write!(f, "made executable (chmod +x) {}", p.display()),
         }
@@ -519,7 +531,28 @@ pub fn predict_failure(command: &str, args: &[String], opts: &SupervisorOptions)
     };
     let fp = crate::heal_memory::fingerprint(command, args);
     let mem = crate::heal_memory::HealMemory::load(path);
-    if mem.record(&fp).is_none() {
+    let known = mem.record(&fp).is_some();
+    let (mut missing, mut confidence) = if known {
+        mem.missing_prerequisites(&fp, &anchor)
+    } else {
+        (Vec::new(), 0.0)
+    };
+    // Structural (cross-program-corroborated) prerequisites apply regardless
+    // of whether this exact program has run before — that's the point of
+    // generalizing them (see `heal_memory::structural_dirs`). Combine with
+    // any per-program missing dirs already found above; `missing_structural_
+    // prerequisites` already excludes dirs this program knows about itself,
+    // so the two lists cannot overlap.
+    let (structural_missing, structural_confidence) = mem.missing_structural_prerequisites(&fp, &anchor);
+    if !structural_missing.is_empty() {
+        confidence = if missing.is_empty() {
+            structural_confidence
+        } else {
+            confidence.max(structural_confidence)
+        };
+        missing.extend(structural_missing);
+    }
+    if !known && missing.is_empty() {
         return FailurePrediction {
             likely: false,
             missing_prerequisites: Vec::new(),
@@ -527,7 +560,6 @@ pub fn predict_failure(command: &str, args: &[String], opts: &SupervisorOptions)
             rationale: "no prior experience with this command".into(),
         };
     }
-    let (missing, confidence) = mem.missing_prerequisites(&fp, &anchor);
     if missing.is_empty() {
         FailurePrediction {
             likely: false,
@@ -606,6 +638,16 @@ pub fn run_supervised(
     if let Some(mem) = memory.as_ref() {
         for dir in mem.immunize_anchored(&fp, &anchor) {
             let heal = Heal::Immunized(dir.clone());
+            println!("[axiom-run] {heal}");
+            healed_paths.insert(dir);
+            report.heals.push(heal);
+        }
+        // Generalized immunity: directories other, unrelated programs have
+        // independently needed — applies even on this program's very first
+        // run, since the evidence is that the gap is in the environment
+        // itself, not specific to any one program's interaction with it.
+        for (dir, corroborated_by) in mem.immunize_structural(&fp, &anchor) {
+            let heal = Heal::StructurallyImmunized(dir.clone(), corroborated_by);
             println!("[axiom-run] {heal}");
             healed_paths.insert(dir);
             report.heals.push(heal);
@@ -846,13 +888,19 @@ fn finalize_memory(
         // under it, so immunity is portable to other checkouts/machines; heals
         // outside the anchor stay absolute. Immunized dirs are included (the
         // run proved them) — remember_dirs dedups against what's already stored.
+        // A structural heal that carried this run to success is now earned,
+        // direct experience for this program too -- not just borrowed from
+        // the programs that originally corroborated it. Folding it in here
+        // means a program benefiting from cross-program immunity strengthens
+        // that same corroboration for the next program, and keeps its own
+        // direct heal even if the corroborating records are ever pruned away.
         let dirs: Vec<PathBuf> = report
             .heals
             .iter()
             .filter_map(|h| match h {
-                Heal::CreatedDirectory(p) | Heal::Immunized(p) => {
-                    Some(crate::heal_memory::relativize_dir(p, anchor))
-                }
+                Heal::CreatedDirectory(p)
+                | Heal::Immunized(p)
+                | Heal::StructurallyImmunized(p, _) => Some(crate::heal_memory::relativize_dir(p, anchor)),
                 _ => None,
             })
             .collect();
@@ -862,7 +910,7 @@ fn finalize_memory(
         let immunity_applied = report
             .heals
             .iter()
-            .any(|h| matches!(h, Heal::Immunized(_)));
+            .any(|h| matches!(h, Heal::Immunized(_) | Heal::StructurallyImmunized(_, _)));
         if immunity_applied {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1079,5 +1127,47 @@ mod tests {
         assert_eq!(heal, Heal::CreatedDirectory(anchor.join("build")));
         assert!(anchor.join("build").exists());
         let _ = std::fs::remove_dir_all(&anchor);
+    }
+
+    fn nanos_tag() -> u128 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    }
+
+    #[test]
+    fn predict_failure_generalizes_a_structural_heal_to_an_unseen_program() {
+        let mem_path = std::env::temp_dir().join(format!("axiom_predict_structural_{}.json", nanos_tag()));
+        let anchor = std::env::temp_dir().join(format!("axiom_predict_anchor_{}", nanos_tag()));
+        std::fs::create_dir_all(&anchor).unwrap();
+
+        // Two distinct, unrelated programs independently learn the same
+        // missing directory -- this is the corroboration that promotes it to
+        // a structural (cross-program) heal.
+        let mut mem = crate::heal_memory::HealMemory::load(&mem_path);
+        mem.remember_dirs(
+            &crate::heal_memory::fingerprint("make", &[]),
+            "make",
+            &[PathBuf::from("dist")],
+        );
+        mem.remember_dirs(
+            &crate::heal_memory::fingerprint("npm", &["run".into()]),
+            "npm run",
+            &[PathBuf::from("dist")],
+        );
+        mem.save().unwrap();
+
+        // A third command, never run before, still gets a failure prediction
+        // from the structural heal alone -- not from any history of its own.
+        let opts = SupervisorOptions {
+            heal_memory_path: Some(mem_path.clone()),
+            anchor: Some(anchor.clone()),
+            ..Default::default()
+        };
+        assert!(!anchor.join("dist").exists());
+        let prediction = predict_failure("gradle", &["build".to_string()], &opts);
+        assert!(prediction.likely, "an unseen program must still inherit a structural prediction");
+        assert_eq!(prediction.missing_prerequisites, vec![anchor.join("dist")]);
+
+        let _ = std::fs::remove_dir_all(&anchor);
+        let _ = std::fs::remove_file(&mem_path);
     }
 }

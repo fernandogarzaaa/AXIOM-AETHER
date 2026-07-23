@@ -541,6 +541,72 @@ fn novel_healed_failure_is_written_to_recall_memory() {
 }
 
 #[test]
+fn structural_immunity_generalizes_across_unrelated_commands() {
+    use axiom_engine::heal_memory::{fingerprint, HealMemory};
+    use axiom_engine::self_heal::Heal::{CreatedDirectory, StructurallyImmunized};
+
+    let anchor = unique_tmp("structural_anchor");
+    std::fs::create_dir_all(&anchor).unwrap();
+    let memory = unique_tmp("structural_mem").with_extension("json");
+    let opts = SupervisorOptions {
+        max_restarts: 3,
+        heal_memory_path: Some(memory.clone()),
+        anchor: Some(anchor.clone()),
+        ..SupervisorOptions::default()
+    };
+
+    // Program A: fails on missing `dist`, heals reactively, learns it directly.
+    let a_args = vec!["-c".to_string(), "echo a > dist/a.out".to_string()];
+    let a = supervise_opts(tiny_pipeline(), "sh".into(), a_args, opts.clone());
+    assert!(a.success);
+    assert_eq!(a.heals, vec![CreatedDirectory(anchor.join("dist"))]);
+
+    // Fresh environment again.
+    std::fs::remove_dir_all(anchor.join("dist")).unwrap();
+
+    // Program B: a *different* command, unrelated to A by fingerprint. Only
+    // one program (A) has corroborated `dist` so far -- below the
+    // corroboration threshold -- so B gets no structural immunity yet and
+    // must heal reactively too, exactly like A did.
+    let b_args = vec!["-c".to_string(), "echo b > dist/b.out".to_string()];
+    let b = supervise_opts(tiny_pipeline(), "sh".into(), b_args, opts.clone());
+    assert!(b.success);
+    assert_eq!(
+        b.heals,
+        vec![CreatedDirectory(anchor.join("dist"))],
+        "a single prior program must not yet generalize"
+    );
+
+    std::fs::remove_dir_all(anchor.join("dist")).unwrap();
+
+    // Program C: brand new, never run before, zero history of its own. With
+    // A and B both independently corroborating `dist`, it is now a structural
+    // heal -- C gets it pre-created before its very first attempt.
+    let c_args = vec!["-c".to_string(), "echo c > dist/c.out".to_string()];
+    let fp_c = fingerprint("sh", &c_args);
+    assert!(HealMemory::load(&memory).record(&fp_c).is_none(), "C must be genuinely unseen");
+
+    let c = supervise_opts(tiny_pipeline(), "sh".into(), c_args, opts);
+    assert!(c.success);
+    assert_eq!(c.attempts, 1, "structural immunity must prevent C's first failure entirely");
+    assert_eq!(c.heals, vec![StructurallyImmunized(anchor.join("dist"), 2)]);
+    assert_eq!(
+        std::fs::read_to_string(anchor.join("dist").join("c.out")).unwrap().trim(),
+        "c"
+    );
+
+    // The successful structural heal must become C's own earned experience,
+    // not just a one-off borrowed from A and B.
+    let mem = HealMemory::load(&memory);
+    let record = mem.record(&fp_c).expect("C must now have its own record");
+    assert!(record.dirs.contains(&PathBuf::from("dist")), "C must own the dir heal directly now");
+    assert_eq!(record.immunizations, 1, "the successful structural run must reinforce C's own belief");
+
+    let _ = std::fs::remove_dir_all(&anchor);
+    let _ = std::fs::remove_file(&memory);
+}
+
+#[test]
 fn failure_history_persists_to_vibe_when_requested() {
     let vibe = unique_tmp("vibe").with_extension("bin");
     let report = supervise_with_vibe(
