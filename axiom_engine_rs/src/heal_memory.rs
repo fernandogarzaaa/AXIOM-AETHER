@@ -170,6 +170,16 @@ impl std::fmt::Display for Novelty {
 /// Relative CE deviation below which a failure counts as a known mode.
 const KNOWN_TOLERANCE: f32 = 0.05;
 
+/// Distinct programs that must independently have needed the same directory
+/// before it counts as a *structural* heal — evidence the gap is in the
+/// environment itself (nothing provisions this path) rather than something
+/// specific to one program's interaction with it. Two is deliberately the
+/// smallest threshold that is still corroboration rather than coincidence: a
+/// single program's own heal stays exactly what it always was (scoped to that
+/// program's fingerprint, per `remember_dirs`); this only fires once a second,
+/// unrelated program independently hits the same missing path.
+const STRUCTURAL_COROBORATION_THRESHOLD: usize = 2;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct MemoryFile {
     programs: HashMap<String, ProgramRecord>,
@@ -330,6 +340,29 @@ impl HealMemory {
                     "    requires env vars (set before running): {}\n",
                     r.required_env.join(", ")
                 ));
+            }
+        }
+        // Cross-program generalization only makes sense on the unfiltered,
+        // whole-environment view — a query is asking about one program, and
+        // this section is deliberately not about any one program.
+        if query.map(str::trim).unwrap_or("").is_empty() {
+            let structural = self.structural_dirs();
+            if !structural.is_empty() {
+                out.push_str(&format!(
+                    "\nStructural (environment-wide) heals ({} director{}, corroborated \
+                     across independent programs — applied even to programs Axiom has \
+                     never run before):\n",
+                    structural.len(),
+                    if structural.len() == 1 { "y" } else { "ies" }
+                ));
+                for (dir, progs) in &structural {
+                    out.push_str(&format!(
+                        "\n• {}\n    corroborated by {} program(s): {}\n",
+                        dir.display(),
+                        progs.len(),
+                        progs.join(", ")
+                    ));
+                }
             }
         }
         out
@@ -501,6 +534,105 @@ impl HealMemory {
             .filter(|d| !d.exists())
             .collect();
         (missing, record.confidence_now(now_secs()))
+    }
+
+    /// Directories independently learned as needed by at least
+    /// [`STRUCTURAL_COROBORATION_THRESHOLD`] distinct programs, with the
+    /// corroborating command lines. Derived entirely from the existing
+    /// per-program records (no separate persisted state to keep in sync) —
+    /// grouping is by exact stored path, matching the equality `remember_dirs`
+    /// itself already uses to dedupe a single program's own repeated heals.
+    pub fn structural_dirs(&self) -> Vec<(PathBuf, Vec<&str>)> {
+        let mut by_dir: HashMap<&Path, Vec<&str>> = HashMap::new();
+        for record in self.data.programs.values() {
+            for d in &record.dirs {
+                by_dir.entry(d.as_path()).or_default().push(record.command.as_str());
+            }
+        }
+        let mut out: Vec<(PathBuf, Vec<&str>)> = by_dir
+            .into_iter()
+            .filter(|(_, progs)| progs.len() >= STRUCTURAL_COROBORATION_THRESHOLD)
+            .map(|(d, mut progs)| {
+                progs.sort_unstable();
+                progs.dedup();
+                (d.to_path_buf(), progs)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Structural directories currently missing for `fp` (re-anchored), and the
+    /// mean matured confidence of their corroborating programs — the same
+    /// anticipatory shape as [`Self::missing_prerequisites`], but generalized
+    /// across programs instead of scoped to one. `fp`'s own already-remembered
+    /// dirs are excluded so a program doesn't get double-counted against its
+    /// own heal.
+    pub fn missing_structural_prerequisites(&self, fp: &str, anchor: &Path) -> (Vec<PathBuf>, f32) {
+        let own_dirs: HashSet<&Path> = self
+            .data
+            .programs
+            .get(fp)
+            .map(|r| r.dirs.iter().map(|d| d.as_path()).collect())
+            .unwrap_or_default();
+        let now = now_secs();
+        let mut missing = Vec::new();
+        let mut confidences = Vec::new();
+        for (dir, corroborators) in self.structural_dirs() {
+            if own_dirs.contains(dir.as_path()) {
+                continue;
+            }
+            let resolved = resolve_dir(&dir, anchor);
+            if resolved.exists() {
+                continue;
+            }
+            // The structural claim is only as credible as the programs
+            // corroborating it — averaged rather than taking this program's
+            // own (nonexistent) confidence.
+            let mean_conf: f32 = self
+                .data
+                .programs
+                .values()
+                .filter(|r| corroborators.contains(&r.command.as_str()))
+                .map(|r| r.confidence_now(now))
+                .sum::<f32>()
+                / corroborators.len().max(1) as f32;
+            confidences.push(mean_conf);
+            missing.push(resolved);
+        }
+        let confidence = if confidences.is_empty() {
+            0.0
+        } else {
+            confidences.iter().sum::<f32>() / confidences.len() as f32
+        };
+        (missing, confidence)
+    }
+
+    /// Pre-create structurally corroborated directories that are currently
+    /// missing for `fp` — the generalized counterpart to
+    /// [`Self::immunize_anchored`]: it applies even when `fp` has never been
+    /// seen before, because the evidence is that the environment itself is
+    /// missing the path, not that this specific program needs it. Returns the
+    /// resolved paths actually created, with how many distinct programs
+    /// corroborate each one.
+    pub fn immunize_structural(&self, fp: &str, anchor: &Path) -> Vec<(PathBuf, usize)> {
+        let own_dirs: HashSet<&Path> = self
+            .data
+            .programs
+            .get(fp)
+            .map(|r| r.dirs.iter().map(|d| d.as_path()).collect())
+            .unwrap_or_default();
+        let mut applied = Vec::new();
+        for (dir, corroborators) in self.structural_dirs() {
+            if own_dirs.contains(dir.as_path()) {
+                continue;
+            }
+            let resolved = resolve_dir(&dir, anchor);
+            if !resolved.exists() && std::fs::create_dir_all(&resolved).is_ok() {
+                applied.push((resolved, corroborators.len()));
+            }
+        }
+        applied
     }
 
     /// Fold one failure's tension into the program's CE history and classify it
@@ -998,5 +1130,91 @@ mod tests {
         let mem = HealMemory::load(&path);
         assert!(mem.record("anything").is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn structural_dirs_require_corroboration_from_distinct_programs() {
+        let mut mem = HealMemory::load(tmp("structural_basic"));
+        let fp_a = fingerprint("make", &[]);
+        let fp_b = fingerprint("npm", &["run".into(), "build".into()]);
+
+        // A single program's own heal is not structural, no matter how many
+        // times it's reinforced.
+        mem.remember_dirs(&fp_a, "make", &[PathBuf::from("dist")]);
+        assert!(mem.structural_dirs().is_empty(), "one program alone must not generalize");
+
+        // A second, unrelated program independently needing the same path is
+        // corroboration: this is now a structural heal.
+        mem.remember_dirs(&fp_b, "npm run build", &[PathBuf::from("dist")]);
+        let structural = mem.structural_dirs();
+        assert_eq!(structural.len(), 1);
+        assert_eq!(structural[0].0, PathBuf::from("dist"));
+        assert_eq!(structural[0].1, vec!["make", "npm run build"]);
+    }
+
+    #[test]
+    fn immunize_structural_applies_to_a_program_never_seen_before() {
+        let dir = std::env::temp_dir().join(tmp("structural_dir").file_stem().unwrap().to_os_string());
+        let mut mem = HealMemory::load(tmp("structural_apply"));
+        mem.remember_dirs(&fingerprint("make", &[]), "make", &[dir.clone()]);
+        mem.remember_dirs(&fingerprint("npm", &["run".into()]), "npm run", &[dir.clone()]);
+
+        // A third program, with zero history of its own, still gets the
+        // structurally-corroborated directory pre-created.
+        let unknown_fp = fingerprint("gradle", &["build".into()]);
+        assert!(mem.record(&unknown_fp).is_none(), "must genuinely be unknown to this program");
+        assert!(!dir.exists());
+        let applied = mem.immunize_structural(&unknown_fp, &std::env::current_dir().unwrap());
+        assert_eq!(applied, vec![(dir.clone(), 2)]);
+        assert!(dir.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn immunize_structural_does_not_duplicate_a_programs_own_known_dir() {
+        let mut mem = HealMemory::load(tmp("structural_no_dup"));
+        let shared = PathBuf::from("shared_dir_xyz");
+        mem.remember_dirs(&fingerprint("a", &[]), "a", &[shared.clone()]);
+        mem.remember_dirs(&fingerprint("b", &[]), "b", &[shared.clone()]);
+
+        // `a` already knows about `shared_dir_xyz` itself -- immunize_structural
+        // must not re-report it as a *structural* heal for `a` (that would
+        // double-count the same directory as two different kinds of evidence).
+        let applied = mem.immunize_structural(&fingerprint("a", &[]), &std::env::temp_dir());
+        assert!(applied.is_empty(), "a program's own dir must not double up as structural: {applied:?}");
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(&shared));
+    }
+
+    #[test]
+    fn missing_structural_prerequisites_predicts_for_an_unknown_program() {
+        let anchor = std::env::temp_dir().join(tmp("structural_predict_anchor").file_stem().unwrap().to_os_string());
+        std::fs::create_dir_all(&anchor).unwrap();
+        let mut mem = HealMemory::load(tmp("structural_predict"));
+        mem.remember_dirs(&fingerprint("a", &[]), "a", &[PathBuf::from("needed")]);
+        mem.remember_dirs(&fingerprint("b", &[]), "b", &[PathBuf::from("needed")]);
+
+        let unknown_fp = fingerprint("c", &[]);
+        let (missing, confidence) = mem.missing_structural_prerequisites(&unknown_fp, &anchor);
+        assert_eq!(missing, vec![anchor.join("needed")]);
+        assert!(confidence >= 0.0, "confidence must be a valid, non-negative estimate");
+
+        let _ = std::fs::remove_dir_all(&anchor);
+    }
+
+    #[test]
+    fn report_text_shows_structural_heals_only_on_the_unfiltered_view() {
+        let mut mem = HealMemory::load(tmp("structural_report"));
+        mem.remember_dirs(&fingerprint("make", &[]), "make", &[PathBuf::from("dist")]);
+        mem.remember_dirs(&fingerprint("npm", &["run".into()]), "npm run", &[PathBuf::from("dist")]);
+
+        let all = mem.report_text(None);
+        assert!(all.contains("Structural (environment-wide) heals"));
+        assert!(all.contains("corroborated by 2 program(s): make, npm run"));
+
+        // A query for one specific program must not surface the cross-cutting
+        // section -- it isn't about that one program.
+        let filtered = mem.report_text(Some("make"));
+        assert!(!filtered.contains("Structural (environment-wide) heals"));
     }
 }
