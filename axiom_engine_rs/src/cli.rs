@@ -129,6 +129,10 @@ pub enum AxiomCommand {
         #[command(subcommand)]
         command: ChimeraCommand,
     },
+    /// Interactive terminal menu for configuring and controlling Axiom (device,
+    /// context/compression settings, local-model routing, daemon control).
+    /// This is also what a bare `axiom` launches in an interactive terminal.
+    Tui,
 }
 
 #[derive(Debug, Subcommand)]
@@ -227,6 +231,9 @@ pub fn parse_entry() -> Result<ParsedCli, clap::Error> {
         return Ok(ParsedCli::Legacy);
     }
     if argv.len() == 1 {
+        if is_interactive_terminal() {
+            return Ok(ParsedCli::Command(AxiomCommand::Tui));
+        }
         AxiomCli::command().print_long_help()?;
         println!();
         return Ok(ParsedCli::HelpPrinted);
@@ -276,6 +283,15 @@ fn should_use_legacy_parser(argv: &[String]) -> bool {
             | "--port"
             | "--device"
     )
+}
+
+/// Whether both stdin and stdout are a real terminal — the condition under
+/// which a bare `axiom` invocation should launch the interactive menu instead
+/// of dumping help text (piped/redirected invocations, e.g. in scripts or CI,
+/// keep today's help-text behavior unchanged).
+fn is_interactive_terminal() -> bool {
+    use crossterm::tty::IsTty;
+    std::io::stdout().is_tty() && std::io::stdin().is_tty()
 }
 
 pub fn normalize_peer(input: &str) -> String {

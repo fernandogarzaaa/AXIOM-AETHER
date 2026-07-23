@@ -113,6 +113,8 @@ pub struct UserConfig {
     pub surprisal: SurprisalConfig,
     pub swarm: SwarmConfig,
     pub models: ModelFetchConfig,
+    #[serde(default)]
+    pub features: FeatureConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -156,6 +158,41 @@ pub struct ModelFetchConfig {
     pub auto_fetch: bool,
 }
 
+/// Opt-in server features that were previously configurable only via
+/// environment variables read at server-process startup (`CompressorConfig`/
+/// `SwarmRouterConfig`'s own `from_env`). Persisting them here lets `axiom
+/// daemon start` carry a user's choices across restarts instead of requiring
+/// them to be re-exported into the shell every time; `daemon::start` turns
+/// these into the same env vars a manually-launched server already reads, so
+/// behavior for either launch path stays identical.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FeatureConfig {
+    pub ttt_compress: bool,
+    pub ttt_compress_threshold_tokens: usize,
+    pub swarm_local: bool,
+    pub mesh_routing: bool,
+    pub ollama_url: String,
+    pub ollama_models: Vec<String>,
+}
+
+impl Default for FeatureConfig {
+    fn default() -> Self {
+        Self {
+            ttt_compress: false,
+            ttt_compress_threshold_tokens: 512,
+            swarm_local: false,
+            mesh_routing: false,
+            ollama_url: "http://127.0.0.1:11434".into(),
+            ollama_models: vec![
+                "phi4:3.8b".into(),
+                "deepseek-r1:8b".into(),
+                "llama3.3:8b".into(),
+                "llama3.1:8b".into(),
+            ],
+        }
+    }
+}
+
 impl Default for UserConfig {
     fn default() -> Self {
         Self {
@@ -188,6 +225,7 @@ impl Default for UserConfig {
                 base_model_url: DEFAULT_MODEL_URL.into(),
                 auto_fetch: true,
             },
+            features: FeatureConfig::default(),
         }
     }
 }
@@ -293,5 +331,15 @@ mod tests {
         let parsed: UserConfig = toml::from_str(&raw).unwrap();
         assert_eq!(parsed, cfg);
         assert_eq!(parsed.runtime.vram_budget_mb, 5200);
+    }
+
+    #[test]
+    fn a_config_toml_written_before_features_existed_still_loads() {
+        let cfg = UserConfig::default();
+        let mut raw = toml::to_string(&cfg).unwrap();
+        let features_start = raw.find("[features]").expect("features section present");
+        raw.truncate(features_start);
+        let parsed: UserConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.features, FeatureConfig::default());
     }
 }

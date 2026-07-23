@@ -82,6 +82,7 @@ pub mod trajectory_sampler;
 pub mod ttt_block;
 pub mod ttt_mlp;
 pub mod ttt_mlp_model;
+pub mod tui;
 pub mod vfs;
 pub mod vibe_memory;
 pub mod weight_merge;
