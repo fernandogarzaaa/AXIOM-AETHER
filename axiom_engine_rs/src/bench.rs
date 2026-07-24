@@ -91,6 +91,39 @@ fn symbol_from_signature(line: &str) -> Option<String> {
     None
 }
 
+/// Extract the candidate symbols from a digest, skipping comment content.
+///
+/// `symbol_from_signature` is line-local and drops lines with a leading comment
+/// marker, but a `/* … */` block comment can carry bare interior lines (prose
+/// with no `*` prefix) that would otherwise be mis-parsed as a signature — e.g.
+/// a line reading `trait to Axiom` inside a header block. Tracking block-comment
+/// state across lines here closes that gap so the fidelity denominator counts
+/// only real signatures.
+fn symbols_in_digest(digest: &str) -> Vec<String> {
+    let mut symbols = Vec::new();
+    let mut in_block_comment = false;
+    for line in digest.lines() {
+        let trimmed = line.trim_start();
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        // A block comment that opens and does not close on the same line starts
+        // a skipped region (single-line `/* … */` is handled by the comment
+        // prefix guard in `symbol_from_signature`).
+        if trimmed.starts_with("/*") && !trimmed.contains("*/") {
+            in_block_comment = true;
+            continue;
+        }
+        if let Some(symbol) = symbol_from_signature(line) {
+            symbols.push(symbol);
+        }
+    }
+    symbols
+}
+
 /// Aggregate bench result over a crawled tree.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BenchReport {
@@ -144,12 +177,10 @@ pub fn run_bench(target: &Path, pipeline: &InferencePipeline) -> Result<BenchRep
         report.skeleton_tokens += skeleton_tokens;
 
         // Round-trip every signature retained in the digest.
-        for line in digest.lines() {
-            if let Some(symbol) = symbol_from_signature(line) {
-                report.symbols_total += 1;
-                if expand_symbol(&source, &symbol).is_some() {
-                    report.symbols_recovered += 1;
-                }
+        for symbol in symbols_in_digest(&digest) {
+            report.symbols_total += 1;
+            if expand_symbol(&source, &symbol).is_some() {
+                report.symbols_recovered += 1;
             }
         }
     }
@@ -206,6 +237,21 @@ mod tests {
             None
         );
         assert_eq!(symbol_from_signature("/// doc for a class Widget"), None);
+    }
+
+    #[test]
+    fn digest_scan_skips_block_comment_interiors() {
+        // A bare interior line of a /* … */ block (no `*` prefix) must not be
+        // mis-parsed as a signature, while real signatures around it still are.
+        let digest = "\
+/*
+ header prose mentioning a trait to Axiom and a class of things
+ more prose describing function bodies
+*/
+pub fn real_fn(x: i32) -> i32 { … }
+struct RealStruct { … }";
+        let symbols = symbols_in_digest(digest);
+        assert_eq!(symbols, vec!["real_fn".to_string(), "RealStruct".to_string()]);
     }
 
     #[test]

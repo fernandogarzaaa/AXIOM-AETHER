@@ -235,9 +235,13 @@ pub async fn run_server(
     };
     // Optional data-plane auth: when AXIOM_API_KEY is set, every route except
     // ops (/healthz,/readyz,/metrics) and /mcp requires `X-Axiom-Key: <key>`.
+    // Trim before storing: a key sourced from a secret file often carries a
+    // trailing newline, and `require_api_key` compares against the trimmed
+    // presented header — so an untrimmed stored key would 401 every request.
     let api_key = std::env::var("AXIOM_API_KEY")
         .ok()
-        .filter(|k| !k.trim().is_empty());
+        .map(|k| k.trim().to_owned())
+        .filter(|k| !k.is_empty());
     if api_key.is_some() {
         println!("[+] Data plane requires X-Axiom-Key header (AXIOM_API_KEY set)");
     } else if host != "127.0.0.1" && host != "localhost" {

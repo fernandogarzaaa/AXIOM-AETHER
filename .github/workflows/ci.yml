@@ -19,6 +19,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege by default: these jobs only read the repo. Individual jobs
+# widen this if they need more (see docker-build).
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Build & test (Rust)
@@ -26,6 +31,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -37,7 +44,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             axiom_engine_rs/target
-          key: ci-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+            axiom_mesh_rs/target
+          key: ci-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock', 'axiom_mesh_rs/Cargo.lock') }}
           restore-keys: ci-${{ runner.os }}-
 
       - name: Install Linux build dependencies
@@ -80,9 +88,15 @@ jobs:
   docker-build:
     name: Docker image build (no push)
     runs-on: ubuntu-22.04
+    # Read the repo; read the Actions cache (buildx gha cache). No write scope.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -105,6 +119,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
