@@ -59,6 +59,13 @@ jobs:
         working-directory: axiom_engine_rs
         run: cargo test --release --locked
 
+      # The Axiom Mesh workspace is a sibling crate graph (axiom_core is a path
+      # dependency of the engine; axiom_prime and axiom_mcp are not, so nothing
+      # here built or tested them before). Cover its own build + test suite.
+      - name: Test (Axiom Mesh workspace)
+        working-directory: axiom_mesh_rs
+        run: cargo test --release --locked
+
       - name: AxiomBench (deterministic pillars)
         working-directory: axiom_engine_rs
         run: cargo run --release --features tools --bin axiombench
