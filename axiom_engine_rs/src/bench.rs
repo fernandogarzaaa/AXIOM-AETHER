@@ -54,6 +54,16 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// e.g. `pub fn run(` → `run`, `class Beta {` → `Beta`.
 fn symbol_from_signature(line: &str) -> Option<String> {
     let t = line.trim_start();
+    // Doc/comment lines are kept verbatim in the digest — they are not
+    // expandable code signatures. Skip them so a decl keyword appearing as an
+    // ordinary English word in prose (e.g. "…trait to Axiom", "elides function
+    // bodies…") isn't mis-parsed into a bogus symbol ("to", "bodies") that then
+    // fails to round-trip and understates fidelity. This is a benchmark-harness
+    // fix only; the compressor itself always kept these lines correctly.
+    const COMMENT_PREFIXES: &[&str] = &["//", "/*", "*", "#", "--", "<!--"];
+    if COMMENT_PREFIXES.iter().any(|p| t.starts_with(p)) {
+        return None;
+    }
     for kw in DECL_KEYWORDS {
         if let Some(rest) = t.split_once(kw).map(|(_, r)| r) {
             // Only treat it as this keyword if `kw` starts at a word boundary
@@ -184,6 +194,18 @@ mod tests {
         // `transform` contains the substring "fn " mid-word — must NOT match it.
         assert_eq!(symbol_from_signature("let transform = 1;"), None);
         assert_eq!(symbol_from_signature("// just a comment"), None);
+        // Doc-comment prose that happens to contain a decl keyword as an
+        // ordinary word must NOT be mis-parsed into a symbol (these two lines
+        // were the only "failures" in the src/ round-trip benchmark).
+        assert_eq!(
+            symbol_from_signature("//! Bridges the router's trait to Axiom's real backend"),
+            None
+        );
+        assert_eq!(
+            symbol_from_signature("//! Axiom's compression elides function bodies into a digest"),
+            None
+        );
+        assert_eq!(symbol_from_signature("/// doc for a class Widget"), None);
     }
 
     #[test]

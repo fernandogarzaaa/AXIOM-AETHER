@@ -233,7 +233,24 @@ pub async fn run_server(
     } else {
         None
     };
-    let state = state.with_mcp(mcp).with_mcp_token(mcp_token);
+    // Optional data-plane auth: when AXIOM_API_KEY is set, every route except
+    // ops (/healthz,/readyz,/metrics) and /mcp requires `X-Axiom-Key: <key>`.
+    let api_key = std::env::var("AXIOM_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    if api_key.is_some() {
+        println!("[+] Data plane requires X-Axiom-Key header (AXIOM_API_KEY set)");
+    } else if host != "127.0.0.1" && host != "localhost" {
+        eprintln!(
+            "[axiom] WARNING: data-plane endpoints are UNAUTHENTICATED and bound to {host}. \
+             Anyone who can reach this host can drive Axiom. Set AXIOM_API_KEY before \
+             exposing it beyond a trusted local network."
+        );
+    }
+    let state = state
+        .with_mcp(mcp)
+        .with_mcp_token(mcp_token)
+        .with_api_key(api_key);
     if state.compression_active() {
         match state.hydrate_compression_cache().await {
             Ok(0) => println!(
