@@ -329,6 +329,26 @@ This list is generated from the actual `.route(...)` registrations across
 here too; it had drifted out of sync with the code before (missing 9 real
 routes, several backing "on by default" features like `/v1/responses`).
 
+### Authentication
+
+Axiom is local-first: with no auth configured the server is open, which is the
+right default for a `127.0.0.1` bind. **Before exposing it beyond a trusted
+local network** (Docker `-p`, Helm Service, a tunnel), set `AXIOM_API_KEY` —
+every route except `/healthz`, `/readyz`, `/metrics`, and `/mcp` then requires
+`X-Axiom-Key: <key>`. Guard the remote `/mcp` transport separately with
+`AXIOM_MCP_TOKEN` (`Authorization: Bearer <token>`). When the server binds off
+loopback without `AXIOM_API_KEY`, it logs a warning at startup.
+
+`X-Axiom-Key` and `Authorization: Bearer` are **bearer secrets** — the server
+only checks their value. Any deployment that carries them over the network must
+terminate **HTTPS/TLS** (a reverse proxy) or run inside an encrypted tunnel;
+over plaintext `http://` they can be captured and replayed. Keep the local
+loopback bind on `http://` — the key is optional there.
+
+```bash
+curl -H "X-Axiom-Key: $AXIOM_API_KEY" https://host/v1/immunity
+```
+
 Example adaptation call:
 
 ```bash
@@ -467,6 +487,8 @@ Useful environment variables:
 | Variable | Effect |
 |---|---|
 | `AXIOM_DEVICE` | `cpu`, `cuda`, `metal`, or `auto`. |
+| `AXIOM_API_KEY` | Optional data-plane auth. When set, every route except `/healthz`, `/readyz`, `/metrics`, and `/mcp` requires the header `X-Axiom-Key: <key>`. A dedicated header is used so it never collides with the client `Authorization`/`x-api-key` the `/v1/messages` proxy relays upstream. Unset ⇒ open (local-first default). Set this before binding off `127.0.0.1`, and serve it over HTTPS/TLS — it is a bearer secret. |
+| `AXIOM_MCP_TOKEN` | Optional bearer token guarding `/mcp` (`Authorization: Bearer <token>`). Independent of `AXIOM_API_KEY`. |
 | `AXIOM_PRODUCTION_BPE` | Enable the trained BPE checkpoint path. |
 | `AXIOM_TOKENIZER` | Path to `axiom_bpe.json`. |
 | `AXIOM_BPE_CKPT` | Path to `axiom_production_bpe.bin`. |

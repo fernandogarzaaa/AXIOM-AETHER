@@ -31,12 +31,50 @@ async fn readyz(State(state): State<AppState>) -> Response {
 // Router construction
 // ---------------------------------------------------------------------------
 
+/// Data-plane auth guard. When `AXIOM_API_KEY` is set (`state.api_key` is
+/// `Some`), every guarded route must present the header `X-Axiom-Key: <key>`.
+/// A dedicated header — not `Authorization`/`x-api-key` — is used so this never
+/// collides with the client credentials the `/v1/messages` proxy relays
+/// upstream. When the key is unset this middleware is a no-op passthrough, which
+/// preserves the open, local-first default. The key is a pre-shared secret
+/// carried over the transport, so a plain equality check is acceptable.
+async fn require_api_key(State(state): State<AppState>, req: axum::extract::Request, next: Next) -> Response {
+    if let Some(expected) = state.api_key.as_ref().as_ref() {
+        let presented = req
+            .headers()
+            .get("x-axiom-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        if presented != Some(expected.as_str()) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "missing or invalid X-Axiom-Key header (this server has AXIOM_API_KEY set)"
+                })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
 /// Build the axum Router with all API routes attached.
+///
+/// Routes split into two groups:
+/// * **public** — `/healthz`, `/readyz`, `/metrics` (ops/observability, must stay
+///   reachable for probes and scrapers) and `/mcp` (guarded separately by its own
+///   `AXIOM_MCP_TOKEN`).
+/// * **guarded** — the data plane, wrapped in [`require_api_key`]. With
+///   `AXIOM_API_KEY` unset the guard is a passthrough, so behavior is unchanged
+///   by default.
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
+    let public = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(export_metrics))
+        .route("/mcp", get(mcp_http_sse).post(post_mcp));
+
+    let guarded = Router::new()
         .route("/v1/fleet/status", get(fleet_status))
         .route("/v1/models", get(list_models))
         .route("/v1/completions", post(create_completion))
@@ -86,10 +124,19 @@ pub fn create_router(state: AppState) -> Router {
             post(post_patches_merge).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route("/v1/chimera/run", post(post_chimera_run))
-        .route("/mcp", get(mcp_http_sse).post(post_mcp))
         .route("/v1/budget", post(post_budget))
         .route("/v1/awareness/:id", get(get_awareness))
         .route("/v1/config", get(get_config).post(post_config))
+        // Gate the whole data plane behind AXIOM_API_KEY (no-op when unset).
+        // `route_layer` scopes the guard to routes defined on `guarded`, so it
+        // never fires for the public router's ops/mcp endpoints or for 404s.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ));
+
+    public
+        .merge(guarded)
         .layer(CorsLayer::permissive())
         // Codex CLI compresses HTTP request bodies (gzip/zstd); decompress
         // before the Json extractors so /v1/responses accepts them.

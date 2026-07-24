@@ -710,6 +710,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_plane_open_by_default_when_no_api_key() {
+        // Default (no AXIOM_API_KEY): a guarded route is reachable with no
+        // X-Axiom-Key header — the local-first behavior is unchanged.
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn data_plane_requires_api_key_when_configured() {
+        let state = make_test_state().await.with_api_key(Some("k3y".into()));
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+
+        // Missing header → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong key → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/config")
+                    .header("x-axiom-key", "wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct key passes the gate (any non-401 status proves auth succeeded).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/config")
+                    .header("x-axiom-key", "k3y")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn ops_endpoints_exempt_from_api_key() {
+        // /healthz and /metrics must stay reachable for probes/scrapers even
+        // when the data plane is locked down.
+        let state = make_test_state().await.with_api_key(Some("k3y".into()));
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        for uri in ["/healthz", "/metrics"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri} should be exempt");
+        }
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
     async fn test_patches_export_and_merge_roundtrip() {
         let dir = std::env::temp_dir().join(format!("axiom_srv_patches_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

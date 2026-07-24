@@ -19,13 +19,20 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege by default: these jobs only read the repo. Individual jobs
+# widen this if they need more (see docker-build).
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Build & test (Rust)
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -37,7 +44,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             axiom_engine_rs/target
-          key: ci-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+            axiom_mesh_rs/target
+          key: ci-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock', 'axiom_mesh_rs/Cargo.lock') }}
           restore-keys: ci-${{ runner.os }}-
 
       - name: Install Linux build dependencies
@@ -59,9 +67,74 @@ jobs:
         working-directory: axiom_engine_rs
         run: cargo test --release --locked
 
+      # The Axiom Mesh workspace is a sibling crate graph (axiom_core is a path
+      # dependency of the engine; axiom_prime and axiom_mcp are not, so nothing
+      # here built or tested them before). Cover its own build + test suite.
+      - name: Test (Axiom Mesh workspace)
+        working-directory: axiom_mesh_rs
+        run: cargo test --release --locked
+
       - name: AxiomBench (deterministic pillars)
         working-directory: axiom_engine_rs
         run: cargo run --release --features tools --bin axiombench
 
       - name: End-to-end smoke (every pillar composes)
         run: ./scripts/demo_end_to_end.sh
+
+  # Validate the Docker image build on PRs. docker.yml only builds on pushes to
+  # main / tags, so a broken Dockerfile (e.g. a missing build-context path) used
+  # to escape review and only surface post-merge. This builds the image (no
+  # push) so the release surface is gated before merge.
+  docker-build:
+    name: Docker image build (no push)
+    runs-on: ubuntu-22.04
+    # Read the repo; read the Actions cache (buildx gha cache). No write scope.
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (amd64, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=ci-docker
+          cache-to: type=gha,mode=max,scope=ci-docker
+
+  # The Python reference implementation in axiom_engine/ (published as the
+  # `axiom-engine` PyPI package) ships its own PyTorch test suite that no job
+  # used to run, so it could rot silently. Exercise it on CPU-only torch.
+  python-reference:
+    name: Python reference engine (tests)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install (CPU torch + package + dev deps)
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch keeps the job light and avoids the CUDA build; it
+          # satisfies the `torch>=2.1` requirement so `-e .` won't re-pull it.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy
+          pip install -e ".[server,dev]"
+
+      - name: Pytest
+        run: python -m pytest tests/ -q

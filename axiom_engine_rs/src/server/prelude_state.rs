@@ -32,6 +32,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use axum::middleware::{self, Next};
 use candle_core::{DType, Device, Tensor};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -254,6 +255,14 @@ pub struct AppState {
     /// `Authorization: Bearer <token>`; when `None`, `/mcp` is unauthenticated
     /// (intended only for trusted/local networks).
     pub mcp_token: Arc<Option<String>>,
+    /// Optional pre-shared key guarding the data-plane routes (`AXIOM_API_KEY`).
+    /// When `Some`, every route except the ops endpoints (`/healthz`, `/readyz`,
+    /// `/metrics`) and `/mcp` (which has its own `AXIOM_MCP_TOKEN`) requires the
+    /// header `X-Axiom-Key: <key>`. A dedicated header is used — not
+    /// `Authorization`/`x-api-key` — so it never collides with the client
+    /// credentials the `/v1/messages` proxy relays upstream. When `None`, the
+    /// data plane is open (the local-first default).
+    pub api_key: Arc<Option<String>>,
     /// Active-compression session store: per-tenant adapted fast-weight
     /// tensors held in a lock-free DashMap. Distinct from `sessions`
     /// above (which serves the legacy `/v1/sessions` API); this store
@@ -383,6 +392,7 @@ impl AppState {
             router: Arc::new(None),
             mcp: Arc::new(None),
             mcp_token: Arc::new(None),
+            api_key: Arc::new(None),
             ttt_sessions: Arc::new(TttSessionStore::new()),
             anthropic_forwarder: Arc::new(None),
             openai_forwarder: Arc::new(None),
@@ -971,6 +981,13 @@ impl AppState {
     /// Set the optional bearer token guarding the `/mcp` route.
     pub fn with_mcp_token(mut self, token: Option<String>) -> Self {
         self.mcp_token = Arc::new(token);
+        self
+    }
+
+    /// Set the optional pre-shared key guarding the data-plane routes
+    /// (`X-Axiom-Key` header). `None` leaves the data plane open.
+    pub fn with_api_key(mut self, key: Option<String>) -> Self {
+        self.api_key = Arc::new(key);
         self
     }
 
