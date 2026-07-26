@@ -366,18 +366,92 @@ synthesis loop, because its output is durable and shared.
 Reused unchanged: `provenance.rs`, `belief.rs`, `patch_memory.rs`,
 `heal_memory.rs`, `memory_store.rs`, `hardware.rs::recommend`, `ttt_block.rs`.
 
-## Open questions
+## Resolved questions
 
-1. **Is Forge's output a Rust crate, a WASM module, or a subprocess contract?**
-   WASM makes isolation nearly free and composition easy, at the cost of syscall
-   reach. This choice constrains A1's design and should be settled first.
-2. **Should the graph be embedded (sled/redb) or stay append-only JSONL?** JSONL
-   preserves the current durability and auditability story; an embedded store
-   makes traversal far cheaper. Measure B2 on JSONL before deciding.
-3. **Who writes the property tests in C3?** A frontier model via
-   `claude_backend.rs`, or a local generator? The frontier path is more capable
-   and reintroduces the API dependency this repo works hard to minimize.
-4. **Does a synthesized tool gossip across the fleet?** The `dwe.rs` + signed
-   export path exists. Sharing *executable artifacts* has a materially different
-   risk profile than sharing weight fragments, and probably wants a separate,
-   more conservative trust threshold.
+Recorded 2026-07-26. These are recommendations with stated reasoning, not
+measurements. Q2 is binding on Tranche 1; the rest bind Phase C and should be
+re-examined when it is briefed.
+
+### Q1. Forge's output format → **WASM (`wasm32-wasip1`) by default, subprocess as escape hatch**
+
+The decisive argument is not composition, it is that **it collapses most of
+Phase A1**. A WASM runtime *is* the isolation boundary: capability-based WASI is
+deny-by-default for filesystem and network, so the common case needs no
+namespaces, no seccomp policy, and no cgroup delegation.
+
+That matters disproportionately here because the cgroups/seccomp/Landlock design
+is **Linux-only**, while `.clinerules` records the primary dev machine as Windows
+and CI runs `ubuntu-22.04`. A Linux-only jail means the sandbox behaves
+differently on the machine it is developed on than on the machine it is tested
+on — a bad property for a security boundary. WASM is uniform across both.
+
+Cost, stated honestly: syscall reach is limited, so a tool needing real process
+spawning or native libraries cannot be a WASM module. Those keep the subprocess
+path and get the heavyweight OS jail — which is the right allocation of effort,
+since they are the minority and the genuinely dangerous case.
+
+Open sub-question: this implies a `wasmtime` dependency, which is a large addition
+to a crate that currently has none of that weight. Evaluate binary-size and
+build-time impact before committing.
+
+### Q2. Graph storage → **stay append-only JSONL** *(binding on Tranche 1)*
+
+Keeps the existing durability and auditability model, requires no new dependency,
+and needs no migration. Task B5 measures traversal cost; revisit an embedded
+store (redb/sled) only if B5 shows a real p95 regression. Do not pre-optimize
+this.
+
+### Q3. Property-test authorship → **local generator first; frontier model opt-in**
+
+Beyond the local-first preference, there is a correctness argument that is
+easy to miss: **if the same frontier model writes both the tool and its test, the
+failures are correlated.** A misunderstanding of the spec shows up identically in
+both, and the test passes vacuously while certifying nothing. That is precisely
+the false-green case the acquisition benchmark is meant to catch, and it would be
+built into the loop by construction.
+
+So: type-directed local generation (proptest-style, derived from the tool's
+signature) as the default, with a frontier-authored path behind an explicit flag
+for cases local generation cannot reach. Where the frontier path is used, prefer
+a *different* model than the one that synthesized the tool.
+
+### Q4. Fleet sharing → **gossip the recipe, never the artifact**
+
+Do not ship executable artifacts across the fleet. Ship the **provenance record
+plus the property test**, and let each peer re-synthesize and re-verify locally.
+
+This is a strictly stronger form of the invariant `patch_memory.rs:9` already
+enforces. A patch is re-verified before it is applied; a *tool* has a wider blast
+radius than a patch to a known file, so it should be re-*derived*, not merely
+re-checked. Sharing the recipe rather than the dish means a compromised peer can
+at worst waste a neighbor's CPU, never hand it a binary it did not build.
+
+Weight fragments (`dwe.rs`) are data and can keep their existing gossip path
+unchanged. This restriction is about executable artifacts only.
+
+## Known repo inconsistency — license declaration
+
+Surfaced during the Tranche 1 audit; **needs an owner decision, not an agent fix.**
+
+The root `LICENSE` file is **Apache-2.0**. Every packaging declaration says
+**MIT**:
+
+| Declaration | Value |
+|---|---|
+| `LICENSE` (root) | Apache-2.0 |
+| `axiom_engine_rs/Cargo.toml` | `license = "MIT"` |
+| `axiom_mesh_rs/Cargo.toml` (workspace, inherited by all three mesh crates) | `license = "MIT"` |
+| `pyproject.toml` | `{ text = "MIT" }` + MIT OSI classifier |
+
+Git history does not disambiguate intent — both files trace to the same commit
+(`63e2aac`), so the tree appears to have been squashed or re-initialized.
+
+**Recommendation: reconcile toward MIT** (replace the `LICENSE` file). The crate
+publishes to crates.io and the wheel to PyPI, both declaring MIT — so MIT is what
+has already been asserted publicly to every downstream consumer at every
+distribution channel. Correcting the outlier file matches what shipped.
+Reconciling the other direction would mean every published artifact to date was
+mislabeled, which is a materially worse position.
+
+This does not block Phase B. It **does** block Phase C's license gate (C2), which
+cannot decide what to admit until the project's own license is unambiguous.
