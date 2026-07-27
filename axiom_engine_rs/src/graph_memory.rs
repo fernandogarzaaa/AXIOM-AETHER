@@ -3,6 +3,7 @@
 //! edges live in a single `edges.jsonl` at the memory root rather than one
 //! file per scope, since edges legitimately cross scopes.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory_store::{now_secs, MemoryRecord};
 
 /// The relationship a `MemoryEdge` records between two `MemoryRecord`s.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// Already implicit in `MemoryRecord.supersedes`.
@@ -136,6 +137,141 @@ pub fn edges_from_records(records: &[MemoryRecord]) -> Vec<MemoryEdge> {
         .collect()
 }
 
+/// Bidirectional adjacency index built from a set of edges. Traversal follows
+/// edges in both directions (a `CausedBy` edge is informative read from
+/// either end), but out-edges and in-edges may carry different weights, so
+/// the two directions are indexed separately.
+pub struct Adjacency {
+    out_edges: HashMap<String, Vec<(EdgeKind, String, f32)>>,
+    in_edges: HashMap<String, Vec<(EdgeKind, String, f32)>>,
+}
+
+impl Adjacency {
+    /// Build from a set of edges, skipping tombstoned ones.
+    pub fn build(edges: &[MemoryEdge]) -> Self {
+        let mut out_edges: HashMap<String, Vec<(EdgeKind, String, f32)>> = HashMap::new();
+        let mut in_edges: HashMap<String, Vec<(EdgeKind, String, f32)>> = HashMap::new();
+        for e in edges {
+            if e.tombstone {
+                continue;
+            }
+            out_edges
+                .entry(e.from.clone())
+                .or_default()
+                .push((e.kind, e.to.clone(), e.weight));
+            in_edges
+                .entry(e.to.clone())
+                .or_default()
+                .push((e.kind, e.from.clone(), e.weight));
+        }
+        Self { out_edges, in_edges }
+    }
+
+    /// Every neighbor reachable from `id` in either direction, as
+    /// `(edge kind, neighbor id, edge weight)`.
+    fn neighbors(&self, id: &str) -> Vec<(EdgeKind, String, f32)> {
+        let mut out = Vec::new();
+        if let Some(v) = self.out_edges.get(id) {
+            out.extend(v.iter().cloned());
+        }
+        if let Some(v) = self.in_edges.get(id) {
+            out.extend(v.iter().cloned());
+        }
+        out
+    }
+}
+
+/// Tuning parameters for `spread`.
+pub struct SpreadParams {
+    pub max_hops: usize,
+    pub max_visited: usize,
+    pub decay: f32,
+    pub min_activation: f32,
+    pub kind_weights: BTreeMap<EdgeKind, f32>,
+}
+
+impl Default for SpreadParams {
+    fn default() -> Self {
+        Self {
+            max_hops: 2,
+            max_visited: 256,
+            decay: 0.5,
+            min_activation: 1e-3,
+            kind_weights: BTreeMap::new(),
+        }
+    }
+}
+
+/// Bounded spreading activation from `seeds` (id, initial activation) over
+/// `adj`. Returns every reached node with accumulated activation, seeds
+/// included, sorted by `(activation descending, id ascending)` for
+/// deterministic output.
+///
+/// `max_visited` is a hard bound on *distinct nodes visited*, not on hop
+/// depth: one hop into a dense region can visit thousands of nodes, so the
+/// bound is enforced while expanding a level, not only between levels.
+/// Already-visited nodes are never re-added to the expansion frontier, so
+/// cycles (including self-loops) cannot cause the traversal to loop forever
+/// -- termination is additionally guaranteed structurally, since the outer
+/// loop runs at most `max_hops` times.
+pub fn spread(adj: &Adjacency, seeds: &[(String, f32)], params: &SpreadParams) -> Vec<(String, f32)> {
+    let mut activation: HashMap<String, f32> = HashMap::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    for (id, act) in seeds {
+        *activation.entry(id.clone()).or_insert(0.0) += act;
+        visited.insert(id.clone());
+    }
+
+    let mut frontier: Vec<(String, f32)> = seeds.to_vec();
+
+    for _ in 0..params.max_hops {
+        if frontier.is_empty() || visited.len() >= params.max_visited {
+            break;
+        }
+        frontier.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let mut next_frontier: Vec<(String, f32)> = Vec::new();
+        for (node, act) in &frontier {
+            if visited.len() >= params.max_visited {
+                break;
+            }
+            for (kind, neighbor, weight) in adj.neighbors(node) {
+                let kind_weight = params.kind_weights.get(&kind).copied().unwrap_or(1.0);
+                let contribution = act * params.decay * weight * kind_weight;
+                if contribution < params.min_activation {
+                    continue;
+                }
+                if visited.contains(&neighbor) {
+                    if let Some(a) = activation.get_mut(&neighbor) {
+                        *a += contribution;
+                    }
+                    continue;
+                }
+                if visited.len() >= params.max_visited {
+                    continue;
+                }
+                visited.insert(neighbor.clone());
+                activation.insert(neighbor.clone(), contribution);
+                next_frontier.push((neighbor, contribution));
+            }
+        }
+        frontier = next_frontier;
+    }
+
+    let mut result: Vec<(String, f32)> = activation.into_iter().collect();
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +392,137 @@ mod tests {
         let loaded = store.load_all();
         assert!(loaded.is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn seed(id: &str, act: f32) -> (String, f32) {
+        (id.to_string(), act)
+    }
+
+    fn find<'a>(result: &'a [(String, f32)], id: &str) -> Option<&'a (String, f32)> {
+        result.iter().find(|(i, _)| i == id)
+    }
+
+    #[test]
+    fn spread_reaches_two_hops() {
+        let edges = vec![
+            edge("a", "b", EdgeKind::CausedBy, 1.0),
+            edge("b", "c", EdgeKind::CausedBy, 1.0),
+        ];
+        let adj = Adjacency::build(&edges);
+        let params = SpreadParams::default();
+        let result = spread(&adj, &[seed("a", 1.0)], &params);
+        assert!(find(&result, "a").is_some());
+        assert!(find(&result, "b").is_some());
+        assert!(find(&result, "c").is_some());
+    }
+
+    #[test]
+    fn spread_decays_with_distance() {
+        let edges = vec![
+            edge("a", "b", EdgeKind::CausedBy, 1.0),
+            edge("b", "c", EdgeKind::CausedBy, 1.0),
+        ];
+        let adj = Adjacency::build(&edges);
+        let params = SpreadParams::default();
+        let result = spread(&adj, &[seed("a", 1.0)], &params);
+        let a = find(&result, "a").unwrap().1;
+        let b = find(&result, "b").unwrap().1;
+        let c = find(&result, "c").unwrap().1;
+        assert!(c < b, "expected activation(c) < activation(b): {c} vs {b}");
+        assert!(b < a, "expected activation(b) < activation(a): {b} vs {a}");
+    }
+
+    #[test]
+    fn spread_respects_max_hops() {
+        let edges = vec![
+            edge("a", "b", EdgeKind::CausedBy, 1.0),
+            edge("b", "c", EdgeKind::CausedBy, 1.0),
+        ];
+        let adj = Adjacency::build(&edges);
+        let params = SpreadParams {
+            max_hops: 1,
+            ..SpreadParams::default()
+        };
+        let result = spread(&adj, &[seed("a", 1.0)], &params);
+        assert!(find(&result, "c").is_none());
+    }
+
+    #[test]
+    fn spread_respects_max_visited() {
+        let mut edges = Vec::new();
+        for i in 0..1000 {
+            edges.push(edge("center", &format!("leaf{i}"), EdgeKind::CoOccurred, 1.0));
+        }
+        let adj = Adjacency::build(&edges);
+        let params = SpreadParams {
+            max_visited: 10,
+            ..SpreadParams::default()
+        };
+        let result = spread(&adj, &[seed("center", 1.0)], &params);
+        assert!(result.len() <= 10);
+    }
+
+    #[test]
+    fn spread_is_deterministic() {
+        let mut edges = Vec::new();
+        for i in 0..50 {
+            edges.push(edge("center", &format!("leaf{i}"), EdgeKind::CoOccurred, 1.0));
+        }
+        let adj = Adjacency::build(&edges);
+        let params = SpreadParams {
+            max_visited: 20,
+            ..SpreadParams::default()
+        };
+        let r1 = spread(&adj, &[seed("center", 1.0)], &params);
+        let r2 = spread(&adj, &[seed("center", 1.0)], &params);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn cycle_does_not_hang() {
+        let edges = vec![
+            edge("a", "b", EdgeKind::CausedBy, 1.0),
+            edge("b", "a", EdgeKind::CausedBy, 1.0),
+            edge("a", "a", EdgeKind::CausedBy, 1.0),
+        ];
+        let adj = Adjacency::build(&edges);
+        let params = SpreadParams::default();
+        // Bounded structurally by max_hops; if this returns at all, it has
+        // not spun on the cycle.
+        let result = spread(&adj, &[seed("a", 1.0)], &params);
+        assert!(find(&result, "a").is_some());
+        assert!(find(&result, "b").is_some());
+    }
+
+    #[test]
+    fn tombstoned_edge_is_not_traversed() {
+        let edges = vec![{
+            let mut e = edge("a", "b", EdgeKind::CausedBy, 1.0);
+            e.tombstone = true;
+            e
+        }];
+        let adj = Adjacency::build(&edges);
+        let params = SpreadParams::default();
+        let result = spread(&adj, &[seed("a", 1.0)], &params);
+        assert!(find(&result, "b").is_none());
+    }
+
+    #[test]
+    fn kind_weights_change_ranking() {
+        let edges = vec![edge("a", "b", EdgeKind::Contradicts, 1.0)];
+        let adj = Adjacency::build(&edges);
+        let mut params = SpreadParams::default();
+        params.kind_weights.insert(EdgeKind::Contradicts, 0.0);
+        let result = spread(&adj, &[seed("a", 1.0)], &params);
+        assert!(find(&result, "b").is_none());
+    }
+
+    #[test]
+    fn empty_seeds_returns_empty() {
+        let edges = vec![edge("a", "b", EdgeKind::CausedBy, 1.0)];
+        let adj = Adjacency::build(&edges);
+        let params = SpreadParams::default();
+        let result = spread(&adj, &[], &params);
+        assert!(result.is_empty());
     }
 }
