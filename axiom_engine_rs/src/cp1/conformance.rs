@@ -198,6 +198,15 @@ fn structural_problems(document: &Value) -> Vec<String> {
     problems
 }
 
+/// The only members the schema declares as `signedBasisPoints`.
+///
+/// Everything else ending in `_bp` is a plain `basisPoints`, whose range starts
+/// at zero. Getting this wrong in the permissive direction is worse than it
+/// looks: this check is the one vendored into EVE and ADAM, so a range wider
+/// than the schema's would let those bindings accept a document the contract
+/// forbids and only the normative repository would notice.
+const SIGNED_BASIS_POINT_MEMBERS: [&str; 1] = ["delta_bp"];
+
 /// Every member whose name ends in `_bp` must be an integer in range.
 ///
 /// Checked by name rather than by schema position so a new basis-point member
@@ -209,12 +218,17 @@ fn walk_basis_points(value: &Value, path: &str, problems: &mut Vec<String>) {
             for (key, child) in map {
                 let child_path = format!("{path}.{key}");
                 if key.ends_with("_bp") {
+                    let low = if SIGNED_BASIS_POINT_MEMBERS.contains(&key.as_str()) {
+                        -10_000
+                    } else {
+                        0
+                    };
                     match child.as_i64() {
                         None => problems.push(format!(
                             "{child_path} ends in `_bp` and must be an integer, found {child}"
                         )),
-                        Some(n) if !(-10_000..=10_000).contains(&n) => problems.push(format!(
-                            "{child_path} is {n}, outside the basis-point range [-10000, 10000]"
+                        Some(n) if !(low..=10_000).contains(&n) => problems.push(format!(
+                            "{child_path} is {n}, outside the basis-point range [{low}, 10000]"
                         )),
                         Some(_) => {}
                     }
@@ -242,7 +256,16 @@ pub fn check_manifest(manifest: &str, files: &[(&str, &[u8])]) -> Vec<String> {
     let mut matched = 0usize;
 
     for line in manifest.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
         let Some((expected, path)) = line.split_once("  ") else {
+            // A manifest is an integrity control. Silently skipping a line we
+            // cannot parse would let a truncated or corrupted manifest report
+            // success while verifying nothing.
+            failures.push(format!(
+                "malformed manifest line (expected `<sha256>  <path>`): {line:?}"
+            ));
             continue;
         };
         let Some((_, bytes)) = files.iter().find(|(name, _)| *name == path) else {
@@ -343,6 +366,32 @@ mod tests {
             failures
                 .iter()
                 .any(|f| f.detail.contains("must be an integer")),
+            "{failures:#?}"
+        );
+    }
+
+    #[test]
+    fn a_negative_confidence_is_reported_but_a_negative_delta_is_accepted() {
+        // `confidence_bp` is a plain basisPoints and may not be negative;
+        // `delta_bp` is the one signed member, because a mutation may make the
+        // organism worse and that is the finding.
+        let negative_confidence = r#"{"confidence_bp":-5000,"cp":"cp1","id":"x","provenance":{"authored_by":"adam","content_hash":"","derived_from":[],"evidence":[],"origin":"o","produced_at":"p"},"type":"Belief"}"#;
+        assert!(check_corpus(negative_confidence)
+            .iter()
+            .any(|f| f.detail.contains("outside the basis-point range [0, 10000]")));
+
+        let negative_delta = r#"{"cp":"cp1","delta_bp":-700,"id":"x","provenance":{"authored_by":"eve","content_hash":"","derived_from":[],"evidence":[],"origin":"o","produced_at":"p"},"type":"FitnessResult"}"#;
+        assert!(!check_corpus(negative_delta)
+            .iter()
+            .any(|f| f.detail.contains("basis-point range")));
+    }
+
+    #[test]
+    fn a_malformed_manifest_line_is_reported_rather_than_skipped() {
+        let manifest = "this line has no separator\n";
+        let failures = check_manifest(manifest, &[("fixtures/canonical.jsonl", b"x")]);
+        assert!(
+            failures.iter().any(|f| f.contains("malformed manifest line")),
             "{failures:#?}"
         );
     }

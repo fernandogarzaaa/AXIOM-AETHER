@@ -3,8 +3,11 @@
 //!
 //! `serde_json::to_string` is *almost* canonical already, but not quite: it
 //! preserves whatever key order the value carries, and CP/1 requires keys
-//! sorted by UTF-8 code unit. This module walks the value and re-emits it with
-//! that ordering imposed, reusing serde_json only for scalar rendering — where
+//! sorted by UTF-8 byte order. This module walks the value and re-emits it with
+//! that ordering imposed — Rust's `str: Ord` is already UTF-8 byte order, which
+//! is why sorting here needs no comparator, and why a JavaScript binding cannot
+//! use a bare `.sort()` (that is UTF-16 code-unit order, which disagrees beyond
+//! the BMP), reusing serde_json only for scalar rendering — where
 //! its escaping rules (escape `"`, `\`, and `U+0000`–`U+001F`, using the short
 //! forms `\b \f \n \r \t` where they exist; leave non-ASCII as literal UTF-8)
 //! already match SPEC.md section 2 rule 3 exactly.
@@ -26,6 +29,9 @@ pub enum CanonicalError {
     FloatNotPermitted { path: String },
     /// A `null` was present. CP/1 writes absent keys instead (SPEC.md 2 rule 6).
     NullNotPermitted { path: String },
+    /// The document carries no `provenance` object, so there is nowhere to
+    /// write its seal. Every CP/1 document must carry one (SPEC.md section 4).
+    ProvenanceMissing,
 }
 
 impl std::fmt::Display for CanonicalError {
@@ -38,6 +44,9 @@ impl std::fmt::Display for CanonicalError {
             CanonicalError::NullNotPermitted { path } => write!(
                 f,
                 "CP/1 canonical form omits absent values rather than writing null; found null at {path}"
+            ),
+            CanonicalError::ProvenanceMissing => f.write_str(
+                "a CP/1 document must carry a `provenance` object before it can be sealed",
             ),
         }
     }
@@ -78,7 +87,10 @@ fn write_value(value: &Value, path: &str, out: &mut String) -> Result<(), Canoni
         }
         Value::String(s) => {
             // Delegate escaping to serde_json, whose rules match CP/1's.
-            out.push_str(&Value::String(s.clone()).to_string());
+            // Serializing the `&str` directly avoids cloning it into a
+            // temporary `Value` on a path that runs for every seal, every
+            // verify and every envelope open.
+            out.push_str(&serde_json::to_string(s).expect("a string always serializes"));
             Ok(())
         }
         Value::Array(items) => {
@@ -104,7 +116,7 @@ fn write_value(value: &Value, path: &str, out: &mut String) -> Result<(), Canoni
                 if i > 0 {
                     out.push(',');
                 }
-                out.push_str(&Value::String(key.clone()).to_string());
+                out.push_str(&serde_json::to_string(key).expect("a string always serializes"));
                 out.push(':');
                 write_value(&map[key], &format!("{path}.{key}"), out)?;
             }
@@ -133,16 +145,20 @@ pub fn content_hash(document: &Value) -> Result<String, CanonicalError> {
     Ok(sha256_hex(to_canonical(&unsealed)?.as_bytes()))
 }
 
-/// Compute and write `provenance.content_hash` into `document`.
+/// Compute and write `provenance.content_hash` into `document`, returning it.
 ///
-/// Returns the hash that was written. A document with no `provenance` object is
-/// left untouched and reported as an error by [`verify_seal`] rather than being
-/// silently accepted here.
+/// Fails with [`CanonicalError::ProvenanceMissing`] when the document has no
+/// `provenance` object. Returning `Ok` there would hand the caller a hash that
+/// was written nowhere: [`super::envelope::SignedEnvelope::seal`] would then
+/// wrap, hash, sign and transmit an unsealed document, and the *receiver* would
+/// reject it. The sender has everything needed to refuse it, so it refuses here.
 pub fn seal(document: &mut Value) -> Result<String, CanonicalError> {
     let hash = content_hash(document)?;
-    if let Some(provenance) = document.get_mut("provenance").and_then(Value::as_object_mut) {
-        provenance.insert("content_hash".to_string(), Value::String(hash.clone()));
-    }
+    let provenance = document
+        .get_mut("provenance")
+        .and_then(Value::as_object_mut)
+        .ok_or(CanonicalError::ProvenanceMissing)?;
+    provenance.insert("content_hash".to_string(), Value::String(hash.clone()));
     Ok(hash)
 }
 
@@ -252,5 +268,26 @@ mod tests {
     fn a_document_without_provenance_never_verifies() {
         let document = json!({ "statement": "x" });
         assert!(!verify_seal(&document).unwrap());
+    }
+
+    #[test]
+    fn sealing_a_document_without_provenance_is_refused_at_the_sender() {
+        // Returning Ok here would hand back a hash written nowhere, and the
+        // defect would surface as a rejection on the receiving side.
+        let mut document = json!({ "statement": "x" });
+        assert_eq!(seal(&mut document), Err(CanonicalError::ProvenanceMissing));
+    }
+
+    #[test]
+    fn keys_are_ordered_by_utf8_bytes_including_beyond_the_bmp() {
+        // U+FFFD encodes as EF BF BD and U+1D11E as F0 9D 84 9E, so UTF-8 byte
+        // order puts U+FFFD first. A binding sorting by UTF-16 code unit would
+        // put U+1D11E first, because its leading surrogate D83D is below FFFD.
+        // Rust's `str: Ord` is UTF-8 byte order, which is what CP/1 requires.
+        let value = json!({ "\u{1D11E}": 1, "\u{FFFD}": 2 });
+        assert_eq!(
+            to_canonical(&value).unwrap(),
+            "{\"\u{FFFD}\":2,\"\u{1D11E}\":1}"
+        );
     }
 }

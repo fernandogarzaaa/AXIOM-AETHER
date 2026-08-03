@@ -28,8 +28,9 @@ jobs:
   # AXIOM is the normative owner of CP/1 (see protocol/cp1/SPEC.md). EVE and
   # ADAM vendor the schema and fixture corpus and verify their copies against
   # MANIFEST.sha256, so an inconsistent normative source here desynchronizes
-  # both of them. Gate it before anything else runs — the check is seconds long
-  # and its failure invalidates the rest.
+  # both of them. Every other job declares `needs: protocol` so this actually
+  # gates them: jobs run in parallel regardless of their order in this file, so
+  # without that dependency a failing protocol check would not stop anything.
   protocol:
     name: CP/1 normative source
     runs-on: ubuntu-22.04
@@ -68,6 +69,8 @@ jobs:
 
   test:
     name: Build & test (Rust)
+    # The protocol gate is cheap and its failure invalidates everything below.
+    needs: protocol
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -128,6 +131,8 @@ jobs:
   # push) so the release surface is gated before merge.
   docker-build:
     name: Docker image build (no push)
+    # The protocol gate is cheap and its failure invalidates everything below.
+    needs: protocol
     runs-on: ubuntu-22.04
     # Read the repo; read the Actions cache (buildx gha cache). No write scope.
     permissions:
@@ -156,6 +161,8 @@ jobs:
   # used to run, so it could rot silently. Exercise it on CPU-only torch.
   python-reference:
     name: Python reference engine (tests)
+    # The protocol gate is cheap and its failure invalidates everything below.
+    needs: protocol
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout

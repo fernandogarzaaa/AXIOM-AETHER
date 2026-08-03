@@ -29,12 +29,12 @@ import sys
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import best_match
 
 CP1_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-
-def canonical(value: object) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+from cp1_canonical import canonical, content_hash  # noqa: E402  (path set above)
 
 
 def check_manifest() -> list[str]:
@@ -46,7 +46,13 @@ def check_manifest() -> list[str]:
     for line in manifest_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        expected, _, rel = line.partition("  ")
+        expected, separator, rel = line.partition("  ")
+        if not separator:
+            # A manifest is an integrity control. Without this check the empty
+            # path resolves to CP1_ROOT and the read below raises IsADirectoryError,
+            # turning a reportable defect into a traceback.
+            failures.append(f"malformed manifest line (expected `<sha256>  <path>`): {line!r}")
+            continue
         target = CP1_ROOT / rel
         if not target.exists():
             failures.append(f"manifest lists {rel}, which does not exist")
@@ -74,26 +80,43 @@ def check_schema(fixtures: list[tuple[int, str, dict]]) -> list[str]:
 
     failures = []
     for lineno, _, doc in fixtures:
-        errors = sorted(validator.iter_errors(doc), key=lambda e: list(e.path))
-        for error in errors:
-            location = "/".join(str(p) for p in error.path) or "<root>"
-            failures.append(f"line {lineno} ({doc.get('type')}) at {location}: {error.message}")
+        # The schema's top level is a `oneOf`, so `iter_errors` yields a single
+        # root error saying only "is not valid under any of the given schemas".
+        # `best_match` descends into `error.context` and returns the branch
+        # failure that actually names the offending member, which is the
+        # difference between an actionable CI message and a shrug.
+        error = best_match(validator.iter_errors(doc))
+        if error is None:
+            continue
+        location = "/".join(str(part) for part in error.absolute_path) or "<root>"
+        failures.append(f"line {lineno} ({doc.get('type')}) at {location}: {error.message}")
     return failures
 
 
 def check_canonical_and_sealed(fixtures: list[tuple[int, str, dict]]) -> list[str]:
+    """Every fixture is already canonical and carries its true content hash.
+
+    Every lookup here is guarded. `main` runs all four checks before reading any
+    result, so `check_schema` does not gate this one — and a hand-edited fixture
+    (the exact case this tool exists to catch) must produce a FAIL line rather
+    than a traceback that kills the CI step.
+    """
     failures = []
     for lineno, raw, doc in fixtures:
         if canonical(doc) != raw:
             failures.append(f"line {lineno} ({doc.get('type')}): not in canonical form")
 
-        recorded = doc["provenance"].get("content_hash")
-        unsealed = json.loads(raw)
-        unsealed["provenance"].pop("content_hash", None)
-        actual = hashlib.sha256(canonical(unsealed).encode("utf-8")).hexdigest()
+        provenance = doc.get("provenance")
+        if not isinstance(provenance, dict):
+            failures.append(f"line {lineno} ({doc.get('type')}): provenance is missing")
+            continue
+
+        recorded = provenance.get("content_hash")
+        actual = content_hash(json.loads(raw))
         if recorded != actual:
+            shown = recorded[:12] if isinstance(recorded, str) else repr(recorded)
             failures.append(
-                f"line {lineno} ({doc.get('type')}): content_hash is {recorded[:12]}…, "
+                f"line {lineno} ({doc.get('type')}): content_hash is {shown}…, "
                 f"true hash is {actual[:12]}…"
             )
     return failures
@@ -113,7 +136,7 @@ def check_coverage(fixtures: list[tuple[int, str, dict]]) -> list[str]:
     event_names = set(schema["$defs"]["Event"]["properties"]["type"]["enum"])
     present = set()
     for _, _, doc in fixtures:
-        kind = doc["type"]
+        kind = doc.get("type")
         present.add("Event" if kind in event_names else kind)
 
     missing = sorted(declared - present)

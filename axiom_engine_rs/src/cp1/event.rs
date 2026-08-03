@@ -213,7 +213,46 @@ pub struct Event {
 }
 
 impl Event {
+    /// Build an event, or refuse it when the provenance disagrees with the
+    /// kind's owning emitter.
+    ///
+    /// `actor` is derived from [`EventKind::emitter`] while `provenance` comes
+    /// from the caller, and the two carry the same concept. Left unchecked they
+    /// can disagree — an `ObservationRecorded` with `actor: "eve"` and
+    /// `provenance.authored_by: "adam"` seals cleanly, satisfies the schema
+    /// because both are valid components, and passes conformance, which never
+    /// compares them. This is the case [`EventKind::emitter`] exists to make
+    /// rejectable, so it is rejected here, where both values are known.
+    pub fn try_new(
+        kind: EventKind,
+        subject_id: impl Into<String>,
+        subject_type: SubjectType,
+        correlation_id: impl Into<String>,
+        payload: BTreeMap<String, PayloadValue>,
+        provenance: Provenance,
+    ) -> Result<Self, EventError> {
+        if provenance.authored_by != kind.emitter() {
+            return Err(EventError::EmitterMismatch {
+                kind,
+                expected: kind.emitter(),
+                found: provenance.authored_by,
+            });
+        }
+        Ok(Self::new(
+            kind,
+            subject_id,
+            subject_type,
+            correlation_id,
+            payload,
+            provenance,
+        ))
+    }
+
     /// Build an event, stamping it with a fresh id and the current instant.
+    ///
+    /// Prefer [`Event::try_new`] when the provenance comes from a caller rather
+    /// than being constructed alongside the event: it rejects a provenance
+    /// whose author contradicts the kind's emitter.
     pub fn new(
         kind: EventKind,
         subject_id: impl Into<String>,
@@ -251,6 +290,38 @@ impl Event {
     }
 }
 
+/// Why an event could not be constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventError {
+    /// The supplied provenance was authored by a component that does not own
+    /// this event kind.
+    EmitterMismatch {
+        kind: EventKind,
+        expected: Component,
+        found: Component,
+    },
+}
+
+impl std::fmt::Display for EventError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventError::EmitterMismatch {
+                kind,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{} may only be emitted by {}, but the provenance is authored by {}",
+                kind.as_str(),
+                expected.as_str(),
+                found.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EventError {}
+
 /// Anything that accepts emitted events.
 ///
 /// A trait rather than a concrete bus so the emitting subsystem never learns
@@ -273,7 +344,13 @@ impl RecordingSink {
     }
 
     pub fn events(&self) -> Vec<Event> {
-        self.events.lock().expect("sink mutex poisoned").clone()
+        // The lock guards a push and a clone, so the data is never left
+        // partially written. Recovering from poisoning keeps one panicking
+        // thread from turning every later `emit` into a panic of its own.
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn kinds(&self) -> Vec<EventKind> {
@@ -285,7 +362,7 @@ impl EventSink for RecordingSink {
     fn emit(&self, event: &Event) {
         self.events
             .lock()
-            .expect("sink mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(event.clone());
     }
 }
@@ -379,6 +456,57 @@ mod tests {
             sealed["causation_id"].as_str(),
             Some("1f1f1f1f-1f1f-4f1f-8f1f-1f1f1f1f1f1f")
         );
+    }
+
+    #[test]
+    fn try_new_refuses_provenance_that_contradicts_the_owning_emitter() {
+        let refused = Event::try_new(
+            EventKind::ObservationRecorded,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            SubjectType::Observation,
+            "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f",
+            BTreeMap::new(),
+            // ObservationRecorded is EVE's to emit.
+            Provenance::now(Component::Adam, "adam:organism"),
+        );
+        let err = refused.expect_err("an ADAM-authored EVE event must be refused");
+        assert!(err.to_string().contains("may only be emitted by eve"));
+    }
+
+    #[test]
+    fn try_new_accepts_provenance_from_the_owning_emitter() {
+        assert!(Event::try_new(
+            EventKind::ContextCompressed,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            SubjectType::Context,
+            "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f",
+            BTreeMap::new(),
+            Provenance::now(Component::Axiom, "axiom:context/compress"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn recording_sink_survives_a_poisoned_lock() {
+        // A telemetry sink must not convert one thread's panic into a
+        // process-wide cascade of panics on every later emit.
+        let sink = std::sync::Arc::new(RecordingSink::new());
+        let poisoner = std::sync::Arc::clone(&sink);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.events.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+
+        sink.emit(&Event::new(
+            EventKind::ContextCompressed,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            SubjectType::Context,
+            "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f",
+            BTreeMap::new(),
+            Provenance::now(Component::Axiom, "axiom:test"),
+        ));
+        assert_eq!(sink.events().len(), 1);
     }
 
     #[test]

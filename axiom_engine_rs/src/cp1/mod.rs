@@ -19,9 +19,11 @@
 //!
 //! It does **not** ship structs for `Genome`, `Skill`, `Belief` and the rest.
 //! Authorship of each canonical type is exclusive (see `protocol/cp1/SPEC.md`
-//! section 3), so those are types AXIOM may never mint and does not read; a
-//! struct for each would be a dead abstraction requiring perpetual maintenance
-//! against a schema it never exercises. Cross-binding agreement on those types
+//! section 3), so those are types AXIOM may never mint or model as owned
+//! bindings. AXIOM does still *read* several of them at the boundary — it draws
+//! on ADAM's memories and beliefs to assemble a `Context` — but a struct for
+//! each would be a dead abstraction requiring perpetual maintenance against a
+//! schema it never exercises. Cross-binding agreement on those types
 //! is established structurally, over the fixture corpus, by [`conformance`] —
 //! which tests the encoding, the thing that actually has to match.
 //!
@@ -69,7 +71,9 @@ pub const VERSION: &str = "1.0.0";
 
 pub use canonical::{content_hash, seal, to_canonical, verify_seal, CanonicalError};
 pub use envelope::{EnvelopeError, SignedEnvelope};
-pub use event::{Event, EventKind, EventSink, PayloadValue, RecordingSink, SubjectType};
+pub use event::{
+    Event, EventError, EventKind, EventSink, PayloadValue, RecordingSink, SubjectType,
+};
 pub use types::{
     BasisPoints, Component, Context, ContextSegment, Provenance, SegmentRole, Timestamp,
 };

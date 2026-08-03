@@ -56,14 +56,28 @@ visible and enforced rather than silent.
 CP/1 documents are JSON. Every document has exactly one **canonical form**, used
 for hashing and signing:
 
-1. Object members are sorted by key, ascending, comparing UTF-8 code units.
+1. Object members are sorted by key, ascending, comparing **UTF-8 bytes**.
+   For valid UTF-8 this is identical to Unicode code-point order. It is *not*
+   identical to UTF-16 code-unit order, which is what a bare JavaScript
+   `Array.prototype.sort()` gives: beyond the BMP the two disagree, because a
+   leading surrogate (`D800`–`DBFF`) sorts below `FFFD` in UTF-16 while the
+   corresponding UTF-8 lead byte (`F0`) sorts above `EF`. Rust's `str: Ord` and
+   Python's `sorted` already produce the required order; a JavaScript binding
+   must compare UTF-8 bytes explicitly. The corpus carries a `Genome` whose
+   `preferences` include `U+FFFD` and `U+1D11E` so any binding that gets this
+   wrong fails the round-trip check rather than shipping divergent hashes.
 2. No insignificant whitespace: no spaces after `:` or `,`, no newlines.
 3. Strings use the shortest valid escaping: only `"`, `\`, and `U+0000`–`U+001F`
    are escaped, the latter as `\u00XX` except for the standard short forms
    `\b \f \n \r \t`.
 4. Arrays preserve order. Order is semantic everywhere in CP/1.
 5. Numbers are **integers only** (see §2.1). They are rendered with no sign for
-   non-negative values, no leading zeros, no exponent, and no fraction.
+   non-negative values, no leading zeros, no exponent, and no fraction. Every
+   integer member is additionally bounded by the schema at 2^53−1
+   (`9007199254740991`) or lower. JavaScript numbers are IEEE-754 doubles, so an
+   unbounded integer is one a Rust binding can emit losslessly and a JavaScript
+   binding silently rounds — and a rounded value re-serializes to different bytes
+   and a different hash.
 6. `null` is never written. An absent value is an absent key.
 
 Canonical form is what `content_hash` commits to and what a signature covers.
@@ -115,6 +129,23 @@ Ownership is exclusive for **authorship**, not for reading. ADAM reads
 measure; AXIOM reads `Memory` to ground a `Context`. None of them may mint a
 document of a type they do not own — a rule the conformance suite cannot check,
 but code review and the `provenance.authored_by` field make auditable.
+
+### 3.0 Protocol messages, which are not canonical types
+
+Two shapes travel the wire without being canonical types, because they describe
+an *exchange* rather than a fact about the organism:
+
+| Message             | Owner | Meaning |
+| ------------------- | ----- | ------- |
+| `ValidationRequest` | ADAM  | Asks EVE to measure a mutation (§7). |
+| `SignedEnvelope`    | —     | Transport wrapper (§6). Carries no provenance of its own. |
+
+`ValidationRequest` is schema'd, sealed, provenance-bearing and covered by the
+conformance corpus exactly like a canonical type — the distinction is that it is
+not a durable record of what the organism is or has experienced, so it never
+appears as an event `subject_type`, and it is not one of the twelve. Adding a
+protocol message is backward-compatible in the sense of §8; adding a canonical
+type is too, but the two lists are versioned separately.
 
 ### 3.1 Rationale: why these twelve, and why ownership is exclusive
 
@@ -263,9 +294,21 @@ boundary is a real isolation boundary for a component whose job is to run
 untrusted scenarios.
 
 **HTTP POST of a `SignedEnvelope`.** For the distributed case, where EVE runs as
-a service. The envelope's HMAC is what makes this safe across the trust
-boundary; over stdio the HMAC is optional because the parent process already
-controls the child.
+a service. Over HTTP the HMAC is **required**: the request crosses a trust
+boundary the receiver does not control, and an unauthenticated envelope proves
+only that its payload is internally consistent — anyone can produce that. A
+receiver reachable over HTTP MUST refuse an envelope with no `hmac`, and MUST
+refuse one whose `hmac` does not verify, before parsing the payload.
+
+Over stdio the HMAC is optional, because the parent process spawned the child
+and controls its argv, environment and file descriptors; requiring a shared
+secret there is ceremony without a threat.
+
+The HMAC is HMAC-SHA256 (RFC 2104) computed over the **64 lowercase-hex ASCII
+characters of the `sha256` member**, not over the payload bytes and not over the
+raw digest — so a receiver verifies it without re-hashing the payload. The key
+is the fleet secret as raw bytes; a secret configured as text is UTF-8 encoded
+with no trailing newline. Comparison MUST be constant-time.
 
 A `SignedEnvelope` wraps any CP/1 document:
 
@@ -275,7 +318,7 @@ A `SignedEnvelope` wraps any CP/1 document:
   "schema": "cp1_signed_envelope",
   "payload": "<canonical-form JSON of the document, as a string>",
   "sha256": "<64 lowercase hex of payload bytes>",
-  "hmac": "<64 lowercase hex, optional>"
+  "hmac": "<64 lowercase hex; REQUIRED over HTTP, optional only over trusted stdio>"
 }
 ```
 

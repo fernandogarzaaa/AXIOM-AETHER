@@ -42,9 +42,28 @@ impl Component {
 /// CP/1 puts no floating point on the wire (SPEC.md section 2.1), so every
 /// fractional quantity crosses a boundary through this type. Conversion is the
 /// only place rounding happens, and it is explicit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct BasisPoints(u16);
+
+/// Validating deserialization.
+///
+/// `#[serde(transparent)]` over a `u16` would accept anything up to 65535, so
+/// the `[0, 10000]` invariant would hold only for values built through the
+/// constructors — exactly the path untrusted bytes bypass. A `Context` carrying
+/// `compression_ratio_bp: 20000` would then deserialize cleanly, report a ratio
+/// of 2.0, and re-serialize into a document every other binding rejects.
+impl<'de> Deserialize<'de> for BasisPoints {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = u16::deserialize(deserializer)?;
+        if raw > 10_000 {
+            return Err(serde::de::Error::custom(format!(
+                "basis points must lie in [0, 10000], got {raw}"
+            )));
+        }
+        Ok(BasisPoints(raw))
+    }
+}
 
 impl BasisPoints {
     pub const ZERO: BasisPoints = BasisPoints(0);
@@ -210,7 +229,7 @@ impl Provenance {
         self
     }
 
-    pub fn derived_from(mut self, ids: impl IntoIterator<Item = String>) -> Self {
+    pub fn with_derived_from(mut self, ids: impl IntoIterator<Item = String>) -> Self {
         self.derived_from.extend(ids);
         self
     }
@@ -335,12 +354,19 @@ impl Context {
     }
 }
 
+/// The distinct source ids quoted by segments of `role`, sorted.
+///
+/// `Vec::dedup` only removes *consecutive* duplicates, so a source quoted in two
+/// non-adjacent segments would survive into a member that gets hashed. Sorting
+/// first fixes that and additionally makes the output independent of segment
+/// order, which is the right property for a hashed member.
 fn collect_sources(segments: &[ContextSegment], role: SegmentRole) -> Vec<String> {
     let mut ids: Vec<String> = segments
         .iter()
         .filter(|s| s.role == role)
         .filter_map(|s| s.source_id.clone())
         .collect();
+    ids.sort_unstable();
     ids.dedup();
     ids
 }
@@ -480,6 +506,34 @@ mod tests {
         );
         assert_eq!(context.compression_ratio_bp, BasisPoints::ONE);
         assert!(context.grounded);
+    }
+
+    #[test]
+    fn basis_points_reject_an_out_of_range_value_on_the_wire() {
+        assert!(serde_json::from_str::<BasisPoints>("10000").is_ok());
+        let err = serde_json::from_str::<BasisPoints>("20000")
+            .expect_err("20000 is outside the basis-point range");
+        assert!(err.to_string().contains("must lie in [0, 10000]"));
+    }
+
+    #[test]
+    fn source_ids_are_deduplicated_even_when_not_adjacent() {
+        let memory = "66666666-6666-4666-8666-666666666666";
+        let other = "66666666-6666-4666-8666-666666666667";
+        let context = Context::assemble(
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            "answer a question",
+            4096,
+            100,
+            50,
+            vec![
+                segment(SegmentRole::Memory, "first quote", Some(memory)),
+                segment(SegmentRole::Memory, "a different memory", Some(other)),
+                segment(SegmentRole::Memory, "the first memory again", Some(memory)),
+            ],
+            Provenance::now(Component::Axiom, "axiom:context/compress"),
+        );
+        assert_eq!(context.memory_ids, vec![memory.to_string(), other.to_string()]);
     }
 
     #[test]

@@ -20,10 +20,13 @@ normalized away.
 from __future__ import annotations
 
 import hashlib
-import json
+import sys
 from pathlib import Path
 
 CP1_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from cp1_canonical import canonical, seal  # noqa: E402  (path set above)
 
 # A fixed instant for every fixture. Fixtures must be byte-reproducible, so
 # nothing here may read the clock.
@@ -55,28 +58,6 @@ U = {
 }
 
 
-def canonical(value: object) -> str:
-    """CP/1 canonical form: sorted keys, no insignificant whitespace.
-
-    `ensure_ascii=False` keeps non-ASCII as literal UTF-8 rather than `\\uXXXX`
-    escapes, matching SPEC.md section 2 rule 3 (shortest valid escaping).
-    """
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-def sealed(doc: dict) -> dict:
-    """Return `doc` with `provenance.content_hash` set to its true value.
-
-    The hash is taken over the canonical form of the document with the
-    `content_hash` member absent — a document cannot commit to its own hash.
-    """
-    unsealed = json.loads(json.dumps(doc))
-    unsealed["provenance"].pop("content_hash", None)
-    digest = hashlib.sha256(canonical(unsealed).encode("utf-8")).hexdigest()
-    doc["provenance"]["content_hash"] = digest
-    return doc
-
-
 def prov(
     authored_by: str,
     origin: str,
@@ -94,7 +75,7 @@ def prov(
 
 
 def identity() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Identity",
@@ -109,7 +90,7 @@ def identity() -> dict:
 
 
 def genome() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Genome",
@@ -122,16 +103,27 @@ def genome() -> dict:
             "capabilities": ["context-compression", "experience-validation"],
             "skills": ["rust-debugging"],
             "policies": ["never accept an unvalidated genome amendment"],
-            "preferences": {"tone": "direct", "verbosity": "low"},
+            # Two of these keys are deliberately non-ASCII, and one is beyond
+            # the BMP. UTF-8 byte order puts "\ufffd" before "\U0001d11e";
+            # UTF-16 code-unit order puts them the other way round, because the
+            # leading surrogate D834 sorts below FFFD. A binding that sorts keys
+            # with a bare JavaScript `.sort()` fails the round-trip check on
+            # this fixture, which is the point of carrying it.
+            "preferences": {
+                "tone": "direct",
+                "verbosity": "low",
+                "\ufffd": "replacement",
+                "\U0001d11e": "g-clef",
+            },
             "committed_at": T1,
-            "commit_reason": "accepted mutation: amend preferences.tone",
+            "commit_reason": "accepted mutation: amend goals.append",
             "provenance": prov("adam", "genome:commit", derived_from=[U["mutation"]]),
         }
     )
 
 
 def capability() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Capability",
@@ -148,12 +140,12 @@ def capability() -> dict:
 
 
 def belief() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Belief",
             "id": U["belief"],
-            "statement": "Unvalidated genome amendments regress task success.",
+            "statement": "Stating a continuity goal improves task success.",
             "confidence_bp": 8200,
             "uncertainty_bp": 1500,
             "status": "held",
@@ -163,7 +155,12 @@ def belief() -> dict:
             "provenance": prov(
                 "adam",
                 "belief:consolidation",
-                evidence=["fitness delta -1800bp on scenario 'bad'"],
+                # Must agree with the FitnessResult this derives from: +700bp,
+                # no scenario regressing. A fixture whose stated evidence
+                # contradicts the document it cites teaches every reader of the
+                # corpus the wrong thing about how provenance is meant to hang
+                # together.
+                evidence=["fitness delta +700bp with no scenario regressing"],
                 derived_from=[U["memory"], U["fitness"]],
             ),
         }
@@ -171,7 +168,7 @@ def belief() -> dict:
 
 
 def memory() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Memory",
@@ -195,7 +192,7 @@ def memory() -> dict:
 
 
 def skill() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Skill",
@@ -217,7 +214,7 @@ def skill() -> dict:
 
 
 def mutation() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Mutation",
@@ -240,7 +237,7 @@ def mutation() -> dict:
 
 
 def reflection() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Reflection",
@@ -261,7 +258,7 @@ def reflection() -> dict:
 
 
 def observation() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Observation",
@@ -284,7 +281,7 @@ def observation() -> dict:
 
 
 def experience() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Experience",
@@ -308,7 +305,7 @@ def experience() -> dict:
 
 
 def fitness_result() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "FitnessResult",
@@ -348,7 +345,7 @@ def fitness_result() -> dict:
 
 
 def context() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "Context",
@@ -383,7 +380,7 @@ def context() -> dict:
 
 
 def validation_request() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "ValidationRequest",
@@ -400,7 +397,7 @@ def validation_request() -> dict:
 
 
 def event() -> dict:
-    return sealed(
+    return seal(
         {
             "cp": "cp1",
             "type": "GenomeCommitted",
@@ -447,8 +444,12 @@ def build_fixtures() -> str:
 def build_manifest() -> str:
     """SHA-256 of every file a vendored binding must copy verbatim."""
     tracked = sorted(
-        [CP1_ROOT / "SPEC.md", CP1_ROOT / "VERSION", CP1_ROOT / "schema" / "cp1.schema.json"]
-        + [CP1_ROOT / "fixtures" / "canonical.jsonl"],
+        [
+            CP1_ROOT / "SPEC.md",
+            CP1_ROOT / "VERSION",
+            CP1_ROOT / "schema" / "cp1.schema.json",
+            CP1_ROOT / "fixtures" / "canonical.jsonl",
+        ],
         key=lambda p: p.relative_to(CP1_ROOT).as_posix(),
     )
     lines = []
@@ -460,8 +461,13 @@ def build_manifest() -> str:
 
 def main() -> None:
     fixtures_path = CP1_ROOT / "fixtures" / "canonical.jsonl"
-    fixtures_path.write_text(build_fixtures(), encoding="utf-8")
-    (CP1_ROOT / "MANIFEST.sha256").write_text(build_manifest(), encoding="utf-8")
+    # `newline="\n"` rather than the platform default: a regeneration on
+    # Windows would otherwise write CRLF, change every byte offset, and change
+    # MANIFEST.sha256 — defeating the byte-reproducibility the corpus exists for.
+    fixtures_path.write_text(build_fixtures(), encoding="utf-8", newline="\n")
+    (CP1_ROOT / "MANIFEST.sha256").write_text(
+        build_manifest(), encoding="utf-8", newline="\n"
+    )
     print(f"wrote {fixtures_path.relative_to(CP1_ROOT)} ({len(BUILDERS)} documents)")
     print("wrote MANIFEST.sha256")
 

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://axiom-aether.dev/protocol/cp1/cp1.schema.json",
   "title": "Cognitive Protocol v1 — canonical types",
-  "description": "Normative schema for the twelve canonical CP/1 document types, the provenance record they all carry, the event envelope, the validation request, and the signed transport envelope. See SPEC.md for rationale.",
+  "description": "Normative schema for the twelve canonical CP/1 document types, the provenance record they all carry, the event envelope, and the two protocol messages that are not canonical types: ValidationRequest and SignedEnvelope. See SPEC.md sections 3 and 3.0 for the distinction.",
 
   "$defs": {
     "uuid": {
@@ -15,6 +15,13 @@
       "type": "string",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$",
       "description": "RFC 3339 UTC with exactly millisecond precision. Fixed precision is required for reproducible hashing."
+    },
+
+    "safeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "description": "A non-negative count. Bounded at 2^53-1 because JavaScript numbers are IEEE-754 doubles: above that, a value one binding emits losslessly rounds in another, and the document's hash stops being reproducible."
     },
 
     "sha256": {
@@ -69,20 +76,9 @@
       "additionalProperties": false
     },
 
-    "documentHeader": {
-      "type": "object",
-      "properties": {
-        "cp": { "const": "cp1" },
-        "id": { "$ref": "#/$defs/uuid" },
-        "provenance": { "$ref": "#/$defs/provenance" }
-      },
-      "required": ["cp", "id", "provenance"]
-    },
-
     "Identity": {
       "type": "object",
       "description": "Who the organism is. Owned by ADAM. Deliberately carries no reference to a model, weights or provider: identity must survive model replacement, so nothing model-specific may appear here.",
-      "allOf": [{ "$ref": "#/$defs/documentHeader" }],
       "properties": {
         "cp": { "const": "cp1" },
         "type": { "const": "Identity" },
@@ -212,7 +208,7 @@
           "description": "Current retrieval strength after decay and reinforcement."
         },
         "decay_rate_bp": { "$ref": "#/$defs/basisPoints" },
-        "access_count": { "type": "integer", "minimum": 0 },
+        "access_count": { "$ref": "#/$defs/safeInteger" },
         "created_at": { "$ref": "#/$defs/timestamp" },
         "last_accessed_at": { "$ref": "#/$defs/timestamp" },
         "provenance": { "$ref": "#/$defs/provenance" }
@@ -240,8 +236,8 @@
           "description": "Ordered steps. Order is semantic."
         },
         "fitness_bp": { "$ref": "#/$defs/basisPoints" },
-        "trials_passed": { "type": "integer", "minimum": 0 },
-        "trials_total": { "type": "integer", "minimum": 0 },
+        "trials_passed": { "$ref": "#/$defs/safeInteger" },
+        "trials_total": { "$ref": "#/$defs/safeInteger" },
         "provenance": { "$ref": "#/$defs/provenance" }
       },
       "required": [
@@ -291,12 +287,12 @@
         "genome_version_id": { "$ref": "#/$defs/uuid" },
         "genome_version_label": { "type": "string" },
         "observed_at": { "$ref": "#/$defs/timestamp" },
-        "memory_total": { "type": "integer", "minimum": 0 },
-        "active_beliefs": { "type": "integer", "minimum": 0 },
-        "promoted_skills": { "type": "integer", "minimum": 0 },
-        "retired_skills": { "type": "integer", "minimum": 0 },
-        "pending_mutations": { "type": "integer", "minimum": 0 },
-        "accepted_mutations": { "type": "integer", "minimum": 0 },
+        "memory_total": { "$ref": "#/$defs/safeInteger" },
+        "active_beliefs": { "$ref": "#/$defs/safeInteger" },
+        "promoted_skills": { "$ref": "#/$defs/safeInteger" },
+        "retired_skills": { "$ref": "#/$defs/safeInteger" },
+        "pending_mutations": { "$ref": "#/$defs/safeInteger" },
+        "accepted_mutations": { "$ref": "#/$defs/safeInteger" },
         "notes": { "type": "array", "items": { "type": "string" } },
         "provenance": { "$ref": "#/$defs/provenance" }
       },
@@ -345,7 +341,7 @@
             "additionalProperties": false
           }
         },
-        "latency_ms": { "type": "integer", "minimum": 0 },
+        "latency_ms": { "$ref": "#/$defs/safeInteger" },
         "error_perceived": { "type": "boolean" },
         "provenance": { "$ref": "#/$defs/provenance" }
       },
@@ -364,7 +360,7 @@
         "type": { "const": "Experience" },
         "id": { "$ref": "#/$defs/uuid" },
         "observation_id": { "$ref": "#/$defs/uuid" },
-        "step": { "type": "integer", "minimum": 0 },
+        "step": { "$ref": "#/$defs/safeInteger" },
         "goal": { "type": "string" },
         "action": {
           "enum": ["click", "type", "press", "scroll", "navigate", "back", "read", "wait", "abandon"]
@@ -413,7 +409,7 @@
         "frustration_bp": { "$ref": "#/$defs/basisPoints" },
         "trust_bp": { "$ref": "#/$defs/basisPoints" },
         "cognitive_load_bp": { "$ref": "#/$defs/basisPoints" },
-        "runs": { "type": "integer", "minimum": 1 }
+        "runs": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
       },
       "required": ["composite_bp", "task_success_bp", "frustration_bp", "trust_bp", "cognitive_load_bp", "runs"],
       "additionalProperties": false
@@ -438,7 +434,7 @@
           "items": { "type": "string" },
           "minItems": 1
         },
-        "trials": { "type": "integer", "minimum": 1 },
+        "trials": { "type": "integer", "minimum": 1, "maximum": 64 },
         "baseline": { "$ref": "#/$defs/measurement" },
         "candidate": { "$ref": "#/$defs/measurement" },
         "delta_bp": {
@@ -464,9 +460,9 @@
         "type": { "const": "Context" },
         "id": { "$ref": "#/$defs/uuid" },
         "purpose": { "type": "string", "minLength": 1 },
-        "token_budget": { "type": "integer", "minimum": 1 },
-        "tokens_before": { "type": "integer", "minimum": 0 },
-        "tokens_after": { "type": "integer", "minimum": 0 },
+        "token_budget": { "$ref": "#/$defs/safeInteger" },
+        "tokens_before": { "$ref": "#/$defs/safeInteger" },
+        "tokens_after": { "$ref": "#/$defs/safeInteger" },
         "compression_ratio_bp": {
           "$ref": "#/$defs/basisPoints",
           "description": "tokens_after / tokens_before. 10000 means nothing was compressed."
@@ -476,8 +472,8 @@
           "description": "False when any segment could not be traced to a cited memory, belief or observation."
         },
         "grounding_failures": { "type": "array", "items": { "type": "string" } },
-        "memory_ids": { "type": "array", "items": { "$ref": "#/$defs/uuid" } },
-        "belief_ids": { "type": "array", "items": { "$ref": "#/$defs/uuid" } },
+        "memory_ids": { "type": "array", "items": { "$ref": "#/$defs/uuid" }, "uniqueItems": true },
+        "belief_ids": { "type": "array", "items": { "$ref": "#/$defs/uuid" }, "uniqueItems": true },
         "segments": {
           "type": "array",
           "items": {
@@ -582,7 +578,14 @@
         "cp": { "const": "cp1" },
         "schema": { "const": "cp1_signed_envelope" },
         "payload": { "type": "string", "minLength": 1 },
-        "sha256": { "$ref": "#/$defs/sha256" },
+        "safeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "description": "A non-negative count. Bounded at 2^53-1 because JavaScript numbers are IEEE-754 doubles: above that, a value one binding emits losslessly rounds in another, and the document's hash stops being reproducible."
+    },
+
+    "sha256": { "$ref": "#/$defs/sha256" },
         "hmac": { "$ref": "#/$defs/sha256" }
       },
       "required": ["cp", "schema", "payload", "sha256"],
