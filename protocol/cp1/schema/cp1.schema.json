@@ -1,0 +1,609 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://axiom-aether.dev/protocol/cp1/cp1.schema.json",
+  "title": "Cognitive Protocol v1 — canonical types",
+  "description": "Normative schema for the twelve canonical CP/1 document types, the provenance record they all carry, the event envelope, the validation request, and the signed transport envelope. See SPEC.md for rationale.",
+
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "Lowercase hyphenated UUID."
+    },
+
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$",
+      "description": "RFC 3339 UTC with exactly millisecond precision. Fixed precision is required for reproducible hashing."
+    },
+
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex SHA-256."
+    },
+
+    "basisPoints": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000,
+      "description": "A ratio in [0,1] expressed as an integer in [0,10000]. CP/1 never puts floating point on the wire; see SPEC.md section 2.1."
+    },
+
+    "signedBasisPoints": {
+      "type": "integer",
+      "minimum": -10000,
+      "maximum": 10000,
+      "description": "A signed ratio in [-1,1] expressed as an integer in [-10000,10000]."
+    },
+
+    "component": {
+      "enum": ["adam", "eve", "axiom"],
+      "description": "The repository that authored a document. Authorship of each canonical type is exclusive; see SPEC.md section 3."
+    },
+
+    "provenance": {
+      "type": "object",
+      "description": "Chain of custody. Mandatory on every CP/1 document.",
+      "properties": {
+        "authored_by": { "$ref": "#/$defs/component" },
+        "produced_at": { "$ref": "#/$defs/timestamp" },
+        "origin": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Machine-readable source, e.g. 'reflection:consolidation', 'eve:scenario/excellent', 'tool:cargo_build'."
+        },
+        "evidence": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Supporting excerpts or URIs. Order is semantic."
+        },
+        "derived_from": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/uuid" },
+          "description": "Ids of the documents this one was computed from, making the organism's knowledge a walkable DAG."
+        },
+        "content_hash": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["authored_by", "produced_at", "origin", "evidence", "derived_from", "content_hash"],
+      "additionalProperties": false
+    },
+
+    "documentHeader": {
+      "type": "object",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": ["cp", "id", "provenance"]
+    },
+
+    "Identity": {
+      "type": "object",
+      "description": "Who the organism is. Owned by ADAM. Deliberately carries no reference to a model, weights or provider: identity must survive model replacement, so nothing model-specific may appear here.",
+      "allOf": [{ "$ref": "#/$defs/documentHeader" }],
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Identity" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "lineage_id": {
+          "$ref": "#/$defs/uuid",
+          "description": "Stable for the organism's entire existence, across every genome version and every model substitution. This, not `id`, is what 'the same organism' means."
+        },
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "established_at": { "$ref": "#/$defs/timestamp" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": ["cp", "type", "id", "lineage_id", "name", "description", "established_at", "provenance"],
+      "additionalProperties": false
+    },
+
+    "Genome": {
+      "type": "object",
+      "description": "The full evolvable state of the organism. Owned by ADAM. Capabilities and skills are referenced by name; the Capability and Skill documents describe them. Keeping the genome to names makes it small, diffable and cheap to hash on every commit.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Genome" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "version_label": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+$",
+          "description": "Major.minor label of this genome version."
+        },
+        "parent_version_id": {
+          "$ref": "#/$defs/uuid",
+          "description": "Absent only on the genesis version."
+        },
+        "identity": { "$ref": "#/$defs/Identity" },
+        "values": { "type": "array", "items": { "type": "string" } },
+        "goals": { "type": "array", "items": { "type": "string" } },
+        "capabilities": { "type": "array", "items": { "type": "string" } },
+        "skills": { "type": "array", "items": { "type": "string" } },
+        "policies": { "type": "array", "items": { "type": "string" } },
+        "preferences": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "committed_at": { "$ref": "#/$defs/timestamp" },
+        "commit_reason": { "type": "string" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "version_label", "identity", "values", "goals",
+        "capabilities", "skills", "policies", "preferences", "committed_at",
+        "commit_reason", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "Capability": {
+      "type": "object",
+      "description": "A declared ability and the concrete provider that satisfies it. Owned by ADAM. The genome names a capability; this document says what having it actually means and who supplies it, which is what lets a capability be re-provided by a different backend without touching the genome.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Capability" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "name": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string" },
+        "kind": {
+          "enum": ["tool", "skill", "environment", "inference", "memory"],
+          "description": "What sort of ability this is, which determines which component can provide it."
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Component-qualified provider reference, e.g. 'axiom:mcp/compress_context' or 'eve:scenario/checkout'."
+        },
+        "requires": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Names of capabilities this one depends on."
+        },
+        "stability": { "enum": ["experimental", "stable", "deprecated"] },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": ["cp", "type", "id", "name", "summary", "kind", "provider", "requires", "stability", "provenance"],
+      "additionalProperties": false
+    },
+
+    "Belief": {
+      "type": "object",
+      "description": "A proposition the organism holds. Owned by ADAM. `uncertainty_bp` exists so a component with a distributional belief model (AXIOM's Beta beliefs) can project onto this type without discarding the distinction between 'succeeded 1 of 1' and 'succeeded 50 of 100', which a scalar confidence collapses.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Belief" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "statement": { "type": "string", "minLength": 1 },
+        "confidence_bp": { "$ref": "#/$defs/basisPoints" },
+        "uncertainty_bp": {
+          "$ref": "#/$defs/basisPoints",
+          "description": "How little evidence backs the confidence. 0 means fully evidenced; 10000 means a bare prior."
+        },
+        "status": { "enum": ["held", "weakened", "retracted", "superseded"] },
+        "evidence_origin": {
+          "enum": ["observation", "reasoning", "instruction", "consolidation", "simulation"]
+        },
+        "supersedes": { "$ref": "#/$defs/uuid" },
+        "formed_at": { "$ref": "#/$defs/timestamp" },
+        "updated_at": { "$ref": "#/$defs/timestamp" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "statement", "confidence_bp", "uncertainty_bp",
+        "status", "evidence_origin", "formed_at", "updated_at", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "Memory": {
+      "type": "object",
+      "description": "A durable, provenanced record consolidated from experience. Owned by ADAM. Embeddings are deliberately absent from the wire: they are an implementation detail whose dimensionality and dtype differ per component, and putting float vectors in a hashed document would reintroduce exactly the canonicalization problem SPEC.md section 2.1 rules out.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Memory" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "kind": { "enum": ["episodic", "semantic", "procedural", "self_knowledge"] },
+        "content": { "type": "string", "minLength": 1 },
+        "confidence_bp": { "$ref": "#/$defs/basisPoints" },
+        "salience_bp": {
+          "$ref": "#/$defs/basisPoints",
+          "description": "Current retrieval strength after decay and reinforcement."
+        },
+        "decay_rate_bp": { "$ref": "#/$defs/basisPoints" },
+        "access_count": { "type": "integer", "minimum": 0 },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "last_accessed_at": { "$ref": "#/$defs/timestamp" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "kind", "content", "confidence_bp", "salience_bp",
+        "decay_rate_bp", "access_count", "created_at", "last_accessed_at", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "Skill": {
+      "type": "object",
+      "description": "A named, testable procedure with a fitness history. Owned by ADAM. Stages are ordered and a skill may only advance one stage at a time, so a skill can never reach `promoted` without having been `tested`.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Skill" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "name": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string" },
+        "stage": { "enum": ["discovered", "defined", "tested", "evaluated", "promoted", "retired"] },
+        "procedure": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Ordered steps. Order is semantic."
+        },
+        "fitness_bp": { "$ref": "#/$defs/basisPoints" },
+        "trials_passed": { "type": "integer", "minimum": 0 },
+        "trials_total": { "type": "integer", "minimum": 0 },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "name", "summary", "stage", "procedure",
+        "fitness_bp", "trials_passed", "trials_total", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "Mutation": {
+      "type": "object",
+      "description": "A proposed change to genome, skills or beliefs. Owned by ADAM. `risk_bp` is intrinsic to the mutation kind and target and is NOT derived from `confidence_bp`: letting a proposal lower its own risk by asserting higher confidence in itself would defeat the point of measuring it externally.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Mutation" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "kind": {
+          "enum": ["amend_genome", "retire_skill", "reconcile_belief", "investigate_conflict"]
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What the mutation acts on: a genome field path ('preferences.tone', 'goals.append'), a skill name, a belief statement, or a conflict topic."
+        },
+        "current_value": { "type": "string" },
+        "proposed_value": { "type": "string" },
+        "rationale": { "type": "string", "minLength": 1 },
+        "confidence_bp": { "$ref": "#/$defs/basisPoints" },
+        "risk_bp": { "$ref": "#/$defs/basisPoints" },
+        "status": { "enum": ["proposed", "validating", "accepted", "rejected"] },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "kind", "target", "rationale",
+        "confidence_bp", "risk_bp", "status", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "Reflection": {
+      "type": "object",
+      "description": "A point-in-time self-assessment across every subsystem. Owned by ADAM. This is the organism's self-model: the only document that reports on the organism as a whole rather than one of its parts.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Reflection" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "genome_version_id": { "$ref": "#/$defs/uuid" },
+        "genome_version_label": { "type": "string" },
+        "observed_at": { "$ref": "#/$defs/timestamp" },
+        "memory_total": { "type": "integer", "minimum": 0 },
+        "active_beliefs": { "type": "integer", "minimum": 0 },
+        "promoted_skills": { "type": "integer", "minimum": 0 },
+        "retired_skills": { "type": "integer", "minimum": 0 },
+        "pending_mutations": { "type": "integer", "minimum": 0 },
+        "accepted_mutations": { "type": "integer", "minimum": 0 },
+        "notes": { "type": "array", "items": { "type": "string" } },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "genome_version_id", "genome_version_label", "observed_at",
+        "memory_total", "active_beliefs", "promoted_skills", "retired_skills",
+        "pending_mutations", "accepted_mutations", "notes", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "Observation": {
+      "type": "object",
+      "description": "One perceived fact about an environment at a point in time. Owned by EVE. Restricted to what an operator could actually perceive: no DOM internals, no network traces, no source code. That restriction is what makes an Observation evidence about experience rather than about implementation.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Observation" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "environment_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Which environment was perceived, e.g. a scenario id or a URL origin."
+        },
+        "surface": { "enum": ["web", "mobile", "cli", "api", "mock"] },
+        "at": { "$ref": "#/$defs/timestamp" },
+        "locator": {
+          "type": "string",
+          "description": "Where within the environment, e.g. a URL or screen id."
+        },
+        "title": { "type": "string" },
+        "signals": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Perceivable text or state facts, in perceived order."
+        },
+        "affordances": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": { "type": "string" },
+              "role": { "type": "string" },
+              "enabled": { "type": "boolean" }
+            },
+            "required": ["label", "role", "enabled"],
+            "additionalProperties": false
+          }
+        },
+        "latency_ms": { "type": "integer", "minimum": 0 },
+        "error_perceived": { "type": "boolean" },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "environment_id", "surface", "at", "signals",
+        "affordances", "latency_ms", "error_perceived", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "Experience": {
+      "type": "object",
+      "description": "An observation situated in intent: what was being attempted, what was predicted, what happened, and how it felt. Owned by EVE. An Observation alone is not experience — experience is the gap between prediction and outcome, which is what drives learning.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Experience" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "observation_id": { "$ref": "#/$defs/uuid" },
+        "step": { "type": "integer", "minimum": 0 },
+        "goal": { "type": "string" },
+        "action": {
+          "enum": ["click", "type", "press", "scroll", "navigate", "back", "read", "wait", "abandon"]
+        },
+        "action_description": { "type": "string" },
+        "prediction": {
+          "type": "object",
+          "properties": {
+            "description": { "type": "string" },
+            "confidence_bp": { "$ref": "#/$defs/basisPoints" },
+            "expects_change": { "type": "boolean" }
+          },
+          "required": ["description", "confidence_bp", "expects_change"],
+          "additionalProperties": false
+        },
+        "outcome": { "enum": ["success", "surprise", "error", "no_change", "abandoned"] },
+        "surprise_bp": {
+          "$ref": "#/$defs/basisPoints",
+          "description": "Distance between prediction and reality. 0 means exactly as predicted."
+        },
+        "affect": {
+          "type": "object",
+          "properties": {
+            "frustration_bp": { "$ref": "#/$defs/basisPoints" },
+            "trust_bp": { "$ref": "#/$defs/basisPoints" },
+            "confidence_bp": { "$ref": "#/$defs/basisPoints" }
+          },
+          "required": ["frustration_bp", "trust_bp", "confidence_bp"],
+          "additionalProperties": false
+        },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "observation_id", "step", "goal", "action",
+        "action_description", "prediction", "outcome", "surprise_bp", "affect", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "measurement": {
+      "type": "object",
+      "description": "One side of a counterfactual fitness comparison.",
+      "properties": {
+        "composite_bp": { "$ref": "#/$defs/basisPoints" },
+        "task_success_bp": { "$ref": "#/$defs/basisPoints" },
+        "frustration_bp": { "$ref": "#/$defs/basisPoints" },
+        "trust_bp": { "$ref": "#/$defs/basisPoints" },
+        "cognitive_load_bp": { "$ref": "#/$defs/basisPoints" },
+        "runs": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["composite_bp", "task_success_bp", "frustration_bp", "trust_bp", "cognitive_load_bp", "runs"],
+      "additionalProperties": false
+    },
+
+    "FitnessResult": {
+      "type": "object",
+      "description": "Evidence-backed measurement of a mutation. Owned by EVE. Fitness is counterfactual: baseline and candidate are measured over the SAME scenarios with the SAME seed, so the only difference between them is the mutation. A result whose two runs used different seeds is malformed and must be rejected by bindings.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "FitnessResult" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "mutation_id": { "$ref": "#/$defs/uuid" },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "The seed both runs used. Required, and identical across baseline and candidate by construction."
+        },
+        "scenario_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "trials": { "type": "integer", "minimum": 1 },
+        "baseline": { "$ref": "#/$defs/measurement" },
+        "candidate": { "$ref": "#/$defs/measurement" },
+        "delta_bp": {
+          "$ref": "#/$defs/signedBasisPoints",
+          "description": "candidate.composite_bp - baseline.composite_bp. Signed: a mutation may make the organism worse, and that is the finding."
+        },
+        "recommendation": { "enum": ["approve", "needs_review", "reject"] },
+        "reason": { "type": "string", "minLength": 1 },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "mutation_id", "seed", "scenario_ids", "trials",
+        "baseline", "candidate", "delta_bp", "recommendation", "reason", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "Context": {
+      "type": "object",
+      "description": "A bounded, compressed, grounded working set handed to a model. Owned by AXIOM. This is the only canonical type that is model-facing, and it is deliberately separate from Memory and Belief: what the organism knows is durable, what it is currently attending to is not.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "Context" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "purpose": { "type": "string", "minLength": 1 },
+        "token_budget": { "type": "integer", "minimum": 1 },
+        "tokens_before": { "type": "integer", "minimum": 0 },
+        "tokens_after": { "type": "integer", "minimum": 0 },
+        "compression_ratio_bp": {
+          "$ref": "#/$defs/basisPoints",
+          "description": "tokens_after / tokens_before. 10000 means nothing was compressed."
+        },
+        "grounded": {
+          "type": "boolean",
+          "description": "False when any segment could not be traced to a cited memory, belief or observation."
+        },
+        "grounding_failures": { "type": "array", "items": { "type": "string" } },
+        "memory_ids": { "type": "array", "items": { "$ref": "#/$defs/uuid" } },
+        "belief_ids": { "type": "array", "items": { "$ref": "#/$defs/uuid" } },
+        "segments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": { "enum": ["identity", "goal", "memory", "belief", "observation", "instruction"] },
+              "content": { "type": "string" },
+              "source_id": { "$ref": "#/$defs/uuid" }
+            },
+            "required": ["role", "content"],
+            "additionalProperties": false
+          }
+        },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "purpose", "token_budget", "tokens_before", "tokens_after",
+        "compression_ratio_bp", "grounded", "grounding_failures", "memory_ids",
+        "belief_ids", "segments", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "ValidationRequest": {
+      "type": "object",
+      "description": "ADAM asks EVE to measure a mutation. Carries the genome hashes rather than the genomes themselves: EVE does not need the organism's state to run scenarios, and shipping it across the boundary would leak ADAM-owned data into a component that has no business authoring it. The hashes let the resulting FitnessResult be pinned to the exact genome pair it was measured against.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": { "const": "ValidationRequest" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "mutation": { "$ref": "#/$defs/Mutation" },
+        "genome_before_hash": { "$ref": "#/$defs/sha256" },
+        "genome_after_hash": { "$ref": "#/$defs/sha256" },
+        "scenario_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "seed": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "trials": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "mutation", "genome_before_hash", "genome_after_hash",
+        "scenario_ids", "seed", "trials", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "Event": {
+      "type": "object",
+      "description": "The organism's nervous system. Subsystems announce facts; nothing calls anything directly. `correlation_id` groups every event of one developmental turn; `causation_id` gives the edge to the event that triggered this one, making a turn a reconstructible tree.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "type": {
+          "enum": [
+            "ObservationRecorded",
+            "ExperienceCreated",
+            "ContextCompressed",
+            "GroundingFailed",
+            "MemoryConsolidated",
+            "BeliefUpdated",
+            "SkillLearned",
+            "ReflectionCompleted",
+            "MutationProposed",
+            "SimulationCompleted",
+            "FitnessMeasured",
+            "MutationAccepted",
+            "MutationRejected",
+            "GenomeCommitted"
+          ]
+        },
+        "id": { "$ref": "#/$defs/uuid" },
+        "occurred_at": { "$ref": "#/$defs/timestamp" },
+        "actor": { "$ref": "#/$defs/component" },
+        "subject_id": { "$ref": "#/$defs/uuid" },
+        "subject_type": {
+          "enum": [
+            "Identity", "Genome", "Capability", "Belief", "Memory", "Skill",
+            "Mutation", "Reflection", "Observation", "Experience",
+            "FitnessResult", "Context"
+          ]
+        },
+        "correlation_id": { "$ref": "#/$defs/uuid" },
+        "causation_id": { "$ref": "#/$defs/uuid" },
+        "payload": {
+          "type": "object",
+          "description": "Event-specific detail. Kept to scalars and short strings so an event log stays readable and cheap; the full document is fetched by subject_id when detail is needed.",
+          "additionalProperties": {
+            "type": ["string", "integer", "boolean"]
+          }
+        },
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "required": [
+        "cp", "type", "id", "occurred_at", "actor", "subject_id",
+        "subject_type", "correlation_id", "payload", "provenance"
+      ],
+      "additionalProperties": false
+    },
+
+    "SignedEnvelope": {
+      "type": "object",
+      "description": "Transport wrapper. `payload` is the canonical-form JSON of the document as a STRING, not a nested object, so the bytes that were hashed are exactly the bytes transmitted — re-serializing a nested object would let the receiver's JSON writer alter what the hash committed to.",
+      "properties": {
+        "cp": { "const": "cp1" },
+        "schema": { "const": "cp1_signed_envelope" },
+        "payload": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "hmac": { "$ref": "#/$defs/sha256" }
+      },
+      "required": ["cp", "schema", "payload", "sha256"],
+      "additionalProperties": false
+    }
+  },
+
+  "oneOf": [
+    { "$ref": "#/$defs/Identity" },
+    { "$ref": "#/$defs/Genome" },
+    { "$ref": "#/$defs/Capability" },
+    { "$ref": "#/$defs/Belief" },
+    { "$ref": "#/$defs/Memory" },
+    { "$ref": "#/$defs/Skill" },
+    { "$ref": "#/$defs/Mutation" },
+    { "$ref": "#/$defs/Reflection" },
+    { "$ref": "#/$defs/Observation" },
+    { "$ref": "#/$defs/Experience" },
+    { "$ref": "#/$defs/FitnessResult" },
+    { "$ref": "#/$defs/Context" },
+    { "$ref": "#/$defs/ValidationRequest" },
+    { "$ref": "#/$defs/Event" }
+  ]
+}

@@ -1,0 +1,354 @@
+# Cognitive Protocol, version 1 (CP/1)
+
+CP/1 is the stable wire contract shared by the three repositories that together
+form one cognitive organism:
+
+| Repository       | Role in the organism                                             |
+| ---------------- | ---------------------------------------------------------------- |
+| **AXIOM-AETHER** | Context engineering, compression, grounding, fast-weight adaptation, provenance, epistemic validation, MCP infrastructure. **Normative owner of CP/1.** |
+| **EVE**          | Environments, simulations, deterministic replay, evaluation, fitness measurement, benchmark scenarios. |
+| **ADAM**         | Genome, identity, beliefs, long-term memory, skills, evolution, reflection, self-model. |
+
+This document is the single normative source. `schema/` holds machine-readable
+JSON Schemas; `fixtures/` holds golden documents that every implementation must
+round-trip byte-identically. `MANIFEST.sha256` pins the exact bytes of both so a
+vendored copy can prove it has not drifted.
+
+## 1. Why a protocol at all
+
+The three repositories are written in Rust, TypeScript and Python, live in
+separate version-control histories, and are released on independent cadences.
+Any design in which one imports another's code creates a build-time dependency
+edge that cannot survive that reality: ADAM cannot link a TypeScript simulation
+engine, and EVE cannot link a `candle`-backed inference crate.
+
+CP/1 replaces the dependency edge with a data edge. Each repository owns a
+**vendored binding** — a hand-written implementation of these schemas in its own
+language — plus a conformance test that reads the *shared* fixtures. Nothing is
+generated at build time, nothing is fetched at build time, and no repository
+needs the others present to compile or test. Drift is caught by the conformance
+test, not by a linker.
+
+### 1.1 Rationale: why not a shared package?
+
+Rejected alternatives, and why:
+
+- **A fourth "common types" repository consumed as a dependency.** Reintroduces
+  the build edge in a worse form: a release of the common repo would have to be
+  coordinated across three package ecosystems (crates.io, npm, PyPI) before any
+  consumer could move. The organism's evolution rate would be capped by its
+  slowest packaging pipeline.
+- **Code generation from the schemas at build time.** Requires a generator
+  toolchain (and its transitive dependencies) in all three CI environments, and
+  produces types that are idiomatic in none of the three languages. The types
+  here are small and stable enough that hand-written bindings are cheaper to
+  read, cheaper to review, and free at build time.
+- **gRPC/protobuf.** Solves a problem CP/1 does not have (high-frequency binary
+  RPC) at the cost of one it does have (human-auditable, hash-stable documents
+  that can be committed to a provenance log and diffed in review).
+
+The chosen design costs one thing: three hand-written bindings must be kept in
+sync. `MANIFEST.sha256` plus per-repository conformance tests make that cost
+visible and enforced rather than silent.
+
+## 2. Encoding and canonical form
+
+CP/1 documents are JSON. Every document has exactly one **canonical form**, used
+for hashing and signing:
+
+1. Object members are sorted by key, ascending, comparing UTF-8 code units.
+2. No insignificant whitespace: no spaces after `:` or `,`, no newlines.
+3. Strings use the shortest valid escaping: only `"`, `\`, and `U+0000`–`U+001F`
+   are escaped, the latter as `\u00XX` except for the standard short forms
+   `\b \f \n \r \t`.
+4. Arrays preserve order. Order is semantic everywhere in CP/1.
+5. Numbers are **integers only** (see §2.1). They are rendered with no sign for
+   non-negative values, no leading zeros, no exponent, and no fraction.
+6. `null` is never written. An absent value is an absent key.
+
+Canonical form is what `content_hash` commits to and what a signature covers.
+
+### 2.1 Rationale: no floating point on the wire
+
+Every quantity that would naturally be a fraction — confidence, fitness, risk,
+similarity, decay — is transmitted as an integer in **basis points**: an
+`integer` in `[0, 10000]` where `10000` means 1.0.
+
+This is not stylistic. A protocol shared by Rust (`f32` in ADAM's memory
+records, `f64` elsewhere) and JavaScript (IEEE-754 double, the only numeric
+type) has no interoperable canonical rendering for floats. `0.1 + 0.2`,
+shortest-round-trip formatting, `-0.0`, and `f32`→`f64` widening all produce
+values that compare equal in one language and hash differently in another. A
+protocol whose hashes depend on the reader's numeric type cannot support
+reproducible provenance, which is the entire point of §4.
+
+Basis points make the wire exact and force every implementation to be explicit
+about where it rounds. Bindings convert at the boundary and only at the
+boundary; internal representations stay whatever each language prefers.
+
+Rounding on encode is **round-half-away-from-zero**, so `0.00005` → `1` bp in
+every binding. Values outside `[0, 1]` are clamped, not wrapped.
+
+## 3. Canonical types
+
+Twelve types are canonical. Every concept in the organism is expressed in terms
+of them, and each has exactly one owning repository — the only component allowed
+to author (as opposed to read) documents of that type.
+
+| Type            | Owner | Meaning |
+| --------------- | ----- | ------- |
+| `Identity`      | ADAM  | Who the organism is. Stable across model replacement. |
+| `Genome`        | ADAM  | The full evolvable state: identity, values, goals, capabilities, skills, preferences, policies. |
+| `Capability`    | ADAM  | A declared ability, and the provider that satisfies it. |
+| `Belief`        | ADAM  | A proposition the organism holds, with confidence and evidence. |
+| `Memory`        | ADAM  | A durable, provenanced record consolidated from experience. |
+| `Skill`         | ADAM  | A named, testable procedure with a fitness history. |
+| `Mutation`      | ADAM  | A proposed change to genome, skills or beliefs. |
+| `Reflection`    | ADAM  | A point-in-time self-assessment across subsystems. |
+| `Observation`   | EVE   | One perceived fact about an environment, at a point in time. |
+| `Experience`    | EVE   | An observation situated in intent: goal, action, outcome, affect. |
+| `FitnessResult` | EVE   | Evidence-backed measurement of a mutation against scenarios. |
+| `Context`       | AXIOM | A bounded, compressed, grounded working set handed to a model. |
+
+Ownership is exclusive for **authorship**, not for reading. ADAM reads
+`FitnessResult` to gate a mutation; EVE reads `Mutation` to know what to
+measure; AXIOM reads `Memory` to ground a `Context`. None of them may mint a
+document of a type they do not own — a rule the conformance suite cannot check,
+but code review and the `provenance.authored_by` field make auditable.
+
+### 3.1 Rationale: why these twelve, and why ownership is exclusive
+
+The pre-CP/1 state of the three repositories contained, by actual count:
+
+- **Three unrelated memory implementations.** ADAM's SQLite store with
+  embeddings and decay, EVE's four-subsystem human memory model (working,
+  episodic, semantic, spatial), and AXIOM's append-only JSONL scope store —
+  plus four more partial stores in AXIOM alone (`heal_memory`, `patch_memory`,
+  `vibe_memory`, `memory_recall`). Each used the word "memory" for a different
+  thing.
+- **Two unrelated belief systems.** ADAM's evidence-and-confidence
+  `BeliefRegistry` and AXIOM's `BetaBelief` (Beta-distributed with
+  Dempster–Shafer combination). Both are correct; they model different things
+  under one name.
+- **A component named for an integration that did not exist.** ADAM's
+  `adam-eve` crate scored mutations by calling a caller-supplied Rust closure.
+  It shared nothing with the EVE repository but the letters. The developmental
+  lifecycle's "validate inside EVE" step therefore had no implementation at all.
+
+CP/1 does not merge those implementations — merging them would destroy real,
+justified differences. It assigns each concept one owner and makes the others
+express their version *as* the canonical type at the boundary. AXIOM's
+`BetaBelief` remains a Beta distribution internally; when it crosses the wire it
+becomes a `Belief` whose `confidence_bp` is the distribution mean and whose
+`uncertainty_bp` carries the variance that a scalar would have discarded. That
+is a lossless-enough projection with a named owner, which is what the system
+lacked.
+
+### 3.2 Common members
+
+Every canonical document carries:
+
+- `cp` — always `"cp1"`. Present so a reader can reject a foreign document
+  before parsing anything else.
+- `type` — the canonical type name, exactly as spelled in the table above.
+- `id` — a UUID, lowercase, hyphenated.
+- `provenance` — see §4.
+
+Timestamps are RFC 3339 with a `Z` offset and exactly millisecond precision
+(`1970-01-01T00:00:00.000Z`). Fixed precision is required: a hash over a
+timestamp that one binding renders with microseconds and another with seconds is
+not reproducible.
+
+## 4. Provenance
+
+`Provenance` is the organism's chain of custody. It is mandatory on every
+document, and it is what makes evolution auditable rather than merely logged.
+
+```
+{
+  "authored_by": "adam",              // "adam" | "eve" | "axiom"
+  "produced_at": "...Z",              // RFC 3339, ms precision
+  "origin": "reflection:consolidation",
+  "evidence": ["<uri or quoted excerpt>", ...],
+  "derived_from": ["<uuid>", ...],    // ids of documents this was computed from
+  "content_hash": "<64 lowercase hex>"
+}
+```
+
+`content_hash` is SHA-256 over the canonical form (§2) of the document with the
+`provenance.content_hash` member **removed** — a document cannot commit to its
+own hash. `derived_from` makes the organism's knowledge a DAG: any belief can be
+walked back through the memories that formed it, to the experiences those were
+consolidated from, to the observations that produced them.
+
+A `SignedEnvelope` (§6) may additionally carry an HMAC-SHA256 over the
+`content_hash`, keyed by a shared fleet secret, for transport across a trust
+boundary. AXIOM's existing `provenance` module implements exactly this
+construction and is the reference implementation.
+
+### 4.1 Rationale: hash excludes the hash, includes everything else
+
+An alternative is to hash only a document's "semantic" fields and exclude
+timestamps and provenance. That makes hashes stable under re-emission, which
+sounds desirable and is in fact the bug: two documents produced by different
+components from different evidence at different times would collide. Since
+`derived_from` and `evidence` are precisely what distinguishes a well-grounded
+belief from a fabricated one, excluding them from the hash would make the
+provenance chain unforgeable in the wrong direction — anyone could substitute
+evidence without changing the hash.
+
+## 5. Events
+
+Everything important emits an event. Events are the organism's nervous system:
+subsystems announce facts and never call each other directly.
+
+Event `type` values are exactly:
+
+| Event                | Emitter | Meaning |
+| -------------------- | ------- | ------- |
+| `ObservationRecorded`| EVE     | An environment was perceived. |
+| `ExperienceCreated`  | EVE     | An observation was situated in goal + action + outcome. |
+| `ContextCompressed`  | AXIOM   | A working set was compressed; carries before/after token counts. |
+| `GroundingFailed`    | AXIOM   | A claim could not be supported by supplied evidence. |
+| `MemoryConsolidated` | ADAM    | Experiences were distilled into a durable memory. |
+| `BeliefUpdated`      | ADAM    | A belief was formed, reinforced, weakened or retracted. |
+| `SkillLearned`       | ADAM    | A skill reached the promoted stage. |
+| `ReflectionCompleted`| ADAM    | A self-assessment across subsystems was produced. |
+| `MutationProposed`   | ADAM    | A change to genome, skills or beliefs was proposed. |
+| `SimulationCompleted`| EVE     | A deterministic scenario run finished. |
+| `FitnessMeasured`    | EVE     | A mutation was scored against baseline and candidate runs. |
+| `MutationAccepted`   | ADAM    | A proposal passed governance and was applied. |
+| `MutationRejected`   | ADAM    | A proposal was refused; carries the reason. |
+| `GenomeCommitted`    | ADAM    | A new immutable genome version was appended. |
+
+The list is closed. Adding an event is a CP/1 version change, because consumers
+switch exhaustively on it — an open enumeration would make every consumer's
+handling of unknown events an untested code path.
+
+Envelope shape:
+
+```
+{
+  "cp": "cp1",
+  "type": "MutationAccepted",
+  "id": "<uuid>",                  // this event's identity
+  "occurred_at": "...Z",
+  "actor": "adam",
+  "subject_id": "<uuid>",          // the canonical document this is about
+  "subject_type": "Mutation",
+  "correlation_id": "<uuid>",      // the lifecycle turn this belongs to
+  "causation_id": "<uuid>",        // the event that caused this one, if any
+  "payload": { ... },              // event-specific, schema'd per event
+  "provenance": { ... }
+}
+```
+
+`correlation_id` is what makes a full developmental turn (§7) reconstructible:
+every event emitted while processing one observation shares it. `causation_id`
+gives the finer-grained edge — which specific event triggered this one — so the
+turn is a tree, not just a bag.
+
+## 6. Transport
+
+CP/1 is transport-agnostic. Two transports are normative because the organism
+uses both:
+
+**Line-delimited JSON over stdio.** One canonical-form document per line, `\n`
+terminated, UTF-8, no BOM. This is how ADAM invokes EVE for fitness measurement:
+ADAM spawns EVE's validator as a subprocess, writes one `ValidationRequest`
+line, and reads `SignedEnvelope` lines until the response. Chosen because it
+needs no network listener, no port allocation, no service discovery and no
+authentication story for the common single-host case — and because a subprocess
+boundary is a real isolation boundary for a component whose job is to run
+untrusted scenarios.
+
+**HTTP POST of a `SignedEnvelope`.** For the distributed case, where EVE runs as
+a service. The envelope's HMAC is what makes this safe across the trust
+boundary; over stdio the HMAC is optional because the parent process already
+controls the child.
+
+A `SignedEnvelope` wraps any CP/1 document:
+
+```
+{
+  "cp": "cp1",
+  "schema": "cp1_signed_envelope",
+  "payload": "<canonical-form JSON of the document, as a string>",
+  "sha256": "<64 lowercase hex of payload bytes>",
+  "hmac": "<64 lowercase hex, optional>"
+}
+```
+
+The payload is a *string*, not a nested object, so the bytes that were hashed
+are the exact bytes transmitted. Re-serializing a nested object would let a
+receiver's JSON writer alter the bytes the hash committed to.
+
+## 7. The developmental lifecycle
+
+CP/1 exists to make one loop executable across three repositories. Each arrow is
+a document crossing a boundary; each stage emits its event.
+
+```
+              EVE                        ADAM                       AXIOM
+               │                          │                           │
+   Observe ────┤ Observation              │                           │
+               │  ObservationRecorded     │                           │
+   Experience ─┤ Experience ─────────────►│                           │
+               │  ExperienceCreated       │                           │
+               │                          ├── Reflect                 │
+               │                          │    ReflectionCompleted    │
+               │                          ├── Consolidate ──► Memory  │
+               │                          │    MemoryConsolidated     │
+               │                          ├── Update beliefs          │
+               │                          │    BeliefUpdated          │
+               │                          ├── Generate mutations      │
+               │                          │    MutationProposed       │
+               │◄─ Mutation ──────────────┤                           │
+   Validate ───┤ (deterministic scenarios)│                           │
+               │  SimulationCompleted     │                           │
+   Measure ────┤ FitnessResult ──────────►│                           │
+               │  FitnessMeasured         │                           │
+               │                          ├── Govern: accept / reject │
+               │                          │    MutationAccepted|Rejected
+               │                          ├── Commit genome           │
+               │                          │    GenomeCommitted        │
+               │                          │                           │
+               │                          └── Context request ───────►│
+               │                                       Context ◄──────┤
+               │                                        ContextCompressed
+```
+
+There is no shortcut edge. In particular a mutation that touches the genome
+beyond low-stakes preferences **cannot** be accepted without a `FitnessResult`
+whose `recommendation` is `approve` and whose provenance chains back to a real
+simulation run. ADAM enforces this; the enforcement is meaningless unless the
+`FitnessResult` was authored by EVE, which is why `provenance.authored_by` is
+mandatory and why ownership (§3) is exclusive.
+
+### 7.1 Rationale: fitness is counterfactual, not absolute
+
+A `FitnessResult` reports two measurements — `baseline` (the organism as it is)
+and `candidate` (the organism with the mutation applied) — over the *same*
+scenario set with the *same* seed, plus their delta. An absolute score would be
+uninterpretable: "this mutation scored 72" says nothing without knowing what the
+organism scored before.
+
+Determinism is what makes the comparison valid. EVE's simulation is seeded
+(`seed` is a required member of `ValidationRequest`), so baseline and candidate
+differ only by the mutation. A `FitnessResult` whose two runs used different
+seeds is malformed, and bindings must reject it.
+
+## 8. Versioning
+
+`cp` is `"cp1"` for the lifetime of this major version. Within it:
+
+- Adding an **optional** member to an existing type is backward-compatible.
+- Adding a new canonical type is backward-compatible.
+- Adding an event, removing anything, renaming anything, changing a member's
+  type, or changing the canonical-form rules is **not**, and requires `cp2`.
+
+`VERSION` holds the exact revision (e.g. `1.0.0`) for diagnostics.
+`MANIFEST.sha256` pins every schema and fixture file. A vendored binding's
+conformance test verifies its copy against the manifest, so a change to the
+normative source that has not been propagated fails CI in the repositories that
+have not yet caught up — loudly, and before anything ships.

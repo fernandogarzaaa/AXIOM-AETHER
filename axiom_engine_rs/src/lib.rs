@@ -14,6 +14,7 @@ pub mod claude_backend;
 pub mod cli;
 pub mod cluster;
 pub mod config;
+pub mod cp1;
 pub mod daemon;
 pub mod context_compressor;
 pub mod contrastive;
