@@ -239,20 +239,28 @@ Referencing an event says *this document was computed from what that event
 announced*. That is the only way to chain a conclusion back to the run that
 produced it, because the run itself is not a canonical type — it is an event.
 
-**Required edge.** A `FitnessResult` MUST list, in its `derived_from`, the id of
-the `SimulationCompleted` event whose runs it summarizes, alongside the id of
-the `Mutation` it scores.
+**Required edge.** A `FitnessResult` whose `baseline.runs` is greater than zero
+MUST list, in its `derived_from`, the id of the `SimulationCompleted` event
+whose runs it summarizes, alongside the id of the `Mutation` it scores.
 
-Without that edge a `FitnessResult` is unfalsifiable. It asserts that baseline
-and candidate each ran *n* times at a given seed, and nothing in the document
-points at the runs — so a fabricated result and a measured one are structurally
+Without that edge such a result is unfalsifiable. It asserts that baseline and
+candidate each ran *n* times at a given seed, and nothing in the document points
+at the runs — so a fabricated result and a measured one are structurally
 identical, and the receiver has no way to tell them apart. This is the one place
 in the protocol where a component reports on work only it can see, which is
 exactly where the chain has to be checkable rather than merely conventional.
 
-Conformance check 5 (§9) enforces the edge over the corpus: it resolves every
-`derived_from` id against the documents present and fails a `FitnessResult`
-whose references do not include a `SimulationCompleted`.
+The condition is `runs > 0` rather than unconditional because a result that
+reports no runs is the honest encoding of *EVE declined to measure this* (§3,
+`FitnessResult`; and `runs` in the schema). There is no simulation for it to
+name, and requiring one would force it to invent the very reference this rule
+exists to make meaningful. A result claiming runs it cannot chain, and a result
+claiming none, are the two consistent states; the gap between them is what check
+5 closes.
+
+Conformance check 5 (§9) enforces this over the corpus: it resolves every
+`derived_from` id against the documents present and fails a `FitnessResult` that
+reports runs without naming a `SimulationCompleted`.
 
 ## 5. Events
 

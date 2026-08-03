@@ -144,7 +144,7 @@ def check_coverage(fixtures: list[tuple[int, str, dict]]) -> list[str]:
 
 
 def check_provenance_edges(fixtures: list[tuple[int, str, dict]]) -> list[str]:
-    """Check 5: derived_from edges resolve, and a FitnessResult names its run.
+    """Check 5: derived_from edges resolve, and a measured FitnessResult names its run.
 
     See SPEC.md section 4.2. A FitnessResult asserts that baseline and candidate
     each ran n times at a given seed; without a reference to the
@@ -174,7 +174,13 @@ def check_provenance_edges(fixtures: list[tuple[int, str, dict]]) -> list[str]:
                 f"line {lineno} ({kind}): derives from itself, which is not a provenance edge"
             )
 
-        if kind != "FitnessResult":
+        # A result reporting no runs is the honest encoding of "EVE declined to
+        # measure this". There is no simulation for it to name, and demanding
+        # one would force it to invent the reference this rule exists to make
+        # meaningful.
+        baseline = doc.get("baseline")
+        baseline_runs = baseline.get("runs", 0) if isinstance(baseline, dict) else 0
+        if kind != "FitnessResult" or baseline_runs == 0:
             continue
 
         if not any(type_by_id.get(ref) == "SimulationCompleted" for ref in derived):

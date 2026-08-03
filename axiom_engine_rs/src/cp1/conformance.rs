@@ -22,9 +22,9 @@
 //!    normative source recorded. Catches a binding running against a stale
 //!    fixture file, which would make checks 1–3 pass against the wrong contract.
 //! 5. **Provenance edges.** `derived_from` ids resolve within the corpus, and a
-//!    `FitnessResult` references the `SimulationCompleted` that produced its
-//!    runs. Catches a measurement that cannot be chained back to the work
-//!    behind it — structurally indistinguishable from a fabricated one.
+//!    `FitnessResult` that reports runs references the `SimulationCompleted`
+//!    that produced them. Catches a measurement that cannot be chained back to
+//!    the work behind it — structurally indistinguishable from a fabricated one.
 
 use serde_json::Value;
 
@@ -95,7 +95,7 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
     // pass over the text so each line is parsed once.
     let mut type_by_id: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    let mut edges: Vec<(usize, String, String, Vec<String>)> = Vec::new();
+    let mut edges: Vec<(usize, String, String, Vec<String>, u64)> = Vec::new();
 
     for (index, line) in corpus.lines().enumerate() {
         let lineno = index + 1;
@@ -172,7 +172,18 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
                         .collect()
                 })
                 .unwrap_or_default();
-            edges.push((lineno, doc_type.clone(), id.to_string(), derived));
+            let baseline_runs = document
+                .get("baseline")
+                .and_then(|b| b.get("runs"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            edges.push((
+                lineno,
+                doc_type.clone(),
+                id.to_string(),
+                derived,
+                baseline_runs,
+            ));
         }
     }
 
@@ -208,15 +219,18 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
 /// apart. This is the one place a component reports on work only it can see,
 /// which is where the chain has to be checkable rather than conventional.
 ///
+/// The edge is required only when `baseline.runs` is non-zero — a result
+/// reporting no runs is EVE declining to measure, and has no run to name.
+///
 /// Scoped to the corpus on purpose: a binding cannot resolve an id it was never
 /// given, so an edge pointing outside the supplied set is not a failure.
 fn provenance_edge_problems(
     type_by_id: &std::collections::BTreeMap<String, String>,
-    edges: &[(usize, String, String, Vec<String>)],
+    edges: &[(usize, String, String, Vec<String>, u64)],
 ) -> Vec<Failure> {
     let mut failures = Vec::new();
 
-    for (lineno, doc_type, id, derived) in edges {
+    for (lineno, doc_type, id, derived, baseline_runs) in edges {
         if derived.contains(id) {
             failures.push(Failure {
                 fixture_line: *lineno,
@@ -225,7 +239,11 @@ fn provenance_edge_problems(
             });
         }
 
-        if doc_type != "FitnessResult" {
+        // A result reporting no runs is the honest encoding of "EVE declined to
+        // measure this". There is no simulation for it to name, and demanding
+        // one would force it to invent the very reference this rule exists to
+        // make meaningful.
+        if doc_type != "FitnessResult" || *baseline_runs == 0 {
             continue;
         }
 
@@ -452,6 +470,27 @@ mod tests {
                 .any(|f| f.document_type == "FitnessResult"
                     && f.detail.contains("names no SimulationCompleted")),
             "check 5 did not fire; failures were {failures:#?}"
+        );
+    }
+
+    #[test]
+    fn a_declined_measurement_need_not_name_a_run() {
+        // The other half of the rule: EVE reports an unmeasurable mutation with
+        // both sides zeroed, and there is no simulation for it to point at.
+        // Demanding one would force it to invent the reference.
+        let mut declined = serde_json::from_str::<Value>(
+                r#"{"baseline":{"cognitive_load_bp":0,"composite_bp":0,"frustration_bp":0,"runs":0,"task_success_bp":0,"trust_bp":0},"candidate":{"cognitive_load_bp":0,"composite_bp":0,"frustration_bp":0,"runs":0,"task_success_bp":0,"trust_bp":0},"cp":"cp1","delta_bp":0,"id":"3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b","mutation_id":"88888888-8888-4888-8888-888888888888","provenance":{"authored_by":"eve","content_hash":"","derived_from":["88888888-8888-4888-8888-888888888888"],"evidence":["runs=0"],"origin":"eve:cp1/validate","produced_at":"2026-01-01T00:00:00.000Z"},"reason":"not measurable by simulation","recommendation":"needs_review","scenario_ids":["excellent"],"seed":1337,"trials":1,"type":"FitnessResult"}"#,
+        )
+        .unwrap();
+        canonical::seal(&mut declined).unwrap();
+        let line = canonical::to_canonical(&declined).unwrap();
+
+        let failures = check_corpus(&line);
+        assert!(
+            !failures
+                .iter()
+                .any(|f| f.detail.contains("names no SimulationCompleted")),
+            "check 5 fired on a declined measurement: {failures:#?}"
         );
     }
 
