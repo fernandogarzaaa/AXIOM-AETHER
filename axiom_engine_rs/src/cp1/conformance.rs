@@ -1,6 +1,6 @@
 //! The shared conformance suite.
 //!
-//! Every CP/1 binding, in every repository, runs the same four checks against
+//! Every CP/1 binding, in every repository, runs the same five checks against
 //! the same golden corpus. That is the entire mechanism keeping three
 //! hand-written bindings in three languages agreeing about the wire — there is
 //! no code generation and no shared library to enforce it, so this suite is
@@ -21,6 +21,10 @@
 //! 4. **Manifest.** The vendored copy of the corpus hashes to what the
 //!    normative source recorded. Catches a binding running against a stale
 //!    fixture file, which would make checks 1–3 pass against the wrong contract.
+//! 5. **Provenance edges.** `derived_from` ids resolve within the corpus, and a
+//!    `FitnessResult` references the `SimulationCompleted` that produced its
+//!    runs. Catches a measurement that cannot be chained back to the work
+//!    behind it — structurally indistinguishable from a fabricated one.
 
 use serde_json::Value;
 
@@ -56,8 +60,13 @@ const REQUIRED_PROVENANCE_MEMBERS: [&str; 6] = [
     "content_hash",
 ];
 
-/// Every canonical type name the corpus must cover.
-const CANONICAL_TYPES: [&str; 13] = [
+/// Every document type the corpus must cover.
+///
+/// Twelve of these are canonical types (SPEC.md section 3). `ValidationRequest`
+/// is not — it is a protocol message (section 3.0) — but it crosses the wire and
+/// must round-trip identically, so it is covered here alongside them. Naming the
+/// constant for canonical types alone would make it contradict the spec.
+const COVERED_TYPES: [&str; 13] = [
     "Identity",
     "Genome",
     "Capability",
@@ -81,6 +90,12 @@ const CANONICAL_TYPES: [&str; 13] = [
 pub fn check_corpus(corpus: &str) -> Vec<Failure> {
     let mut failures = Vec::new();
     let mut seen_types = std::collections::BTreeSet::new();
+    // Check 5 reads across documents, so it needs the whole corpus indexed
+    // before any edge can be resolved. Collected here rather than in a second
+    // pass over the text so each line is parsed once.
+    let mut type_by_id: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut edges: Vec<(usize, String, String, Vec<String>)> = Vec::new();
 
     for (index, line) in corpus.lines().enumerate() {
         let lineno = index + 1;
@@ -141,16 +156,34 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
         for detail in structural_problems(&document) {
             failures.push(fail(detail));
         }
+
+        // Indexed for check 5, below.
+        if let Some(id) = document.get("id").and_then(Value::as_str) {
+            type_by_id.insert(id.to_string(), doc_type.clone());
+            let derived = document
+                .get("provenance")
+                .and_then(|p| p.get("derived_from"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            edges.push((lineno, doc_type.clone(), id.to_string(), derived));
+        }
     }
 
     // Coverage: a corpus missing a type would let that type's encoding drift
     // in every binding at once, undetected.
-    for expected in CANONICAL_TYPES {
+    for expected in COVERED_TYPES {
         if !seen_types.contains(expected) {
             failures.push(Failure {
                 fixture_line: 0,
                 document_type: expected.to_string(),
-                detail: "no fixture covers this canonical type".to_string(),
+                detail: "no fixture covers this document type".to_string(),
             });
         }
     }
@@ -160,6 +193,57 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
             document_type: "Event".to_string(),
             detail: "no fixture covers the event envelope".to_string(),
         });
+    }
+
+    failures.extend(provenance_edge_problems(&type_by_id, &edges));
+    failures
+}
+
+/// Check 5: `derived_from` edges resolve, and a `FitnessResult` names its run.
+///
+/// See SPEC.md section 4.2. A `FitnessResult` asserts that baseline and
+/// candidate each ran *n* times at a given seed; without a reference to the
+/// `SimulationCompleted` that produced those runs, a measured result and a
+/// fabricated one are structurally identical and the receiver cannot tell them
+/// apart. This is the one place a component reports on work only it can see,
+/// which is where the chain has to be checkable rather than conventional.
+///
+/// Scoped to the corpus on purpose: a binding cannot resolve an id it was never
+/// given, so an edge pointing outside the supplied set is not a failure.
+fn provenance_edge_problems(
+    type_by_id: &std::collections::BTreeMap<String, String>,
+    edges: &[(usize, String, String, Vec<String>)],
+) -> Vec<Failure> {
+    let mut failures = Vec::new();
+
+    for (lineno, doc_type, id, derived) in edges {
+        if derived.contains(id) {
+            failures.push(Failure {
+                fixture_line: *lineno,
+                document_type: doc_type.clone(),
+                detail: "derives from itself, which is not a provenance edge".to_string(),
+            });
+        }
+
+        if doc_type != "FitnessResult" {
+            continue;
+        }
+
+        let names_a_run = derived
+            .iter()
+            .filter_map(|ref_id| type_by_id.get(ref_id))
+            .any(|referenced| referenced == "SimulationCompleted");
+
+        if !names_a_run {
+            failures.push(Failure {
+                fixture_line: *lineno,
+                document_type: doc_type.clone(),
+                detail: "provenance.derived_from names no SimulationCompleted; a measurement \
+                         that cannot be chained back to its run is indistinguishable from a \
+                         fabricated one (SPEC.md section 4.2)"
+                    .to_string(),
+            });
+        }
     }
 
     failures
@@ -343,8 +427,44 @@ mod tests {
         // than no suite: it reports success while testing nothing.
         assert_eq!(
             corpus().lines().filter(|l| !l.trim().is_empty()).count(),
-            14,
-            "the corpus should hold one document per canonical type plus an event"
+            15,
+            "the corpus should hold one document per covered type, plus the two \
+             events: a GenomeCommitted for the envelope and a SimulationCompleted \
+             for the FitnessResult to chain back to"
+        );
+    }
+
+    #[test]
+    fn a_fitness_result_that_names_no_run_is_rejected() {
+        // The fabricated-evidence case: a well-formed, correctly sealed
+        // FitnessResult that points only at the mutation it scores. Nothing
+        // about its bytes is wrong — it simply cannot be chained back to any
+        // work, which is the whole property check 5 exists to enforce.
+        let corpus = corpus()
+            .lines()
+            .filter(|line| !line.contains("\"SimulationCompleted\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let failures = check_corpus(&corpus);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.document_type == "FitnessResult"
+                    && f.detail.contains("names no SimulationCompleted")),
+            "check 5 did not fire; failures were {failures:#?}"
+        );
+    }
+
+    #[test]
+    fn a_document_deriving_from_itself_is_rejected() {
+        let corpus = corpus().lines().next().unwrap().replace(
+            "\"derived_from\":[]",
+            "\"derived_from\":[\"11111111-1111-4111-8111-111111111111\"]",
+        );
+        let failures = check_corpus(&corpus);
+        assert!(
+            failures.iter().any(|f| f.detail.contains("derives from itself")),
+            "{failures:#?}"
         );
     }
 

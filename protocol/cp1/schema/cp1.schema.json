@@ -409,7 +409,7 @@
         "frustration_bp": { "$ref": "#/$defs/basisPoints" },
         "trust_bp": { "$ref": "#/$defs/basisPoints" },
         "cognitive_load_bp": { "$ref": "#/$defs/basisPoints" },
-        "runs": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+        "runs": { "type": "integer", "description": "Sessions behind this side of the comparison. Zero is legal and meaningful: it is how EVE reports a mutation it declined to measure. A floor of 1 would force the wire to claim a run that never happened, in exactly the case where honesty matters most.", "minimum": 0, "maximum": 9007199254740991 }
       },
       "required": ["composite_bp", "task_success_bp", "frustration_bp", "trust_bp", "cognitive_load_bp", "runs"],
       "additionalProperties": false

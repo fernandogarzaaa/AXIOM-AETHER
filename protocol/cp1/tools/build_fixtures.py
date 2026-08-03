@@ -53,6 +53,7 @@ U = {
     "context": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     "request": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
     "event": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+    "simulation": "2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a",
     "correlation": "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f",
     "causation": "1f1f1f1f-1f1f-4f1f-8f1f-1f1f1f1f1f1f",
 }
@@ -337,7 +338,10 @@ def fitness_result() -> dict:
                 "eve",
                 "eve:cp1/validate",
                 evidence=["seed=1337", "scenarios=excellent,average,bad", "trials=3"],
-                derived_from=[U["mutation"]],
+                # SPEC 4.2: a FitnessResult must name the run it
+                # summarizes, or a measured result and a fabricated one
+                # are structurally identical.
+                derived_from=[U["mutation"], U["simulation"]],
                 produced_at=T2,
             ),
         }
@@ -396,6 +400,33 @@ def validation_request() -> dict:
     )
 
 
+def simulation_completed() -> dict:
+    """The run a FitnessResult chains back to (SPEC 4.2)."""
+    return seal(
+        {
+            "cp": "cp1",
+            "type": "SimulationCompleted",
+            "id": U["simulation"],
+            "occurred_at": T2,
+            "actor": "eve",
+            "subject_id": U["mutation"],
+            "subject_type": "Mutation",
+            "correlation_id": U["correlation"],
+            "causation_id": U["causation"],
+            "payload": {
+                "seed": 1337,
+                "scenarios": "excellent,average,bad",
+                "trials": 3,
+                # Both sides of the counterfactual, so the run's own record
+                # says how many sessions stand behind the score.
+                "baseline_runs": 9,
+                "candidate_runs": 9,
+            },
+            "provenance": prov("eve", "eve:cp1/simulate", derived_from=[U["mutation"]], produced_at=T2),
+        }
+    )
+
+
 def event() -> dict:
     return seal(
         {
@@ -430,6 +461,7 @@ BUILDERS = [
     reflection,
     observation,
     experience,
+    simulation_completed,
     fitness_result,
     context,
     validation_request,

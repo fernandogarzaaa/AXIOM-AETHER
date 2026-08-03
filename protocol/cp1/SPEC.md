@@ -228,6 +228,32 @@ belief from a fabricated one, excluding them from the hash would make the
 provenance chain unforgeable in the wrong direction — anyone could substitute
 evidence without changing the hash.
 
+### 4.2 Events are addressable in `derived_from`
+
+An entry in `derived_from` is the `id` of any CP/1 document — a canonical type
+**or an event**. Events carry an `id` of the same shape (§5) and are documents
+in their own right, so no schema distinction is needed; what follows is the
+semantics, which a schema cannot express.
+
+Referencing an event says *this document was computed from what that event
+announced*. That is the only way to chain a conclusion back to the run that
+produced it, because the run itself is not a canonical type — it is an event.
+
+**Required edge.** A `FitnessResult` MUST list, in its `derived_from`, the id of
+the `SimulationCompleted` event whose runs it summarizes, alongside the id of
+the `Mutation` it scores.
+
+Without that edge a `FitnessResult` is unfalsifiable. It asserts that baseline
+and candidate each ran *n* times at a given seed, and nothing in the document
+points at the runs — so a fabricated result and a measured one are structurally
+identical, and the receiver has no way to tell them apart. This is the one place
+in the protocol where a component reports on work only it can see, which is
+exactly where the chain has to be checkable rather than merely conventional.
+
+Conformance check 5 (§9) enforces the edge over the corpus: it resolves every
+`derived_from` id against the documents present and fails a `FitnessResult`
+whose references do not include a `SimulationCompleted`.
+
 ## 5. Events
 
 Everything important emits an event. Events are the organism's nervous system:
@@ -395,3 +421,23 @@ seeds is malformed, and bindings must reject it.
 conformance test verifies its copy against the manifest, so a change to the
 normative source that has not been propagated fails CI in the repositories that
 have not yet caught up — loudly, and before anything ships.
+
+## 9. Conformance
+
+Every binding, in every repository, runs the same checks against the same
+vendored corpus. That is the whole mechanism keeping three hand-written
+bindings in three languages agreeing about the wire — there is no code
+generation and no shared library, so this suite is load-bearing.
+
+| # | Check | The failure it catches |
+| - | ----- | ---------------------- |
+| 1 | **Round trip.** Parsing a fixture and re-encoding it in canonical form reproduces the exact bytes. | A binding whose key ordering, number rendering or string escaping differs from the normative source — the class of bug that silently produces documents other components reject. |
+| 2 | **Seal.** Each fixture's `provenance.content_hash` is the true hash of the document with that member removed. | A binding that hashes a different byte sequence than it transmits. |
+| 3 | **Structure.** Required members are present with the right shapes, and basis-point members are integers in range. | A binding that would accept a float where the protocol forbids one, or a magnitude where only a delta may be signed. |
+| 4 | **Manifest.** The vendored copy hashes to what the normative source recorded. | A binding running against a stale corpus, which would make checks 1–3 pass against the wrong contract. |
+| 5 | **Provenance edges.** `derived_from` ids resolve within the corpus, and a `FitnessResult` references a `SimulationCompleted` (§4.2). | A measurement that cannot be chained back to the run that produced it, which is indistinguishable from a fabricated one. |
+
+Check 5 is the only one that reads across documents rather than within one. It
+is deliberately scoped to the corpus: a binding cannot resolve an id it has
+never been given, so the check enforces the edges among documents actually
+present and says nothing about ids that point outside the set.

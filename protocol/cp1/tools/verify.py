@@ -143,6 +143,49 @@ def check_coverage(fixtures: list[tuple[int, str, dict]]) -> list[str]:
     return [f"no fixture covers canonical type {name}" for name in missing]
 
 
+def check_provenance_edges(fixtures: list[tuple[int, str, dict]]) -> list[str]:
+    """Check 5: derived_from edges resolve, and a FitnessResult names its run.
+
+    See SPEC.md section 4.2. A FitnessResult asserts that baseline and candidate
+    each ran n times at a given seed; without a reference to the
+    SimulationCompleted that produced those runs, a measured result and a
+    fabricated one are structurally identical, and the receiver cannot tell them
+    apart. This is the one place a component reports on work only it can see.
+
+    Scoped to the corpus: an edge pointing outside the supplied set is not a
+    failure, because a binding cannot resolve an id it was never given.
+    """
+    type_by_id = {
+        doc["id"]: doc.get("type") for _, _, doc in fixtures if isinstance(doc.get("id"), str)
+    }
+
+    failures = []
+    for lineno, _, doc in fixtures:
+        kind = doc.get("type")
+        provenance = doc.get("provenance")
+        if not isinstance(provenance, dict):
+            continue
+        derived = provenance.get("derived_from")
+        if not isinstance(derived, list):
+            continue
+
+        if doc.get("id") in derived:
+            failures.append(
+                f"line {lineno} ({kind}): derives from itself, which is not a provenance edge"
+            )
+
+        if kind != "FitnessResult":
+            continue
+
+        if not any(type_by_id.get(ref) == "SimulationCompleted" for ref in derived):
+            failures.append(
+                f"line {lineno} ({kind}): provenance.derived_from names no "
+                "SimulationCompleted; a measurement that cannot be chained back to "
+                "its run is indistinguishable from a fabricated one (SPEC.md 4.2)"
+            )
+    return failures
+
+
 def main() -> int:
     fixtures = load_fixtures()
     groups = {
@@ -150,6 +193,7 @@ def main() -> int:
         "schema": check_schema(fixtures),
         "canonical/sealed": check_canonical_and_sealed(fixtures),
         "coverage": check_coverage(fixtures),
+        "provenance edges": check_provenance_edges(fixtures),
     }
 
     total = 0
