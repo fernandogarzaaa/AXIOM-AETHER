@@ -96,6 +96,7 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
     // document's own subject_id and payload, not just confirming it exists.
     // Collected here rather than in a second pass so each line is parsed once.
     let mut doc_by_id: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    let mut first_seen_at: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut edges: Vec<(usize, String, String, Vec<String>)> = Vec::new();
 
     for (index, line) in corpus.lines().enumerate() {
@@ -173,7 +174,24 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
                 })
                 .unwrap_or_default();
             edges.push((lineno, doc_type.clone(), id.to_string(), derived));
-            doc_by_id.insert(id.to_string(), document.clone());
+            // A duplicate id makes any derived_from reference to it ambiguous:
+            // resolving to whichever document happened to be inserted last
+            // would let check 5 validate the wrong provenance edge, silently.
+            // The first occurrence wins, deterministically, and the duplicate
+            // is reported rather than swallowed.
+            if let Some(first_line) = first_seen_at.get(id) {
+                failures.push(Failure {
+                    fixture_line: lineno,
+                    document_type: doc_type.clone(),
+                    detail: format!(
+                        "id also used at line {first_line}; a derived_from reference to it is \
+                         ambiguous"
+                    ),
+                });
+            } else {
+                first_seen_at.insert(id.to_string(), lineno);
+                doc_by_id.insert(id.to_string(), document.clone());
+            }
         }
     }
 
@@ -271,59 +289,58 @@ fn provenance_edge_problems(
 
         let mutation_id = document.get("mutation_id").and_then(Value::as_str);
 
-        let matching_run = derived.iter().find_map(|ref_id| {
-            let referenced = doc_by_id.get(ref_id)?;
-            let is_completion = referenced.get("type").and_then(Value::as_str)
-                == Some("SimulationCompleted");
-            is_completion.then_some(referenced)
-        });
+        // Order in `derived_from` carries no meaning, and nothing forbids a
+        // result from also referencing an unrelated SimulationCompleted (a
+        // memory citing several runs, say). So this evaluates every referenced
+        // completion rather than stopping at the first one: the edge is valid
+        // the moment *any* of them matches both mutation_id and the reported
+        // run counts, and a candidate that fails one check is not evidence the
+        // edge is broken if a later candidate satisfies it.
+        let completions: Vec<&Value> = derived
+            .iter()
+            .filter_map(|ref_id| doc_by_id.get(ref_id))
+            .filter(|referenced| referenced.get("type").and_then(Value::as_str) == Some("SimulationCompleted"))
+            .collect();
 
-        match matching_run {
-            None => failures.push(Failure {
+        if completions.is_empty() {
+            failures.push(Failure {
                 fixture_line: *lineno,
                 document_type: doc_type.clone(),
                 detail: "provenance.derived_from names no SimulationCompleted; a measurement \
                          that cannot be chained back to its run is indistinguishable from a \
                          fabricated one (SPEC.md section 4.2)"
                     .to_string(),
-            }),
-            Some(run) => {
-                let subject_matches =
-                    run.get("subject_id").and_then(Value::as_str) == mutation_id;
-                let run_baseline = run
-                    .get("payload")
-                    .and_then(|p| p.get("baseline_runs"))
-                    .and_then(Value::as_u64);
-                let run_candidate = run
-                    .get("payload")
-                    .and_then(|p| p.get("candidate_runs"))
-                    .and_then(Value::as_u64);
-                let counts_match =
-                    run_baseline == Some(baseline_runs) && run_candidate == Some(candidate_runs);
+            });
+            continue;
+        }
 
-                if !subject_matches {
-                    failures.push(Failure {
-                        fixture_line: *lineno,
-                        document_type: doc_type.clone(),
-                        detail: "the referenced SimulationCompleted's subject_id does not match \
-                                 this result's mutation_id; a real run for a different mutation \
-                                 is not evidence about this one (SPEC.md section 4.2)"
-                            .to_string(),
-                    });
-                }
-                if !counts_match {
-                    failures.push(Failure {
-                        fixture_line: *lineno,
-                        document_type: doc_type.clone(),
-                        detail: format!(
-                            "the referenced SimulationCompleted reports baseline_runs={run_baseline:?} \
-                             candidate_runs={run_candidate:?}, which does not match this result's \
-                             baseline.runs={baseline_runs} candidate.runs={candidate_runs} \
-                             (SPEC.md section 4.2)"
-                        ),
-                    });
-                }
-            }
+        let satisfied = completions.iter().any(|run| {
+            let subject_matches = run.get("subject_id").and_then(Value::as_str) == mutation_id;
+            let run_baseline = run
+                .get("payload")
+                .and_then(|p| p.get("baseline_runs"))
+                .and_then(Value::as_u64);
+            let run_candidate = run
+                .get("payload")
+                .and_then(|p| p.get("candidate_runs"))
+                .and_then(Value::as_u64);
+            subject_matches
+                && run_baseline == Some(baseline_runs)
+                && run_candidate == Some(candidate_runs)
+        });
+
+        if !satisfied {
+            failures.push(Failure {
+                fixture_line: *lineno,
+                document_type: doc_type.clone(),
+                detail: format!(
+                    "{} referenced SimulationCompleted event(s) exist, but none has \
+                     subject_id={mutation_id:?} with baseline_runs={baseline_runs} and \
+                     candidate_runs={candidate_runs}; a real run for a different mutation or \
+                     count is not evidence about this result (SPEC.md section 4.2)",
+                    completions.len()
+                ),
+            });
         }
     }
 
@@ -572,9 +589,7 @@ mod tests {
         );
         let failures = check_corpus(&mutated);
         assert!(
-            failures
-                .iter()
-                .any(|f| f.detail.contains("subject_id does not match")),
+            failures.iter().any(|f| f.detail.contains("but none has subject_id")),
             "{failures:#?}"
         );
     }
@@ -590,10 +605,36 @@ mod tests {
         let mutated = full.replace(old, "\"payload\":{\"baseline_runs\":1,\"candidate_runs\":1,");
         let failures = check_corpus(&mutated);
         assert!(
-            failures
-                .iter()
-                .any(|f| f.detail.contains("does not match this result's")),
+            failures.iter().any(|f| f.detail.contains("but none has subject_id")),
             "{failures:#?}"
+        );
+    }
+
+    #[test]
+    fn a_fitness_result_matching_a_later_referenced_run_is_accepted() {
+        // Order in derived_from carries no meaning. Add an unrelated, non
+        // matching SimulationCompleted ahead of the real one and the edge must
+        // still be accepted — the first candidate failing is not evidence the
+        // edge itself is broken.
+        let decoy = "{\"actor\":\"eve\",\"cp\":\"cp1\",\"id\":\"4c4c4c4c-4c4c-4c4c-8c4c-4c4c4c4c4c4c\",\
+                      \"occurred_at\":\"2026-01-01T00:00:02.000Z\",\
+                      \"payload\":{\"baseline_runs\":1,\"candidate_runs\":1,\"scenarios\":\"x\",\"seed\":1,\"trials\":1},\
+                      \"provenance\":{\"authored_by\":\"eve\",\"content_hash\":\"\",\"derived_from\":[],\"evidence\":[],\
+                      \"origin\":\"eve:cp1/simulate\",\"produced_at\":\"2026-01-01T00:00:02.000Z\"},\
+                      \"subject_id\":\"99999999-9999-4999-8999-999999999999\",\"subject_type\":\"Mutation\",\
+                      \"type\":\"SimulationCompleted\"}";
+        let full = corpus();
+        let old = "\"derived_from\":[\"88888888-8888-4888-8888-888888888888\",\"2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a\"]";
+        assert!(full.contains(old), "fixture shape changed; update this test");
+        let new = "\"derived_from\":[\"88888888-8888-4888-8888-888888888888\",\"4c4c4c4c-4c4c-4c4c-8c4c-4c4c4c4c4c4c\",\"2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a\"]";
+        let mutated = format!("{}\n{decoy}", full.replace(old, new));
+
+        let failures = check_corpus(&mutated);
+        assert!(
+            !failures.iter().any(|f| f.document_type == "FitnessResult"
+                && (f.detail.contains("but none has subject_id")
+                    || f.detail.contains("names no SimulationCompleted"))),
+            "a decoy earlier in derived_from should not block the real match: {failures:#?}"
         );
     }
 
@@ -612,6 +653,29 @@ mod tests {
         let failures = check_corpus(&mutated);
         assert!(
             failures.iter().any(|f| f.detail.contains("disagree")),
+            "{failures:#?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_id_is_reported_and_the_first_document_wins() {
+        // Two documents sharing an id make any derived_from reference to that
+        // id ambiguous. Silently resolving to whichever was inserted last
+        // (map-overwrite semantics) would let check 5 validate the wrong edge
+        // without any signal that something is wrong.
+        let identity = "{\"cp\":\"cp1\",\"id\":\"11111111-1111-4111-8111-111111111111\",\
+                         \"provenance\":{\"authored_by\":\"adam\",\"content_hash\":\"\",\
+                         \"derived_from\":[],\"evidence\":[],\"origin\":\"o\",\"produced_at\":\"p\"},\
+                         \"type\":\"Identity\"}";
+        let duplicate = "{\"cp\":\"cp1\",\"id\":\"11111111-1111-4111-8111-111111111111\",\
+                          \"provenance\":{\"authored_by\":\"adam\",\"content_hash\":\"\",\
+                          \"derived_from\":[],\"evidence\":[],\"origin\":\"elsewhere\",\"produced_at\":\"p\"},\
+                          \"type\":\"Belief\"}";
+        let corpus = format!("{identity}\n{duplicate}");
+
+        let failures = check_corpus(&corpus);
+        assert!(
+            failures.iter().any(|f| f.detail.contains("also used at line 1")),
             "{failures:#?}"
         );
     }

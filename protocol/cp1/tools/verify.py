@@ -202,14 +202,31 @@ def check_provenance_edges(fixtures: list[tuple[int, str, dict]]) -> list[str]:
     subject_id matches this result's mutation_id (a real event for a different
     mutation says nothing about this one), and its reported run counts match
     baseline.runs/candidate.runs (otherwise a result claiming 90 runs could cite
-    a real event that ran once).
+    a real event that ran once). Order in derived_from carries no meaning, so
+    every referenced SimulationCompleted is a candidate, not just the first --
+    the edge is satisfied the moment any of them matches.
+
+    An id must be unique within the corpus: two documents sharing one make any
+    reference to it ambiguous, so a duplicate is reported rather than silently
+    resolved to whichever was seen last.
 
     Scoped to the corpus: an edge pointing outside the supplied set is not a
     failure, because a binding cannot resolve an id it was never given.
     """
-    doc_by_id = {doc["id"]: doc for _, _, doc in fixtures if isinstance(doc.get("id"), str)}
-
+    doc_by_id: dict[str, dict] = {}
     failures = []
+    for lineno, _, doc in fixtures:
+        doc_id = doc.get("id")
+        if not isinstance(doc_id, str):
+            continue
+        if doc_id in doc_by_id:
+            failures.append(
+                f"line {lineno} ({doc.get('type')}): id also used by an earlier "
+                "document; a derived_from reference to it is ambiguous"
+            )
+            continue
+        doc_by_id[doc_id] = doc
+
     for lineno, _, doc in fixtures:
         kind = doc.get("type")
         provenance = doc.get("provenance")
@@ -246,15 +263,12 @@ def check_provenance_edges(fixtures: list[tuple[int, str, dict]]) -> list[str]:
         if baseline_runs == 0 and candidate_runs == 0:
             continue
 
-        run = next(
-            (
-                doc_by_id[ref]
-                for ref in derived
-                if ref in doc_by_id and doc_by_id[ref].get("type") == "SimulationCompleted"
-            ),
-            None,
-        )
-        if run is None:
+        completions = [
+            doc_by_id[ref]
+            for ref in derived
+            if ref in doc_by_id and doc_by_id[ref].get("type") == "SimulationCompleted"
+        ]
+        if not completions:
             failures.append(
                 f"line {lineno} ({kind}): provenance.derived_from names no "
                 "SimulationCompleted; a measurement that cannot be chained back to "
@@ -262,23 +276,24 @@ def check_provenance_edges(fixtures: list[tuple[int, str, dict]]) -> list[str]:
             )
             continue
 
-        if run.get("subject_id") != doc.get("mutation_id"):
-            failures.append(
-                f"line {lineno} ({kind}): the referenced SimulationCompleted's "
-                "subject_id does not match this result's mutation_id; a real run "
-                "for a different mutation is not evidence about this one "
-                "(SPEC.md 4.2)"
+        def matches(run: dict) -> bool:
+            payload = run.get("payload")
+            run_baseline = payload.get("baseline_runs") if isinstance(payload, dict) else None
+            run_candidate = payload.get("candidate_runs") if isinstance(payload, dict) else None
+            return (
+                run.get("subject_id") == doc.get("mutation_id")
+                and run_baseline == baseline_runs
+                and run_candidate == candidate_runs
             )
 
-        payload = run.get("payload")
-        run_baseline = payload.get("baseline_runs") if isinstance(payload, dict) else None
-        run_candidate = payload.get("candidate_runs") if isinstance(payload, dict) else None
-        if run_baseline != baseline_runs or run_candidate != candidate_runs:
+        if not any(matches(run) for run in completions):
             failures.append(
-                f"line {lineno} ({kind}): the referenced SimulationCompleted reports "
-                f"baseline_runs={run_baseline!r} candidate_runs={run_candidate!r}, "
-                f"which does not match this result's baseline.runs={baseline_runs} "
-                f"candidate.runs={candidate_runs} (SPEC.md 4.2)"
+                f"line {lineno} ({kind}): {len(completions)} referenced "
+                "SimulationCompleted event(s) exist, but none has "
+                f"subject_id={doc.get('mutation_id')!r} with "
+                f"baseline_runs={baseline_runs} and candidate_runs={candidate_runs}; "
+                "a real run for a different mutation or count is not evidence "
+                "about this result (SPEC.md 4.2)"
             )
     return failures
 

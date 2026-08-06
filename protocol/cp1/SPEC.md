@@ -284,6 +284,14 @@ every `derived_from` id against the documents present, rejects unequal
 `baseline.runs`/`candidate.runs`, and fails a `FitnessResult` that reports runs
 without naming a matching `SimulationCompleted`.
 
+Two properties of the check follow from ids being how everything is addressed.
+Order in `derived_from` carries no meaning — nothing forbids a result from also
+referencing an unrelated `SimulationCompleted`, so the edge is satisfied the
+moment *any* referenced completion matches, not only the first one a binding
+happens to check. And an `id` MUST be unique within a corpus a binding
+evaluates: two documents sharing one make any reference to it ambiguous, which
+a binding MUST report rather than resolve by picking whichever it saw last.
+
 ## 5. Events
 
 Everything important emits an event. Events are the organism's nervous system:
