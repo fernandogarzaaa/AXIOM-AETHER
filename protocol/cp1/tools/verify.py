@@ -188,7 +188,8 @@ def check_binding_type_list(declared: set[str]) -> list[str]:
 
 
 def check_provenance_edges(fixtures: list[tuple[int, str, dict]]) -> list[str]:
-    """Check 5: derived_from edges resolve, and a measured FitnessResult names its run.
+    """Check 5: derived_from edges resolve, run counts agree, and a measured
+    FitnessResult names -- and matches -- the run that produced it.
 
     See SPEC.md section 4.2. A FitnessResult asserts that baseline and candidate
     each ran n times at a given seed; without a reference to the
@@ -196,12 +197,17 @@ def check_provenance_edges(fixtures: list[tuple[int, str, dict]]) -> list[str]:
     fabricated one are structurally identical, and the receiver cannot tell them
     apart. This is the one place a component reports on work only it can see.
 
+    Naming a SimulationCompleted is not enough -- it must be the one. A
+    reference is checked three ways: it resolves within the corpus, its
+    subject_id matches this result's mutation_id (a real event for a different
+    mutation says nothing about this one), and its reported run counts match
+    baseline.runs/candidate.runs (otherwise a result claiming 90 runs could cite
+    a real event that ran once).
+
     Scoped to the corpus: an edge pointing outside the supplied set is not a
     failure, because a binding cannot resolve an id it was never given.
     """
-    type_by_id = {
-        doc["id"]: doc.get("type") for _, _, doc in fixtures if isinstance(doc.get("id"), str)
-    }
+    doc_by_id = {doc["id"]: doc for _, _, doc in fixtures if isinstance(doc.get("id"), str)}
 
     failures = []
     for lineno, _, doc in fixtures:
@@ -218,20 +224,61 @@ def check_provenance_edges(fixtures: list[tuple[int, str, dict]]) -> list[str]:
                 f"line {lineno} ({kind}): derives from itself, which is not a provenance edge"
             )
 
+        if kind != "FitnessResult":
+            continue
+
+        baseline = doc.get("baseline")
+        candidate = doc.get("candidate")
+        baseline_runs = baseline.get("runs", 0) if isinstance(baseline, dict) else 0
+        candidate_runs = candidate.get("runs", 0) if isinstance(candidate, dict) else 0
+        if baseline_runs != candidate_runs:
+            failures.append(
+                f"line {lineno} ({kind}): baseline.runs ({baseline_runs}) and "
+                f"candidate.runs ({candidate_runs}) disagree; a counterfactual is "
+                "valid only when both sides ran the same number of times "
+                "(SPEC.md 4.2)"
+            )
+
         # A result reporting no runs is the honest encoding of "EVE declined to
         # measure this". There is no simulation for it to name, and demanding
         # one would force it to invent the reference this rule exists to make
         # meaningful.
-        baseline = doc.get("baseline")
-        baseline_runs = baseline.get("runs", 0) if isinstance(baseline, dict) else 0
-        if kind != "FitnessResult" or baseline_runs == 0:
+        if baseline_runs == 0 and candidate_runs == 0:
             continue
 
-        if not any(type_by_id.get(ref) == "SimulationCompleted" for ref in derived):
+        run = next(
+            (
+                doc_by_id[ref]
+                for ref in derived
+                if ref in doc_by_id and doc_by_id[ref].get("type") == "SimulationCompleted"
+            ),
+            None,
+        )
+        if run is None:
             failures.append(
                 f"line {lineno} ({kind}): provenance.derived_from names no "
                 "SimulationCompleted; a measurement that cannot be chained back to "
                 "its run is indistinguishable from a fabricated one (SPEC.md 4.2)"
+            )
+            continue
+
+        if run.get("subject_id") != doc.get("mutation_id"):
+            failures.append(
+                f"line {lineno} ({kind}): the referenced SimulationCompleted's "
+                "subject_id does not match this result's mutation_id; a real run "
+                "for a different mutation is not evidence about this one "
+                "(SPEC.md 4.2)"
+            )
+
+        payload = run.get("payload")
+        run_baseline = payload.get("baseline_runs") if isinstance(payload, dict) else None
+        run_candidate = payload.get("candidate_runs") if isinstance(payload, dict) else None
+        if run_baseline != baseline_runs or run_candidate != candidate_runs:
+            failures.append(
+                f"line {lineno} ({kind}): the referenced SimulationCompleted reports "
+                f"baseline_runs={run_baseline!r} candidate_runs={run_candidate!r}, "
+                f"which does not match this result's baseline.runs={baseline_runs} "
+                f"candidate.runs={candidate_runs} (SPEC.md 4.2)"
             )
     return failures
 

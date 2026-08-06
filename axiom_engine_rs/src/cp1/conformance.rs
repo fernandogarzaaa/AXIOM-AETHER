@@ -91,11 +91,12 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
     let mut failures = Vec::new();
     let mut seen_types = std::collections::BTreeSet::new();
     // Check 5 reads across documents, so it needs the whole corpus indexed
-    // before any edge can be resolved. Collected here rather than in a second
-    // pass over the text so each line is parsed once.
-    let mut type_by_id: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    let mut edges: Vec<(usize, String, String, Vec<String>, u64)> = Vec::new();
+    // before any edge can be resolved. The full document is kept, not just its
+    // type: verifying a SimulationCompleted edge means reading the referenced
+    // document's own subject_id and payload, not just confirming it exists.
+    // Collected here rather than in a second pass so each line is parsed once.
+    let mut doc_by_id: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    let mut edges: Vec<(usize, String, String, Vec<String>)> = Vec::new();
 
     for (index, line) in corpus.lines().enumerate() {
         let lineno = index + 1;
@@ -159,7 +160,6 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
 
         // Indexed for check 5, below.
         if let Some(id) = document.get("id").and_then(Value::as_str) {
-            type_by_id.insert(id.to_string(), doc_type.clone());
             let derived = document
                 .get("provenance")
                 .and_then(|p| p.get("derived_from"))
@@ -172,18 +172,8 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let baseline_runs = document
-                .get("baseline")
-                .and_then(|b| b.get("runs"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            edges.push((
-                lineno,
-                doc_type.clone(),
-                id.to_string(),
-                derived,
-                baseline_runs,
-            ));
+            edges.push((lineno, doc_type.clone(), id.to_string(), derived));
+            doc_by_id.insert(id.to_string(), document.clone());
         }
     }
 
@@ -206,11 +196,12 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
         });
     }
 
-    failures.extend(provenance_edge_problems(&type_by_id, &edges));
+    failures.extend(provenance_edge_problems(&doc_by_id, &edges));
     failures
 }
 
-/// Check 5: `derived_from` edges resolve, and a `FitnessResult` names its run.
+/// Check 5: `derived_from` edges resolve, run counts agree, and a measured
+/// `FitnessResult` names — and matches — the run that produced it.
 ///
 /// See SPEC.md section 4.2. A `FitnessResult` asserts that baseline and
 /// candidate each ran *n* times at a given seed; without a reference to the
@@ -219,18 +210,22 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
 /// apart. This is the one place a component reports on work only it can see,
 /// which is where the chain has to be checkable rather than conventional.
 ///
-/// The edge is required only when `baseline.runs` is non-zero — a result
-/// reporting no runs is EVE declining to measure, and has no run to name.
+/// Naming *a* `SimulationCompleted` is not enough — it must be *the* one. A
+/// reference is checked three ways: it resolves within the corpus, its
+/// `subject_id` matches this result's `mutation_id` (a real event for a
+/// different mutation says nothing about this one), and its reported run
+/// counts match `baseline.runs`/`candidate.runs` (otherwise a result claiming
+/// 90 runs could cite a real event that ran once).
 ///
 /// Scoped to the corpus on purpose: a binding cannot resolve an id it was never
 /// given, so an edge pointing outside the supplied set is not a failure.
 fn provenance_edge_problems(
-    type_by_id: &std::collections::BTreeMap<String, String>,
-    edges: &[(usize, String, String, Vec<String>, u64)],
+    doc_by_id: &std::collections::BTreeMap<String, Value>,
+    edges: &[(usize, String, String, Vec<String>)],
 ) -> Vec<Failure> {
     let mut failures = Vec::new();
 
-    for (lineno, doc_type, id, derived, baseline_runs) in edges {
+    for (lineno, doc_type, id, derived) in edges {
         if derived.contains(id) {
             failures.push(Failure {
                 fixture_line: *lineno,
@@ -239,28 +234,96 @@ fn provenance_edge_problems(
             });
         }
 
+        if doc_type != "FitnessResult" {
+            continue;
+        }
+        let document = &doc_by_id[id];
+
+        let baseline_runs = document
+            .get("baseline")
+            .and_then(|m| m.get("runs"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let candidate_runs = document
+            .get("candidate")
+            .and_then(|m| m.get("runs"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if baseline_runs != candidate_runs {
+            failures.push(Failure {
+                fixture_line: *lineno,
+                document_type: doc_type.clone(),
+                detail: format!(
+                    "baseline.runs ({baseline_runs}) and candidate.runs ({candidate_runs}) \
+                     disagree; a counterfactual is valid only when both sides ran the same \
+                     number of times (SPEC.md section 4.2)"
+                ),
+            });
+        }
+
         // A result reporting no runs is the honest encoding of "EVE declined to
         // measure this". There is no simulation for it to name, and demanding
         // one would force it to invent the very reference this rule exists to
         // make meaningful.
-        if doc_type != "FitnessResult" || *baseline_runs == 0 {
+        if baseline_runs == 0 && candidate_runs == 0 {
             continue;
         }
 
-        let names_a_run = derived
-            .iter()
-            .filter_map(|ref_id| type_by_id.get(ref_id))
-            .any(|referenced| referenced == "SimulationCompleted");
+        let mutation_id = document.get("mutation_id").and_then(Value::as_str);
 
-        if !names_a_run {
-            failures.push(Failure {
+        let matching_run = derived.iter().find_map(|ref_id| {
+            let referenced = doc_by_id.get(ref_id)?;
+            let is_completion = referenced.get("type").and_then(Value::as_str)
+                == Some("SimulationCompleted");
+            is_completion.then_some(referenced)
+        });
+
+        match matching_run {
+            None => failures.push(Failure {
                 fixture_line: *lineno,
                 document_type: doc_type.clone(),
                 detail: "provenance.derived_from names no SimulationCompleted; a measurement \
                          that cannot be chained back to its run is indistinguishable from a \
                          fabricated one (SPEC.md section 4.2)"
                     .to_string(),
-            });
+            }),
+            Some(run) => {
+                let subject_matches =
+                    run.get("subject_id").and_then(Value::as_str) == mutation_id;
+                let run_baseline = run
+                    .get("payload")
+                    .and_then(|p| p.get("baseline_runs"))
+                    .and_then(Value::as_u64);
+                let run_candidate = run
+                    .get("payload")
+                    .and_then(|p| p.get("candidate_runs"))
+                    .and_then(Value::as_u64);
+                let counts_match =
+                    run_baseline == Some(baseline_runs) && run_candidate == Some(candidate_runs);
+
+                if !subject_matches {
+                    failures.push(Failure {
+                        fixture_line: *lineno,
+                        document_type: doc_type.clone(),
+                        detail: "the referenced SimulationCompleted's subject_id does not match \
+                                 this result's mutation_id; a real run for a different mutation \
+                                 is not evidence about this one (SPEC.md section 4.2)"
+                            .to_string(),
+                    });
+                }
+                if !counts_match {
+                    failures.push(Failure {
+                        fixture_line: *lineno,
+                        document_type: doc_type.clone(),
+                        detail: format!(
+                            "the referenced SimulationCompleted reports baseline_runs={run_baseline:?} \
+                             candidate_runs={run_candidate:?}, which does not match this result's \
+                             baseline.runs={baseline_runs} candidate.runs={candidate_runs} \
+                             (SPEC.md section 4.2)"
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -491,6 +554,65 @@ mod tests {
                 .iter()
                 .any(|f| f.detail.contains("names no SimulationCompleted")),
             "check 5 fired on a declined measurement: {failures:#?}"
+        );
+    }
+
+    #[test]
+    fn a_fitness_result_citing_a_run_for_a_different_mutation_is_rejected() {
+        // Naming *a* SimulationCompleted was never the whole property — it has
+        // to be the SimulationCompleted for this mutation. Swap the event's
+        // subject_id for an unrelated one and the edge must be refused even
+        // though a matching-typed document still resolves.
+        let old = "\"subject_id\":\"88888888-8888-4888-8888-888888888888\",\"subject_type\":\"Mutation\"";
+        let full = corpus();
+        assert!(full.contains(old), "fixture shape changed; update this test");
+        let mutated = full.replace(
+            old,
+            "\"subject_id\":\"99999999-9999-4999-8999-999999999999\",\"subject_type\":\"Mutation\"",
+        );
+        let failures = check_corpus(&mutated);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.detail.contains("subject_id does not match")),
+            "{failures:#?}"
+        );
+    }
+
+    #[test]
+    fn a_fitness_result_citing_mismatched_run_counts_is_rejected() {
+        // The event resolves and names the right mutation, but reports a
+        // different number of runs than the result claims. A result claiming
+        // 90 runs must not be able to cite a real event that ran once.
+        let old = "\"payload\":{\"baseline_runs\":9,\"candidate_runs\":9,";
+        let full = corpus();
+        assert!(full.contains(old), "fixture shape changed; update this test");
+        let mutated = full.replace(old, "\"payload\":{\"baseline_runs\":1,\"candidate_runs\":1,");
+        let failures = check_corpus(&mutated);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.detail.contains("does not match this result's")),
+            "{failures:#?}"
+        );
+    }
+
+    #[test]
+    fn unequal_baseline_and_candidate_runs_are_rejected() {
+        // Run parity (SPEC.md section 4.2): a counterfactual is valid only
+        // because both sides ran the same number of times. Unequal counts are
+        // a defect on their own, independent of whether an edge is present.
+        let old = "\"baseline\":{\"cognitive_load_bp\":4200,\"composite_bp\":6400,\"frustration_bp\":3100,\"runs\":9,\"task_success_bp\":6667,\"trust_bp\":6000}";
+        let full = corpus();
+        assert!(full.contains(old), "fixture shape changed; update this test");
+        let mutated = full.replace(
+            old,
+            "\"baseline\":{\"cognitive_load_bp\":4200,\"composite_bp\":6400,\"frustration_bp\":3100,\"runs\":8,\"task_success_bp\":6667,\"trust_bp\":6000}",
+        );
+        let failures = check_corpus(&mutated);
+        assert!(
+            failures.iter().any(|f| f.detail.contains("disagree")),
+            "{failures:#?}"
         );
     }
 
