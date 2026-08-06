@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -140,7 +141,50 @@ def check_coverage(fixtures: list[tuple[int, str, dict]]) -> list[str]:
         present.add("Event" if kind in event_names else kind)
 
     missing = sorted(declared - present)
-    return [f"no fixture covers canonical type {name}" for name in missing]
+    failures = [f"no fixture covers canonical type {name}" for name in missing]
+    failures.extend(check_binding_type_list(declared - {"Event"}))
+    return failures
+
+
+# `const COVERED_TYPES: [&str; 13] = [ "Identity", ... ];`
+_COVERED_TYPES_RE = re.compile(
+    r"const\s+COVERED_TYPES\s*:\s*\[&str;\s*\d+\]\s*=\s*\[(?P<body>[^\]]*)\]",
+    re.DOTALL,
+)
+
+
+def check_binding_type_list(declared: set[str]) -> list[str]:
+    """The Rust binding's hardcoded type list must match the schema's.
+
+    `check_coverage` derives its expectation from the schema, so it tracks the
+    schema automatically. The Rust binding hardcodes the same set as
+    `COVERED_TYPES`. Without this, adding a fourteenth type to the schema would
+    be reported here as a missing fixture, while COVERED_TYPES stayed at
+    thirteen and the vendored copies in EVE and ADAM kept passing with a silent
+    coverage hole.
+
+    `declared` here excludes "Event": the Rust binding checks event coverage
+    separately (`seen_types.contains("Event")`), so COVERED_TYPES never lists it.
+
+    The binding lives outside `protocol/`, so a checkout that vendored only the
+    protocol directory has nothing to compare against; that is a skip, not a
+    failure.
+    """
+    binding = CP1_ROOT.parent.parent / "axiom_engine_rs" / "src" / "cp1" / "conformance.rs"
+    if not binding.is_file():
+        return []
+
+    match = _COVERED_TYPES_RE.search(binding.read_text(encoding="utf-8"))
+    if match is None:
+        return [f"could not find COVERED_TYPES in {binding.name}; the drift guard is not running"]
+
+    listed = set(re.findall(r'"([^"]+)"', match.group("body")))
+    if listed == declared:
+        return []
+    return [
+        f"COVERED_TYPES in {binding.name} disagrees with the schema: "
+        f"only in schema {sorted(declared - listed)}, only in binding {sorted(listed - declared)}"
+    ]
 
 
 def check_provenance_edges(fixtures: list[tuple[int, str, dict]]) -> list[str]:

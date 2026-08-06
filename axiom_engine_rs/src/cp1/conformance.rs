@@ -496,10 +496,23 @@ mod tests {
 
     #[test]
     fn a_document_deriving_from_itself_is_rejected() {
-        let corpus = corpus().lines().next().unwrap().replace(
-            "\"derived_from\":[]",
-            "\"derived_from\":[\"11111111-1111-4111-8111-111111111111\"]",
+        // Depends on two things being true of the first fixture line: it has an
+        // empty derived_from, and a known id. Asserted before mutating so a
+        // future reorder of build_fixtures.py fails here, on the stale
+        // assumption, rather than downstream on a no-op replace.
+        let first = corpus().lines().next().unwrap().to_string();
+        let id = serde_json::from_str::<Value>(&first).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            first.contains("\"derived_from\":[]"),
+            "the first fixture no longer has an empty derived_from; update this test"
         );
+
+        // The mutated line no longer matches its seal, so check 2 also fires;
+        // this test only asserts on check 5's message, which stays correct.
+        let corpus = first.replace("\"derived_from\":[]", &format!("\"derived_from\":[\"{id}\"]"));
         let failures = check_corpus(&corpus);
         assert!(
             failures.iter().any(|f| f.detail.contains("derives from itself")),
