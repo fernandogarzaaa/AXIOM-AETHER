@@ -1,0 +1,26 @@
+{
+  "name": "axiom",
+  "version": "0.4.1",
+  "description": "Axiom — local-first online Test-Time Training runtime. Adds 20 MCP tools for context compression, persistent memory and recall, grounding verification, drift detection, learned self-healing immunity, and a multi-agent task board.",
+  "author": {
+    "name": "fernandogarzaaa",
+    "url": "https://github.com/fernandogarzaaa"
+  },
+  "homepage": "https://github.com/fernandogarzaaa/AXIOM-AETHER",
+  "repository": "https://github.com/fernandogarzaaa/AXIOM-AETHER",
+  "license": "MIT",
+  "keywords": [
+    "ttt",
+    "context-compression",
+    "memory",
+    "grounding",
+    "self-healing",
+    "mcp"
+  ],
+  "mcpServers": {
+    "axiom": {
+      "command": "axiom",
+      "args": ["--mode", "mcp"]
+    }
+  }
+}

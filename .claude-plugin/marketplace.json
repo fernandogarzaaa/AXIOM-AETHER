@@ -1,0 +1,20 @@
+{
+  "name": "axiom-aether",
+  "owner": {
+    "name": "fernandogarzaaa",
+    "url": "https://github.com/fernandogarzaaa"
+  },
+  "metadata": {
+    "description": "Axiom — a local-first Rust runtime for online Test-Time Training, context compression, grounding, and self-healing execution.",
+    "version": "0.4.1"
+  },
+  "plugins": [
+    {
+      "name": "axiom",
+      "source": "./",
+      "description": "Adds the Axiom MCP tools: compress a repository into a dense context fingerprint and expand symbols back on demand, store and recall durable project memory, verify claims against evidence, score code for architectural drift, report learned self-healing immunity, and coordinate multi-agent work through a task board. Requires the `axiom` binary on PATH (see repository README for install).",
+      "category": "productivity",
+      "keywords": ["ttt", "context-compression", "memory", "grounding", "mcp"]
+    }
+  ]
+}
