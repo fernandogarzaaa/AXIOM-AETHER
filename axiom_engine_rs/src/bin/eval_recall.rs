@@ -9,6 +9,7 @@ use axiom_engine::embedder::embed_text;
 use axiom_engine::inference::{InferencePipeline, InferenceRuntimeOptions};
 use axiom_engine::memory_recall::{recall, RecallParams};
 use axiom_engine::memory_store::{now_secs, MemoryKind, MemoryRecord, MemoryStore};
+use axiom_engine::model_meta::ModelMeta;
 use candle_core::Device;
 
 /// Elementwise mean over a set of equal-length vectors.
@@ -57,8 +58,21 @@ fn main() {
     let ckpt =
         std::env::var("AXIOM_BPE_CKPT").unwrap_or_else(|_| "____no_such_checkpoint____".to_string());
 
-    let config =
-        AxiomConfig { d_model: 256, n_layers: 4, vocab_size: 16000, lr_inner: 1e-3, norm_eps: 1e-6 };
+    // Prefer dims from the checkpoint sidecar (matches entrypoint.rs's production
+    // load path) so this eval scores the real deployed model instead of silently
+    // falling back to a shape-mismatched random pipeline.
+    let config = match ModelMeta::load(&ckpt) {
+        Some(m) => AxiomConfig {
+            d_model: m.d_model,
+            n_layers: m.n_layers,
+            vocab_size: m.vocab_size,
+            lr_inner: m.lr_inner,
+            norm_eps: m.norm_eps,
+        },
+        None => {
+            AxiomConfig { d_model: 256, n_layers: 4, vocab_size: 16000, lr_inner: 1e-3, norm_eps: 1e-6 }
+        }
+    };
     let runtime = InferenceRuntimeOptions { tokenizer_path: tok, ..Default::default() };
     let pipeline =
         match InferencePipeline::with_checkpoint_and_options(config, Device::Cpu, &ckpt, runtime) {
