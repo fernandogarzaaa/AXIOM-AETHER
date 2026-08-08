@@ -11,11 +11,17 @@ Generated (unix): 1783089448
 
 ## How to read these
 
-Two of the four pillars run on a **very small sample**, and the `n` column exists
-so a percentage cannot be mistaken for a rate. `3/3` is a smoke check that the
-round-trip works at all; it is not evidence of a 100% recovery rate, and neither
-is a 75.1% reduction measured over three records evidence of a 75% reduction in
-general. Both are deliberately reported as counts.
+**Three of the four pillars run on a tiny sample** — cognition (n=3), fleet
+(n=2), and cost (n=3) — and the `n` column exists so a percentage cannot be
+mistaken for a rate. `3/3` is a smoke check that the round-trip works at all; it
+is not evidence of a 100% recovery rate, and neither is a 75.1% reduction
+measured over three records evidence of a 75% reduction in general. Both are
+deliberately reported as counts.
+
+Fleet is the one small-`n` pillar where that is not a limitation: it is a
+pass/fail check that immunity transfers between two nodes and that a signed
+fragment is accepted, so two nodes is the whole scenario. Its timings are
+single-run and should be read as "fast enough", not as benchmarks.
 
 For the compression figure that **is** measured at scale, run
 `axiom bench axiom_engine_rs/src`: **82.4% token savings (173,446 -> 30,474) with

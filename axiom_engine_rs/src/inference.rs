@@ -30,11 +30,13 @@ pub struct InferencePipeline {
     vocab_size: u32,
     tokenizer: TokenizerBackend,
     streamer: JitContextStreamer,
-    /// True when real trained weights were loaded. False means the model is
-    /// randomly initialized, so every cross-entropy it reports sits at the
-    /// `ln(vocab_size)` uniform-distribution floor and carries no learning
-    /// signal. Callers that print CE must say so rather than let a reader
-    /// mistake the entropy floor for a measurement.
+    /// True when a checkpoint file was found and loaded. False means the
+    /// model is randomly initialized, so any cross-entropy it reports is a
+    /// property of untrained weights and is not evidence of learning.
+    /// Callers that print CE must say so rather than let a reader mistake it
+    /// for a measurement. (Observed on the default d256/vocab-256 config, an
+    /// untrained run sits at ~5.545 = ln(256), i.e. the uniform floor -- an
+    /// observation for that configuration, not a guarantee for every one.)
     checkpoint_loaded: bool,
 }
 
@@ -79,7 +81,19 @@ impl InferencePipeline {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let model = AxiomTTTLM::new_with_options(vb, config.clone(), learned_gate)?;
 
-        let checkpoint_loaded = Path::new(checkpoint).exists();
+        // `Path::exists()` returns false on ANY metadata failure, including a
+        // permission error on a checkpoint that is present. Falling through to
+        // random weights in that case -- while reporting `checkpoint_loaded ==
+        // false` -- is exactly the silent-degradation this flag exists to
+        // prevent. Distinguish "absent" from "cannot tell", and fail loudly on
+        // the latter rather than quietly running untrained.
+        let checkpoint_loaded = Path::new(checkpoint).try_exists().map_err(|e| {
+            candle_core::Error::Msg(format!(
+                "cannot determine whether checkpoint {checkpoint} exists: {e}. \
+                 Refusing to start: silently falling back to random weights here \
+                 would misreport an untrained model as loaded."
+            ))
+        })?;
         if checkpoint_loaded {
             varmap.load(checkpoint)?;
             // Diagnostics go to stderr: stdout is reserved as a pure protocol
@@ -172,9 +186,9 @@ impl InferencePipeline {
         })
     }
 
-    /// True when trained weights were loaded. When false, any cross-entropy
-    /// this pipeline reports is the `ln(vocab_size)` entropy floor of an
-    /// untrained model, not evidence of learning.
+    /// True when a checkpoint was found and loaded. When false, any
+    /// cross-entropy this pipeline reports comes from randomly initialized
+    /// weights and is not evidence of learning.
     pub fn checkpoint_loaded(&self) -> bool {
         self.checkpoint_loaded
     }
