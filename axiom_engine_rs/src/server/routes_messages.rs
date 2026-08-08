@@ -29,6 +29,19 @@ async fn create_message(
         .get("x-axiom-session-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    // The orchestrator declares the reasoning capability a turn needs via
+    // `X-Axiom-Capability` (or an `axiom_capability` body field). Axiom never
+    // infers it: there is no complexity classifier here, and an unrecognized
+    // label parses to `None` rather than being guessed into a tier.
+    let declared_capability = headers
+        .get("x-axiom-capability")
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::model_router::Capability::parse)
+        .or_else(|| {
+            body.get("axiom_capability")
+                .and_then(Value::as_str)
+                .and_then(crate::model_router::Capability::parse)
+        });
     if state.compression_active() {
         // Capture the client's own credentials so we can relay them upstream.
         // This is what makes the proxy work for a Claude *subscription*
@@ -46,8 +59,14 @@ async fn create_message(
             anthropic_version: header_str("anthropic-version"),
             anthropic_beta: header_str("anthropic-beta"),
         };
-        match compressed_messages_path(&state, &body, session_override.as_deref(), &client_auth)
-            .await
+        match compressed_messages_path(
+            &state,
+            &body,
+            session_override.as_deref(),
+            &client_auth,
+            declared_capability,
+        )
+        .await
         {
             Ok(resp) => return resp,
             Err(err) => return err.into_response(),
@@ -153,6 +172,7 @@ async fn compressed_messages_path(
     body: &Value,
     session_override: Option<&str>,
     client_auth: &ClientAuth,
+    declared_capability: Option<crate::model_router::Capability>,
 ) -> Result<Response, ApiError> {
     let forwarder = state.anthropic_forwarder.as_ref().as_ref().cloned();
     if forwarder.is_none() && state.swarm_router.as_ref().is_none() {
@@ -708,15 +728,39 @@ async fn compressed_messages_path(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if let Some(target) = crate::model_router::route(&original_model, mechanical, cooldown, &route_mode)
-        {
+        // `declared_capability` is SUPPLIED by the orchestrator (header or body,
+        // resolved in `create_message`), never inferred here. When absent the
+        // decision falls through to the pre-existing economic path, so every
+        // existing caller behaves exactly as before.
+        let signals = crate::model_router::TurnSignals {
+            capability: declared_capability,
+            mechanical,
+            cooldown,
+        };
+        let decision = crate::model_router::select_model(
+            &original_model,
+            &signals,
+            crate::model_router::RoutingMode::parse(&route_mode),
+        );
+        // Routing telemetry carries no token figures; the context pipeline
+        // reports its own reduction separately. A downgrade is a cost decision,
+        // never a compression one.
+        eprintln!(
+            "[axiom-routing] session={session_id} {}",
+            decision.telemetry_line()
+        );
+        if decision.changed {
             if let Some(obj) = outbound.as_object_mut() {
-                obj.insert("model".to_string(), Value::String(target.to_string()));
+                obj.insert(
+                    "model".to_string(),
+                    Value::String(decision.selected_model.clone()),
+                );
             }
-            eprintln!(
-                "[axiom-pss] R1 route: {original_model} -> {target} (session {session_id}, mode {route_mode})"
-            );
-            routed_from = Some(original_model);
+            // Only an economic downgrade attributes quota savings; a capability
+            // selection changed the model for correctness, not for cost.
+            if decision.economic_downgrade {
+                routed_from = Some(original_model);
+            }
         }
     }
 
