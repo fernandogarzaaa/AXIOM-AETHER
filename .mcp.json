@@ -1,5 +1,4 @@
 {
-  "$comment": "Drop-in MCP server config for Claude Code and any client that reads .mcp.json. Requires the `axiom` binary on PATH — install with scripts/install.sh (Linux/macOS), scripts/install.ps1 (Windows), `cargo install --path axiom_engine_rs`, or `pip install axiom-engine`. To pin a trained checkpoint, append: \"--checkpoint\", \"checkpoints/axiom_production_bpe.bin\" — omit it to use the auto-bootstrapped model.",
   "mcpServers": {
     "axiom": {
       "command": "axiom",

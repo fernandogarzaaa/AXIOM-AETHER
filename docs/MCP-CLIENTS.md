@@ -27,7 +27,7 @@ with this doc again.
 This repository is also a Claude Code **plugin marketplace**, so you can install
 Axiom's MCP server without hand-editing any config file. From inside Claude Code:
 
-```
+```text
 /plugin marketplace add fernandogarzaaa/AXIOM-AETHER
 /plugin install axiom@axiom-aether
 ```
@@ -47,7 +47,9 @@ manual `.mcp.json` route below and append
 Manifest files: [`.claude-plugin/plugin.json`](../.claude-plugin/plugin.json),
 [`.claude-plugin/marketplace.json`](../.claude-plugin/marketplace.json), and a
 drop-in [`.mcp.json`](../.mcp.json) at the repository root for clients that read
-it directly.
+it directly. The root `.mcp.json` is kept schema-only (no comment keys) so a
+strict client cannot reject it; setup notes live here instead. It requires the
+`axiom` binary on `PATH`, same as the plugin.
 
 ## Claude Desktop / Claude Code / Cline -- works today (stdio)
 
