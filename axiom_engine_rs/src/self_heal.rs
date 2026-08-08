@@ -742,8 +742,18 @@ pub fn run_supervised(
         report.tokens_absorbed += ids.len();
         report.absorption_passes += passes;
         let ce_after = sequence_ce(pipeline, &states, &ids)?;
+        // Without trained weights the model sits at the ln(vocab_size) uniform
+        // floor, so both figures are that constant and absorption cannot move
+        // them. Say so on the line itself: an unqualified "CE a -> b" reads as a
+        // measurement of learning, and a reader should not have to know the
+        // checkpoint state to interpret it.
+        let untrained_note = if pipeline.checkpoint_loaded() {
+            ""
+        } else {
+            "  [untrained model: CE is the ln(vocab) entropy floor, not a learning signal]"
+        };
         println!(
-            "[axiom-run]   tension: CE {ce_before:.3} -> {ce_after:.3} after {passes} absorption pass(es) ({} tokens)",
+            "[axiom-run]   tension: CE {ce_before:.3} -> {ce_after:.3} after {passes} absorption pass(es) ({} tokens){untrained_note}",
             ids.len()
         );
         report.tension.push(TensionSample {

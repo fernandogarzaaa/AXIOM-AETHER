@@ -10,14 +10,28 @@ services:
       dockerfile: Dockerfile
     image: ${AXIOM_IMAGE:-ghcr.io/fernandogarzaaa/axiom-aether:latest}
     container_name: axiom_inference_provider
+    # Published on the LOOPBACK interface only. Axiom's data plane is
+    # unauthenticated unless AXIOM_API_KEY is set, so publishing on every host
+    # interface would hand the engine to anyone who can reach this machine.
+    # To expose it deliberately, set AXIOM_BIND=0.0.0.0 -- and set
+    # AXIOM_API_KEY at the same time.
     ports:
-      - "${AXIOM_PORT:-8080}:8080"
+      - "${AXIOM_BIND:-127.0.0.1}:${AXIOM_PORT:-8080}:8080"
+    # The image runs as uid 10001 (`axiom`), not root. These mounts only need to
+    # be writable when AXIOM_CHECKPOINT_URL is set and the entrypoint downloads
+    # into them; reads work regardless of owner. If a download fails with a
+    # permission error, run `chown -R 10001:10001 ./checkpoints ./tokenizer_cache`
+    # on the host, or pre-place the checkpoint files yourself.
     volumes:
       - ./checkpoints:/app/checkpoints
       - ./tokenizer_cache:/app/tokenizer_cache
     environment:
+      # 0.0.0.0 is correct INSIDE the container (it must accept traffic from the
+      # Docker bridge); host-side exposure is controlled by `ports` above.
       - AXIOM_HOST=0.0.0.0
       - AXIOM_PORT=8080
+      # Data-plane auth. Unset = open; the server warns loudly at boot.
+      - AXIOM_API_KEY=${AXIOM_API_KEY:-}
       - AXIOM_DEVICE=${AXIOM_DEVICE:-cpu}
       - AXIOM_CONTEXT_API_URL=${AXIOM_CONTEXT_API_URL:-https://api.exa.ai/search}
       - AXIOM_CONTEXT_API_KEY=${AXIOM_CONTEXT_API_KEY}

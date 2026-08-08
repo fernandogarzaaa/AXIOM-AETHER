@@ -30,6 +30,12 @@ pub struct InferencePipeline {
     vocab_size: u32,
     tokenizer: TokenizerBackend,
     streamer: JitContextStreamer,
+    /// True when real trained weights were loaded. False means the model is
+    /// randomly initialized, so every cross-entropy it reports sits at the
+    /// `ln(vocab_size)` uniform-distribution floor and carries no learning
+    /// signal. Callers that print CE must say so rather than let a reader
+    /// mistake the entropy floor for a measurement.
+    checkpoint_loaded: bool,
 }
 
 impl InferencePipeline {
@@ -73,7 +79,8 @@ impl InferencePipeline {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let model = AxiomTTTLM::new_with_options(vb, config.clone(), learned_gate)?;
 
-        if Path::new(checkpoint).exists() {
+        let checkpoint_loaded = Path::new(checkpoint).exists();
+        if checkpoint_loaded {
             varmap.load(checkpoint)?;
             // Diagnostics go to stderr: stdout is reserved as a pure protocol
             // channel for `--mode mcp` (JSON-RPC stdio). The HTTP server prints
@@ -161,7 +168,15 @@ impl InferencePipeline {
             vocab_size: config.vocab_size as u32,
             tokenizer,
             streamer,
+            checkpoint_loaded,
         })
+    }
+
+    /// True when trained weights were loaded. When false, any cross-entropy
+    /// this pipeline reports is the `ln(vocab_size)` entropy floor of an
+    /// untrained model, not evidence of learning.
+    pub fn checkpoint_loaded(&self) -> bool {
+        self.checkpoint_loaded
     }
 
     /// Return a reference to the device this pipeline runs on.
