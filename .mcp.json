@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "axiom": {
+      "command": "axiom",
+      "args": ["--mode", "mcp"]
+    }
+  }
+}

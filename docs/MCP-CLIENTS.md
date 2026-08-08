@@ -22,6 +22,35 @@ with this doc again.
 > see [`CLINE-SETUP.md`](CLINE-SETUP.md). This page below is the transport
 > reference.
 
+## Claude Code plugin -- one-command install (recommended)
+
+This repository is also a Claude Code **plugin marketplace**, so you can install
+Axiom's MCP server without hand-editing any config file. From inside Claude Code:
+
+```text
+/plugin marketplace add fernandogarzaaa/AXIOM-AETHER
+/plugin install axiom@axiom-aether
+```
+
+The plugin registers the `axiom` MCP server (`axiom --mode mcp`) for you.
+
+**Prerequisite:** the `axiom` binary must be on your `PATH` -- the plugin
+manifest declares the server, it does not compile the engine. Install it with
+`scripts/install.sh` (Linux/macOS), `scripts/install.ps1` (Windows),
+`cargo install --path axiom_engine_rs`, or `pip install axiom-engine`. Verify
+with `axiom --version` before installing the plugin.
+
+To pin a trained checkpoint instead of the auto-bootstrapped model, use the
+manual `.mcp.json` route below and append
+`"--checkpoint", "checkpoints/axiom_production_bpe.bin"` to `args`.
+
+Manifest files: [`.claude-plugin/plugin.json`](../.claude-plugin/plugin.json),
+[`.claude-plugin/marketplace.json`](../.claude-plugin/marketplace.json), and a
+drop-in [`.mcp.json`](../.mcp.json) at the repository root for clients that read
+it directly. The root `.mcp.json` is kept schema-only (no comment keys) so a
+strict client cannot reject it; setup notes live here instead. It requires the
+`axiom` binary on `PATH`, same as the plugin.
+
 ## Claude Desktop / Claude Code / Cline -- works today (stdio)
 
 Axiom's MCP server speaks JSON-RPC over **stdio**, the transport Claude Desktop,
