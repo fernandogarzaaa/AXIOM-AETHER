@@ -10,14 +10,38 @@ services:
       dockerfile: Dockerfile
     image: ${AXIOM_IMAGE:-ghcr.io/fernandogarzaaa/axiom-aether:latest}
     container_name: axiom_inference_provider
+    # Published on the LOOPBACK interface only. Axiom's data plane is
+    # unauthenticated unless AXIOM_API_KEY is set, so publishing on every host
+    # interface would hand the engine to anyone who can reach this machine.
+    # To expose it deliberately, set AXIOM_BIND=0.0.0.0 -- and set
+    # AXIOM_API_KEY at the same time.
     ports:
-      - "${AXIOM_PORT:-8080}:8080"
+      - "${AXIOM_BIND:-127.0.0.1}:${AXIOM_PORT:-8080}:8080"
+    # The image runs as uid 10001 (`axiom`), not root, and a bind mount REPLACES
+    # the image directory -- so image-side ownership does not carry over.
+    #
+    # `checkpoints` stays a bind mount because you generally want to see and
+    # place those files yourself. It only needs to be writable when
+    # AXIOM_CHECKPOINT_URL or AXIOM_TOKENIZER_URL is set and the entrypoint
+    # downloads into it; reads work regardless of owner. If a download fails with
+    # a permission error: `chown -R 10001:10001 ./checkpoints`, or pre-place the
+    # files yourself.
+    #
+    # `tokenizer_cache` is a Docker-managed volume instead: the engine writes it
+    # at runtime (not only on download), so a host directory owned by another uid
+    # would break normal operation rather than just an optional fetch. A managed
+    # volume inherits the image directory's ownership, so it is writable by uid
+    # 10001 with no host-side setup.
     volumes:
       - ./checkpoints:/app/checkpoints
-      - ./tokenizer_cache:/app/tokenizer_cache
+      - axiom_tokenizer_cache:/app/tokenizer_cache
     environment:
+      # 0.0.0.0 is correct INSIDE the container (it must accept traffic from the
+      # Docker bridge); host-side exposure is controlled by `ports` above.
       - AXIOM_HOST=0.0.0.0
       - AXIOM_PORT=8080
+      # Data-plane auth. Unset = open; the server warns loudly at boot.
+      - AXIOM_API_KEY=${AXIOM_API_KEY:-}
       - AXIOM_DEVICE=${AXIOM_DEVICE:-cpu}
       - AXIOM_CONTEXT_API_URL=${AXIOM_CONTEXT_API_URL:-https://api.exa.ai/search}
       - AXIOM_CONTEXT_API_KEY=${AXIOM_CONTEXT_API_KEY}
@@ -29,3 +53,9 @@ services:
       options:
         max-size: "100m"
         max-file: "3"
+
+# Managed volume for the runtime tokenizer cache. Declared here so it inherits
+# the image directory's ownership (uid 10001) rather than a host directory's,
+# which is what keeps it writable under the non-root USER.
+volumes:
+  axiom_tokenizer_cache:

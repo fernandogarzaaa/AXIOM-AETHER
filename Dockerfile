@@ -52,16 +52,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
+# Run as an unprivileged user. The entrypoint may download a checkpoint into
+# /app/checkpoints and the engine writes /app/tokenizer_cache, so those two are
+# owned by `axiom`; nothing else needs to be writable. Root is not required for
+# anything this image does -- it binds 8080, not a privileged port.
+RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin axiom
+
 # Create the app directory structure
 WORKDIR /app
-RUN mkdir -p /app/checkpoints /app/tokenizer_cache
+RUN mkdir -p /app/checkpoints /app/tokenizer_cache \
+    && chown -R axiom:axiom /app
 
 # Copy the binary from the builder stage
 COPY --from=builder /build/axiom_engine_rs/target/release/axiom_engine /app/axiom_engine
 
 # Copy the entrypoint script
 COPY scripts/docker_entrypoint.sh /app/docker_entrypoint.sh
-RUN chmod +x /app/docker_entrypoint.sh
+RUN chmod +x /app/docker_entrypoint.sh \
+    && chown axiom:axiom /app/axiom_engine /app/docker_entrypoint.sh
+
+# Drop privileges. Everything below this line runs as `axiom`, including the
+# entrypoint and the server itself.
+USER axiom
 
 # Expose the default server port
 EXPOSE 8080
