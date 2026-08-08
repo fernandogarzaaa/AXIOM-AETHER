@@ -86,15 +86,41 @@ fn case_g_haiku_with_large_context_is_optimized() {
 }
 
 #[test]
-fn context_optimization_is_byte_identical_across_all_three_tiers() {
-    // The strongest form of E/F/G: the reduction is a pure function of context
-    // size, so the three tiers cannot differ. Optimization is not a privilege
-    // of the cheap tier.
-    let opus = optimize(LARGE_CONTEXT_TOKENS);
-    let sonnet = optimize(LARGE_CONTEXT_TOKENS);
-    let haiku = optimize(LARGE_CONTEXT_TOKENS);
-    assert_eq!(opus, sonnet);
-    assert_eq!(sonnet, haiku);
+fn optimization_tracks_context_size_and_ignores_the_selected_tier() {
+    // Two halves, so the assertions can actually fail.
+    //
+    // First: the reduction genuinely responds to its input. Without this, the
+    // equality check below would pass against a constant.
+    let small = optimize(NOOP_THRESHOLD_TOKENS + 1);
+    let large = optimize(LARGE_CONTEXT_TOKENS);
+    assert_ne!(
+        small, large,
+        "optimization must respond to context size, or the invariance check below is vacuous"
+    );
+
+    // Second: routing to three genuinely different tiers leaves the report
+    // untouched. The selections below really do differ, so a future change that
+    // fed the selected model into the context path would break this.
+    let tiers: Vec<String> = [
+        Capability::Mechanical,
+        Capability::General,
+        Capability::Reasoning,
+    ]
+    .iter()
+    .map(|c| select_model("claude-sonnet-5", &declared(*c), CAPABILITY).selected_model)
+    .collect();
+    assert_eq!(
+        tiers,
+        vec!["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-4-8"],
+        "the three selections must actually differ for this test to mean anything"
+    );
+    for _tier in &tiers {
+        assert_eq!(
+            optimize(LARGE_CONTEXT_TOKENS),
+            large,
+            "context optimization is not a privilege of any one tier"
+        );
+    }
 }
 
 // ---- Case H: compression cannot change model selection ----
@@ -108,18 +134,23 @@ fn case_h_context_size_does_not_change_model_selection() {
         Capability::HighRiskReasoning,
     ] {
         let baseline = select_model("claude-sonnet-5", &declared(cap), CAPABILITY);
+        let mut seen_reports = Vec::new();
         for tokens in [0usize, NOOP_THRESHOLD_TOKENS, LARGE_CONTEXT_TOKENS, 5_000_000] {
-            let report = optimize(tokens);
-            // Re-running selection after optimization must produce the same
-            // decision: `select_model` takes no context argument at all, which
-            // is the structural guarantee this asserts.
+            seen_reports.push(optimize(tokens));
             let after = select_model("claude-sonnet-5", &declared(cap), CAPABILITY);
             assert_eq!(
                 baseline, after,
-                "{cap:?} selection changed after optimizing {tokens} tokens (saved {})",
-                report.tokens_saved_est()
+                "{cap:?} selection changed while optimizing {tokens} tokens"
             );
         }
+        // Guard against the assertion above going vacuous: the contexts really
+        // did span no-op and heavily-reduced outcomes, and selection still did
+        // not move.
+        assert!(
+            seen_reports.iter().any(ContextReport::is_noop)
+                && seen_reports.iter().any(|r| r.tokens_saved_est() > 0),
+            "the loop must cover both a no-op and a real reduction to be meaningful"
+        );
     }
 }
 

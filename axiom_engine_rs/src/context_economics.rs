@@ -107,7 +107,14 @@ pub struct ContextReport {
     /// Whether the evidence guard admitted this reduction.
     pub evidence_preserved: bool,
     /// Always true. Token figures are local estimates, never billed counts.
+    /// `skip_deserializing` pins the invariant: an inbound payload cannot set
+    /// it false and claim these are billed figures.
+    #[serde(default = "always_true", skip_deserializing)]
     pub estimated: bool,
+}
+
+fn always_true() -> bool {
+    true
 }
 
 impl ContextReport {

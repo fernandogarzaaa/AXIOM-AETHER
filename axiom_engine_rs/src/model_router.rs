@@ -38,6 +38,14 @@
 //! | `on` | `EconomicDowngrade { high_tier_only: false }` | shipped behavior, any Claude tier |
 //! | `capability` | [`RoutingMode::CapabilitySelection`] | opt-in: select the tier the caller asked for |
 //!
+//! **`capability` replaces the economic path rather than layering on it.** It
+//! ignores `mechanical` and `cooldown`, never sets `economic_downgrade`, and
+//! keeps the requested model when no capability is declared. An operator who
+//! switches from `auto` to `capability` therefore gives up the per-turn quota
+//! relief `auto` provides on undeclared turns; that is the trade, and it is
+//! deliberate -- mixing the two would reintroduce exactly the conflation this
+//! module exists to remove.
+//!
 //! `off` / `auto` / `on` are behaviorally identical to the pre-existing
 //! implementation when no capability is supplied, which is the backward-compat
 //! contract every existing caller relies on.
@@ -206,6 +214,9 @@ pub enum RoutingReason {
     CapabilityMatched,
     /// Mode admits only scarce high tiers and this is not one.
     ModeExcludesTier,
+    /// Already on the cheapest tier; there is nothing to downgrade to. Distinct
+    /// from `CapabilitySatisfied`, which means a *declared* capability matched.
+    AlreadyCheapestTier,
     /// Not a mechanical turn (fresh reasoning, or an error cooldown is active).
     NotMechanical,
     /// Mechanical turn moved to the cheap tier to relieve a scarce quota bucket.
@@ -222,6 +233,7 @@ impl RoutingReason {
             RoutingReason::CapabilityFloorHeld => "capability_floor_held",
             RoutingReason::CapabilityMatched => "capability_matched",
             RoutingReason::ModeExcludesTier => "mode_excludes_tier",
+            RoutingReason::AlreadyCheapestTier => "already_cheapest_tier",
             RoutingReason::NotMechanical => "not_mechanical",
             RoutingReason::MechanicalDowngrade => "mechanical_downgrade",
         }
@@ -249,9 +261,14 @@ pub struct RoutingDecision {
 impl RoutingDecision {
     /// One-line telemetry. Deliberately carries no token figures, so a reader
     /// cannot infer context reduction from a routing line.
+    ///
+    /// The model fields are rendered with `{:?}`: `original_model` is
+    /// client-controlled, and a value containing a newline or space would
+    /// otherwise break the `key=value` framing and let a caller forge a second
+    /// `[axiom-routing]` log line. Debug formatting escapes control characters.
     pub fn telemetry_line(&self) -> String {
         format!(
-            "original_model={} selected_model={} capability={} mode={} reason={} economic_downgrade={} changed={}",
+            "original_model={:?} selected_model={:?} capability={} mode={} reason={} economic_downgrade={} changed={}",
             self.original_model,
             self.selected_model,
             self.capability.map(Capability::as_str).unwrap_or("none"),
@@ -321,7 +338,7 @@ pub fn select_model(requested: &str, signals: &TurnSignals, mode: RoutingMode) -
                 return keep(RoutingReason::NotMechanical);
             }
             if requested.contains("haiku") {
-                return keep(RoutingReason::CapabilitySatisfied);
+                return keep(RoutingReason::AlreadyCheapestTier);
             }
             if high_tier_only && !is_high_tier(requested) {
                 return keep(RoutingReason::ModeExcludesTier);
@@ -492,6 +509,50 @@ mod tests {
                 assert_eq!(d.reason, RoutingReason::CapabilityFloorHeld);
             }
         }
+    }
+
+    #[test]
+    fn declared_mechanical_still_permits_the_economic_downgrade() {
+        // The boundary of the veto: it is `> Mechanical`, not `>= Mechanical`.
+        // Without this, changing the comparison to `>=` would silently disable
+        // the shipped cost path and every other test would still pass.
+        let signals = TurnSignals {
+            capability: Some(Capability::Mechanical),
+            mechanical: true,
+            cooldown: 0,
+        };
+        let d = select_model("claude-opus-4-8", &signals, AUTO);
+        assert!(d.economic_downgrade);
+        assert_eq!(d.reason, RoutingReason::MechanicalDowngrade);
+        assert_eq!(d.selected_model, ROUTE_TARGET);
+    }
+
+    #[test]
+    fn already_haiku_is_distinct_from_a_declared_capability_match() {
+        // Both keep the model, but a telemetry reader must be able to tell "no
+        // cheaper tier exists" from "the caller's declared capability is met".
+        let economic = select_model("claude-haiku-4-5", &mechanical_turn(), AUTO);
+        assert_eq!(economic.reason, RoutingReason::AlreadyCheapestTier);
+        assert_eq!(economic.capability, None);
+
+        let declared_match =
+            select_model("claude-haiku-4-5", &declared(Capability::Mechanical), CAPABILITY);
+        assert_eq!(declared_match.reason, RoutingReason::CapabilitySatisfied);
+        assert_ne!(economic.reason, declared_match.reason);
+    }
+
+    #[test]
+    fn telemetry_line_escapes_a_forged_model_id() {
+        // `original_model` is client-controlled and the line goes to stderr, so
+        // a newline must not be able to fabricate a second log record.
+        let signals = mechanical_turn();
+        let d = select_model("claude-opus-4-8\n[axiom-routing] forged=true", &signals, AUTO);
+        let line = d.telemetry_line();
+        assert!(
+            !line.contains('\n'),
+            "a newline in a model id must not break the line framing: {line:?}"
+        );
+        assert!(line.contains("\\n"), "the newline should be escaped, not dropped");
     }
 
     #[test]
