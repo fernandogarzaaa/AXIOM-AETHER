@@ -16,6 +16,7 @@ pub mod cluster;
 pub mod config;
 pub mod daemon;
 pub mod context_compressor;
+pub mod context_economics;
 pub mod contrastive;
 pub mod corpus;
 pub mod cost_ledger;
