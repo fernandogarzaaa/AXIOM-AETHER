@@ -25,9 +25,17 @@ single-run and should be read as "fast enough", not as benchmarks.
 
 For the compression figure that **is** measured at scale, run
 `axiom bench axiom_engine_rs/src`: **82.4% token savings (173,446 -> 30,474) with
-2181/2181 = 100.0% signature round-trip** over 120 files. That number carries a
-real sample size and is the one to cite. It also runs with no checkpoint, since
-skeleton compression is structural rather than model-dependent.
+2181/2181 = 100.0% signature round-trip** over 120 files, measured under the
+**legacy 256-vocab tokenizer** (`AXIOM_PRODUCTION_BPE=0`, no checkpoint required).
+Under the production BPE tokenizer (`AXIOM_PRODUCTION_BPE=1`, vocab 8000, with
+`checkpoints/axiom_production_bpe.bin`), the same 121-file tree measures
+**86.7% token savings (583,521 -> 77,843) with 2229/2229 = 100.0% signature
+round-trip** — see `bench/ttt/RESULTS-2026-08-09.md` for the full comparison.
+Signature extraction itself (the structural part) is confirmed model-independent —
+both configs hit 100.0% round-trip fidelity — but the **token-count-based
+percentage is tokenizer-dependent**, since `AXIOM_PRODUCTION_BPE` switches the
+active tokenizer alongside the model. Cite the figure together with which
+tokenizer produced it.
 
 Answer-quality effects are not measured anywhere here and are not claimed. Token
 savings and structural fidelity are measured offline; whether a smaller context
