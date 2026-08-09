@@ -320,6 +320,48 @@ fn fetch_base_model(url: &str, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Fetch the production BPE checkpoint (+ tokenizer) from a release URL if
+/// one is configured and the files aren't already present.
+///
+/// Mirrors the `AXIOM_CHECKPOINT_URL` / `AXIOM_TOKENIZER_URL` convention
+/// `scripts/docker_entrypoint.sh` already uses, so the same release asset
+/// works for both the container entrypoint and `axiom init`. Every prior
+/// audit of this repo found that a fresh clone (and CI) never has a trained
+/// checkpoint — `axiom init` only ever bootstrapped the small legacy model
+/// (see `bootstrap.rs`), never the production BPE one. This closes that gap
+/// when a URL is configured; unset (the default), `axiom init`'s behavior is
+/// unchanged.
+///
+/// Best-effort: a fetch failure or unset URL returns `Ok(false)` rather than
+/// erroring, so callers should fall back to the offline bootstrap.
+pub fn ensure_production_checkpoint() -> io::Result<bool> {
+    let Ok(ckpt_url) = std::env::var("AXIOM_CHECKPOINT_URL") else {
+        return Ok(false);
+    };
+    let ckpt_path = std::env::var("AXIOM_BPE_CKPT")
+        .unwrap_or_else(|_| "checkpoints/axiom_production_bpe.bin".to_string());
+    let ckpt_target = Path::new(&ckpt_path);
+    if ckpt_target.exists() {
+        return Ok(false);
+    }
+    fetch_base_model(&ckpt_url, ckpt_target)?;
+
+    if let Ok(tok_url) = std::env::var("AXIOM_TOKENIZER_URL") {
+        let tok_path = std::env::var("AXIOM_TOKENIZER")
+            .unwrap_or_else(|_| "checkpoints/axiom_bpe.json".to_string());
+        let tok_target = Path::new(&tok_path);
+        if !tok_target.exists() {
+            if let Err(e) = fetch_base_model(&tok_url, tok_target) {
+                eprintln!(
+                    "[axiom] tokenizer fetch failed ({e}); checkpoint was fetched but the \
+                     production model needs a matching tokenizer too."
+                );
+            }
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

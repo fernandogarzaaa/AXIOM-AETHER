@@ -634,6 +634,20 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             println!("[axiom] config: {}", paths.config.display());
             println!("[axiom] logs:   {}", paths.logs_dir.display());
 
+            // Prefer a real trained production checkpoint when AXIOM_CHECKPOINT_URL
+            // is configured (same convention scripts/docker_entrypoint.sh uses) --
+            // best-effort, does not affect the legacy bootstrap below either way.
+            match config::ensure_production_checkpoint() {
+                Ok(true) => println!(
+                    "[axiom] fetched production checkpoint from AXIOM_CHECKPOINT_URL"
+                ),
+                Ok(false) => {}
+                Err(err) => eprintln!(
+                    "[axiom] production checkpoint fetch skipped: {err}. Falling back to the \
+                     offline bootstrap below."
+                ),
+            }
+
             // Bootstrap a real local checkpoint so the proxy never boots on
             // random weights. Offline (procedural dataset), bounded, best-effort
             // — a training error here must not fail `init`.
