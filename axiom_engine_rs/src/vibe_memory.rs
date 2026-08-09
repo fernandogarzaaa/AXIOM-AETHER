@@ -129,7 +129,13 @@ impl MasterVibe {
                     self.d_model, self.d_model
                 )));
             }
-            states.push(t.to_dtype(DType::F32)?);
+            let t = t.to_dtype(DType::F32)?;
+            if !tensor_is_finite(&t)? {
+                return Err(candle_core::Error::Msg(format!(
+                    "vibe layer {i} contains non-finite values (corrupt master file)"
+                )));
+            }
+            states.push(t);
         }
         Ok(states)
     }
@@ -199,10 +205,23 @@ impl MasterVibe {
                 let keep = self.decay; // weight on the existing master
                 let take = 1.0 - self.decay; // weight on the new session
                 let mut out = Vec::with_capacity(self.n_layers);
-                for (m, s) in master.iter().zip(session_states.iter()) {
+                for (i, (m, s)) in master.iter().zip(session_states.iter()).enumerate() {
                     let m_part = m.affine(keep, 0.0)?; // decay * W_master
                     let s_part = s.to_dtype(DType::F32)?.affine(take, 0.0)?; // (1-decay) * W_session
-                    out.push(m_part.add(&s_part)?);
+                    let merged_layer = m_part.add(&s_part)?;
+                    // Both inputs pass the finite check above individually, but the
+                    // merge itself can still overflow to non-finite (e.g. two large
+                    // finite values summing past f32::MAX). Reject the whole commit
+                    // rather than let an Inf/NaN layer become permanently baked into
+                    // the master — every later EMA update of a poisoned layer stays
+                    // poisoned (`decay * Inf + take * anything == Inf`), silently
+                    // wrecking every future `prime_states()` caller.
+                    if !tensor_is_finite(&merged_layer)? {
+                        return Err(candle_core::Error::Msg(format!(
+                            "EMA merge of vibe layer {i} produced non-finite values; refusing to commit"
+                        )));
+                    }
+                    out.push(merged_layer);
                 }
                 out
             }
@@ -333,6 +352,61 @@ mod tests {
 
         let reloaded = MasterVibe::load_or_init(&path, 2, 3, &dev, 0.9);
         assert!(reloaded.is_initialized());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Reproduces the real-world corruption found in `axiom_master_vibe.bin`:
+    /// a poisoned (non-finite) master must not be allowed to merge with a
+    /// perfectly healthy new session, because `decay * Inf + take * finite`
+    /// is still `Inf` — the corruption would otherwise stay baked in forever.
+    #[test]
+    fn commit_session_rejects_non_finite_merge_result() {
+        let dev = Device::Cpu;
+        let mut vibe = MasterVibe::load_or_init(
+            std::env::temp_dir().join("axiom_vibe_test_poisoned_merge.bin"),
+            1,
+            2,
+            &dev,
+            0.9,
+        );
+        // Directly poison the master (same module → private field access),
+        // simulating a file that was corrupted before this guard existed.
+        vibe.master = Some(vec![Tensor::new(
+            &[[f32::INFINITY, 0.0f32], [0.0, 1.0]],
+            &dev,
+        )
+        .unwrap()]);
+
+        let healthy_session = eye_states(1, 2, &dev);
+        let err = vibe.commit_session(&healthy_session);
+        assert!(err.is_err(), "merging a healthy session into a poisoned master must be rejected");
+        // The master must remain untouched by the rejected commit.
+        let still_poisoned = vibe.prime_states().unwrap();
+        let flat = still_poisoned[0].flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(flat[0].is_infinite());
+    }
+
+    /// A master vibe file that is already corrupt on disk (non-finite values,
+    /// e.g. from before the merge-result guard existed) must not silently
+    /// load and poison every future `prime_states()` caller.
+    #[test]
+    fn load_or_init_rejects_non_finite_file() {
+        let dev = Device::Cpu;
+        let path = std::env::temp_dir().join("axiom_vibe_test_corrupt_file.bin");
+        let _ = std::fs::remove_file(&path);
+
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        map.insert(
+            "vibe.layer_0".to_string(),
+            Tensor::new(&[[f32::INFINITY, 0.0f32], [0.0, 1.0]], &dev).unwrap(),
+        );
+        candle_core::safetensors::save(&map, &path).unwrap();
+
+        let vibe = MasterVibe::load_or_init(&path, 1, 2, &dev, 0.9);
+        assert!(
+            !vibe.is_initialized(),
+            "a corrupt on-disk master must fall back to an empty (uninitialized) master, not load"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
