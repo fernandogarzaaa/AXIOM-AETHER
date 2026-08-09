@@ -25,8 +25,52 @@ permissions:
   contents: read
 
 jobs:
+  # AXIOM is the normative owner of CP/1 (see protocol/cp1/SPEC.md). EVE and
+  # ADAM vendor the schema and fixture corpus and verify their copies against
+  # MANIFEST.sha256, so an inconsistent normative source here desynchronizes
+  # both of them. Every other job declares `needs: protocol` so this actually
+  # gates them: jobs run in parallel regardless of their order in this file, so
+  # without that dependency a failing protocol check would not stop anything.
+  protocol:
+    name: CP/1 normative source
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install validator
+        run: python -m pip install --quiet jsonschema
+
+      # Verifies four independent properties: the manifest hashes match, every
+      # fixture validates against the schema, every fixture is already in
+      # canonical form with a correct content_hash, and every canonical type is
+      # covered by at least one fixture.
+      - name: Verify protocol consistency
+        run: python3 protocol/cp1/tools/verify.py
+
+      # The fixtures are generated. If regenerating them changes anything, the
+      # committed corpus is stale and the vendored copies in EVE and ADAM are
+      # pinned to bytes that no longer reflect the source.
+      - name: Check fixtures are regenerated
+        run: |
+          python3 protocol/cp1/tools/build_fixtures.py
+          if ! git diff --quiet -- protocol/cp1; then
+            echo "::error::protocol/cp1 is not up to date; run tools/build_fixtures.py and commit the result"
+            git diff --stat -- protocol/cp1
+            exit 1
+          fi
+
   test:
     name: Build & test (Rust)
+    # The protocol gate is cheap and its failure invalidates everything below.
+    needs: protocol
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -87,6 +131,8 @@ jobs:
   # push) so the release surface is gated before merge.
   docker-build:
     name: Docker image build (no push)
+    # The protocol gate is cheap and its failure invalidates everything below.
+    needs: protocol
     runs-on: ubuntu-22.04
     # Read the repo; read the Actions cache (buildx gha cache). No write scope.
     permissions:
@@ -115,6 +161,8 @@ jobs:
   # used to run, so it could rot silently. Exercise it on CPU-only torch.
   python-reference:
     name: Python reference engine (tests)
+    # The protocol gate is cheap and its failure invalidates everything below.
+    needs: protocol
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
