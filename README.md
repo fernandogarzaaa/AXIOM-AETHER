@@ -601,6 +601,7 @@ axiom_engine_rs/src/
   belief.rs                Beta belief and conflict-aware peer confidence
   cli.rs                   clap subcommands
   context_compressor.rs    context partitioning and digest construction
+  graph_memory.rs          directed edge graph over memory records + bounded spreading activation
   hallucination.rs         evidence-relative grounding checks
   heal_memory.rs           learned self-healing memory
   inference.rs             tokenizer plus inference pipeline
