@@ -9,7 +9,7 @@ async fn create_session(
     let states = {
         let pipeline = state
             .pipeline
-            .lock()
+            .read()
             .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
         pipeline
             .init_session_states()
@@ -96,7 +96,7 @@ async fn adapt(
     let updated_states = {
         let pipeline = state
             .pipeline
-            .lock()
+            .read()
             .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
         pipeline
             .adapt_on_corpus_with_steps(&req.corpus, initial_states, steps_per_token)
@@ -310,7 +310,7 @@ fn messages_to_prompt(messages: &[ChatMessage]) -> String {
 fn count_prompt_tokens(state: &AppState, prompt: &str) -> Result<usize, ApiError> {
     let pipeline = state
         .pipeline
-        .lock()
+        .read()
         .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
     Ok(pipeline.token_count(prompt))
 }
@@ -318,7 +318,7 @@ fn count_prompt_tokens(state: &AppState, prompt: &str) -> Result<usize, ApiError
 fn count_corpus_tokens(state: &AppState, corpus: &[String]) -> Result<usize, ApiError> {
     let pipeline = state
         .pipeline
-        .lock()
+        .read()
         .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
     Ok(corpus.iter().map(|text| pipeline.token_count(text)).sum())
 }
@@ -330,7 +330,7 @@ fn partition_messages_for_state(
 ) -> Result<crate::anthropic_forwarder::PartitionedMessages, ApiError> {
     let pipeline = state
         .pipeline
-        .lock()
+        .read()
         .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
     Ok(partition_messages(messages, threshold, |text| {
         pipeline.token_count(text)
@@ -370,7 +370,7 @@ fn run_generation(
             // Stateless generation.
             let pipeline = state
                 .pipeline
-                .lock()
+                .read()
                 .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
             pipeline
                 .generate(prompt, max_tokens)
@@ -398,7 +398,7 @@ fn run_generation(
             let (text, updated_states) = {
                 let pipeline = state
                     .pipeline
-                    .lock()
+                    .read()
                     .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
                 pipeline
                     .generate_with_session(prompt, max_tokens, initial_states)
@@ -449,7 +449,7 @@ fn resolve_or_create_session(
         let states = {
             let pipeline = state
                 .pipeline
-                .lock()
+                .read()
                 .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
             pipeline
                 .init_session_states()

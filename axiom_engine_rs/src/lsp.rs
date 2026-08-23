@@ -6,7 +6,7 @@
 //! editor typing never waits on Candle computation.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use candle_core::Result as CandleResult;
@@ -39,7 +39,7 @@ pub struct AxiomLspBackend {
 
 pub async fn run_lsp_server(pipeline: InferencePipeline) -> Result<(), String> {
     let (updates_tx, updates_rx) = mpsc::channel(64);
-    let pipeline = Arc::new(Mutex::new(pipeline));
+    let pipeline = Arc::new(RwLock::new(pipeline));
     let sessions = Arc::new(TttSessionStore::new());
     tokio::spawn(run_prefill_worker(updates_rx, pipeline, sessions));
 
@@ -130,7 +130,7 @@ impl AxiomLspBackend {
 
 async fn run_prefill_worker(
     mut updates: mpsc::Receiver<LspUpdate>,
-    pipeline: Arc<Mutex<InferencePipeline>>,
+    pipeline: Arc<RwLock<InferencePipeline>>,
     sessions: Arc<TttSessionStore>,
 ) {
     while let Some(update) = updates.recv().await {
@@ -142,12 +142,12 @@ async fn run_prefill_worker(
 
 fn prefill_update(
     update: LspUpdate,
-    pipeline: Arc<Mutex<InferencePipeline>>,
+    pipeline: Arc<RwLock<InferencePipeline>>,
     sessions: Arc<TttSessionStore>,
 ) -> CandleResult<usize> {
     let digest = structural_digest_for_lsp(&update.uri, &update.text);
     let pipeline = pipeline
-        .lock()
+        .read()
         .map_err(|_| candle_core::Error::Msg("pipeline lock poisoned".into()))?;
     let handle = sessions.get_or_create(&update.uri, &pipeline)?;
     let mut states = handle.blocking_lock();

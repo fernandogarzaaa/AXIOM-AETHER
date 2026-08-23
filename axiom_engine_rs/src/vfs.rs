@@ -159,7 +159,7 @@ impl NeuralVfs {
         &self,
         path: impl AsRef<Path>,
         session_id: &str,
-        pipeline: Arc<std::sync::Mutex<InferencePipeline>>,
+        pipeline: Arc<std::sync::RwLock<InferencePipeline>>,
         sessions: Arc<TttSessionStore>,
     ) -> Result<VfsReadReport, String> {
         let resolved = self.resolve(path.as_ref())?;
@@ -177,7 +177,7 @@ impl NeuralVfs {
         let session_for_task = session_id.clone();
         let token_count: CandleResult<usize> = spawn_blocking(move || {
             let pipeline = pipeline
-                .lock()
+                .read()
                 .map_err(|_| candle_core::Error::Msg("pipeline lock poisoned".into()))?;
             let handle = sessions.get_or_create(&session_for_task, &pipeline)?;
             let mut states = handle.blocking_lock();

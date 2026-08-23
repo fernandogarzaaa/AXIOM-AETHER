@@ -349,6 +349,24 @@ loopback bind on `http://` — the key is optional there.
 curl -H "X-Axiom-Key: $AXIOM_API_KEY" https://host/v1/immunity
 ```
 
+### Process execution capability
+
+`POST /v1/hypervisor/jit_run` is not an ordinary data-plane route: it executes
+a caller-supplied `command`/`args` as a child process and can overwrite
+`source_path` on disk with a synthesized patch. `AXIOM_API_KEY` controls *who*
+may call the data plane; it does not itself decide whether this specific
+`process.execute` capability should exist on this server at all. It is
+**disabled by default** and returns `403` until you set:
+
+```bash
+AXIOM_ENABLE_JIT_EXEC=1
+```
+
+Treat this the same way you'd treat exposing a build shell: fine for a local
+loopback dev workflow, dangerous on a network-reachable host without
+`AXIOM_API_KEY` set alongside it. See
+[`docs/SECURITY-AUDIT.md`](docs/SECURITY-AUDIT.md) for the full threat model.
+
 Example adaptation call:
 
 ```bash
@@ -489,9 +507,11 @@ Useful environment variables:
 | `AXIOM_DEVICE` | `cpu`, `cuda`, `metal`, or `auto`. |
 | `AXIOM_API_KEY` | Optional data-plane auth. When set, every route except `/healthz`, `/readyz`, `/metrics`, and `/mcp` requires the header `X-Axiom-Key: <key>`. A dedicated header is used so it never collides with the client `Authorization`/`x-api-key` the `/v1/messages` proxy relays upstream. Unset ⇒ open (local-first default). Set this before binding off `127.0.0.1`, and serve it over HTTPS/TLS — it is a bearer secret. |
 | `AXIOM_MCP_TOKEN` | Optional bearer token guarding `/mcp` (`Authorization: Bearer <token>`). Independent of `AXIOM_API_KEY`. |
+| `AXIOM_ENABLE_JIT_EXEC` | Off by default. Set to `1`/`true`/`on` to enable `POST /v1/hypervisor/jit_run`, which executes a caller-supplied command and can overwrite `source_path` on disk. A `process.execute` capability, distinct from `AXIOM_API_KEY` (which only decides *who* may call it). See [Process execution capability](#process-execution-capability). |
 | `AXIOM_PRODUCTION_BPE` | Enable the trained BPE checkpoint path. |
 | `AXIOM_TOKENIZER` | Path to `axiom_bpe.json`. |
 | `AXIOM_BPE_CKPT` | Path to `axiom_production_bpe.bin`. |
+| `AXIOM_CHECKPOINT_SHA256` / `AXIOM_TOKENIZER_SHA256` | Optional pinned SHA-256 for the artifact fetched via `AXIOM_CHECKPOINT_URL` / `AXIOM_TOKENIZER_URL`. When set, a mismatch deletes the partial download and fails `axiom init` instead of installing an unverified checkpoint. When unset, the fetch still succeeds but the computed hash is printed so you can capture and pin it. |
 | `AXIOM_DRIFT_THRESHOLD` | Override drift threshold. |
 | `AXIOM_TTT_COMPRESS` | Enable proxy compression. |
 | `AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS` | Compression threshold. |
@@ -519,6 +539,11 @@ docker run -p 3000:8080 \
   -e AXIOM_TOKENIZER_URL=https://github.com/fernandogarzaaa/AXIOM-AETHER/releases/latest/download/axiom_bpe.json \
   ghcr.io/fernandogarzaaa/axiom-aether:latest
 ```
+
+Pin the expected hash so a corrupted or substituted release asset fails closed
+instead of silently becoming the model (add `AXIOM_CHECKPOINT_SHA256` /
+`AXIOM_TOKENIZER_SHA256`, computed from a release you've already verified once
+— e.g. `sha256sum axiom_production_bpe.bin`).
 
 ## Kubernetes
 
@@ -553,6 +578,20 @@ upgrades.
 Experimental pieces remain opt-in or documented as research until they have
 repeatable evaluation and clear operational value.
 
+## Audits, Architecture, and Roadmap
+
+This repository is audited repeatedly against its own code and tests, not
+against its own claims. The current set:
+
+| Document | Covers |
+|---|---|
+| [`docs/ARCHITECTURE-AUDIT.md`](docs/ARCHITECTURE-AUDIT.md) | What's CORE vs. EXPERIMENTAL vs. dead, subsystem-by-subsystem evidence (TTT, checkpoints, memory, self-healing, concurrency), a terminology map, and every open branch/PR's disposition |
+| [`docs/SECURITY-AUDIT.md`](docs/SECURITY-AUDIT.md) | Execution surfaces, the `AXIOM_ENABLE_JIT_EXEC` capability gate, checkpoint integrity, and what's *not* an isolation boundary despite the name |
+| [`docs/COMPETITIVE-ANALYSIS.md`](docs/COMPETITIVE-ANALYSIS.md) | How AXIOM compares to Letta/Mem0/Zep, LLMLingua, and LiteLLM/Portkey — what's genuinely differentiated vs. unmeasured |
+| [`docs/AXIOMBENCH.md`](docs/AXIOMBENCH.md) | What's actually measured today vs. simulated vs. not built yet, and the spec for the task-success benchmark this project doesn't have |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Every finding, ranked P0–P4, with what's already fixed |
+| [`docs/AUDIT_2026-07.md`](docs/AUDIT_2026-07.md), [`docs/ARCHITECTURE-UNIFIED.md`](docs/ARCHITECTURE-UNIFIED.md) | Prior audit passes — Docker/CI, and the AXIOM/EVE/ADAM cross-repository ownership map — still accurate for what they cover |
+
 ## Repository Map
 
 ```text
@@ -562,6 +601,7 @@ axiom_engine_rs/src/
   belief.rs                Beta belief and conflict-aware peer confidence
   cli.rs                   clap subcommands
   context_compressor.rs    context partitioning and digest construction
+  graph_memory.rs          directed edge graph over memory records + bounded spreading activation
   hallucination.rs         evidence-relative grounding checks
   heal_memory.rs           learned self-healing memory
   inference.rs             tokenizer plus inference pipeline

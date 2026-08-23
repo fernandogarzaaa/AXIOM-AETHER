@@ -251,10 +251,32 @@ pub async fn run_server(
              exposing it beyond a trusted local network."
         );
     }
+    // Optional process-execution capability: POST /v1/hypervisor/jit_run runs
+    // an arbitrary caller-supplied command and can overwrite a source file on
+    // disk. Off by default — an operator must opt in explicitly. See
+    // docs/SECURITY-AUDIT.md for the threat model before enabling this on a
+    // network-reachable host.
+    let jit_exec_enabled = std::env::var("AXIOM_ENABLE_JIT_EXEC")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
+        .unwrap_or(false);
+    if jit_exec_enabled {
+        println!(
+            "[+] Hypervisor jit_run enabled (AXIOM_ENABLE_JIT_EXEC=1): \
+             POST /v1/hypervisor/jit_run will execute caller-supplied commands."
+        );
+        if api_key.is_none() {
+            eprintln!(
+                "[axiom] WARNING: process execution is enabled with NO data-plane auth \
+                 (AXIOM_API_KEY unset) — anyone who can reach this host can run arbitrary \
+                 commands as this process. Set AXIOM_API_KEY before exposing it."
+            );
+        }
+    }
     let state = state
         .with_mcp(mcp)
         .with_mcp_token(mcp_token)
-        .with_api_key(api_key);
+        .with_api_key(api_key)
+        .with_jit_exec_enabled(jit_exec_enabled);
     if state.compression_active() {
         match state.hydrate_compression_cache().await {
             Ok(0) => println!(

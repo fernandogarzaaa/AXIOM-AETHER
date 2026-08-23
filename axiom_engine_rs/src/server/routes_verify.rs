@@ -11,7 +11,7 @@ async fn healthz() -> impl IntoResponse {
 /// pipeline lock is reachable (not poisoned) and report the live model id so
 /// the probe doubles as a smoke check. Returns 503 if the lock is poisoned.
 async fn readyz(State(state): State<AppState>) -> Response {
-    match state.pipeline.try_lock() {
+    match state.pipeline.try_read() {
         Ok(_) | Err(std::sync::TryLockError::WouldBlock) => (
             StatusCode::OK,
             Json(serde_json::json!({ "status": "ready", "model": state.model_id })),
@@ -319,7 +319,7 @@ fn claim_ce(
 /// "how surprising is this to the model." Bounded to a token budget so the
 /// adaptive-compression gate stays cheap. Locks the pipeline briefly.
 fn mean_surprisal(state: &AppState, text: &str) -> Option<f32> {
-    let pipeline = state.pipeline.lock().ok()?;
+    let pipeline = state.pipeline.read().ok()?;
     let ids: Vec<u32> = pipeline.encode_text(text).into_iter().take(256).collect();
     let states = pipeline.init_session_states().ok()?;
     claim_ce(&pipeline, &states, &ids)
@@ -488,7 +488,7 @@ async fn verify_grounding(State(state): State<AppState>, Json(body): Json<Value>
         let pipeline = state.pipeline.clone();
         let evidence_s = evidence.to_string();
         let lifts = tokio::task::spawn_blocking(move || {
-            let p = pipeline.lock().ok()?;
+            let p = pipeline.read().ok()?;
             Some(neural_lifts(&p, &evidence_s, &claims))
         })
         .await
