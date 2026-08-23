@@ -23,7 +23,7 @@
 
 use std::error::Error;
 use std::path::{Component, Path};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use candle_core::{Device, Tensor};
@@ -55,7 +55,7 @@ const DRIFT_MAX_TOKENS: usize = 512;
 /// Shared engine context handed to every tool invocation.
 #[derive(Clone)]
 pub struct McpContext {
-    pipeline: Arc<Mutex<InferencePipeline>>,
+    pipeline: Arc<RwLock<InferencePipeline>>,
     vibe: Arc<Mutex<MasterVibe>>,
     /// Tier-2 lossless memory store (Phase 2.0): JSONL records per scope.
     memory: Arc<Mutex<MemoryStore>>,
@@ -163,7 +163,7 @@ pub async fn build_context(
     );
 
     Ok(McpContext {
-        pipeline: Arc::new(Mutex::new(pipeline)),
+        pipeline: Arc::new(RwLock::new(pipeline)),
         vibe: Arc::new(Mutex::new(vibe)),
         memory: Arc::new(Mutex::new(memory)),
         embedder,
@@ -1342,7 +1342,7 @@ fn predict_states_blocking(args: &Value, ctx: &McpContext) -> Value {
         .unwrap_or("")
         .to_string();
 
-    let guard = match ctx.pipeline.lock() {
+    let guard = match ctx.pipeline.read() {
         Ok(g) => g,
         Err(_) => {
             return crate::predictive_tools::handle_predict_states(args, &Device::Cpu, None);
@@ -1482,7 +1482,7 @@ fn compress_path_blocking(path: &str, ctx: &McpContext) -> Result<String, String
 
     let pipeline = ctx
         .pipeline
-        .lock()
+        .read()
         .map_err(|_| "pipeline lock poisoned".to_string())?;
     let token_ids = pipeline.encode_text(&corpus);
     let tokens_processed = token_ids.len();
@@ -1559,7 +1559,7 @@ fn should_skip_compression_path(path: &Path) -> bool {
 fn evaluate_drift_blocking(code: &str, ctx: &McpContext) -> Result<(String, bool), String> {
     let pipeline = ctx
         .pipeline
-        .lock()
+        .read()
         .map_err(|_| "pipeline lock poisoned".to_string())?;
     let mut ids = pipeline.encode_text(code);
     if ids.len() < 2 {
@@ -1635,7 +1635,7 @@ fn embed_query(text: &str, ctx: &McpContext) -> Result<Vec<f32>, String> {
     }
     let pipeline = ctx
         .pipeline
-        .lock()
+        .read()
         .map_err(|_| "pipeline lock poisoned".to_string())?;
     embed_text(&pipeline, text).map_err(|err| err.to_string())
 }
@@ -1653,7 +1653,7 @@ fn remember_blocking(
     let drift = {
         let pipeline = ctx
             .pipeline
-            .lock()
+            .read()
             .map_err(|_| "pipeline lock poisoned".to_string())?;
         drift_score(&pipeline, text).unwrap_or(0.0)
     };

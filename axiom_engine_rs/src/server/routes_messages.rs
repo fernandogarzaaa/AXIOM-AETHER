@@ -455,7 +455,7 @@ async fn compressed_messages_path(
         // runtime keeps serving other requests during the gradient steps.
         let fp_result: Result<_, ApiError> = tokio::task::spawn_blocking(move || {
             let pipeline = pipeline_arc
-                .lock()
+                .read()
                 .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
             let session = store
                 .get_or_create(&session_id_clone, &pipeline)
@@ -1363,7 +1363,7 @@ async fn compressed_openai_chat_path(
 
         let fp_result: Result<_, ApiError> = spawn_blocking(move || {
             let pipeline = pipeline_arc
-                .lock()
+                .read()
                 .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
             let session = store
                 .get_or_create(&session_id_clone, &pipeline)
@@ -1722,7 +1722,7 @@ fn empty_fingerprint(
 ) -> Result<MemoryFingerprint, ApiError> {
     let pipeline = state
         .pipeline
-        .lock()
+        .read()
         .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
     let n_layers = pipeline.model().config.n_layers;
     let d_model = pipeline.model().config.d_model;

@@ -57,7 +57,7 @@ async fn compressed_responses_payload(
     let threshold = state.controls.threshold();
     let context_tokens = state
         .pipeline
-        .lock()
+        .read()
         .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?
         .token_count(&plan.total_context());
     if context_tokens < threshold {
@@ -187,7 +187,7 @@ async fn responses_run_fingerprint(
     let started = Instant::now();
     let fingerprint = spawn_blocking(move || -> Result<_, ApiError> {
         let pipeline = pipeline_arc
-            .lock()
+            .read()
             .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
         let session = store
             .get_or_create(&session_for_task, &pipeline)
@@ -703,7 +703,8 @@ fn chat_completion_sse(
                 ApiError::Internal(m)
                 | ApiError::NotFound(m)
                 | ApiError::BadRequest(m)
-                | ApiError::Conflict(m) => m,
+                | ApiError::Conflict(m)
+                | ApiError::Forbidden(m) => m,
                 ApiError::Upstream { status, message } => {
                     format!("upstream {status}: {message}")
                 }

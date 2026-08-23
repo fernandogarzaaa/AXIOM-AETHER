@@ -315,17 +315,38 @@ mod tests {
     }
 
     /// Drop the pipeline `Arc` on a blocking thread for the same reason.
-    async fn safe_drop(arc: std::sync::Arc<std::sync::Mutex<crate::inference::InferencePipeline>>) {
+    async fn safe_drop(arc: std::sync::Arc<std::sync::RwLock<crate::inference::InferencePipeline>>) {
         tokio::task::spawn_blocking(move || drop(arc))
             .await
             .unwrap();
+    }
+
+    /// `AppState.pipeline` must be an `RwLock`, not a `Mutex`: the whole point
+    /// of switching (see the field doc) is that concurrent readers — e.g. the
+    /// `responses_run_fingerprint` JoinSet fan-out — can hold the lock
+    /// simultaneously instead of serializing on a single writer-only mutex. A
+    /// `Mutex` would make the second `try_read()` below fail with
+    /// `WouldBlock` while the first guard is alive; this regresses if the
+    /// field is ever changed back.
+    #[tokio::test]
+    async fn pipeline_lock_allows_concurrent_readers() {
+        let state = make_test_state().await;
+        let first = state.pipeline.read().unwrap();
+        let second = state
+            .pipeline
+            .try_read()
+            .expect("a second concurrent reader must not block behind the first");
+        assert_eq!(first.token_count("same pipeline"), second.token_count("same pipeline"));
+        drop(first);
+        drop(second);
+        safe_drop(state.pipeline.clone()).await;
     }
 
     fn seed_active_test_session(state: &AppState, session_id: &str) {
         let now = unix_now();
         let states = state
             .pipeline
-            .lock()
+            .read()
             .unwrap()
             .init_session_states()
             .unwrap();
@@ -452,7 +473,7 @@ mod tests {
         ));
 
         {
-            let pipeline = state.pipeline.lock().unwrap();
+            let pipeline = state.pipeline.read().unwrap();
             let handle = state
                 .ttt_sessions
                 .get_or_create("persist-s1", &pipeline)
@@ -990,7 +1011,7 @@ mod tests {
         let session_id = "quantized-session".to_string();
         let now = unix_now();
         let states = {
-            let pipeline = state.pipeline.lock().unwrap();
+            let pipeline = state.pipeline.read().unwrap();
             pipeline.init_session_states().unwrap()
         };
         {

@@ -229,7 +229,15 @@ impl SessionData {
 ///   checkpoint write) acquire an exclusive write lock.
 #[derive(Clone)]
 pub struct AppState {
-    pub pipeline: Arc<Mutex<InferencePipeline>>,
+    /// The base model + tokenizer. Immutable once loaded — every
+    /// `InferencePipeline` method used on the hot path takes `&self`; the only
+    /// mutable state involved in generation/adaptation is the per-session
+    /// fast-weight `Vec<Tensor>` threaded through explicitly (see
+    /// `context_compressor::TttSessionStore`), never `self`. `RwLock` (not
+    /// `Mutex`) so concurrent requests — e.g. the JoinSet fan-out in
+    /// `responses_run_fingerprint` — can hold the read lock simultaneously
+    /// instead of serializing on a single writer-only mutex.
+    pub pipeline: Arc<RwLock<InferencePipeline>>,
     pub device: Device,
     /// Active TTT sessions keyed by UUID string.
     /// `RwLock` enables concurrent reads; mutations take an exclusive write.
@@ -383,7 +391,7 @@ impl AppState {
     pub fn new(pipeline: InferencePipeline, model_id: String) -> Self {
         let device = pipeline.device().clone();
         Self {
-            pipeline: Arc::new(Mutex::new(pipeline)),
+            pipeline: Arc::new(RwLock::new(pipeline)),
             device,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             sequence_versions: Arc::new(RwLock::new(HashMap::new())),
@@ -727,7 +735,7 @@ impl AppState {
 
         let adapt_result = spawn_blocking(move || {
             let pipeline = pipeline_arc
-                .lock()
+                .read()
                 .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
             let handle = store
                 .get_or_create(&session_id_for_task, &pipeline)

@@ -13,7 +13,7 @@
 //! server therefore build the router inside `tokio::task::spawn_blocking` (see
 //! `server.rs`).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use serde_json::json;
 
@@ -29,14 +29,14 @@ const OPENDROP_ROUTER_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 
 /// Local TTT pipeline as a router backend (always-available fallback).
 struct LocalPipelineBackend {
-    pipeline: Arc<Mutex<InferencePipeline>>,
+    pipeline: Arc<RwLock<InferencePipeline>>,
 }
 
 impl ChatBackend for LocalPipelineBackend {
     fn complete(&self, prompt: &str, max_tokens: usize) -> Result<String, BackendError> {
         let pipeline = self
             .pipeline
-            .lock()
+            .read()
             .map_err(|_| BackendError::Upstream("pipeline lock poisoned".into()))?;
         pipeline
             .generate(prompt, max_tokens)
@@ -164,7 +164,7 @@ fn claude_from_key() -> Option<ClaudeBackend> {
 ///
 /// **Must be called off the Tokio runtime** (see module docs): it constructs
 /// blocking `reqwest` clients.
-pub fn router_from_env(pipeline: Arc<Mutex<InferencePipeline>>) -> Option<Router> {
+pub fn router_from_env(pipeline: Arc<RwLock<InferencePipeline>>) -> Option<Router> {
     let backend = std::env::var("AXIOM_BACKEND").unwrap_or_default();
     let mode = router_mode_from(&backend)?;
 
