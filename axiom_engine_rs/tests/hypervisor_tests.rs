@@ -182,7 +182,7 @@ async fn jit_run_endpoint_repairs_source_and_feeds_ttt() {
     // Fails with `exit 1`; Q-TTT collapses to the exit-code-flip candidate.
     std::fs::write(&script, "#!/bin/sh\necho 'build failed' >&2\nexit 1\n").unwrap();
 
-    let app = create_router(test_state().await);
+    let app = create_router(test_state().await.with_jit_exec_enabled(true));
     let resp = app
         .oneshot(
             Request::builder()
@@ -223,7 +223,7 @@ async fn jit_run_restores_source_when_repair_fails() {
     let original = "#!/bin/sh\necho 'mysterious failure mode' >&2\nexit 3\n";
     std::fs::write(&script, original).unwrap();
 
-    let app = create_router(test_state().await);
+    let app = create_router(test_state().await.with_jit_exec_enabled(true));
     let resp = app
         .oneshot(
             Request::builder()
@@ -250,4 +250,33 @@ async fn jit_run_restores_source_when_repair_fails() {
     assert_eq!(std::fs::read_to_string(&script).unwrap(), original);
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn jit_run_endpoint_is_disabled_by_default() {
+    // `jit_exec_enabled` defaults to `false`: a server started with no
+    // AXIOM_ENABLE_JIT_EXEC configuration must refuse to execute a
+    // caller-supplied command at all, not merely require auth for it.
+    let app = create_router(test_state().await);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/hypervisor/jit_run")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "jit-disabled",
+                        "command": "echo",
+                        "args": ["should not run"],
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    assert!(body.contains("AXIOM_ENABLE_JIT_EXEC"));
 }

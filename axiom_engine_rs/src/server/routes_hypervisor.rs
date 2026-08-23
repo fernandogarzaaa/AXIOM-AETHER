@@ -172,6 +172,19 @@ async fn hypervisor_jit_run(
     State(state): State<AppState>,
     Json(req): Json<HypervisorJitRunRequest>,
 ) -> Result<Json<HypervisorJitRunResponse>, ApiError> {
+    // Capability gate: this route executes an arbitrary caller-supplied
+    // command as a child process and can overwrite `source_path` on disk.
+    // `AXIOM_API_KEY` (if set) controls who may call any data-plane route;
+    // this flag controls whether *this specific* process-execution capability
+    // exists at all, and defaults to off. See docs/SECURITY-AUDIT.md.
+    if !state.jit_exec_enabled {
+        return Err(ApiError::Forbidden(
+            "process execution is disabled on this server; set AXIOM_ENABLE_JIT_EXEC=1 \
+             to enable the poly-jit repair capability (arbitrary command execution) — \
+             see docs/SECURITY-AUDIT.md before enabling on a network-reachable host"
+                .into(),
+        ));
+    }
     if req.command.trim().is_empty() {
         return Err(ApiError::BadRequest("command is required".into()));
     }

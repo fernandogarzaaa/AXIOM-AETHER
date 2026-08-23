@@ -271,6 +271,16 @@ pub struct AppState {
     /// credentials the `/v1/messages` proxy relays upstream. When `None`, the
     /// data plane is open (the local-first default).
     pub api_key: Arc<Option<String>>,
+    /// Capability gate for `POST /v1/hypervisor/jit_run` (`AXIOM_ENABLE_JIT_EXEC`).
+    /// That route executes an arbitrary caller-supplied `command`/`args` as a
+    /// child process and can overwrite `source_path` with a synthesized patch —
+    /// it is a `process.execute` + `filesystem.write` capability, not merely
+    /// data-plane access. `AXIOM_API_KEY` controls *who* may call it; this flag
+    /// controls whether the capability exists at all. Defaults to `false`
+    /// (disabled) so a server started with no configuration cannot be used for
+    /// remote command execution; an operator must opt in explicitly, ideally
+    /// alongside `AXIOM_API_KEY`. See docs/SECURITY-AUDIT.md.
+    pub jit_exec_enabled: bool,
     /// Active-compression session store: per-tenant adapted fast-weight
     /// tensors held in a lock-free DashMap. Distinct from `sessions`
     /// above (which serves the legacy `/v1/sessions` API); this store
@@ -401,6 +411,7 @@ impl AppState {
             mcp: Arc::new(None),
             mcp_token: Arc::new(None),
             api_key: Arc::new(None),
+            jit_exec_enabled: false,
             ttt_sessions: Arc::new(TttSessionStore::new()),
             anthropic_forwarder: Arc::new(None),
             openai_forwarder: Arc::new(None),
@@ -999,6 +1010,14 @@ impl AppState {
         self
     }
 
+    /// Enable the `process.execute` capability behind `POST
+    /// /v1/hypervisor/jit_run` (`AXIOM_ENABLE_JIT_EXEC`). Off by default; see
+    /// the field doc on [`AppState::jit_exec_enabled`].
+    pub fn with_jit_exec_enabled(mut self, enabled: bool) -> Self {
+        self.jit_exec_enabled = enabled;
+        self
+    }
+
     /// Install an Anthropic forwarder for the compression pipeline.
     pub fn with_anthropic_forwarder(mut self, forwarder: Option<AnthropicForwarder>) -> Self {
         self.anthropic_forwarder = Arc::new(forwarder);
@@ -1206,6 +1225,10 @@ enum ApiError {
     NotFound(String),
     BadRequest(String),
     Conflict(String),
+    /// A capability that exists in the binary but is not enabled on this
+    /// server (e.g. `AXIOM_ENABLE_JIT_EXEC` unset). Distinct from `BadRequest`:
+    /// the request is well-formed, the operator has simply not opted in.
+    Forbidden(String),
     /// Upstream (Anthropic) failure. Carries the upstream status code so the
     /// client can distinguish auth/rate-limit/server errors and the message
     /// body for diagnostics.
@@ -1222,6 +1245,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
             ApiError::Upstream { status, message } => {
                 // Pass the upstream status through when it's a valid client/
                 // server code; otherwise surface a 502 Bad Gateway.

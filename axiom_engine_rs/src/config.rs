@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const DEFAULT_CHECKPOINT_PATH: &str = "axiom_kernel_v1.safetensors";
 pub const DEFAULT_EOS_TOKEN: u32 = 2;
@@ -278,11 +279,23 @@ pub fn ensure_base_model(paths: &AxiomPaths, cfg: &UserConfig) -> io::Result<Opt
     if !cfg.models.auto_fetch {
         return Ok(None);
     }
-    fetch_base_model(&cfg.models.base_model_url, &target)?;
+    fetch_base_model(&cfg.models.base_model_url, &target, None)?;
     Ok(Some(target))
 }
 
-fn fetch_base_model(url: &str, target: &Path) -> io::Result<()> {
+/// Download `url` into `target`, verifying integrity before the file is ever
+/// visible under its final name.
+///
+/// When `expected_sha256` is `Some`, the download is hashed while streaming
+/// and compared case-insensitively; a mismatch deletes the partial download
+/// and returns an error instead of installing an unverified checkpoint —
+/// a checkpoint fetched over the network and loaded straight into the
+/// runtime is a supply-chain input, so a corrupted or substituted artifact
+/// must fail loudly rather than silently become "the model". When
+/// `expected_sha256` is `None` (the common case: no pinned hash configured),
+/// the computed digest is still printed so an operator can capture and pin
+/// it for next time; this is not a security check by itself, only a record.
+fn fetch_base_model(url: &str, target: &Path, expected_sha256: Option<&str>) -> io::Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -303,6 +316,7 @@ fn fetch_base_model(url: &str, target: &Path) -> io::Result<()> {
     );
     let tmp = target.with_extension("download");
     let mut file = fs::File::create(&tmp)?;
+    let mut hasher = Sha256::new();
     let mut buf = [0_u8; 64 * 1024];
     let mut downloaded = 0_u64;
     loop {
@@ -311,13 +325,41 @@ fn fetch_base_model(url: &str, target: &Path) -> io::Result<()> {
             break;
         }
         file.write_all(&buf[..n])?;
+        hasher.update(&buf[..n]);
         downloaded += n as u64;
         pb.set_position(downloaded);
     }
     file.flush()?;
-    fs::rename(tmp, target)?;
+    drop(file);
     pb.finish_and_clear();
+    let digest = format!("{:x}", hasher.finalize());
+    if let Err(e) = verify_checksum(expected_sha256, &digest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(io::Error::other(format!("checkpoint integrity check failed for {url}: {e}")));
+    }
+    match expected_sha256 {
+        Some(_) => println!("[axiom] checkpoint sha256 verified: {digest}"),
+        None => println!(
+            "[axiom] fetched {url} (sha256={digest}, unverified — no expected hash configured; \
+             pin it to verify future fetches)"
+        ),
+    }
+    fs::rename(tmp, target)?;
     Ok(())
+}
+
+/// Compare a computed digest against an optional pinned one. `None` always
+/// passes (nothing was pinned to check against); a mismatch is reported with
+/// both values so the failure is actionable from the message alone.
+fn verify_checksum(expected_sha256: Option<&str>, actual_digest: &str) -> Result<(), String> {
+    match expected_sha256 {
+        None => Ok(()),
+        Some(expected) if expected.eq_ignore_ascii_case(actual_digest) => Ok(()),
+        Some(expected) => Err(format!(
+            "expected sha256={expected}, got sha256={actual_digest}. The partial download was \
+             deleted; refusing to install an unverified checkpoint."
+        )),
+    }
 }
 
 /// Fetch the production BPE checkpoint (+ tokenizer) from a release URL if
@@ -333,7 +375,14 @@ fn fetch_base_model(url: &str, target: &Path) -> io::Result<()> {
 /// unchanged.
 ///
 /// Best-effort: a fetch failure or unset URL returns `Ok(false)` rather than
-/// erroring, so callers should fall back to the offline bootstrap.
+/// erroring, so callers should fall back to the offline bootstrap. A checksum
+/// *mismatch* is the one exception — that is a verification failure, not a
+/// network hiccup, and propagates as `Err` so it cannot be silently treated
+/// as "no checkpoint configured, fall back".
+///
+/// Set `AXIOM_CHECKPOINT_SHA256` / `AXIOM_TOKENIZER_SHA256` to pin the
+/// expected digest of each download; unset (the default) fetches without
+/// enforcement but still logs the computed hash. See docs/SECURITY-AUDIT.md.
 pub fn ensure_production_checkpoint() -> io::Result<bool> {
     let Ok(ckpt_url) = std::env::var("AXIOM_CHECKPOINT_URL") else {
         return Ok(false);
@@ -344,14 +393,16 @@ pub fn ensure_production_checkpoint() -> io::Result<bool> {
     if ckpt_target.exists() {
         return Ok(false);
     }
-    fetch_base_model(&ckpt_url, ckpt_target)?;
+    let ckpt_sha256 = std::env::var("AXIOM_CHECKPOINT_SHA256").ok();
+    fetch_base_model(&ckpt_url, ckpt_target, ckpt_sha256.as_deref())?;
 
     if let Ok(tok_url) = std::env::var("AXIOM_TOKENIZER_URL") {
         let tok_path = std::env::var("AXIOM_TOKENIZER")
             .unwrap_or_else(|_| "checkpoints/axiom_bpe.json".to_string());
         let tok_target = Path::new(&tok_path);
         if !tok_target.exists() {
-            if let Err(e) = fetch_base_model(&tok_url, tok_target) {
+            let tok_sha256 = std::env::var("AXIOM_TOKENIZER_SHA256").ok();
+            if let Err(e) = fetch_base_model(&tok_url, tok_target, tok_sha256.as_deref()) {
                 eprintln!(
                     "[axiom] tokenizer fetch failed ({e}); checkpoint was fetched but the \
                      production model needs a matching tokenizer too."
@@ -373,6 +424,23 @@ mod tests {
         let parsed: UserConfig = toml::from_str(&raw).unwrap();
         assert_eq!(parsed, cfg);
         assert_eq!(parsed.runtime.vram_budget_mb, 5200);
+    }
+
+    #[test]
+    fn verify_checksum_passes_when_nothing_pinned() {
+        assert!(verify_checksum(None, "anything").is_ok());
+    }
+
+    #[test]
+    fn verify_checksum_passes_on_case_insensitive_match() {
+        assert!(verify_checksum(Some("ABCDEF"), "abcdef").is_ok());
+    }
+
+    #[test]
+    fn verify_checksum_fails_on_mismatch_with_both_hashes_in_message() {
+        let err = verify_checksum(Some("expected123"), "actual456").unwrap_err();
+        assert!(err.contains("expected123"));
+        assert!(err.contains("actual456"));
     }
 
     #[test]
