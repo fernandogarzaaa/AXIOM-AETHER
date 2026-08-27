@@ -223,7 +223,78 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                  echo './server.go:2:4: build failed'; exit 1; else exit 0; fi",
             ],
         ),
-        // 8. Coordinated multi-file: the verifier requires BOTH scripts to exit
+        // 8. C/C++ compiler diagnostic format (`file.c:line:col: error:`) +
+        //    fixture-marker repair. Exercises the inline `path.ext:line:col`
+        //    localizer against a `.c` extension.
+        EvalCase::new(
+            "c-compiler-localize",
+            &[(
+                "calc.c",
+                "/* AXIOM_POLYJIT_FIXTURE_FAIL */\nint calc(void) { return 0; }\n",
+            )],
+            "sh",
+            &[
+                "-c",
+                "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL calc.c; then \
+                 echo 'calc.c:1:4: error: build gate failed'; exit 1; else exit 0; fi",
+            ],
+        ),
+        // 9. TypeScript diagnostic format (`file.ts:line:col - error TSxxxx`) +
+        //    marker repair. Exercises the `.ts` extension through the same
+        //    inline `path.ext:line:col` localizer.
+        EvalCase::new(
+            "ts-frame-localize",
+            &[(
+                "api.ts",
+                "// AXIOM_POLYJIT_FIXTURE_FAIL\nexport const ok = true;\n",
+            )],
+            "sh",
+            &[
+                "-c",
+                "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL api.ts; then \
+                 echo 'api.ts:1:4: error TS0001: gate failed'; exit 1; else exit 0; fi",
+            ],
+        ),
+        // 10. Java-flavoured `File.java:line:` frame + marker repair.
+        EvalCase::new(
+            "java-frame-localize",
+            &[("Gate.java", "// AXIOM_POLYJIT_FIXTURE_FAIL\nclass Gate {}\n")],
+            "sh",
+            &[
+                "-c",
+                "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL Gate.java; then \
+                 echo 'Gate.java:1: error: gate failed'; exit 1; else exit 0; fi",
+            ],
+        ),
+        // 11. Ruby error format (`file.rb:line: ... (RuntimeError)`) + marker repair.
+        EvalCase::new(
+            "ruby-frame-localize",
+            &[("task.rb", "# AXIOM_POLYJIT_FIXTURE_FAIL\nputs 'ok'\n")],
+            "sh",
+            &[
+                "-c",
+                "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL task.rb; then \
+                 echo 'task.rb:1: gate failed (RuntimeError)'; exit 1; else exit 0; fi",
+            ],
+        ),
+        // 12. Nested-path resolution (`src/util/gate.sh:line`) + exit-1 flip.
+        //     The fault is in a subdirectory, so the localizer must resolve a
+        //     relative multi-segment path under the sandbox root, not just a
+        //     root-level file.
+        EvalCase::new(
+            "nested-path-localize",
+            &[(
+                "src/util/gate.sh",
+                "#!/bin/sh\necho placeholder\nexit 1\n",
+            )],
+            "sh",
+            &[
+                "-c",
+                "if grep -q 'exit 1' src/util/gate.sh; then \
+                 echo 'src/util/gate.sh:3:1: nonzero exit'; exit 1; else exit 0; fi",
+            ],
+        ),
+        // 13. Coordinated multi-file: the verifier requires BOTH scripts to exit
         //    0, but each is independently broken. No single-file repair passes,
         //    so the single-file solve path cannot solve it — only the agentic
         //    loop's atomic multi-file transaction (fix both, verify, commit) can.
@@ -241,7 +312,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 ("b.sh", "#!/bin/sh\nexit 0\n"),
             ],
         ),
-        // 9. Held-out verification split: the fix must pass the train verifier
+        // 14. Held-out verification split: the fix must pass the train verifier
         //    (a.sh) AND the held-out verifier (b.sh) before it is committed.
         //    A train-only fix (patching a.sh alone) would be the classic
         //    test-overfit patch — the holdout gate rejects it; the scripted
