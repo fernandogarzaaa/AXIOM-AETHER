@@ -74,7 +74,10 @@ st "5. axiom immunity — learned experience report"
 "$BIN" immunity 2>&1 | grep -qiE "confidence|immun" && ok "immunity report renders the learned heal" || no "immunity"
 
 st "6. axiom chimera — the ChimeraLang DSL, end to end (VM + belief + certificate)"
-cat > "$CH" <<'CHIM'
+# ChimeraLang is behind the `experimental` cargo feature (docs/EXPERIMENTAL.md);
+# a stock build has no `chimera` subcommand.
+if "$BIN" chimera --help >/dev/null 2>&1; then
+    cat > "$CH" <<'CHIM'
 val scores = [1, 2, 3]
 for s in scores
   emit s
@@ -83,10 +86,13 @@ belief cause := inquire { prompt: "why?", agents: [local], ttl: 0 }
 guard cause against hallucination { max_risk: 0.4 }
 emit cause
 CHIM
-"$BIN" chimera run "$CH" 2>&1 | sed 's/^/    /'
-"$BIN" chimera run "$CH" 2>&1 | grep -q "3" && ok "chimera run executed VM + belief paths" || no "chimera run"
-"$BIN" chimera prove "$CH" --out "$WORK/cert.json" >/dev/null 2>&1
-"$BIN" chimera verify "$WORK/cert.json" 2>&1 | grep -qi VALID && ok "chimera certificate verifies offline" || no "chimera cert"
+    "$BIN" chimera run "$CH" 2>&1 | sed 's/^/    /'
+    "$BIN" chimera run "$CH" 2>&1 | grep -q "3" && ok "chimera run executed VM + belief paths" || no "chimera run"
+    "$BIN" chimera prove "$CH" --out "$WORK/cert.json" >/dev/null 2>&1
+    "$BIN" chimera verify "$WORK/cert.json" 2>&1 | grep -qi VALID && ok "chimera certificate verifies offline" || no "chimera cert"
+else
+    echo "    SKIP — build with --features experimental to include ChimeraLang"
+fi
 
 st "7. axiom eval-agentic — reproducible capability score (no LLM)"
 EVAL="$("$BIN" eval-agentic 2>&1)"

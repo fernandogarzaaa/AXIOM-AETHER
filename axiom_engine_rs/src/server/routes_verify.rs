@@ -123,17 +123,23 @@ pub fn create_router(state: AppState) -> Router {
             // this route so larger-but-valid fixes can still gossip.
             post(post_patches_merge).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
-        .route("/v1/chimera/run", post(post_chimera_run))
         .route("/v1/budget", post(post_budget))
         .route("/v1/awareness/:id", get(get_awareness))
-        .route("/v1/config", get(get_config).post(post_config))
-        // Gate the whole data plane behind AXIOM_API_KEY (no-op when unset).
-        // `route_layer` scopes the guard to routes defined on `guarded`, so it
-        // never fires for the public router's ops/mcp endpoints or for 404s.
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_api_key,
-        ));
+        .route("/v1/config", get(get_config).post(post_config));
+
+    // Experimental data-plane routes — compiled only with `--features
+    // experimental` (see docs/EXPERIMENTAL.md). Attached here, before
+    // `route_layer` below, so they still sit behind the AXIOM_API_KEY guard.
+    #[cfg(feature = "experimental")]
+    let guarded = guarded.route("/v1/chimera/run", post(post_chimera_run));
+
+    // Gate the whole data plane behind AXIOM_API_KEY (no-op when unset).
+    // `route_layer` scopes the guard to routes defined on `guarded`, so it
+    // never fires for the public router's ops/mcp endpoints or for 404s.
+    let guarded = guarded.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        require_api_key,
+    ));
 
     public
         .merge(guarded)

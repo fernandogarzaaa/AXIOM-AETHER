@@ -90,6 +90,10 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
 /// beliefs are grounded in it via [`crate::chimera::RouterAdapter`] (with agent
 /// pins like `[claude]`/`[gpt]` honored); otherwise the offline mock adapter is
 /// used so programs still run.
+///
+/// Experimental: compiled only with `--features experimental` (see
+/// `docs/EXPERIMENTAL.md`); the `/v1/chimera/run` route is registered only then.
+#[cfg(feature = "experimental")]
 async fn post_chimera_run(State(state): State<AppState>, body: String) -> axum::response::Response {
     use axum::response::IntoResponse;
     let source = match serde_json::from_str::<serde_json::Value>(&body) {
