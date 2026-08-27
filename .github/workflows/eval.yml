@@ -1,0 +1,65 @@
+name: Agentic Eval
+
+# Runs the built-in autonomous-repair eval on every PR and every push to a
+# working branch. `axiom eval-agentic` materializes a set of seeded broken-repo
+# fixtures, drives the real localize -> deterministic Poly-JIT repair -> verify
+# loop on each (all offline, no model or network), and exits non-zero unless it
+# drives every fixture green. ci.yml already runs `cargo test`, which covers the
+# eval harness's unit tests; this job exercises the end-to-end subcommand as a
+# capability gate, which nothing else did.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "claude/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: eval-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  eval-agentic:
+    name: Agentic eval suite
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            axiom_engine_rs/target
+          key: eval-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+          restore-keys: eval-${{ runner.os }}-
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
+
+      - name: Build axiom binary
+        working-directory: axiom_engine_rs
+        run: cargo build --release --locked --bin axiom
+
+      - name: Run agentic eval (deterministic offline fixtures)
+        working-directory: axiom_engine_rs
+        run: cargo run --release --locked --bin axiom -- eval-agentic
+        env:
+          RUST_LOG: info
+          AXIOM_DEVICE: cpu
