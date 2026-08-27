@@ -45,12 +45,14 @@ REPAIR="$(printf '%s\n' "$REPAIR_OUT" | grep -oE 'score: [0-9]+/[0-9]+ = [0-9]+%
 # --- 2. context compression ------------------------------------------------- --
 say "metric 2/3 — context compression (bench)…"
 parse_bench() {
-  # extracts: "<savings>% token savings (<a> -> <b>) with <k>/<k> = <p>% ... round-trip"
-  printf '%s\n' "$1" \
-    | grep -iE 'token savings|round-trip' \
-    | tr '\n' ' ' \
-    | sed -E 's/.*?([0-9.]+% token savings[^)]*\)).*?([0-9]+\/[0-9]+ = [0-9.]+%[^.]*round-trip).*/\1 with \2/I' \
-    | sed -E 's/  +/ /g'
+  # pull the two figures out of the bench output independently, then join them
+  local blob savings roundtrip
+  blob="$(printf '%s\n' "$1" | tr '\n' ' ' | sed -E 's/  +/ /g')"
+  savings="$(printf '%s' "$blob"   | grep -oiE '[0-9]+(\.[0-9]+)?% token savings( \([0-9,]+ ?-> ?[0-9,]+\))?' | head -1)"
+  roundtrip="$(printf '%s' "$blob" | grep -oiE '[0-9]+/[0-9]+ = [0-9]+(\.[0-9]+)?% (signature )?round-trip' | head -1)"
+  if [ -n "$savings" ] && [ -n "$roundtrip" ]; then
+    printf '%s with %s' "$savings" "$roundtrip"
+  fi
 }
 COMP_LEGACY_OUT="$(AXIOM_PRODUCTION_BPE=0 "$BIN" bench "$TREE" 2>&1)"
 COMP_LEGACY="$(parse_bench "$COMP_LEGACY_OUT")"
