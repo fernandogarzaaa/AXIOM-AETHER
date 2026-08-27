@@ -41,42 +41,63 @@ evidence in this repo supports as important.
   `learned_gate`) but no `min_engine_version` or monotonic schema version.
   Low risk today (3 flags); add before a 4th is needed. See
   ARCHITECTURE-AUDIT.md §3.3.
-- [ ] **`graph_memory.rs` integration**: the edge store + spreading
-  activation merged this pass (ARCHITECTURE-AUDIT.md §3.4) is tested in
-  isolation but not wired into `memory_recall.rs`. Needs a real design
-  decision (which edge kinds auto-seed, how much `spread()` output widens a
-  recall query, interaction with the existing recency/supersession rerank)
-  — do this as its own reviewed PR, and evaluate it against
-  [AXIOMBENCH.md](AXIOMBENCH.md)'s proposed wrong-memory-rate metric once
-  that harness exists, not by feel.
+- [x] **DONE** — `graph_memory.rs` wired into `memory_recall.rs`
+  (`recall_with_graph`) and the `axiom_recall` MCP tool: bounded
+  spreading activation widens direct cosine hits, scope-confined, capped by
+  `RecallParams.graph_k` (default 3), each expanded hit marked
+  `via_graph = true` so precision can be measured separately once
+  [AXIOMBENCH.md](AXIOMBENCH.md)'s harness exists. `axiom_recall` also now
+  writes `CoOccurred` edges between hits returned together, so the graph
+  grows from real usage instead of staying backfill-only. See
+  ARCHITECTURE-AUDIT.md §3.4 for the full design-decision writeup.
 
 ## P2 — Major product / research gaps
 
-- [ ] **Build the AXIOMBench task-success harness.** The mission brief's
-  own top priority; not built this pass because it requires real agent-run
-  infrastructure this audit cannot fabricate credibly. Full spec — task
-  suite design, metrics already instrumented vs. missing, the
-  measured/simulated/estimated labeling rule — is in
-  [AXIOMBENCH.md](AXIOMBENCH.md) §3. This is the single highest-value next
-  project for this repository's scientific credibility.
-- [ ] **Wire `graph_memory.rs` into recall** (see P1 above — listed twice
-  deliberately, since it's both an architectural loose end and a research
-  question: does spreading activation improve or hurt recall precision).
-- [ ] **`sandbox.rs` rename**, with a deprecation path for the
-  `AXIOM_SANDBOX_*` env var names. See SECURITY-AUDIT.md §3. Scoped as P2
-  (not P1) because the current naming is a clarity gap, not an active
-  vulnerability — the mechanism itself (`cargo check`, no deps, no
-  build.rs) is low-risk as implemented.
+- [x] **DONE (partial)** / **[ ] still open (the rest)** — **Build the
+  AXIOMBench task-success harness.** The mission brief's own top priority.
+  Round 2 built and ran a first, real, narrow slice: `axiombench --ablation`
+  measures the self-healing repair loop's baseline-vs-AXIOM pass rate over
+  the 9-fixture `eval-agentic` suite (0/9 → 9/9, real and reproducible, not
+  simulated — see AXIOMBENCH.md §3 for the result and its scope caveats).
+  **Still open**: this covers exactly one dimension (self-healing) on one
+  hand-built fixture suite with no live agent involved. Compression,
+  memory, and adaptation still have zero task-outcome measurement, and
+  building that credibly needs real agent-run infrastructure this audit
+  pass doesn't have. Full spec — task suite design, metrics already
+  instrumented vs. missing, the measured/simulated/estimated labeling rule
+  — is in [AXIOMBENCH.md](AXIOMBENCH.md) §4. Still the single highest-value
+  next project for this repository's scientific credibility.
+- [x] **DONE (wiring)** — see P1 above. The *research question* remains
+  genuinely open and belongs here, not there: does spreading activation
+  measurably improve or hurt recall precision, once
+  [AXIOMBENCH.md](AXIOMBENCH.md)'s wrong-memory-rate metric exists to
+  measure it? The `via_graph` flag exists specifically so that experiment
+  is possible when the harness is built; it hasn't been run.
+- [x] **DONE** — `sandbox.rs`/`SandboxController` renamed to
+  `compile_verify.rs`/`CompileVerifier`, with `AXIOM_SANDBOX_*` accepted as
+  deprecated aliases for one release. See SECURITY-AUDIT.md §3.
 - [ ] **Capability-model pattern, generalized.** `AXIOM_ENABLE_JIT_EXEC` is
   the first instance; the next capability-shaped surface should follow the
   same pattern (dedicated off-by-default flag, checked first, tested with an
   explicit disabled-by-default regression test) rather than accreting a
   generic policy engine speculatively. See SECURITY-AUDIT.md §7.
-- [ ] **Checksum manifest for release checkpoints.** This pass added
-  *support* for pinning a checksum; it didn't publish one. Recommend
-  publishing a signed `SHA256SUMS` alongside GitHub releases so
-  `AXIOM_CHECKPOINT_SHA256` has a maintainer-verified source to be pinned
-  from, closing the residual gap noted in SECURITY-AUDIT.md §2.
+- [x] **DONE (partially — corrected from round 1)** — `release.yml`'s
+  `checkpoint` job *already* published `SHA256SUMS.txt` alongside every
+  checkpoint/tokenizer release asset (`sha256sum ckpt_release/* >
+  ckpt_release/SHA256SUMS.txt`); round 1 of this audit missed that and
+  incorrectly reported it as missing. What actually was missing: the
+  **Docker container entrypoint** (`scripts/docker_entrypoint.sh`) fetches
+  checkpoints via a completely separate shell-based path from `axiom
+  init`'s Rust path, and had no integrity verification at all — round 1's
+  `AXIOM_CHECKPOINT_SHA256` fix only covered the Rust path. Fixed in round
+  2: `docker_entrypoint.sh` now verifies against the same
+  `AXIOM_CHECKPOINT_SHA256`/`AXIOM_TOKENIZER_SHA256` env vars, fail-closed
+  on mismatch, tested directly (extracted-function unit test, not just
+  read). **Still open**: `SHA256SUMS.txt` itself is unsigned — a compromised
+  release pipeline could publish a new "correct" hash alongside a bad
+  binary. GPG/sigstore signing needs real key material and CI secret
+  configuration this audit pass doesn't have access to set up; left as a
+  named gap, not implemented speculatively.
 
 ## P3 — Performance improvements
 
@@ -111,14 +132,23 @@ evidence in this repo supports as important.
   `docs/audit-2026-06` (all confirmed superseded/stale, evidence in the
   table). `claude/docs-audit-fixes` (95 lines of un-reviewed doc diff
   remaining) is worth a quick look before deciding, not blind deletion.
-- [ ] **`cargo fmt` is not a CI gate**, and the repo is not currently
-  `cargo fmt --check`-clean even in files untouched by this pass (confirmed:
-  large diffs in `bin/axiombench/*.rs`, `bin/build_pairs.rs`, and others).
-  Not fixed in this pass (would be a large, unrelated diff). Recommend
-  either adding `cargo fmt --check` to CI and doing one dedicated
-  formatting-only PR to establish the baseline, or explicitly documenting
-  that this repo doesn't enforce rustfmt and removing any implication
-  otherwise.
+- [x] **DONE (documented; deliberately not reformatted)** — measured the
+  actual size of the gap: `rustfmt --check` across every file in
+  `axiom_engine_rs/src/` disagrees with **77 of 127 files (61%)**, ~12,200
+  lines of diff, 894 individual hunks. `CONTRIBUTING.md` already tells
+  contributors to run `cargo fmt` before a PR, but nothing has ever enforced
+  it in CI, so the tree drifted this far unnoticed. A diff this size is not
+  a same-pass fix: a mechanical repo-wide reformat touching 61% of files
+  would swamp every other change in this audit's diff, and is real,
+  deliberate, isolated work a maintainer should schedule on its own, not
+  something to smuggle into an unrelated PR. Fixed the actual problem
+  instead — `CONTRIBUTING.md` now says explicitly that `cargo fmt --check`
+  isn't CI-enforced and that a contributor should format only the files
+  they touch, not the whole tree, so nobody wastes a PR discovering this
+  the hard way. **Still open, for whoever picks it up next**: do the
+  dedicated formatting-only PR (large but mechanical and low-risk — rustfmt
+  doesn't change semantics), then add `cargo fmt --check` to `ci.yml` so it
+  can't drift this far again.
 - [ ] **Terminology table** (ARCHITECTURE-AUDIT.md §6) should be folded into
   the top-level README's architecture section for new-contributor
   discoverability — done partially in this pass's README diff (the security

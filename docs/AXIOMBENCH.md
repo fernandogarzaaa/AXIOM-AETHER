@@ -5,32 +5,38 @@ improvement" and asks for a framework comparing baseline agent / +memory /
 +compression / +adaptation / +full AXIOM across coding, multi-file, long-context,
 tool-heavy, memory, and failure-recovery tasks, with a hard measured /
 simulated / estimated distinction and never presenting simulated numbers as
-real. This document has three parts, in order of how much confidence to put
-in each: **(1) what already exists and was reverified this pass — measured**,
-**(2) a real gap found in the existing tooling — measured**, **(3) a spec for
-the comparison the mission brief actually asks for — not built, because
-building it credibly requires infrastructure (real agent runs against real
-repos, at real cost) this audit pass cannot fabricate**.
+real. This document has four parts, in order of how much confidence to put in
+each: **(1) what already exists and was reverified this pass — measured**,
+**(2) a real gap found in the existing tooling — measured**, **(3) a first,
+narrow, real ablation this pass built and ran — measured**, **(4) a spec for
+the full comparison the mission brief actually asks for — not built,
+because building it credibly requires infrastructure (real agent runs
+against real repos, at real cost) this audit pass cannot fabricate**.
 
 Per the mission brief's closing instruction — *"Never manufacture evidence...
-if something cannot be verified, explicitly label it unverified"* — part 3 is
-a specification and a punch list, not a result. Presenting invented numbers
-for a baseline-vs-AXIOM agent comparison would be exactly the dishonesty this
-document exists to prevent.
+if something cannot be verified, explicitly label it unverified"* — part 4 is
+a specification and a punch list, not a result: it covers the comparison
+dimensions (compression, memory, adaptation) that genuinely have no
+task-outcome measurement anywhere in this repo, and building that
+credibly needs infrastructure this pass doesn't have. Part 3 is a real,
+narrow, measured result on the one dimension (self-healing) where an
+existing deterministic task suite already made an honest baseline-vs-AXIOM
+comparison buildable without fabricating anything.
 
 ---
 
 ## 1. What exists today (reverified this pass — MEASURED)
 
 `axiom_engine_rs/src/bin/axiombench/` is a real, working benchmark binary
-(`cargo run --features tools --bin axiombench`) with four pillars:
+(`cargo run --features tools --bin axiombench`) with five pillars:
 
 | Pillar | What it measures | n | Character |
 |---|---|---|---|
 | cognition | Symbol exact-recovery through the structural compressor | 3 | Smoke check |
 | trust | Supported-claim coverage + neural contradiction catch-rate | 240 calibration claims | Calibrated result |
 | fleet | Cross-node immunity transfer + signed DWE fragment acceptance | 2 nodes | Pass/fail, not a benchmark |
-| cost | Byte reduction over replayed real sessions | 3 replayed records | Indicative only |
+| ablation (`--ablation`, added round 2) | Baseline (no repair) vs +AXIOM (`solve` loop) task pass rate over the `eval-agentic` fixture suite | 9 fixtures | Measured, narrow scope — see §3 below |
+| cost (`--live`) | Byte reduction over replayed real sessions | 3 replayed records | Indicative only |
 
 Plus the compression benchmark run separately (`axiom bench <path>`),
 measured at real scale: **82.4%–86.7% token savings with 100% signature
@@ -82,7 +88,56 @@ or preserve it, or move it to a separate file the generator doesn't touch)
 rather than overwrite the whole file with only the pillars it happened to
 run this time.
 
-## 3. What AXIOMBench does not yet measure (gap, not built)
+## 3. A first, narrow, real baseline-vs-AXIOM ablation (MEASURED, round 2)
+
+Round 1 of this audit stopped at documenting the gap: no pillar measured
+whether an AXIOM mechanism changes a task *outcome*, only whether the
+mechanism itself executes correctly. Round 2 closes the smallest honest
+slice of that gap with real infrastructure rather than waiting for the
+full harness in §4: the **`ablation` pillar** (`axiombench --ablation`,
+`src/bin/axiombench/ablation.rs`).
+
+**What it does, exactly**: runs the same 9 deterministic, seeded
+broken-repo fixtures `axiom eval-agentic` already uses
+(`agentic_eval::builtin_cases`) through two arms — **baseline**
+(materialize the fixture's starting files, run its verify command once,
+attempt zero repair) and **+AXIOM** (the real `crate::solve` loop: env-heal
+→ Poly-JIT source repair → verify-gate, identical code path to
+`eval-agentic`). Both arms execute real code against real temp
+directories; nothing is mocked or estimated.
+
+**Result, this run** (reproducible: `cargo run --release --features tools
+--bin axiombench -- --ablation`):
+
+```
+[ablation] self-heal repair loop: 0/9 pass with no repair attempted vs 9/9 with AXIOM's solve loop
+```
+
+**What this is evidence of, precisely**: the `solve` repair loop's
+verify-gated env-heal/Poly-JIT machinery functions end-to-end on its own
+test suite — a real, executed, reproducible result, not simulated.
+
+**What this is NOT evidence of, stated as plainly as the result itself**:
+this is not "AXIOM fixes 100% of broken code." The 9 fixtures are
+constructed, by `agentic_eval.rs`'s own design, to be repairable by exactly
+this mechanism (`"each failure is one the Poly-JIT layer can repair
+without any model or network"`) — a baseline of 0/9 and an AXIOM score of
+9/9 is close to the expected outcome by construction, not a surprising
+capability discovery. It is a real regression test elevated to a
+benchmark, not a study of how AXIOM performs on broken code in general.
+Treat a 100%-vs-0% swing on a hand-built fixture suite as what it is: proof
+the mechanism works, not a measurement of how much it helps in the wild.
+The `n=9` and the `read_as` field on this pillar's `PillarResult` exist
+specifically so nothing downstream can cite this as a general capability
+number without also carrying that caveat — see
+`ablation.rs::run_ablation`'s own `scope_note` field in its output detail.
+
+**Why this doesn't close §4's gap**: it only exercises the self-healing
+dimension, on a hand-built fixture suite, with no live LLM agent in the
+loop. Compression, memory, and adaptation still have zero task-outcome
+coverage — see §4.
+
+## 4. What AXIOMBench does not yet measure (gap, not built)
 
 Every existing pillar measures a **mechanism working** (compression ratio,
 round-trip fidelity, contradiction catch-rate, immunity transfer, byte
@@ -110,7 +165,7 @@ research priority — and it is also genuinely not something an audit pass
 can produce trustworthy numbers for by Friday afternoon. What follows is the
 spec, so the next person who picks this up isn't starting from nothing.
 
-### 3.1 Ablation configuration surface
+### 4.1 Ablation configuration surface
 
 Every mechanism AXIOM adds already has a real, working env-var off-switch —
 confirmed by reading the code, not assumed:
@@ -133,7 +188,7 @@ them. This is worth stating precisely because it reframes the remaining work
 correctly: not "add ablation support," but "build the measurement harness
 that uses the ablation support that already exists."
 
-### 3.2 Proposed task suite (spec, not fixtures — none of this exists yet)
+### 4.2 Proposed task suite (spec, not fixtures — none of this exists yet)
 
 Grouped by what the mission brief asks for, with an honest note on
 difficulty of building each fairly:
@@ -164,18 +219,19 @@ difficulty of building each fairly:
 5. **Memory tasks** — recall correctness and, specifically, **wrong-memory
    rate** (the mission brief's own metric) — inject known facts across
    sessions, query for them later, and separately measure false-positive
-   recalls. This is the one category where `graph_memory.rs`'s new
-   `spread()` function (merged this pass, not yet wired into
-   `memory_recall.rs`) should be evaluated for whether it improves or hurts
-   recall precision once it *is* wired in — a natural first real use of the
-   new module.
+   recalls. `graph_memory.rs`'s `spread()` is now wired into
+   `memory_recall::recall_with_graph` (round 2 of this audit) and every
+   graph-expanded hit is marked `via_graph = true` on `RecallHit` precisely
+   so this category can measure direct-hit and graph-hit precision
+   separately once this harness exists — the instrumentation is in place;
+   the experiment comparing the two hasn't been run.
 6. **Failure-recovery tasks** — deliberately broken environments/code,
    measuring repair success/failure/regression rate. `axiom eval-agentic`'s
    9 fixtures are the closest existing artifact but test AXIOM's repair
    loop directly, not an agent using AXIOM as infrastructure — worth
    reusing as seed fixtures, not as the whole suite.
 
-### 3.3 Required metrics, and which are already instrumented
+### 4.3 Required metrics, and which are already instrumented
 
 | Metric | Already measured somewhere in this repo? |
 |---|---|
@@ -189,7 +245,7 @@ difficulty of building each fairly:
 | Task success (the actual outcome metric) | **Does not exist anywhere in this repo.** This is the central gap |
 | Context size | Yes — token counts are already tracked throughout |
 
-### 3.4 What "measured / simulated / estimated" must mean once this is built
+### 4.4 What "measured / simulated / estimated" must mean once this is built
 
 Stated explicitly so whoever builds this doesn't have to re-derive the
 mission brief's rule: a number is **measured** only if it comes from an
@@ -213,6 +269,9 @@ right pattern to extend, not replace.
 # Deterministic pillars (cognition, trust, fleet):
 cargo run --release --features tools --bin axiombench
 
+# + the self-heal baseline-vs-AXIOM ablation (§3):
+cargo run --release --features tools --bin axiombench -- --ablation
+
 # Compression at scale:
 cargo run --release --bin axiom -- bench axiom_engine_rs/src
 
@@ -220,6 +279,8 @@ cargo run --release --bin axiom -- bench axiom_engine_rs/src
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_axiombench_cost_mock.ps1
 ```
 
-Note: running `axiombench` without also running the cost pillar will
-overwrite `RESULTS.md`'s hand-maintained caveats (§2) — review the diff
-before committing, or restore from git if it drops content you need.
+Note: since round 2 of this audit, running `axiombench` without a given
+pillar (e.g. without `--ablation` or `--live`) preserves that pillar's
+last-recorded row in `RESULTS.md` rather than dropping it (§2's bug is
+fixed) — but still review the diff before committing, since the hand-written
+prose above/below the table is still hand-maintained, not regenerated.

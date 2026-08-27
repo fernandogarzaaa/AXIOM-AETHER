@@ -237,7 +237,12 @@ pytest tests/
 ## Pull Request Guidelines
 
 1. **One concern per PR** — keep changes focused.
-2. **Run `cargo fmt` and `cargo test`** before opening a PR.
+2. **Run `cargo fmt` and `cargo test`** before opening a PR. Note: `cargo fmt
+   --check` is not currently a CI gate, and the tree is not currently fully
+   formatted (an audit found ~60% of `src/` files have drifted from what
+   `rustfmt` would produce — see `docs/ROADMAP.md`). Format the files *you
+   touch*, not the whole tree — a repo-wide reformat is real, deliberate,
+   separate work, not something to fold into an unrelated PR's diff.
 3. **Update `CONTRIBUTING.md`** if you add a new module or change the architecture.
 4. **Add tests** for new server endpoints.
 5. **Document public API** with doc-comments (`///` in Rust, docstrings in Python).

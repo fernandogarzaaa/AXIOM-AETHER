@@ -142,10 +142,13 @@ tests):
 **Claims this repo cannot currently defend, and should not make**:
 
 - That TTT adaptation, structural compression, or self-healing measurably
-  improve *agent task success* — no benchmark in this repo measures this;
-  see [AXIOMBENCH.md](AXIOMBENCH.md). Every existing benchmark measures a
-  mechanism working (compression ratio, round-trip fidelity, repair
-  pass/fail), never a downstream outcome.
+  improve *general agent task success* — no benchmark in this repo measures
+  that; see [AXIOMBENCH.md](AXIOMBENCH.md). The one exception is narrow and
+  should not be overgeneralized from: an `axiombench --ablation` run shows
+  self-healing's repair loop taking a 9-fixture suite from 0/9 to 9/9 —
+  real, but on fixtures purpose-built to be fixable by that exact
+  mechanism, not evidence about broken code in general. Compression and
+  adaptation still have zero task-outcome measurement of any kind.
 - That AXIOM's memory subsystem is more capable than Zep's temporal graph or
   Letta's self-editing memory — it currently has less of the retrieval
   sophistication either offers (no temporal queries, no agent-directed

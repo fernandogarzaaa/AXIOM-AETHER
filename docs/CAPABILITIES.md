@@ -108,7 +108,7 @@ read-only cwd), `axiom_align_generation` / `axiom_predict_states` /
 - **DWE** (`dwe.rs`, `server/routes_fleet.rs`) — binary `W̃`-delta exchange between peers, HMAC authenticated, replay guarded, and observable through live counters/status.
 - **AxiomBench** (`src/bin/axiombench/`) — reproducible cognition, trust, fleet, and live cost evidence; `RESULTS.md` carries the current headline table.
 - **CVM cost stack** (`cache_safety.rs`, `cvm_store.rs`, `digest.rs`, `prefix_diet.rs`, `keepalive.rs`, `cost_ledger.rs`) — dollar-true cost reduction for `/v1/messages` traffic: never rewrites bytes at/before a client cache breakpoint, digests heavy tool results into a recoverable content-addressed store, and tracks real USD cost (not byte counts) per session. Design + measured-vs-simulated status: [`docs/superpowers/plans/2026-07-10-cvm-cost-stack.md`](superpowers/plans/2026-07-10-cvm-cost-stack.md), README's [CVM Cost Stack](../README.md#cvm-cost-stack) section.
-- **Hypervisor** — Neural VFS (`vfs.rs`), Poly JIT source repair (`poly_jit.rs`) ranked by a Q-TTT simulator (`q_manifold.rs`, `hamiltonian.rs`), compile-check sandbox (`sandbox.rs`).
+- **Hypervisor** — Neural VFS (`vfs.rs`), Poly JIT source repair (`poly_jit.rs`) ranked by a Q-TTT simulator (`q_manifold.rs`, `hamiltonian.rs`), compile-check verifier (`compile_verify.rs`; a `cargo check` verifier in an isolated temp directory, not a process isolation boundary — see `docs/SECURITY-AUDIT.md`).
 - **Training** — `train_tokenizer`, `train_semantic` (early-stopping on held-out CE), `eval_model` (acceptance + drift-gate calibration); `scripts/train_cpu_quickstart.sh`.
 
 ## Try it

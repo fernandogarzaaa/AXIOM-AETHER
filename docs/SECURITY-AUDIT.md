@@ -1,23 +1,22 @@
-# AXIOM-AETHER — Security Audit (2026-08-23)
+# AXIOM-AETHER — Security Audit (2026-08-23, updated same day — round 2)
 
 Scope: every path in the repository that executes a subprocess, writes to
 the filesystem outside its own scratch space, accepts network input, or
 fetches/loads external artifacts. Written treating autonomous execution as
-hostile by default, per the mission brief. One finding in this audit was
-fixed as part of this pass (marked **FIXED**); the rest are documented
-findings with a recommended disposition, not code changes, because they are
-either already adequately mitigated, or the fix requires a product decision
-this audit shouldn't make unilaterally (e.g., renaming a public-facing env
-var).
+hostile by default, per the mission brief. Findings 1, 2, and 3 were fixed
+across two passes on the same audit (marked **FIXED**, with which pass
+noted); the rest are documented findings with a recommended disposition,
+not code changes, because they are either already adequately mitigated, or
+the fix requires a product decision this audit shouldn't make unilaterally.
 
 ## Summary table
 
 | # | Finding | Severity | Status |
 |---|---|---|---|
-| 1 | `POST /v1/hypervisor/jit_run` — unauthenticated-by-default arbitrary command execution | **P0** | **FIXED** this pass |
-| 2 | Checkpoint downloads had no integrity verification | **P1** | **FIXED** this pass |
-| 3 | `sandbox.rs` naming implies a security boundary it doesn't provide | P2 | Documented, not renamed |
-| 4 | No execution isolation anywhere (self_heal, solve, poly_jit, sandbox all run real subprocesses) | P1 (architectural), not new in this pass | Documented |
+| 1 | `POST /v1/hypervisor/jit_run` — unauthenticated-by-default arbitrary command execution | **P0** | **FIXED** (pass 1) |
+| 2 | Checkpoint downloads had no integrity verification | **P1** | **FIXED** (pass 1) |
+| 3 | `sandbox.rs` naming implies a security boundary it doesn't provide | P2 | **FIXED** (pass 2) — renamed to `compile_verify.rs`/`CompileVerifier` |
+| 4 | No execution isolation anywhere (self_heal, solve, poly_jit, compile_verify all run real subprocesses) | P1 (architectural) | Documented, not built — see below |
 | 5 | Data-plane bind defaults to `0.0.0.0` with auth opt-in | P1, already flagged and partly mitigated (2026-07-24 audit) | Documented, reinforced |
 | 6 | Patch-memory trust model | — | **Strength**, not a finding |
 | 7 | No formal capability model | P2 | Documented, scoped recommendation below |
@@ -118,29 +117,44 @@ deletes the partial download and returns `Err` (propagated as a real
 printed so an operator can capture and pin it for next time. Unit-tested in
 isolation (`verify_checksum_*`, three tests, no network required).
 
-**Residual risk, not fixed**: this is opt-in verification. `AXIOM_CHECKPOINT_URL`
-itself remains untrusted-input-shaped (an operator-supplied string, fetched
-over whatever scheme it specifies — nothing forces HTTPS). No signature
-scheme exists (SHA-256 alone protects against corruption/substitution once a
-hash is pinned by an out-of-band-verified source, not against a compromised
-source publishing a new "correct" hash alongside a bad binary). A published,
-maintainer-signed checksum manifest (e.g. alongside GitHub releases) would
-close that gap; tracked in [ROADMAP.md](ROADMAP.md).
+**Update (round 2)**: `release.yml`'s `checkpoint` job already publishes a
+`SHA256SUMS.txt` release asset for every checkpoint/tokenizer/drift-gate
+file (`sha256sum ckpt_release/* > ckpt_release/SHA256SUMS.txt`) — round 1
+of this audit missed that and incorrectly recommended it as future work.
+That manifest is the "maintainer-verified source to pin from" this fix
+needed; it already existed. What round 1's fix *didn't* cover: the Docker
+container entrypoint (`scripts/docker_entrypoint.sh`) fetches checkpoints
+via a separate, shell-based path — not `config.rs::fetch_base_model` at
+all — and had zero verification. Fixed in round 2: the same
+`AXIOM_CHECKPOINT_SHA256`/`AXIOM_TOKENIZER_SHA256` env vars now verify
+there too, fail-closed on mismatch, deleting the partial download.
+
+**Residual risk, still not fixed**: this is opt-in verification.
+`AXIOM_CHECKPOINT_URL` itself remains untrusted-input-shaped (an
+operator-supplied string, fetched over whatever scheme it specifies —
+nothing forces HTTPS). `SHA256SUMS.txt` itself is **unsigned** — SHA-256
+alone protects against corruption/substitution once a hash is pinned by an
+out-of-band-verified source, not against a compromised release pipeline
+publishing a new "correct" hash alongside a bad binary. Real GPG/sigstore
+signing needs key material and CI secret configuration this audit pass
+doesn't have access to set up; tracked in [ROADMAP.md](ROADMAP.md) as a
+named, deliberately-not-implemented gap rather than something faked with a
+placeholder key.
 
 ---
 
-## 3. `sandbox.rs` naming (P2, documented only)
+## 3. `sandbox.rs` naming (P2, FIXED in pass 2)
 
-`SandboxController` (`sandbox.rs`) is, by its own module doc, honest about
-what it is: *"a closed-loop local compilation sandbox... creates an isolated
+`SandboxController` (`sandbox.rs`) was, by its own module doc, honest about
+what it did: *"a closed-loop local compilation sandbox... creates an isolated
 temp Cargo package, runs compiler checks... The sandbox never writes into the
-real repository."* Mechanically, it runs `cargo check --message-format=json`
+real repository."* Mechanically, it ran `cargo check --message-format=json`
 against a synthesized `Cargo.toml` with **zero external dependencies and no
 `build.rs`** — no proc-macros, no network access during the check, no
 arbitrary code actually executes (`cargo check` type-checks; it doesn't run
-`main` or tests). In this exact configuration, the practical risk is low.
+`main` or tests). In this exact configuration, the practical risk was low.
 
-The finding is naming, not behavior: `AXIOM_SANDBOX_VERIFY`/
+The finding was naming, not behavior: `AXIOM_SANDBOX_VERIFY`/
 `AXIOM_SANDBOX_ROOT`/`AXIOM_SANDBOX_MAX_STEPS` and the type name
 `SandboxController` read, to an operator skimming env vars, like they imply
 a process/OS security boundary (seccomp, a container, a VM) — they don't.
@@ -148,18 +162,20 @@ The mission brief is explicit: *"Do not call something a 'sandbox' unless
 it provides an actual security boundary... rename it appropriately unless
 you can safely implement real isolation."*
 
-**Why not renamed in this pass**: the env var names are part of the public
-configuration surface (documented in README, referenced in scripts); a
-rename is a breaking change for anyone already setting
-`AXIOM_SANDBOX_VERIFY`, and doing it well means a deprecation path
-(accept both old and new names for a release), not a mechanical
-find-replace. That's real, scoped follow-up work, not something to rush
-inside an audit pass. **Recommendation** (tracked in ROADMAP.md): rename to
-something that names what it is (`AXIOM_COMPILE_VERIFY` /
-`CompileVerifier`), keep the old env var names as deprecated aliases for one
-release, and update `sandbox.rs`'s own doc comment to state explicitly
-*"this is a compile-time verifier, not a process isolation boundary"* at the
-top, not three sentences in.
+**Fixed**: `sandbox.rs` → `compile_verify.rs`, `SandboxController` →
+`CompileVerifier`, `SandboxDiagnostic` → `CompileDiagnostic`,
+`SandboxRunReport`/`SandboxError` → `CompileVerifyReport`/
+`CompileVerifyError`. The module doc now leads with *"This is not a process
+isolation boundary"* instead of three sentences in. Env vars renamed to
+`AXIOM_COMPILE_VERIFY[_ROOT|_MAX_STEPS|_TIMEOUT_SECS]`, with the old
+`AXIOM_SANDBOX_*` names still accepted for one release as deprecated
+aliases (a warning is logged when an alias is used) — checked before
+renaming that these vars were undocumented anywhere in README, scripts, or
+config, so the actual blast radius was two source files, not a public
+config surface; the alias path is defensive insurance, not a response to a
+known dependency. Regression test:
+`deprecated_env_alias_is_used_when_new_name_unset` (also asserts the new
+name wins when both are set).
 
 ---
 
@@ -167,7 +183,7 @@ top, not three sentences in.
 
 Every subprocess this codebase runs — `self_heal.rs`'s verify commands,
 `solve.rs`'s repair-loop re-verification, `poly_jit.rs`'s
-`run_process`/`run_with_feedback`, `sandbox.rs`'s `cargo check` — executes as
+`run_process`/`run_with_feedback`, `compile_verify.rs`'s `cargo check` — executes as
 a **real child process of the Axiom server or CLI**, with that process's own
 filesystem and network access. There is no container, no seccomp/AppArmor
 profile, no chroot, no resource cgroup, anywhere in this codebase.
