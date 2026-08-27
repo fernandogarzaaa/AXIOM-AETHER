@@ -150,7 +150,12 @@ fn main() {
     for (q, expected) in queries {
         let q_emb = embed(q);
         let results =
-            recall(&store, &["personal".to_string()], &q_emb, &RecallParams { min_score: 0.0, k });
+            recall(
+                &store,
+                &["personal".to_string()],
+                &q_emb,
+                &RecallParams { min_score: 0.0, k, ..Default::default() },
+            );
         let ids: Vec<&str> = results.iter().map(|h| h.record.id.as_str()).collect();
         if ids.first() == Some(&expected) {
             hits_at_1 += 1;

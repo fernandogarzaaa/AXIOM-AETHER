@@ -36,7 +36,8 @@ use crate::context_compressor::{
 };
 use crate::embedder::{embed_text, EmbeddingModel};
 use crate::inference::InferencePipeline;
-use crate::memory_recall::{recall, RecallParams};
+use crate::graph_memory::EdgeStore;
+use crate::memory_recall::{recall, recall_with_graph, record_co_occurrence, RecallParams};
 use crate::memory_store::{now_secs, MemoryKind, MemoryRecord, MemoryStore};
 use crate::session_awareness::AwarenessStore;
 use crate::vibe_memory::MasterVibe;
@@ -59,6 +60,11 @@ pub struct McpContext {
     vibe: Arc<Mutex<MasterVibe>>,
     /// Tier-2 lossless memory store (Phase 2.0): JSONL records per scope.
     memory: Arc<Mutex<MemoryStore>>,
+    /// Directed edge graph over `memory`'s records, rooted at the same
+    /// directory (`graph_memory.rs`). Widens `axiom_recall` with bounded
+    /// spreading activation and records co-occurrence between hits returned
+    /// together for the same query.
+    edges: Arc<Mutex<EdgeStore>>,
     /// Trained contrastive embedder (Phase 2.0.1); None → pipeline TTT fallback.
     embedder: Option<Arc<EmbeddingModel>>,
     /// When true, new tool sessions start from the master vibe instead of
@@ -147,6 +153,8 @@ pub async fn build_context(
         std::env::var("AXIOM_MEMORY_DIR").unwrap_or_else(|_| "checkpoints/memory".to_string());
     let memory = MemoryStore::open(&memory_dir)
         .map_err(|e| format!("failed to open memory store at {memory_dir}: {e}"))?;
+    let edges = EdgeStore::open(&memory_dir)
+        .map_err(|e| format!("failed to open edge store at {memory_dir}: {e}"))?;
     eprintln!("[mcp] memory store at {memory_dir}");
 
     // Phase 2.0.1 trained embedder (CPU for the MCP path). Absent → TTT fallback.
@@ -166,6 +174,7 @@ pub async fn build_context(
         pipeline: Arc::new(RwLock::new(pipeline)),
         vibe: Arc::new(Mutex::new(vibe)),
         memory: Arc::new(Mutex::new(memory)),
+        edges: Arc::new(Mutex::new(edges)),
         embedder,
         prime,
         drift_threshold,
@@ -1701,14 +1710,28 @@ fn recall_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result
         .memory
         .lock()
         .map_err(|_| "memory lock poisoned".to_string())?;
-    let hits = recall(&store, &scopes, &q_emb, &RecallParams::default());
+    let edges = ctx
+        .edges
+        .lock()
+        .map_err(|_| "edge store lock poisoned".to_string())?;
+    let hits = recall_with_graph(&store, &edges, &scopes, &q_emb, &RecallParams::default());
     if hits.is_empty() {
         return Ok("no relevant memories found".to_string());
     }
+    // Every query that returns 2+ hits together is itself corroborating
+    // evidence they're related, independent of whether graph expansion found
+    // anything this time -- see graph_memory::EdgeKind::CoOccurred and
+    // memory_recall::record_co_occurrence. Best-effort: a write failure here
+    // must never fail the read the caller actually asked for.
+    let hit_ids: Vec<String> = hits.iter().map(|h| h.record.id.clone()).collect();
+    if let Err(e) = record_co_occurrence(&edges, &hit_ids, 5) {
+        eprintln!("[mcp] axiom_recall: co-occurrence edge write skipped: {e}");
+    }
     let mut out = String::from("<axiom_recall>\n");
     for h in &hits {
+        let tag = if h.via_graph { " via=graph" } else { "" };
         out.push_str(&format!(
-            "• [{:.2}] id={} scope={} ts={}\n  {}\n",
+            "• [{:.2}]{tag} id={} scope={} ts={}\n  {}\n",
             h.score, h.record.id, h.record.scope, h.record.ts, h.record.body
         ));
     }

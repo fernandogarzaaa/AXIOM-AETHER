@@ -7,10 +7,20 @@
 use serde_json::json;
 
 /// One competitive-axis measurement. Shared by every pillar.
+#[derive(Default)]
 pub struct PillarResult {
     pub name: String,
     pub headline: String,
     pub detail: serde_json::Value,
+    /// Sample size behind `headline`, when meaningful -- lets a report
+    /// distinguish a measured rate from a smoke-check count. `None` when the
+    /// pillar was skipped or a count isn't meaningful.
+    pub sample_n: Option<u64>,
+    /// One short phrase on how to read `headline` -- "smoke check, not a
+    /// rate", "calibrated result", etc. Carried alongside the number so a
+    /// regenerated RESULTS.md can't drop the caveat that makes the number
+    /// trustworthy (see `write_results_md` in `main.rs`).
+    pub read_as: Option<String>,
 }
 
 fn samples() -> Vec<(&'static str, &'static str)> {
@@ -44,6 +54,8 @@ pub fn run_cognition() -> PillarResult {
         name: "cognition".into(),
         headline: format!("{:.0}% symbol exact-recovery ({recovered}/{total})", rate * 100.0),
         detail: json!({ "recovered": recovered, "total": total, "rate": rate }),
+        sample_n: Some(total as u64),
+        read_as: Some("smoke check, not a rate".into()),
     }
 }
 

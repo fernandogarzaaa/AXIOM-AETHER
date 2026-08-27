@@ -68,7 +68,7 @@ use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarder
 use crate::poly_jit::{PolyJitEngine, PolyJitReport, PolyJitRunRequest, PolyJitStatus};
 use crate::quantization::{NF4QuantizedDescriptor, NF4Quantizer};
 use crate::responses_compressor::{apply_plan, plan_compression};
-use crate::sandbox::{SandboxController, SandboxDiagnostic};
+use crate::compile_verify::{CompileDiagnostic, CompileVerifier};
 use crate::session_awareness::AwarenessStore;
 use crate::surprisal::{ExactAttentionResidualCache, ExactResidualTelemetry};
 use crate::swarm_route::{LocalSwarmRouteMatrix, SwarmMatrixState};
@@ -780,45 +780,45 @@ impl AppState {
         })
     }
 
-    async fn sandbox_local_synthesis(&self, session_id: &str, content: &str) {
-        if SandboxController::rust_code_blocks(content).is_empty() {
+    async fn compile_verify_local_synthesis(&self, session_id: &str, content: &str) {
+        if CompileVerifier::rust_code_blocks(content).is_empty() {
             return;
         }
-        let Some(sandbox) = SandboxController::from_env() else {
+        let Some(verifier) = CompileVerifier::from_env() else {
             return;
         };
         let state = self.clone();
         let cache_path = compression_cache_path();
-        let result = sandbox
+        let result = verifier
             .verify_rust_code_blocks_with_feedback(session_id, content, move |diag| {
                 let state = state.clone();
                 let cache_path = cache_path.clone();
-                async move { state.adapt_sandbox_diagnostic(diag, &cache_path).await }
+                async move { state.adapt_compile_verify_diagnostic(diag, &cache_path).await }
             })
             .await;
         match result {
             Ok(report) if report.passed => eprintln!(
-                "[sandbox] session={} rust_blocks={} passed attempts={}",
+                "[compile-verify] session={} rust_blocks={} passed attempts={}",
                 report.session_id, report.blocks_checked, report.attempts
             ),
             Ok(report) => eprintln!(
-                "[sandbox] session={} rust_blocks={} failed diagnostics={} attempts={}",
+                "[compile-verify] session={} rust_blocks={} failed diagnostics={} attempts={}",
                 report.session_id,
                 report.blocks_checked,
                 report.diagnostics.len(),
                 report.attempts
             ),
-            Err(e) => eprintln!("[sandbox] verification skipped: {e}"),
+            Err(e) => eprintln!("[compile-verify] verification skipped: {e}"),
         }
     }
 
-    async fn adapt_sandbox_diagnostic(
+    async fn adapt_compile_verify_diagnostic(
         &self,
-        diag: SandboxDiagnostic,
+        diag: CompileDiagnostic,
         cache_path: &FsPath,
     ) -> Result<(), String> {
         let message = format!(
-            "sandbox compiler check failed at step {} with status {:?}",
+            "compile-verify check failed at step {} with status {:?}",
             diag.step, diag.status_code
         );
         let trace = diag.feedback_trace();
@@ -826,7 +826,7 @@ impl AppState {
             TttFeedbackRequest {
                 session_id: diag.session_id,
                 message,
-                feedback_type: Some("sandbox_compilation_error".to_string()),
+                feedback_type: Some("compile_verify_error".to_string()),
                 trace: Some(trace),
             },
             cache_path,

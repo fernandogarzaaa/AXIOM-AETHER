@@ -1,27 +1,45 @@
 # AxiomBench Results
 
-Generated (unix): 1783089448
+Generated (unix): 1787847615
 
+<!-- axiombench:table:start -->
 | Pillar | Headline | n | Read as |
 |---|---|---|---|
-| cognition | 3/3 symbol exact-recovery | **3** | smoke check, not a rate |
-| trust | 100% supported coverage; neural contradiction catch-rate 10% -> 100% (threshold 0.750) | 240 calibration claims | calibrated result |
-| fleet | node B pre-immunized in 0.17 ms; signed DWE applied in 0.10 ms (pass) | 2 nodes | pass/fail, not a benchmark |
-| cost | 75.1% byte reduction | **3 replayed records from 3 sessions** | indicative only |
+| cognition | 100% symbol exact-recovery (3/3) | 3 | smoke check, not a rate |
+| trust | 100% supported coverage, neural contradiction catch-rate 10% -> 100% (threshold 0.750) | 240 | calibrated result |
+| fleet | node B pre-immunized in 0.19 ms; signed DWE applied in 0.07 ms (pass) | 2 | pass/fail, not a benchmark |
+| ablation | self-heal repair loop: 0/9 pass with no repair attempted vs 9/9 with AXIOM's solve loop | 9 | measured, deterministic, offline -- narrow scope (self-heal only), see docs/AXIOMBENCH.md |
+| cost | 75.1% byte reduction | 3 | indicative only |
+<!-- axiombench:table:end -->
 
 ## How to read these
 
-**Three of the four pillars run on a tiny sample** — cognition (n=3), fleet
-(n=2), and cost (n=3) — and the `n` column exists so a percentage cannot be
-mistaken for a rate. `3/3` is a smoke check that the round-trip works at all; it
-is not evidence of a 100% recovery rate, and neither is a 75.1% reduction
-measured over three records evidence of a 75% reduction in general. Both are
-deliberately reported as counts.
+**Four of the five pillars run on a tiny sample** — cognition (n=3), fleet
+(n=2), ablation (n=9), and cost (n=3) — and the `n` column exists so a
+percentage cannot be mistaken for a rate. `3/3` is a smoke check that the
+round-trip works at all; it is not evidence of a 100% recovery rate, and
+neither is a 75.1% reduction measured over three records evidence of a 75%
+reduction in general. Both are deliberately reported as counts.
 
 Fleet is the one small-`n` pillar where that is not a limitation: it is a
 pass/fail check that immunity transfers between two nodes and that a signed
 fragment is accepted, so two nodes is the whole scenario. Its timings are
 single-run and should be read as "fast enough", not as benchmarks.
+
+**Ablation is a real baseline-vs-AXIOM comparison, deliberately narrow in
+scope.** It runs the same 9 deterministic broken-repo fixtures
+`axiom eval-agentic` uses through two arms: "baseline" materializes each
+fixture and runs its verify command once with zero repair attempted;
+"AXIOM" runs the real `solve` loop (environment heal -> Poly-JIT source
+repair -> verify-gate). Both arms execute real code — nothing here is
+simulated. What it is *not*: a general "does AXIOM make agents better at
+coding" benchmark. It measures the self-healing repair capability
+specifically, on 9 fixtures engineered to be fixable by that specific
+mechanism — a 0/9 → 9/9 result says the repair loop works on its own test
+suite, which is expected by construction, not surprising. It does not
+generalize to arbitrary broken code, and no claim here should imply it
+does. See [`docs/AXIOMBENCH.md`](docs/AXIOMBENCH.md) for the full scope
+statement and what a real task-success benchmark would need.
 
 For the compression figure that **is** measured at scale, run
 `axiom bench axiom_engine_rs/src`: **82.4% token savings (173,446 -> 30,474) with
@@ -43,10 +61,17 @@ changes what a model produces requires a separate upstream evaluation.
 
 ## Reproduce
 
-Deterministic pillars:
+Deterministic pillars (cognition, trust, fleet):
 
 ```bash
 cargo run --release --features tools --bin axiombench
+```
+
+Add the ablation pillar (builds a real inference pipeline, still offline —
+this is why it's opt-in rather than part of the fast default run):
+
+```bash
+cargo run --release --features tools --bin axiombench -- --ablation
 ```
 
 Compression at scale:

@@ -792,7 +792,7 @@ async fn compressed_messages_path(
         match router.route_chat_payload(&outbound).await {
             Ok(local) => {
                 state
-                    .sandbox_local_synthesis(&session_id, &local.content)
+                    .compile_verify_local_synthesis(&session_id, &local.content)
                     .await;
                 return Ok(Json(local_anthropic_message_response(&outbound, local)).into_response());
             }
@@ -1460,7 +1460,7 @@ async fn compressed_openai_chat_path(
         match router.route_chat_payload(&outbound).await {
             Ok(local) => {
                 state
-                    .sandbox_local_synthesis(&session_id, &local.content)
+                    .compile_verify_local_synthesis(&session_id, &local.content)
                     .await;
                 return local_openai_chat_response(&outbound, local);
             }

@@ -161,6 +161,7 @@ pub fn run_cost_with(base_url: &str, dir: &Path) -> PillarResult {
             name: "cost".into(),
             headline: "skipped - no corpus (add bench/corpus/*.jsonl and run with --live)".into(),
             detail: json!({ "skipped": true, "reason": "no corpus", "corpus_dir": dir.display().to_string() }),
+            ..Default::default()
         };
     }
 
@@ -174,6 +175,7 @@ pub fn run_cost_with(base_url: &str, dir: &Path) -> PillarResult {
                 name: "cost".into(),
                 headline: format!("skipped - HTTP client unavailable ({error})"),
                 detail: json!({ "skipped": true, "reason": "client", "error": error.to_string() }),
+                ..Default::default()
             };
         }
     };
@@ -182,6 +184,7 @@ pub fn run_cost_with(base_url: &str, dir: &Path) -> PillarResult {
             name: "cost".into(),
             headline: format!("skipped - proxy metrics unavailable at {base_url}"),
             detail: json!({ "skipped": true, "reason": "proxy unavailable", "base_url": base_url, "error": error }),
+            ..Default::default()
         };
     }
 
@@ -294,6 +297,8 @@ pub fn run_cost_with(base_url: &str, dir: &Path) -> PillarResult {
             "byte_reduction": reduction,
             "errors": details,
         }),
+        sample_n: Some(replayed as u64),
+        read_as: Some("indicative only".into()),
     }
 }
 

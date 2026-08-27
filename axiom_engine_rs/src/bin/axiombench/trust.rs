@@ -160,6 +160,8 @@ pub fn run_trust() -> PillarResult {
                 Family::Contradiction.as_str(): family_count(&holdout, Family::Contradiction),
             },
         }),
+        sample_n: Some(rows.len() as u64),
+        read_as: Some("calibrated result".into()),
     }
 }
 

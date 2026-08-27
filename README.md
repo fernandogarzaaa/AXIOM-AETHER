@@ -542,8 +542,19 @@ docker run -p 3000:8080 \
 
 Pin the expected hash so a corrupted or substituted release asset fails closed
 instead of silently becoming the model (add `AXIOM_CHECKPOINT_SHA256` /
-`AXIOM_TOKENIZER_SHA256`, computed from a release you've already verified once
-— e.g. `sha256sum axiom_production_bpe.bin`).
+`AXIOM_TOKENIZER_SHA256`). Every release publishes a `SHA256SUMS.txt` asset
+alongside the checkpoint — copy the matching line's hash from there rather
+than computing it yourself from a download you haven't independently
+verified:
+
+```bash
+curl -fsSL https://github.com/fernandogarzaaa/AXIOM-AETHER/releases/latest/download/SHA256SUMS.txt
+```
+
+`scripts/docker_entrypoint.sh` (what the container image actually runs at
+boot) verifies against these env vars itself, before the checkpoint is ever
+loaded — a mismatch deletes the partial download and the container exits
+non-zero rather than starting on an unverified model.
 
 ## Kubernetes
 

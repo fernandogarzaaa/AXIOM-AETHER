@@ -198,25 +198,53 @@ conclusion, confirmed again here by reading each module's actual contract):
 | `vibe_memory.rs` | EMA-merged fast-weight tensors — the model's *numeric* accumulated state, not text | `Vec<Tensor>` per layer |
 | `heal_memory.rs` | Environment-repair experience (missing dirs, permission fixes), keyed by a command fingerprint | `ProgramRecord { dirs, confidence, ce_history }` |
 | `patch_memory.rs` | Verified source-code fixes, locally *and* fleet-shared | `Candidate { sha256, content, ... }`, trust boundary: never applied without a fresh local verify (see §3.5) |
-| `graph_memory.rs` **(new, merged this pass — see §8)** | Directed, weighted edges between `MemoryRecord` ids (`Supersedes`, `CausedBy`, `GeneralizesTo`, `Contradicts`, `CoOccurred`, …) + bounded spreading activation | `MemoryEdge`, append-only `edges.jsonl` |
+| `graph_memory.rs` (merged in pass 1) + `memory_recall.rs::recall_with_graph` (wired in pass 2) | Directed, weighted edges between `MemoryRecord` ids (`Supersedes`, `CausedBy`, `GeneralizesTo`, `Contradicts`, `CoOccurred`, …) + bounded spreading activation, now consulted by `axiom_recall` | `MemoryEdge`, append-only `edges.jsonl` |
 
 **Graph-memory branch disposition** (mission brief §5 explicitly asks for
 this): `claude/graph-b1-edge-store` (PR #143) and `claude/graph-b2-spread`
 (PR #144, superset of #143) were open, draft, unmerged. Read in full,
 compared against `main`, and unit-tested in isolation (14/14 pass, including
 cycle-safety, tombstone handling, determinism, and a `max_visited`-bound
-stress case over 1,000 edges). Verdict: **complete and correct as a
-building block, not yet integrated** — `graph_memory.rs` is a standalone
-module; nothing in `memory_recall.rs` or the MCP tool surface calls
-`spread()` yet to widen a recall result. Disposition: **merged** (§8) because
-it is additive-only (one new file + one `pub mod` line, zero touches to
-existing files, zero behavior change until something calls it), well-tested,
-and directly reusable; **wiring it into `axiom_recall`/`axiom_remember` is
-left as the next PR** (tracked in [ROADMAP.md](ROADMAP.md)) rather than done
-here, because that integration decision (which edge kinds to seed
-automatically, how much spread to add to a recall query, how it interacts
-with the existing recency/supersession rerank) deserves its own review, not
-a rider on an audit pass.
+stress case over 1,000 edges). Verdict at the time: **complete and correct
+as a building block, not yet integrated** — merged as additive-only,
+integration left for a follow-up.
+
+**Integration (pass 2)**: `memory_recall::recall_with_graph` widens
+`recall`'s direct cosine hits with bounded spreading activation, seeded from
+the direct hits' own ids/scores. Design decisions made explicit rather than
+left implicit:
+- **Scope confinement is load-bearing, not incidental.** Spreading activation
+  runs over *all* edges regardless of scope (an edge can legitimately link
+  records in different scopes — e.g. a fix in `project:x` that caused a
+  decision in `personal`), but a graph-expanded hit is only ever surfaced if
+  it resolves to a record already in the *requested* scopes' pool. A record
+  outside the caller's requested scopes is never returned via graph
+  expansion, even if a stored edge points to it — regression-tested
+  (`recall_with_graph_never_surfaces_a_record_outside_the_requested_scopes`).
+- **Graph-expanded hits are never conflated with direct matches.**
+  `RecallHit.via_graph: bool` is `false` for every hit plain `recall` would
+  have returned and `true` only for hits spreading activation added — the
+  `axiom_recall` tool output tags these `via=graph` in its human-readable
+  list. This is specifically so a future wrong-memory-rate evaluation (see
+  [AXIOMBENCH.md](AXIOMBENCH.md)) can measure direct-hit and graph-hit
+  precision separately rather than as one blended number.
+- **Bounded, not additive without limit**: `RecallParams.graph_k` (default
+  3) caps how many graph-expanded hits a single recall can add, independent
+  of how many edges/hops are actually reachable — regression-tested
+  (`recall_with_graph_respects_graph_k_cap`, 5 linked leaves, cap enforced
+  at 2).
+- **The graph is now populated by real usage, not just backfill.**
+  `axiom_recall` calls `record_co_occurrence` after every multi-hit result,
+  writing bounded pairwise `CoOccurred` edges between the hits returned
+  together — the same-session-coactivation signal `EdgeKind::CoOccurred`'s
+  own doc comment anticipated when it was merged in pass 1, previously
+  unused. This is a write on what's nominally a read path, done
+  deliberately (a query result *is* evidence of relatedness) and
+  best-effort (a write failure is logged, never fails the caller's read).
+- **Deliberately not extended to `search`/`fetch`** (the ChatGPT-connector
+  ids/title/url alias tools) in this pass — that's an externally-dictated
+  JSON schema, not an internal contract, and changing it wasn't warranted
+  by this task.
 
 ### 3.5 Self-healing
 
@@ -340,7 +368,7 @@ command with zero capability gate beyond the general (opt-in, off-by-default)
 `AXIOM_API_KEY` — on a server that binds `0.0.0.0` by default. This is fixed
 in this pass with a dedicated, off-by-default `AXIOM_ENABLE_JIT_EXEC`
 capability gate, independent of `AXIOM_API_KEY`. Full writeup, threat model,
-and the rest of the execution-surface inventory (sandbox.rs naming, poly_jit,
+and the rest of the execution-surface inventory (compile_verify.rs naming, poly_jit,
 self_heal's subprocess execution, patch trust model) are in
 [SECURITY-AUDIT.md](SECURITY-AUDIT.md).
 
@@ -357,7 +385,7 @@ self_heal's subprocess execution, patch trust model) are in
 | DWE | Delta-weight exchange (fleet immunity fragments) | `dwe.rs` |
 | PSS | (Local-answer short-circuit gate; see `routes_messages.rs`) | `routes_messages.rs` |
 | Hypervisor | The Poly JIT + Neural VFS surface (`/v1/hypervisor/*`) — **not** a real hypervisor (no VM/OS isolation); the name predates this audit and is kept for API stability | `server/routes_hypervisor.rs` |
-| Sandbox (`sandbox.rs`) | A `cargo check`-only compile verifier in an isolated temp directory — **not** a process/OS security boundary (no seccomp, no container, no resource limits beyond a wall-clock timeout) | `sandbox.rs`; see SECURITY-AUDIT.md for the naming recommendation |
+| Compile verifier (`compile_verify.rs`, formerly `sandbox.rs`/`SandboxController`) | A `cargo check`-only compile verifier in an isolated temp directory — **not** a process/OS security boundary (no seccomp, no container, no resource limits beyond a wall-clock timeout). Renamed in a follow-up pass so the name matches the guarantee; `AXIOM_SANDBOX_*` env vars still work as deprecated aliases for one release | `compile_verify.rs`; see SECURITY-AUDIT.md §3 |
 | Q-TTT / Hamiltonian / quantum manifold | A classical, deterministic tensor-network simulator using physics-inspired optimization terminology (imaginary-time evolution, variational collapse) — the module doc itself says "not literal quantum computing" | `hamiltonian.rs`, `q_manifold.rs` |
 | Axiom Mesh (`axiom_mesh_rs`) | A separate, standalone control-theoretic multi-agent orchestration research workspace; only its `axiom_core` routing primitive has a real (opt-in) dependency edge into the shipped product | `axiom_mesh_rs/` |
 | ChimeraLang | A ported cognition-language DSL, integrated but not load-bearing for any shipped default path | `chimera.rs` |
@@ -419,7 +447,10 @@ the code contradicts it.
 
    No branches were force-deleted or PRs force-closed in this pass — that is
    a destructive, visible action better left to the repository owner; the
-   table above is the recommendation.
+   table above is the recommendation. **Update, round 2**: the user asked for
+   this to be acted on; PRs #81, #143, #144 are now commented and closed
+   (see §9). Branch deletion remains blocked pending explicit approval — see
+   §9 for why.
 7. **This document, plus [SECURITY-AUDIT.md](SECURITY-AUDIT.md),
    [COMPETITIVE-ANALYSIS.md](COMPETITIVE-ANALYSIS.md),
    [AXIOMBENCH.md](AXIOMBENCH.md), and [ROADMAP.md](ROADMAP.md).**
@@ -430,3 +461,50 @@ capability gate: `jit_run_endpoint_is_disabled_by_default`; checksum:
 `verify_checksum_{passes_when_nothing_pinned,passes_on_case_insensitive_match,
 fails_on_mismatch_with_both_hashes_in_message}`). Full suite: **812/812
 (engine) + 72/72 (mesh) passing, 0 failed**, `clippy --lib -D warnings` clean.
+
+## 9. Changes made in round 2
+
+Follow-up pass acting on every item round 1 left open (the user asked for
+"all of it"). In priority order:
+
+1. **PR/branch disposition acted on**: PRs #81, #143, #144 commented
+   (explaining the disposition from §8's table) and closed. Branch
+   *deletion* (`git push origin --delete`) was blocked by this session's
+   permission classifier as a destructive action — flagged to the user
+   directly rather than worked around; the 9 branches from §8's table still
+   exist on `origin` pending explicit approval.
+2. **`sandbox.rs` → `compile_verify.rs` rename** (§6's terminology table,
+   SECURITY-AUDIT.md §3): `SandboxController` → `CompileVerifier` and
+   friends, `AXIOM_SANDBOX_*` → `AXIOM_COMPILE_VERIFY_*` with the old names
+   kept as deprecated aliases for one release (verified: these env vars
+   were undocumented and referenced nowhere outside two source files, so
+   the alias is defensive insurance, not a response to a known dependency).
+3. **Checkpoint integrity, corrected**: round 1 recommended publishing a
+   signed checksum manifest as future work; round 1 had missed that
+   `release.yml` already publishes `SHA256SUMS.txt`. What was genuinely
+   missing — the Docker container entrypoint
+   (`scripts/docker_entrypoint.sh`) fetches checkpoints via a separate
+   shell path with zero verification — is now fixed, tested directly
+   (extracted-function unit test), fail-closed on mismatch, same as round
+   1's Rust-side fix.
+4. **`graph_memory.rs` wired into `memory_recall.rs`** and the
+   `axiom_recall` MCP tool (§3.4): bounded spreading activation now widens
+   direct cosine hits, scope-confined, capped, every graph-expanded hit
+   marked `via_graph = true`; `axiom_recall` also now writes `CoOccurred`
+   edges between co-retrieved hits so the graph grows from real usage.
+5. **`axiombench`'s `RESULTS.md`-overwrite bug fixed** (found in round 1,
+   AXIOMBENCH.md §2): the table is now marker-delimited and regenerated in
+   place; hand-written prose and any pillar not run this time both survive.
+6. **A first, real, narrow AXIOMBench ablation pillar** (`--ablation`,
+   AXIOMBENCH.md §3): baseline-vs-AXIOM self-healing pass rate over the
+   `eval-agentic` fixture suite, measured this pass at 0/9 → 9/9, with the
+   scope caveat (fixtures are purpose-built for this mechanism) stated
+   as prominently as the number itself.
+7. **`cargo fmt` gap measured, not mechanically fixed**: 77/127 files
+   (61%) diverge from `rustfmt`, ~12,200 lines — too large a diff to fold
+   into this pass safely. `CONTRIBUTING.md` now says explicitly that
+   `cargo fmt --check` isn't CI-enforced and to format only touched files,
+   rather than leaving contributors to discover the gap by surprise.
+
+Full suite after round 2: **819/819 (engine) passing, 0 failed**, `clippy
+--lib -D warnings` clean.
