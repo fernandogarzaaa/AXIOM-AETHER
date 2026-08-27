@@ -82,6 +82,8 @@ pub fn run_fleet() -> PillarResult {
             "unsigned_rejected": unsigned_rejected,
             "signed_ok": signed_ok,
         }),
+        sample_n: Some(2),
+        read_as: Some("pass/fail, not a benchmark".into()),
     }
 }
 
