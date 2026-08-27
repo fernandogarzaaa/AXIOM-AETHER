@@ -43,57 +43,60 @@ code still compiles and its own tests still run — it is demoted, not abandoned
 
 ---
 
-## File-by-file gating checklist (for the follow-up PR)
+## Entanglement map (grep, as of `dfb6bbc`)
 
-Each `mod`, subcommand variant, dispatch arm, route, and MCP tool for the three
-subsystems gets `#[cfg(feature = "experimental")]`. Because `#[cfg]` on an enum
-variant removes it from every `match`, the dispatch arms must be gated to match.
+Not every experimental-looking module is cleanly severable. What actually
+references each candidate, outside itself:
 
-### `axiom_engine_rs/src/lib.rs` — module declarations
+| Module | Referenced by | Severable? |
+|---|---|---|
+| `chimera` | `entrypoint.rs`, `server/routes_tools.rs` | **Yes** — contained. |
+| `state_predictor` / `trajectory_sampler` / `alignment_loop` / `predictive_tools` | each other + `mcp_stdio.rs` only | **Yes** — as one cluster. |
+| `dwe` / `cluster` / `swarm_route` / `swarm_router` / `mesh_router` / `vfs` | **`server/prelude_state.rs`** (shared state *struct fields*), `server/run.rs`, `server/routes_fleet.rs`, `bin/axiombench/fleet.rs` | Only via a `#[cfg]`-field refactor of the server state — real work. |
+| `daemon` | **`config.rs`**, **`tui.rs`**, `entrypoint.rs` | Entangled with core config + the TUI. Gating needs those refs gated too. |
+| `hamiltonian` / `q_manifold` | **`poly_jit.rs`** (the core repair engine), `server/prelude_state.rs` | **No — stays core.** Do not gate. |
 
-Gate: `alignment_loop` (4), `chimera` (12), `cluster` (15), `daemon` (18),
-`dwe` (27), `hamiltonian` (34), `predictive_tools` (57), `q_manifold` (61),
-`state_predictor` (74), `swarm_route` (76), `mesh_router` (77),
-`swarm_router` (78), `trajectory_sampler` (83), `vfs` (88).
+So the earlier "gate 14 modules" plan was wrong: `hamiltonian`/`q_manifold`
+are load-bearing for the spearhead, and `daemon` is wired into core config.
 
-*(line numbers as of `dfb6bbc`; grep to re-confirm)*
+## Staged plan
 
-### `axiom_engine_rs/src/cli.rs` — subcommand surface
+**Stage 1 — `chimera` only** (contained; one PR, CI-verified):
 
-- `#[cfg(feature = "experimental")]` on `AxiomCommand` variants: `Daemon`,
-  `Mount`, `Swarm`, `Fleet`, `Chimera`.
-- Same attribute on the sub-enums: `ChimeraCommand`, `DaemonCommand`,
-  `FleetCommand`, `SwarmCommand`.
+| File | Change |
+|---|---|
+| `Cargo.toml` | add `experimental = []` to `[features]`. |
+| `lib.rs` | `#[cfg(feature = "experimental")]` on `pub mod chimera;`. |
+| `cli.rs` | `#[cfg(feature = "experimental")]` on the `AxiomCommand::Chimera { .. }` variant **and** the `ChimeraCommand` enum. |
+| `entrypoint.rs` | `#[cfg(feature = "experimental")]` on the `AxiomCommand::Chimera { command } => { … }` match arm. Variant + arm both gated ⇒ the `match` stays exhaustive in both feature states, no wildcard. |
+| `server/routes_tools.rs` | `#[cfg(feature = "experimental")]` on `async fn post_chimera_run` (its `crate::chimera::…` refs are fully-qualified — no `use` to gate). |
+| `server/routes_verify.rs` | Split the `guarded` builder: drop `/v1/chimera/run` from the chain, then `#[cfg(feature = "experimental")] let guarded = guarded.route("/v1/chimera/run", post(post_chimera_run));` **before** `.route_layer(require_api_key)` so the route keeps the API-key guard. |
+| `server/tests.rs` | `#[cfg(feature = "experimental")]` on `test_chimera_run_endpoint_executes_a_program`. |
+| `.github/workflows/ci.yml` | new job `experimental`: `cargo test --features experimental --locked`. |
+| `README.md` / `CONTRIBUTING.md` | flip "moving behind" → "build with `--features experimental`" for ChimeraLang. |
 
-### `axiom_engine_rs/src/entrypoint.rs` — dispatch arms
+**Stage 2 — predictive-reasoning cluster** (`state_predictor` + `trajectory_sampler`
++ `alignment_loop` + `predictive_tools`): gate the four `mod`s, the three MCP
+tool-dispatch arms + tool-list entries in `mcp_stdio.rs`, the
+`predict_states_blocking` helper, and the tool-list test `assert!`s. Make the
+README "20 tools" count dynamic or feature-aware.
 
-Gate the `match` arms: `AxiomCommand::Daemon { .. }` (~675),
-`AxiomCommand::Mount { .. }` (~699), `AxiomCommand::Chimera { .. }` (~1068),
-`AxiomCommand::Swarm { .. }` (~1134), `AxiomCommand::Fleet { .. }` (~1205),
-and the `fn print_daemon_status` helper (~1342). With the variants gated, the
-outer `match` needs no wildcard — but confirm it still compiles exhaustively
-under **both** feature states.
+**Stage 3 — DWE swarm / fleet + VFS hypervisor**: the big one. Requires making
+the `dwe` / `cluster` / `swarm*` / `vfs` fields on `server/prelude_state.rs`'s
+state struct `#[cfg]`-conditional, which ripples through every constructor and
+`.field` access in `server/run.rs` and the fleet/hypervisor route modules, plus
+gating `daemon` alongside its `config.rs` + `tui.rs` refs, plus the `Swarm` /
+`Fleet` / `Daemon` / `Mount` CLI variants + arms + `print_daemon_status`, plus
+the `bin/axiombench` fleet pillar. Do this only with a local build loop.
 
-### `axiom_engine_rs/src/server/routes_verify.rs` — route registrations
+### Acceptance (per stage)
 
-Gate these `.route(...)` lines and their handler `fn`s:
-`/v1/fleet/status`, `/v1/cluster/sync`, `/v1/cluster/merge`,
-`/v1/hypervisor/mount|read|list|stat|jit_run|jit_status`,
-`/v1/hypervisor/quantum_coherent_state`, `/v1/swarm/matrix_state`,
-`/v1/chimera/run`. Build the experimental routes into a sub-`Router` added with
-`#[cfg]` so the router expression stays valid when the feature is off.
-
-Also check `server/routes_fleet.rs`, `server/routes_tools.rs`,
-`server/prelude_state.rs` (state fields), `server/run.rs`, `server.rs`,
-`swarm_route.rs`, `fault_locate.rs` — each references `dwe::` / fleet / chimera.
-
-### `axiom_engine_rs/src/mcp_stdio.rs` — MCP tools
-
-Gate the tool-dispatch arms and the tool-list entries for
-`axiom_predict_states`, `axiom_sample_trajectories`, `axiom_align_generation`
-(and the `predict_states_blocking` helper + the `assert!` in the tool-list
-test). The tool count in the README (currently "20 tools") drops accordingly
-when the feature is off — update it, or report it dynamically.
+- `cargo build --locked` + `cargo test --release --locked` pass with the feature
+  **off**, and the gated surface is absent from `--help`, the route table, and
+  the MCP tool list.
+- `cargo test --features experimental --locked` passes with it **on**.
+- `./scripts/demo_end_to_end.sh` still ends `FAIL 0` (Stage 3: its swarm step
+  must be feature-gated in the script or the script built with the feature).
 
 ### `axiom_engine_rs/src/bin/axiombench/` (`tools` feature)
 
