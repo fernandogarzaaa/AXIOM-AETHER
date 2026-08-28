@@ -125,6 +125,7 @@ pub enum AxiomCommand {
     /// Run AXIOM's in-tree ChimeraLang (AI-cognition DSL): check, run, prove
     /// (emit a signed certificate), or verify a certificate. `.chimera` programs
     /// execute on the same belief/provenance substrate as the engine itself.
+    #[cfg(feature = "experimental")]
     Chimera {
         #[command(subcommand)]
         command: ChimeraCommand,
@@ -135,6 +136,7 @@ pub enum AxiomCommand {
     Tui,
 }
 
+#[cfg(feature = "experimental")]
 #[derive(Debug, Subcommand)]
 pub enum ChimeraCommand {
     /// Lex + parse a `.chimera` file, reporting syntax errors (the verify gate).

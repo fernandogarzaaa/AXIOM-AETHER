@@ -85,18 +85,24 @@ else
 fi
 
 step "Pillar 4 — ChimeraLang DSL (in-tree port: run + prove/verify certificate)"
-cat > "$TMP/demo.chimera" <<'CHIM'
+# ChimeraLang is behind the `experimental` cargo feature (docs/EXPERIMENTAL.md).
+# A stock build has no `chimera` subcommand — skip the pillar rather than fail it.
+if "$BIN" chimera --help >/dev/null 2>&1; then
+    cat > "$TMP/demo.chimera" <<'CHIM'
 val scores = [1, 2, 3]
 for s in scores
   emit s
 end
 CHIM
-"$BIN" chimera run "$TMP/demo.chimera" 2>&1 | sed 's/^/    /'
-"$BIN" chimera run "$TMP/demo.chimera" 2>&1 | grep -q "3" \
-    && ok "chimera run executed a program" || bad "chimera run produced no output"
-"$BIN" chimera prove "$TMP/demo.chimera" --out "$TMP/chimera_cert.json" >/dev/null 2>&1
-"$BIN" chimera verify "$TMP/chimera_cert.json" 2>&1 | grep -qi "VALID" \
-    && ok "chimera certificate verifies offline" || bad "chimera cert did not verify"
+    "$BIN" chimera run "$TMP/demo.chimera" 2>&1 | sed 's/^/    /'
+    "$BIN" chimera run "$TMP/demo.chimera" 2>&1 | grep -q "3" \
+        && ok "chimera run executed a program" || bad "chimera run produced no output"
+    "$BIN" chimera prove "$TMP/demo.chimera" --out "$TMP/chimera_cert.json" >/dev/null 2>&1
+    "$BIN" chimera verify "$TMP/chimera_cert.json" 2>&1 | grep -qi "VALID" \
+        && ok "chimera certificate verifies offline" || bad "chimera cert did not verify"
+else
+    printf '  \033[33mSKIP\033[0m ChimeraLang (build with --features experimental to include it)\n'
+fi
 
 step "summary"
 printf '\n  %d passed, %d failed\n\n' "$PASS" "$FAIL"

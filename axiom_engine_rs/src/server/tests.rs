@@ -634,6 +634,7 @@ mod tests {
         safe_drop(pipeline_arc).await;
     }
 
+    #[cfg(feature = "experimental")]
     #[tokio::test]
     async fn test_chimera_run_endpoint_executes_a_program() {
         let state = make_test_state().await;

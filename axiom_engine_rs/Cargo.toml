@@ -52,6 +52,11 @@ tools = []
 # own Anthropic account. Off by default -- run explicitly via
 # `cargo test --features live-eval --test cvm_eval` (see scripts/cvm_eval.sh).
 live-eval = []
+# Experimental subsystems that are wired but not covered by the proof loop
+# (docs/EXPERIMENTAL.md). Off by default so `cargo install`, the pip wheel,
+# Docker, and release builds ship only the proven surface. Stage 1 gates the
+# ChimeraLang DSL (`axiom chimera`, `POST /v1/chimera/run`).
+experimental = []
 
 # Dev/training/eval binaries, gated behind the `tools` feature (see above).
 [[bin]]

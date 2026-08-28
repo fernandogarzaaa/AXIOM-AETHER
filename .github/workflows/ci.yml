@@ -125,6 +125,46 @@ jobs:
       - name: End-to-end smoke (every pillar composes)
         run: ./scripts/demo_end_to_end.sh
 
+  # The `experimental` feature (docs/EXPERIMENTAL.md) gates wired-but-unproven
+  # subsystems out of the default build. The `test` job above already covers the
+  # feature-OFF surface; this job keeps the feature-ON surface compiling and its
+  # own tests passing, so gated code is demoted, not abandoned.
+  experimental:
+    name: Build & test (--features experimental)
+    needs: protocol
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            axiom_engine_rs/target
+          key: ci-experimental-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+          restore-keys: ci-experimental-${{ runner.os }}-
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
+
+      - name: Build (release, experimental)
+        working-directory: axiom_engine_rs
+        run: cargo build --release --locked --features experimental
+
+      - name: Test (experimental)
+        working-directory: axiom_engine_rs
+        run: cargo test --release --locked --features experimental
+
   # Validate the Docker image build on PRs. docker.yml only builds on pushes to
   # main / tags, so a broken Dockerfile (e.g. a missing build-context path) used
   # to escape review and only surface post-merge. This builds the image (no

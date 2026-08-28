@@ -1,14 +1,19 @@
 use crate::{
-    agentic, agentic_eval, bench, bootstrap, chimera, claude_backend, cli, config, daemon,
-    fault_locate, hardware, heal_memory, inference, lsp, mcp_stdio, meta_train, patch_memory,
-    prime, provenance, self_heal, server, solve, train, tui, vibe_memory,
+    agentic, agentic_eval, bench, bootstrap, claude_backend, cli, config, daemon, fault_locate,
+    hardware, heal_memory, inference, lsp, mcp_stdio, meta_train, patch_memory, prime, provenance,
+    self_heal, server, solve, train, tui, vibe_memory,
 };
+// Experimental: compiled only with `--features experimental` (docs/EXPERIMENTAL.md).
+#[cfg(feature = "experimental")]
+use crate::chimera;
 
 use std::env;
 use std::path::PathBuf;
 
 use candle_core::{bail, Device, Result};
-use cli::{AxiomCommand, ChimeraCommand, DaemonCommand, ParsedCli, SwarmCommand};
+use cli::{AxiomCommand, DaemonCommand, ParsedCli, SwarmCommand};
+#[cfg(feature = "experimental")]
+use cli::ChimeraCommand;
 use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use inference::{InferencePipeline, InferenceRuntimeOptions};
 use train::AxiomTrainer;
@@ -1065,6 +1070,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             }
             None => println!("[axiom] heal memory disabled (AXIOM_HEAL_MEMORY=0)."),
         },
+        #[cfg(feature = "experimental")]
         AxiomCommand::Chimera { command } => {
             let read = |p: &std::path::Path| -> candle_core::Result<String> {
                 std::fs::read_to_string(p)
