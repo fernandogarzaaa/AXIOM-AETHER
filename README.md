@@ -29,13 +29,14 @@ general answer-quality claims that are not proven by the repository.
 | Self-healing runner | Runs a command, detects supported environment failures, applies bounded heals, and records learned immunity. | `self_heal.rs`, `heal_memory.rs`, `entrypoint.rs` |
 | Autonomous solve loop | Uses the runner plus source repair attempts to drive a verifier command toward green. | `solve.rs`, `poly_jit.rs`, `sandbox.rs` |
 | Grounding verification | Checks whether response claims are supported by supplied evidence and can expand dropped symbols when a session digest is available. | `hallucination.rs`, `/v1/verify` in `server/routes_verify.rs` |
-| Swarm and provenance | Shares selected learned state through signed immunity export/merge and weighted belief logic. Patch gossip is Byzantine-robust (bounded per-peer trust). DWE weight fragments are fleet-key HMAC authenticated with replay rejection and current/previous key rotation; `/v1/fleet/status` and `axiom_dwe_*` metrics expose live fleet health. Compose peers with `axiom fleet status\|join`. | `belief.rs`, `provenance.rs`, `weight_merge.rs`, `patch_memory.rs`, `dwe.rs`, `server/routes_fleet.rs` |
+| Provenance & belief | Signed immunity export/merge verification and `BetaBelief` conflict-aware peer confidence; DARE/TIES checkpoint + peer weight merge. | `belief.rs`, `provenance.rs`, `weight_merge.rs`, `patch_memory.rs` |
 | Calibrated trust gate | `/v1/verify` ships a data-calibrated conformal threshold (calibrated on `bench/trust/claims.jsonl` at δ=0.10 for ≥90% coverage of genuinely supported claims), plus a neural contradiction-catch-rate benchmark. A `calibrate` request mode retunes it for your own labeled data. | `hallucination.rs`, `bench/trust/`, `server/routes_verify.rs` |
-| ChimeraLang DSL | In-tree Rust implementation of the [ChimeraLang](https://github.com/fernandogarzaaa/ChimeraLang) AI-cognition language: `belief/inquire/resolve/guard/evolve` programs run on the same `BetaBelief` + provenance substrate, with tamper-evident run certificates. | `chimera.rs`, CLI `axiom chimera`, `/v1/chimera/run` |
 | Search ingestion node | Scrapes web pages, ingests text through local TTT, and emits an Axiom fingerprint for downstream use. | `src/bin/search_node.rs`, `search_scrape.rs`, `search_ingest.rs` |
 | CVM cost stack | Reduces real dollar cost of proxied `/v1/messages` traffic: cache-safety hardening (never rewrites bytes at/before a client `cache_control` breakpoint), a content-addressed L2 store with recoverable stubs, and digest admission control for heavy tool results. **On by default** (`AXIOM_CVM_DIGEST=skeleton`); dollar-true cost telemetry via `/metrics` and `GET /v1/awareness/:id`. See [CVM Cost Stack](#cvm-cost-stack) below. | `cache_safety.rs`, `cvm_store.rs`, `digest.rs`, `cost_ledger.rs`, `server/routes_messages.rs` |
 
 For a compact index of surfaces, see [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md).
+The three numbers the project stands behind are in [Proof Loop](#proof-loop);
+surfaces that are wired but unproven are in [Experimental](#experimental).
 For research upgrades and what is still planned, see [`docs/UPGRADES.md`](docs/UPGRADES.md).
 
 ### AxiomBench
@@ -68,6 +69,28 @@ multi-architecture GHCR image for `linux/amd64` and `linux/arm64`.
 Local verification requires a working Rust toolchain. If `RUSTUP_HOME` or
 `CARGO_HOME` points to a missing drive, fix that before running local `cargo`
 commands.
+
+## Proof Loop
+
+Every release republishes three headline numbers, each with the command that
+reproduces it. Definitions, caveats, and the release ritual:
+[`docs/PROOF-LOOP.md`](docs/PROOF-LOOP.md). Between releases,
+[`.github/workflows/proof-loop.yml`](.github/workflows/proof-loop.yml)
+regenerates them on every push and fails if the repair gate regresses.
+
+| Metric | Value | Config | Measured |
+|---|---|---|---|
+| **Autonomous repair** — `axiom eval-agentic` | 9/9 = 100% | built-in fixtures, CPU, no LLM | 2026-08-28 |
+| **Compression** — `axiom bench axiom_engine_rs/src` | 86.7% savings, 2229/2229 = 100% round-trip | `AXIOM_PRODUCTION_BPE=1` | 2026-08-09 |
+| **Compression** — same, legacy tokenizer | 82.4% savings, 2181/2181 = 100% round-trip | `AXIOM_PRODUCTION_BPE=0` | 2026-08-09 |
+| **Cost, real traffic** — `/metrics` delta | 65.1% / 41.4% quota savings | two live Claude Code sessions | 2026-07-17 |
+| **Trust gate** — `axiombench` | 100% supported coverage; contradiction catch-rate 10% → 100% (τ=0.75) | 240 calibration claims | AxiomBench |
+
+Each figure's caveat travels with it in [What is measured vs
+simulated](#cvm-cost-stack) below and in [`RESULTS.md`](RESULTS.md) — don't
+quote one without its caveat. The autonomous-repair line is a capability gate,
+not yet a rate; the plan to make it one is in
+[`docs/BENCH-REPAIR.md`](docs/BENCH-REPAIR.md).
 
 ## Honest Scope
 
@@ -305,23 +328,25 @@ GET    /v1/budget
 GET    /v1/ttt/sessions
 DELETE /v1/ttt/sessions
 POST   /v1/ttt/feedback
-POST   /v1/cluster/sync
-POST   /v1/cluster/merge
 GET    /v1/immunity
-POST   /v1/immunity/merge
 GET    /v1/patches
-POST   /v1/hypervisor/mount
-POST   /v1/hypervisor/read
-POST   /v1/hypervisor/jit_run
-GET    /v1/hypervisor/jit_status
-GET    /v1/hypervisor/list
-GET    /v1/hypervisor/stat
-GET    /v1/hypervisor/quantum_coherent_state
-POST   /v1/chimera/run
-GET    /v1/fleet/status
-GET    /v1/swarm/matrix_state
 GET    /v1/config
 POST   /v1/config
+
+# Experimental — moving behind `--features experimental` (see § Experimental):
+POST   /v1/immunity/merge                   # DWE swarm — fleet immunity gossip
+POST   /v1/cluster/sync                     # DWE swarm
+POST   /v1/cluster/merge                    # DWE swarm
+GET    /v1/fleet/status                     # DWE swarm
+GET    /v1/swarm/matrix_state               # DWE swarm
+POST   /v1/chimera/run                      # ChimeraLang DSL
+POST   /v1/hypervisor/mount                 # VFS hypervisor
+POST   /v1/hypervisor/read                  # VFS hypervisor
+POST   /v1/hypervisor/jit_run               # VFS hypervisor — also needs AXIOM_ENABLE_JIT_EXEC=1
+GET    /v1/hypervisor/jit_status            # VFS hypervisor
+GET    /v1/hypervisor/list                  # VFS hypervisor
+GET    /v1/hypervisor/stat                  # VFS hypervisor
+GET    /v1/hypervisor/quantum_coherent_state # VFS hypervisor
 ```
 
 This list is generated from the actual `.route(...)` registrations across
@@ -432,7 +457,9 @@ Tool catalog (20 tools):
 
 Wired and reachable, but the state-prediction head has **no trained checkpoint
 yet**, so output is not a calibrated forecast: responses carry `trained: false`
-and an explicit `state_source`. Treat as scaffolding, not inference. See
+and an explicit `state_source`. Treat as scaffolding, not inference. Moving
+behind the `experimental` feature — see
+[`docs/EXPERIMENTAL.md`](docs/EXPERIMENTAL.md) and
 [`docs/UPGRADES.md`](docs/UPGRADES.md).
 
 | Tool | Purpose |
@@ -566,6 +593,21 @@ helm install axiom deploy/helm/axiom -f deploy/helm/axiom/values-gpu.yaml
 ```
 
 Full guide: [`docs/DEPLOY_K8S.md`](docs/DEPLOY_K8S.md).
+
+## Experimental
+
+Wired and reachable, but **not covered by the [Proof Loop](#proof-loop), not
+benchmarked, and not part of the supported surface.** These are moving behind a
+`cargo` feature named `experimental` (default off) so stock builds — `cargo
+install`, the pip wheel, Docker, releases — ship only the proven surface.
+File-by-file plan: [`docs/EXPERIMENTAL.md`](docs/EXPERIMENTAL.md).
+
+| Subsystem | Surface | Status |
+|---|---|---|
+| **ChimeraLang DSL** | `axiom chimera check\|run\|prove\|verify`, `POST /v1/chimera/run` (`chimera.rs`) | In-tree interpreter for the [ChimeraLang](https://github.com/fernandogarzaaa/ChimeraLang) cognition language on the `BetaBelief` + provenance substrate, with tamper-evident certificates. Runs; no evaluation harness. |
+| **VFS hypervisor** | `axiom daemon\|mount`, `GET/POST /v1/hypervisor/*` (`daemon.rs`, `vfs.rs`) | User-mode "neural VFS" prototype. `jit_run` executes a caller-supplied command and can overwrite files — separately gated by `AXIOM_ENABLE_JIT_EXEC`; see [`docs/SECURITY-AUDIT.md`](docs/SECURITY-AUDIT.md). |
+| **DWE swarm / fleet** | `axiom swarm\|fleet`, `/v1/fleet/status`, `/v1/cluster/{sync,merge}`, `/v1/swarm/matrix_state`, `POST /v1/immunity/merge` (`dwe.rs`, `cluster.rs`, `swarm_*.rs`, `mesh_router.rs`, `server/routes_fleet.rs`) | Distributed Weight Exchange: signed fast-weight fragments + verified-patch gossip. Safety model is sound (Byzantine-robust, provenance-gated, fleet-key HMAC); cross-node behaviour is smoke-tested only (n=2, [`RESULTS.md`](RESULTS.md)). |
+| **Predictive reasoning** (MCP) | `axiom_predict_states`, `axiom_sample_trajectories`, `axiom_align_generation` (`predictive_tools.rs`, `state_predictor.rs`) | Scaffolding — the state-prediction head has **no trained checkpoint**; responses carry `trained: false`. |
 
 ## Research And Upgrade Notes
 
