@@ -4,6 +4,7 @@ use axiom_engine::config::AxiomConfig;
 use axiom_engine::inference::InferencePipeline;
 use axiom_engine::poly_jit::{PolyJitEngine, PolyJitRunRequest};
 use axiom_engine::server::{create_router, AppState};
+use axiom_engine::solve::posix_shell;
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use candle_core::Device;
@@ -192,7 +193,7 @@ async fn jit_run_endpoint_repairs_source_and_feeds_ttt() {
                 .body(Body::from(
                     json!({
                         "session_id": "jit-1",
-                        "command": "sh",
+                        "command": posix_shell(),
                         "args": [script.to_string_lossy()],
                         "source_path": script.to_string_lossy(),
                     })
@@ -232,7 +233,7 @@ async fn jit_run_restores_source_when_repair_fails() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "command": "sh",
+                        "command": posix_shell(),
                         "args": [script.to_string_lossy()],
                         "source_path": script.to_string_lossy(),
                     })

@@ -463,6 +463,34 @@ fn rel_path_for(src: &Path, anchor: Option<&Path>) -> String {
         .unwrap_or_else(|| src.display().to_string())
 }
 
+/// Resolves a POSIX-compatible shell for running the `sh`/`sh -c "..."`
+/// verify commands used throughout the deterministic eval fixtures
+/// ([`crate::agentic_eval::builtin_cases`]) and this module's own test
+/// suite. On Unix this is always `"sh"` -- unconditionally present, nothing
+/// changes there. On Windows, a bare `"sh"` command often fails even on a
+/// machine with Git for Windows installed, because `git.exe` being on PATH
+/// does not put its bundled `sh.exe` on PATH too. This checks the common
+/// Git-for-Windows install locations first; if none exist, it falls back to
+/// the bare `"sh"` unchanged -- so a machine with no POSIX shell at all
+/// fails exactly as it did before this function existed, rather than being
+/// silently papered over.
+pub fn posix_shell() -> String {
+    if cfg!(windows) {
+        let candidates = [
+            r"C:\Program Files\Git\bin\sh.exe",
+            r"C:\Program Files\Git\usr\bin\sh.exe",
+            r"C:\Program Files (x86)\Git\bin\sh.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\sh.exe",
+        ];
+        for c in candidates {
+            if std::path::Path::new(c).exists() {
+                return c.to_string();
+            }
+        }
+    }
+    "sh".to_string()
+}
+
 /// Run the verify command, returning whether it exited 0. Bounded by
 /// [`verify_timeout`] (delegates to [`run_verify_capture`]).
 pub fn run_verify(command: &str, args: &[String], working_dir: Option<&Path>) -> bool {
@@ -580,7 +608,7 @@ mod tests {
     // verify command: pass only if the file contains "FIXED".
     fn grep_fixed(path: &Path) -> (String, Vec<String>) {
         (
-            "sh".to_string(),
+            posix_shell(),
             vec![
                 "-c".to_string(),
                 format!("grep -q FIXED '{}'", path.display()),
@@ -641,7 +669,7 @@ mod tests {
         // Verify emits a marker on stderr when failing, so the rejected attempt's
         // trace is non-empty and gets threaded back as feedback (grep -q alone is
         // silent, which would give no feedback to test with).
-        let cmd = "sh".to_string();
+        let cmd = posix_shell();
         let args = vec![
             "-c".to_string(),
             format!("grep -q FIXED '{}' || {{ echo NEED_FIXED >&2; exit 1; }}", path.display()),
@@ -666,14 +694,14 @@ mod tests {
 
     #[test]
     fn run_verify_reflects_exit_code() {
-        assert!(run_verify("sh", &["-c".into(), "exit 0".into()], None));
-        assert!(!run_verify("sh", &["-c".into(), "exit 1".into()], None));
+        assert!(run_verify(&posix_shell(), &["-c".into(), "exit 0".into()], None));
+        assert!(!run_verify(&posix_shell(), &["-c".into(), "exit 1".into()], None));
     }
 
     #[test]
     fn run_verify_capture_returns_stdout_stderr_and_status() {
         let (ok, trace) = run_verify_capture(
-            "sh",
+            &posix_shell(),
             &["-c".into(), "echo out_marker; echo err_marker >&2; exit 3".into()],
             None,
         );

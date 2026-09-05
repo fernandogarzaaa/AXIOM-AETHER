@@ -18,7 +18,10 @@ use serde_json::Value;
 
 /// Minimum block size (bytes, after trimming) eligible for dedup. Below this
 /// the marker line itself would cost more than it saves.
-const MIN_DEDUP_BYTES: usize = 400;
+///
+/// `pub(crate)`: [`crate::fuzzy_dedup`] reuses this threshold so both dedup
+/// tiers apply to the same size class of block.
+pub(crate) const MIN_DEDUP_BYTES: usize = 400;
 
 /// Replaces every occurrence of a deduped block after the first.
 pub const DEDUP_MARKER: &str = "[AXIOM-DEDUP: identical to an earlier block in this prompt]";
@@ -104,7 +107,12 @@ fn split_heading_boundaries(segment: &str) -> (Vec<String>, Vec<String>) {
 
 /// Full block split: paragraph boundaries, then heading boundaries within
 /// each paragraph. Same `(blocks, separators)` reconstruction contract.
-fn split_blocks(text: &str) -> (Vec<String>, Vec<String>) {
+///
+/// `pub(crate)` (not private): [`crate::fuzzy_dedup`] reuses this exact
+/// boundary logic so the two dedup tiers (exact-byte and near-duplicate)
+/// agree on what a "block" is -- a block that's eligible for one tier is
+/// defined identically for the other.
+pub(crate) fn split_blocks(text: &str) -> (Vec<String>, Vec<String>) {
     let (para_segments, para_seps) = split_paragraphs(text);
     let mut all_blocks = Vec::new();
     let mut all_seps = Vec::new();

@@ -17,7 +17,7 @@ use crate::agentic::{
     agentic_loop, agentic_loop_with_holdout, AttemptMemory, EditSet, ProposeContext, Proposer,
 };
 use crate::inference::InferencePipeline;
-use crate::solve::{run_verify, run_verify_capture, solve, SolveOptions};
+use crate::solve::{posix_shell, run_verify, run_verify_capture, solve, SolveOptions};
 
 /// A seeded broken project: files to materialize and the verify command that
 /// must be driven to green. The fix is reachable by the deterministic repair
@@ -152,7 +152,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 "run.sh",
                 "#!/bin/sh\necho 'run.sh:2:1: boom' >&2\nexit 1\n",
             )],
-            "sh",
+            &posix_shell(),
             &["run.sh"],
         ),
         // 2. Poly-JIT fixture marker repair.
@@ -162,7 +162,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 "check.sh",
                 "#!/bin/sh\necho 'check.sh:1:1: AXIOM_POLYJIT_FIXTURE_FAIL'\nexit 1\n",
             )],
-            "sh",
+            &posix_shell(),
             &["check.sh"],
         ),
         // 3. Multi-file: a passing helper cited first, the failing file second;
@@ -173,7 +173,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 ("helper.sh", "#!/bin/sh\necho 'helper.sh:1:1: note'\nexit 0\n"),
                 ("main.sh", "#!/bin/sh\necho 'main.sh:3:1: boom' >&2\nexit 1\n"),
             ],
-            "sh",
+            &posix_shell(),
             &["-c", "sh helper.sh; sh main.sh"],
         ),
         // 4. Rust-format localization (`--> file:line`) + a second deterministic
@@ -182,7 +182,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         EvalCase::new(
             "rust-assert-flip",
             &[("widget.rs", "pub fn f() { assert_eq!(1, 2); }\n")],
-            "sh",
+            &posix_shell(),
             &[
                 "-c",
                 "if grep -q 'assert_eq!(1, 2)' widget.rs; then \
@@ -194,7 +194,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         EvalCase::new(
             "python-frame-localize",
             &[("core.py", "# AXIOM_POLYJIT_FIXTURE_FAIL\n")],
-            "sh",
+            &posix_shell(),
             &[
                 "-c",
                 "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL core.py; then \
@@ -205,7 +205,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         EvalCase::new(
             "js-stack-localize",
             &[("index.js", "// index.js\nprocess.exit 1\n")],
-            "sh",
+            &posix_shell(),
             &[
                 "-c",
                 "if grep -q 'exit 1' index.js; then \
@@ -216,7 +216,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         EvalCase::new(
             "go-frame-localize",
             &[("server.go", "package main\n// exit 1 placeholder\n")],
-            "sh",
+            &posix_shell(),
             &[
                 "-c",
                 "if grep -q 'exit 1' server.go; then \
@@ -232,7 +232,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 "calc.c",
                 "/* AXIOM_POLYJIT_FIXTURE_FAIL */\nint calc(void) { return 0; }\n",
             )],
-            "sh",
+            &posix_shell(),
             &[
                 "-c",
                 "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL calc.c; then \
@@ -248,7 +248,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 "api.ts",
                 "// AXIOM_POLYJIT_FIXTURE_FAIL\nexport const ok = true;\n",
             )],
-            "sh",
+            &posix_shell(),
             &[
                 "-c",
                 "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL api.ts; then \
@@ -259,7 +259,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         EvalCase::new(
             "java-frame-localize",
             &[("Gate.java", "// AXIOM_POLYJIT_FIXTURE_FAIL\nclass Gate {}\n")],
-            "sh",
+            &posix_shell(),
             &[
                 "-c",
                 "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL Gate.java; then \
@@ -270,7 +270,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         EvalCase::new(
             "ruby-frame-localize",
             &[("task.rb", "# AXIOM_POLYJIT_FIXTURE_FAIL\nputs 'ok'\n")],
-            "sh",
+            &posix_shell(),
             &[
                 "-c",
                 "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL task.rb; then \
@@ -287,7 +287,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 "src/util/gate.sh",
                 "#!/bin/sh\necho placeholder\nexit 1\n",
             )],
-            "sh",
+            &posix_shell(),
             &[
                 "-c",
                 "if grep -q 'exit 1' src/util/gate.sh; then \
@@ -304,7 +304,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 ("a.sh", "#!/bin/sh\nexit 1\n"),
                 ("b.sh", "#!/bin/sh\nexit 1\n"),
             ],
-            "sh",
+            &posix_shell(),
             &["-c", "sh a.sh && sh b.sh"],
             // Coordinated fix: both files must go green together.
             &[
@@ -324,14 +324,14 @@ pub fn builtin_cases() -> Vec<EvalCase> {
                 ("a.sh", "#!/bin/sh\nexit 1\n"),
                 ("b.sh", "#!/bin/sh\nexit 1\n"),
             ],
-            "sh",
+            &posix_shell(),
             &["-c", "sh a.sh"],
             &[
                 ("a.sh", "#!/bin/sh\nexit 0\n"),
                 ("b.sh", "#!/bin/sh\nexit 0\n"),
             ],
         )
-        .with_holdout("sh", &["-c", "sh b.sh"]),
+        .with_holdout(&posix_shell(), &["-c", "sh b.sh"]),
     ]
 }
 
@@ -508,7 +508,7 @@ mod tests {
         let case = EvalCase::new_agentic(
             "escape-attempt",
             &[("a.sh", "#!/bin/sh\nexit 1\n")],
-            "sh",
+            &posix_shell(),
             &["-c", "exit 1"],
             &[("../../evil.sh", "pwned")],
         );

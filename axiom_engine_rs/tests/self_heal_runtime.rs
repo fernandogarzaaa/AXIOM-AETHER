@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use axiom_engine::config::AxiomConfig;
 use axiom_engine::inference::InferencePipeline;
 use axiom_engine::self_heal::{run_supervised, Heal, SupervisorOptions};
+use axiom_engine::solve::posix_shell;
 use candle_core::Device;
 
 fn tiny_pipeline() -> InferencePipeline {
@@ -100,7 +101,7 @@ fn heals_missing_directory_and_completes() {
 
     let report = supervise(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         vec!["-c".into(), script],
         3,
     );
@@ -130,7 +131,7 @@ fn heals_missing_directory_and_completes() {
 fn stops_without_applicable_heal_and_propagates_exit_code() {
     let report = supervise(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         vec!["-c".into(), "exit 7".into()],
         3,
     );
@@ -165,7 +166,7 @@ fn never_fabricates_missing_file_content() {
 fn clean_run_is_untouched() {
     let report = supervise(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         vec!["-c".into(), "true".into()],
         3,
     );
@@ -184,7 +185,7 @@ fn transient_fault_retries_then_succeeds() {
         "if [ -f {m} ]; then echo recovered; else touch {m}; echo 'connect: Connection refused' >&2; exit 1; fi",
         m = marker.display()
     );
-    let report = supervise(tiny_pipeline(), "sh".into(), vec!["-c".into(), script], 3);
+    let report = supervise(tiny_pipeline(), posix_shell(), vec!["-c".into(), script], 3);
 
     assert!(report.success, "must recover after the transient retry");
     assert_eq!(report.attempts, 2);
@@ -199,7 +200,7 @@ fn transient_retries_are_bounded() {
     // then the supervisor must stop rather than loop.
     let report = supervise(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         vec![
             "-c".into(),
             "echo 'connect: Connection timed out' >&2; exit 1".into(),
@@ -225,7 +226,7 @@ fn learned_immunity_pre_heals_a_fresh_environment() {
     // Run 1: fails on the missing dir, heals reactively, succeeds, learns.
     let first = supervise_full(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         args.clone(),
         3,
         None,
@@ -242,7 +243,7 @@ fn learned_immunity_pre_heals_a_fresh_environment() {
     // Run 2: immunity pre-creates the remembered dir → zero failures.
     let second = supervise_full(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         args,
         3,
         None,
@@ -270,7 +271,7 @@ fn immunity_is_per_command_fingerprint() {
 
     let first = supervise_full(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         vec!["-c".into(), script_a],
         3,
         None,
@@ -281,7 +282,7 @@ fn immunity_is_per_command_fingerprint() {
     // Different command: must start with no immunity heals applied.
     let other = supervise_full(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         vec!["-c".into(), "true".into()],
         3,
         None,
@@ -304,7 +305,7 @@ fn novel_faults_are_absorbed_harder_than_familiar_ones() {
 
     let first = supervise_full(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         args.clone(),
         3,
         None,
@@ -319,7 +320,7 @@ fn novel_faults_are_absorbed_harder_than_familiar_ones() {
 
     let second = supervise_full(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         args,
         3,
         None,
@@ -339,7 +340,7 @@ fn absorption_is_deep_without_memory_history() {
     // No heal memory → no classification → treat the fault as unfamiliar.
     let report = supervise(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         vec!["-c".into(), "exit 1".into()],
         3,
     );
@@ -370,14 +371,14 @@ fn immunity_is_location_invariant_across_working_directories() {
     };
 
     // Run 1 in dir A: fails on missing build/out, heals it, succeeds, learns.
-    let a = supervise_opts(tiny_pipeline(), "sh".into(), args.clone(), mk(dir_a.clone()));
+    let a = supervise_opts(tiny_pipeline(), posix_shell(), args.clone(), mk(dir_a.clone()));
     assert!(a.success);
     assert_eq!(a.heals, vec![CreatedDirectory(dir_a.join("build").join("out"))]);
 
     // Run 2 in dir B: never ran here, yet immunity pre-creates build/out under B
     // and the program succeeds on the first attempt.
     assert!(!dir_b.join("build").join("out").exists());
-    let b = supervise_opts(tiny_pipeline(), "sh".into(), args, mk(dir_b.clone()));
+    let b = supervise_opts(tiny_pipeline(), posix_shell(), args, mk(dir_b.clone()));
     assert!(b.success);
     assert_eq!(b.attempts, 1, "portable immunity → first-try success in a new location");
     assert_eq!(b.heals, vec![Immunized(dir_b.join("build").join("out"))]);
@@ -400,7 +401,7 @@ fn predicts_failure_from_missing_prerequisites_before_running() {
     // Teach Axiom that this command needs ./build/out (relative).
     let mut mem = HealMemory::load(&memory);
     mem.remember_dirs(
-        &fingerprint("sh", &["-c".into(), "echo x > build/out/r".into()]),
+        &fingerprint(&posix_shell(), &["-c".into(), "echo x > build/out/r".into()]),
         "sh -c echo x > build/out/r",
         &[PathBuf::from("build/out")],
     );
@@ -411,7 +412,7 @@ fn predicts_failure_from_missing_prerequisites_before_running() {
         anchor: Some(anchor),
         ..SupervisorOptions::default()
     };
-    let cmd = "sh".to_string();
+    let cmd = posix_shell();
     let args = vec!["-c".to_string(), "echo x > build/out/r".to_string()];
 
     // Prerequisite missing under the anchor → failure predicted before running.
@@ -475,7 +476,7 @@ fn diagnoses_and_remembers_missing_env_var() {
     let args = vec!["-c".to_string(), script.to_string()];
     let report = supervise_opts(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         args.clone(),
         SupervisorOptions {
             max_restarts: 3,
@@ -492,7 +493,7 @@ fn diagnoses_and_remembers_missing_env_var() {
         report.diagnostics
     );
     // …and the requirement is remembered for advisories / `axiom immunity`.
-    let fp = fingerprint("sh", &args);
+    let fp = fingerprint(&posix_shell(), &args);
     let mem = HealMemory::load(&memory);
     assert_eq!(
         mem.record(&fp).map(|r| r.required_env.clone()),
@@ -513,7 +514,7 @@ fn novel_healed_failure_is_written_to_recall_memory() {
 
     let report = supervise_opts(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         vec!["-c".into(), script],
         SupervisorOptions {
             max_restarts: 3,
@@ -557,7 +558,7 @@ fn structural_immunity_generalizes_across_unrelated_commands() {
 
     // Program A: fails on missing `dist`, heals reactively, learns it directly.
     let a_args = vec!["-c".to_string(), "echo a > dist/a.out".to_string()];
-    let a = supervise_opts(tiny_pipeline(), "sh".into(), a_args, opts.clone());
+    let a = supervise_opts(tiny_pipeline(), posix_shell(), a_args, opts.clone());
     assert!(a.success);
     assert_eq!(a.heals, vec![CreatedDirectory(anchor.join("dist"))]);
 
@@ -569,7 +570,7 @@ fn structural_immunity_generalizes_across_unrelated_commands() {
     // corroboration threshold -- so B gets no structural immunity yet and
     // must heal reactively too, exactly like A did.
     let b_args = vec!["-c".to_string(), "echo b > dist/b.out".to_string()];
-    let b = supervise_opts(tiny_pipeline(), "sh".into(), b_args, opts.clone());
+    let b = supervise_opts(tiny_pipeline(), posix_shell(), b_args, opts.clone());
     assert!(b.success);
     assert_eq!(
         b.heals,
@@ -583,10 +584,10 @@ fn structural_immunity_generalizes_across_unrelated_commands() {
     // A and B both independently corroborating `dist`, it is now a structural
     // heal -- C gets it pre-created before its very first attempt.
     let c_args = vec!["-c".to_string(), "echo c > dist/c.out".to_string()];
-    let fp_c = fingerprint("sh", &c_args);
+    let fp_c = fingerprint(&posix_shell(), &c_args);
     assert!(HealMemory::load(&memory).record(&fp_c).is_none(), "C must be genuinely unseen");
 
-    let c = supervise_opts(tiny_pipeline(), "sh".into(), c_args, opts);
+    let c = supervise_opts(tiny_pipeline(), posix_shell(), c_args, opts);
     assert!(c.success);
     assert_eq!(c.attempts, 1, "structural immunity must prevent C's first failure entirely");
     assert_eq!(c.heals, vec![StructurallyImmunized(anchor.join("dist"), 2)]);
@@ -611,7 +612,7 @@ fn failure_history_persists_to_vibe_when_requested() {
     let vibe = unique_tmp("vibe").with_extension("bin");
     let report = supervise_with_vibe(
         tiny_pipeline(),
-        "sh".into(),
+        posix_shell(),
         vec!["-c".into(), "exit 3".into()],
         1,
         Some(vibe.clone()),

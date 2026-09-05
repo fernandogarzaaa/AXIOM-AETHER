@@ -6,6 +6,7 @@ use axiom_engine::config::AxiomConfig;
 use axiom_engine::heal_memory::{fingerprint, HealMemory};
 use axiom_engine::inference::InferencePipeline;
 use axiom_engine::self_heal::{run_supervised, Heal, SupervisorOptions};
+use axiom_engine::solve::posix_shell;
 use axiom_engine::server::{create_router, AppState};
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
@@ -209,7 +210,7 @@ fn herd_immunity_end_to_end() {
     let args = vec!["-c".to_string(), script];
     let mem_a = unique_tmp("herd_a").with_extension("json");
 
-    let first = supervise("sh".into(), args.clone(), mem_a.clone());
+    let first = supervise(posix_shell(), args.clone(), mem_a.clone());
     assert!(first.success);
     assert_eq!(first.heals, vec![Heal::CreatedDirectory(out_dir.clone())]);
 
@@ -223,7 +224,7 @@ fn herd_immunity_end_to_end() {
     std::fs::remove_dir_all(&base).unwrap();
     assert!(!out_dir.exists());
 
-    let second = supervise("sh".into(), args, mem_b.clone());
+    let second = supervise(posix_shell(), args, mem_b.clone());
     assert!(second.success);
     assert_eq!(
         second.attempts, 1,
