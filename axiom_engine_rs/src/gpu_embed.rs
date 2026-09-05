@@ -45,11 +45,22 @@ pub mod bert_backend {
     use candle_core::{Device, Tensor};
     use candle_nn::VarBuilder;
     use candle_transformers::models::bert::{BertModel, Config, DTYPE};
-    use tokenizers::Tokenizer;
+    use tokenizers::{Tokenizer, TruncationParams};
 
     /// See the module-level sizing note for why base, not large, is the
     /// default for a 2GB budget.
     pub const DEFAULT_GPU_MODEL_REPO: &str = "BAAI/bge-base-en-v1.5";
+    const BERT_MAX_TOKENS: usize = 512;
+
+    fn configure_truncation(tokenizer: &mut Tokenizer) -> anyhow::Result<()> {
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: BERT_MAX_TOKENS,
+                ..Default::default()
+            }))
+            .map_err(anyhow::Error::msg)?;
+        Ok(())
+    }
 
     pub struct BertEmbedBackend {
         model: BertModel,
@@ -73,7 +84,8 @@ pub mod bert_backend {
             let weights_path = repo_api.get("model.safetensors")?;
 
             let config: Config = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
-            let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
+            let mut tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
+            configure_truncation(&mut tokenizer)?;
 
             // Safety: standard candle pattern (matches candle-examples/bert)
             // -- mmaps the safetensors file directly rather than reading it
@@ -100,7 +112,9 @@ pub mod bert_backend {
             #[cfg(feature = "cuda")]
             {
                 match Device::new_cuda(0) {
-                    Ok(device) => Self::load(repo, device),
+                    Ok(device) => {
+                        Self::load(repo, device).or_else(|_| Self::load(repo, Device::Cpu))
+                    }
                     Err(_) => Self::load(repo, Device::Cpu),
                 }
             }
@@ -144,6 +158,75 @@ pub mod bert_backend {
                 out.push(pooled);
             }
             Some(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use candle_nn::VarBuilder;
+        use std::collections::HashMap;
+        use tokenizers::{
+            models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
+            processors::template::TemplateProcessing,
+        };
+
+        #[test]
+        fn long_input_is_truncated_before_bert_forward() {
+            let vocab = HashMap::from([
+                ("[UNK]".to_string(), 0),
+                ("[CLS]".to_string(), 1),
+                ("[SEP]".to_string(), 2),
+                ("word".to_string(), 3),
+            ]);
+            let word_level = WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("[UNK]".to_string())
+                .build()
+                .unwrap();
+            let mut tokenizer = Tokenizer::new(word_level);
+            tokenizer
+                .with_pre_tokenizer(Whitespace::default())
+                .with_post_processor(
+                    TemplateProcessing::builder()
+                        .try_single("[CLS] $A [SEP]")
+                        .unwrap()
+                        .special_tokens(vec![("[CLS]", 1), ("[SEP]", 2)])
+                        .build()
+                        .unwrap(),
+                );
+            configure_truncation(&mut tokenizer).unwrap();
+            let long_input = std::iter::repeat("word")
+                .take(BERT_MAX_TOKENS + 100)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let encoding = tokenizer.encode(long_input.as_str(), true).unwrap();
+            assert_eq!(encoding.len(), BERT_MAX_TOKENS);
+            assert_eq!(encoding.get_ids().first(), Some(&1));
+            assert_eq!(encoding.get_ids().last(), Some(&2));
+
+            let config = Config {
+                vocab_size: 4,
+                hidden_size: 8,
+                num_hidden_layers: 1,
+                num_attention_heads: 2,
+                intermediate_size: 16,
+                ..Default::default()
+            };
+            let device = Device::Cpu;
+            let model = BertModel::load(VarBuilder::zeros(DTYPE, &device), &config).unwrap();
+            let backend = BertEmbedBackend {
+                model,
+                tokenizer,
+                device,
+            };
+
+            let embeddings = backend
+                .embed_batch(&[long_input])
+                .expect("embedding succeeds");
+
+            assert_eq!(embeddings.len(), 1);
+            assert_eq!(embeddings[0].len(), config.hidden_size);
         }
     }
 }

@@ -218,7 +218,10 @@ pub fn fuzzy_diet<B: SimilarityBackend>(
         }
     }
 
-    let fuzzy_dedup_tokens = original_tokens.saturating_sub(result.split_whitespace().count());
+    let fuzzy_dedup_tokens = exact_deduped
+        .split_whitespace()
+        .count()
+        .saturating_sub(result.split_whitespace().count());
     (
         result,
         FuzzyDietReport {
@@ -256,19 +259,23 @@ impl AutoBackend {
         {
             use crate::gpu_embed::bert_backend::{BertEmbedBackend, DEFAULT_GPU_MODEL_REPO};
             // Only attempt a CUDA device when the `cuda` feature is compiled
-            // in (requires CUDA toolkit at build time). Otherwise stay on CPU
-            // so `--features fuzzy-embed-gpu` alone compiles everywhere.
+            // in (requires CUDA toolkit at build time). A CUDA initialization
+            // or model-load failure still retries the same model on CPU before
+            // moving on to Model2Vec.
             #[cfg(feature = "cuda")]
-            let (device, active) = match candle_core::Device::new_cuda(0) {
-                Ok(d) => (d, "bert-gpu"),
-                Err(_) => (candle_core::Device::Cpu, "bert-cpu"),
-            };
-            #[cfg(not(feature = "cuda"))]
-            let (device, active) = (candle_core::Device::Cpu, "bert-cpu");
-            if let Ok(b) = BertEmbedBackend::load(DEFAULT_GPU_MODEL_REPO, device) {
+            if let Ok(device) = candle_core::Device::new_cuda(0) {
+                if let Ok(b) = BertEmbedBackend::load(DEFAULT_GPU_MODEL_REPO, device) {
+                    return Self {
+                        inner: Some(Box::new(b)),
+                        active_backend: "bert-gpu",
+                    };
+                }
+            }
+            if let Ok(b) = BertEmbedBackend::load(DEFAULT_GPU_MODEL_REPO, candle_core::Device::Cpu)
+            {
                 return Self {
                     inner: Some(Box::new(b)),
-                    active_backend: active,
+                    active_backend: "bert-cpu",
                 };
             }
         }
@@ -444,6 +451,24 @@ mod tests {
         let (out, report) = fuzzy_diet(&text, &backend, 0.9);
         assert_eq!(report.blocks_marked, 0);
         assert_eq!(out, text);
+    }
+
+    #[test]
+    fn fuzzy_token_savings_exclude_exact_dedup_savings() {
+        let repeated = block('r', 500);
+        let unique = block('u', 500);
+        let mut vectors = std::collections::HashMap::new();
+        vectors.insert(repeated.trim().to_string(), vec![1.0, 0.0]);
+        vectors.insert(unique.trim().to_string(), vec![0.0, 1.0]);
+        let backend = StubBackend { vectors };
+
+        let text = format!("{repeated}\n\n{unique}\n\n{repeated}");
+        let (out, report) = fuzzy_diet(&text, &backend, 0.9);
+
+        assert!(out.contains(prefix_diet::DEDUP_MARKER));
+        assert!(report.backend_active);
+        assert_eq!(report.blocks_marked, 0);
+        assert_eq!(report.fuzzy_dedup_tokens, 0);
     }
 
     #[test]
