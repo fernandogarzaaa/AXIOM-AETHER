@@ -31,6 +31,8 @@ pub mod encoder;
 pub mod entrypoint;
 pub mod epistemic_drift;
 pub mod fault_locate;
+pub mod fuzzy_dedup;
+pub mod gpu_embed;
 pub mod graph_memory;
 pub mod hamiltonian;
 pub mod hallucination;

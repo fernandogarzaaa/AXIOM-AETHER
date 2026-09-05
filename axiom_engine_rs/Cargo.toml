@@ -57,6 +57,21 @@ live-eval = []
 # Docker, and release builds ship only the proven surface. Stage 1 gates the
 # ChimeraLang DSL (`axiom chimera`, `POST /v1/chimera/run`).
 experimental = []
+# Fuzzy (near-duplicate) dedup tier -- extends S4's exact-byte dedup with a
+# small pretrained static-embedding similarity oracle (src/fuzzy_dedup.rs).
+# Off by default: adds an external model dependency and, like S4 before it,
+# needs a real-traffic measurement pass and its own eval gate before any
+# default flips to on. See docs/EXPERIMENTAL.md.
+fuzzy-embed = ["dep:model2vec-rs", "dep:anyhow"]
+# GPU-first tier on top of fuzzy-embed: tries a larger contextual model
+# (bge-base, ~109M params, fits a 2GB VRAM budget -- see src/gpu_embed.rs)
+# on CUDA when the `cuda` feature is also enabled, otherwise the same model
+# on CPU, then falls back further to fuzzy-embed's small Model2Vec model
+# (crate::fuzzy_dedup::AutoBackend implements the full cascade). Does NOT
+# imply `cuda` so machines without a CUDA toolkit can still compile and run
+# CPU-only (`--features fuzzy-embed-gpu` alone); add `,cuda` explicitly for
+# GPU acceleration (requires nvcc / CUDA toolkit).
+fuzzy-embed-gpu = ["dep:candle-transformers", "dep:hf-hub", "fuzzy-embed"]
 
 # Dev/training/eval binaries, gated behind the `tools` feature (see above).
 [[bin]]
@@ -155,6 +170,25 @@ toml = "1.1.2"
 dirs = "6.0.0"
 ratatui = "0.29"
 crossterm = "0.28"
+# Fuzzy dedup tier (src/fuzzy_dedup.rs): extends S4 prefix_diet from
+# byte-identical dedup to near-duplicate dedup via a small, pretrained,
+# externally-distilled static embedding model used only as a similarity
+# oracle -- never for generation. Both optional so default builds
+# (`cargo install`, the pip wheel, Docker, release binaries) carry no
+# dependency on an external model. Enable with `--features fuzzy-embed`.
+# See docs/EXPERIMENTAL.md.
+model2vec-rs = { version = "0.1", optional = true }
+anyhow = { version = "1", optional = true }
+# GPU-first fuzzy-dedup backend (src/gpu_embed.rs): a larger, pretrained
+# contextual encoder (BAAI/bge-base-en-v1.5) used purely as a similarity
+# oracle, sized to fit a 2GB VRAM budget. Pinned to 0.10.2 to match this
+# crate's existing candle-core/candle-nn = "0.10.2" pins exactly, rather than
+# crates.io's newer 0.11.0, so enabling this feature never forces a candle
+# upgrade across the rest of the engine. hf-hub fetches config/tokenizer/
+# weights from the Hub (no bundled checkpoint, same convention as the rest
+# of this file's `exclude` list).
+candle-transformers = { version = "0.10.2", optional = true }
+hf-hub = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
