@@ -375,6 +375,39 @@ pub fn route(model: &str, mechanical: bool, cooldown: u32, mode: &str) -> Option
     }
 }
 
+/// Bridge from caller-declared task kind to tier capability (L3 task_router).
+///
+/// Maps [`crate::backend_router::TaskKind`] (which picks *provider*) to a
+/// [`Capability`] (which picks *tier*):
+/// - `CodeRepair` -> `General` (implementation, diagnosis);
+/// - `Reasoning` -> `Reasoning` (step-by-step inference);
+/// - `General` -> `None`: unclassified traffic declares nothing and the router
+///   does nothing, rather than being guessed cheap.
+///
+/// The input is caller-declared, never inferred from prompt text, length, or
+/// keywords. See experiments/task_router/manifest.json (frozen 2026-09-07).
+pub fn capability_for_task(task: crate::backend_router::TaskKind) -> Option<Capability> {
+    match task {
+        crate::backend_router::TaskKind::CodeRepair => Some(Capability::General),
+        crate::backend_router::TaskKind::Reasoning => Some(Capability::Reasoning),
+        crate::backend_router::TaskKind::General => None,
+    }
+}
+
+/// Route a turn for a caller-declared task kind: [`select_model`] with the
+/// bridged capability and no mechanical/cooldown signals.
+pub fn select_for_task(
+    requested: &str,
+    task: crate::backend_router::TaskKind,
+    mode: RoutingMode,
+) -> RoutingDecision {
+    let signals = TurnSignals {
+        capability: capability_for_task(task),
+        ..TurnSignals::default()
+    };
+    select_model(requested, &signals, mode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +666,61 @@ mod tests {
             RoutingMode::Off,
             "an unknown mode must never rewrite a model"
         );
+    }
+
+    // ---- L3 task_router bridge ----
+
+    #[test]
+    fn task_kind_maps_to_capability_with_general_undeclared() {
+        use crate::backend_router::TaskKind as T;
+        assert_eq!(capability_for_task(T::CodeRepair), Some(Capability::General));
+        assert_eq!(capability_for_task(T::Reasoning), Some(Capability::Reasoning));
+        assert_eq!(
+            capability_for_task(T::General),
+            None,
+            "unclassified traffic must not be guessed into a tier"
+        );
+    }
+
+    #[test]
+    fn select_for_task_routes_declared_kinds_in_capability_mode() {
+        use crate::backend_router::TaskKind as T;
+        let d = select_for_task("claude-haiku-4-5", T::CodeRepair, CAPABILITY);
+        assert!(d.changed);
+        assert_eq!(d.selected_model, GENERAL_TIER);
+        assert_eq!(d.reason, RoutingReason::CapabilityMatched);
+        assert!(!d.economic_downgrade);
+
+        let d = select_for_task("claude-sonnet-5", T::Reasoning, CAPABILITY);
+        assert!(d.changed);
+        assert_eq!(d.selected_model, REASONING_TIER);
+
+        let d = select_for_task("claude-opus-4-8", T::Reasoning, CAPABILITY);
+        assert!(!d.changed, "opus already clears the reasoning floor");
+        assert_eq!(d.reason, RoutingReason::CapabilitySatisfied);
+    }
+
+    #[test]
+    fn select_for_task_leaves_general_undeclared_and_guards_scope() {
+        use crate::backend_router::TaskKind as T;
+        let d = select_for_task("claude-opus-4-8", T::General, CAPABILITY);
+        assert!(!d.changed);
+        assert_eq!(d.reason, RoutingReason::CapabilityNotSupplied);
+
+        let d = select_for_task("openai-fable-5", T::Reasoning, CAPABILITY);
+        assert!(!d.changed, "non-Claude ids are never rewritten");
+        assert_eq!(d.reason, RoutingReason::NotClaude);
+
+        let d = select_for_task("claude-opus-4-8", T::Reasoning, RoutingMode::Off);
+        assert!(!d.changed);
+        assert_eq!(d.reason, RoutingReason::Disabled);
+    }
+
+    #[test]
+    fn select_for_task_declared_capability_holds_floor_in_auto_mode() {
+        use crate::backend_router::TaskKind as T;
+        let d = select_for_task("claude-opus-4-8", T::CodeRepair, AUTO);
+        assert!(!d.changed, "a declared General floor vetoes the cost move");
+        assert_eq!(d.reason, RoutingReason::CapabilityFloorHeld);
     }
 }

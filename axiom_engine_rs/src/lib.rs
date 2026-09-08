@@ -9,6 +9,7 @@ pub mod belief;
 pub mod bench;
 pub mod bootstrap;
 pub mod cache_safety;
+pub mod cache_stack;
 #[cfg(feature = "experimental")]
 pub mod chimera;
 pub mod claude_backend;
