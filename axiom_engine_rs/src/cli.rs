@@ -39,6 +39,13 @@ pub enum AxiomCommand {
         /// Directory to crawl and measure (defaults to the current directory).
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Print one `[bench] UNRECOVERED <file>: <symbol>` line per signature
+        /// that failed to round-trip.
+        #[arg(long)]
+        verbose: bool,
+        /// Exit non-zero when any signature failed to round-trip.
+        #[arg(long)]
+        strict: bool,
     },
     /// Autonomy (Pillar 3): drive a failing verify command to green by chaining
     /// environment self-healing and Poly JIT / LLM source repair, then
