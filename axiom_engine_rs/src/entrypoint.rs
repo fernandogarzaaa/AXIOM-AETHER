@@ -736,7 +736,11 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 .unwrap_or_else(|_| std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH));
             prime::run_prime(&path, &pipeline, &vibe_path)?;
         }
-        AxiomCommand::Bench { path } => {
+        AxiomCommand::Bench {
+            path,
+            verbose,
+            strict,
+        } => {
             // Same model resolution as prime/server; bench only reads the
             // tokenizer for token counts, so a missing checkpoint is harmless.
             let device = device_from_str(
@@ -752,7 +756,11 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             };
             let pipeline =
                 InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
-            bench::run_bench(&path, &pipeline)?;
+            bench::run_bench(
+                &path,
+                &pipeline,
+                bench::BenchOptions { verbose, strict },
+            )?;
         }
         AxiomCommand::Solve {
             max_rounds,

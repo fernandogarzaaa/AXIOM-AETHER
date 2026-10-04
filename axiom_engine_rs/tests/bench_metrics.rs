@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use axiom_engine::bench::run_bench;
+use axiom_engine::bench::{run_bench, BenchOptions};
 use axiom_engine::config::AxiomConfig;
 use axiom_engine::inference::InferencePipeline;
 use candle_core::Device;
@@ -47,7 +47,7 @@ fn bench_reports_savings_and_full_fidelity_on_code() {
     fs::write(root.join("widget.rs"), src).unwrap();
 
     let pipeline = tiny_pipeline();
-    let report = run_bench(&root, &pipeline).expect("bench must succeed");
+    let report = run_bench(&root, &pipeline, BenchOptions::default()).expect("bench must succeed");
 
     assert_eq!(report.files, 1);
     assert!(report.original_tokens > 0);

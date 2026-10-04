@@ -493,7 +493,7 @@ The runtime supports both legacy `--mode` operation and newer subcommands:
 axiom --mode generate|train|server|mcp|lsp|meta-train|doctor
 axiom init [--no-fetch] [--no-train]
 axiom prime {dir}
-axiom bench {dir}
+axiom bench [--verbose] [--strict] {dir}
 axiom run [--dry-run] [--max-restarts N] -- {cmd}
 axiom solve [--source PATH] [--max-rounds N] -- {cmd}
 axiom task --goal "<desc>" [--file PATH]... [--max-attempts N] -- {cmd}

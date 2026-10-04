@@ -17,7 +17,7 @@
 //! It is intentionally honest about its limits: it does not claim an answer-
 //! quality delta it cannot measure offline.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use candle_core::Result;
 
@@ -132,6 +132,28 @@ pub struct BenchReport {
     pub skeleton_tokens: usize,
     pub symbols_total: usize,
     pub symbols_recovered: usize,
+    /// Signatures `expand_symbol` could not recover, with their source files.
+    pub unrecovered: Vec<UnrecoveredSymbol>,
+}
+
+/// One signature that failed to round-trip through `expand_symbol`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrecoveredSymbol {
+    /// Source file the unrecoverable signature was extracted from.
+    pub file: PathBuf,
+    /// The symbol `expand_symbol` could not recover.
+    pub symbol: String,
+}
+
+/// Options for `run_bench`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BenchOptions {
+    /// Print one `[bench] UNRECOVERED <file>: <symbol>` line per signature
+    /// that failed to round-trip.
+    pub verbose: bool,
+    /// Return an error (after printing the report) when any signature failed
+    /// to round-trip, so CI can gate on 100% fidelity.
+    pub strict: bool,
 }
 
 impl BenchReport {
@@ -150,11 +172,38 @@ impl BenchReport {
         }
         self.symbols_recovered as f64 / self.symbols_total as f64
     }
+
+    /// True when every retained signature round-tripped (vacuously true when
+    /// no signatures were kept).
+    pub fn is_lossless(&self) -> bool {
+        self.symbols_recovered == self.symbols_total
+    }
+}
+
+/// Round-trip every signature in `digest` against `source`, returning the
+/// ones `expand_symbol` could not recover (with the file they came from).
+fn unrecovered_in_file(source: &str, digest: &str, file: &Path) -> Vec<UnrecoveredSymbol> {
+    symbols_in_digest(digest)
+        .into_iter()
+        .filter(|symbol| expand_symbol(source, symbol).is_none())
+        .map(|symbol| UnrecoveredSymbol {
+            file: file.to_path_buf(),
+            symbol,
+        })
+        .collect()
 }
 
 /// Crawl `target`, skeletonize each source file, and measure token savings plus
 /// expand round-trip fidelity.
-pub fn run_bench(target: &Path, pipeline: &InferencePipeline) -> Result<BenchReport> {
+///
+/// With `BenchOptions::verbose`, unrecoverable signatures are printed as
+/// `[bench] UNRECOVERED <file>: <symbol>`. With `BenchOptions::strict`, a
+/// non-lossless result is returned as an error after the report is printed.
+pub fn run_bench(
+    target: &Path,
+    pipeline: &InferencePipeline,
+    opts: BenchOptions,
+) -> Result<BenchReport> {
     let max_files = env_usize("AXIOM_BENCH_MAX_FILES", DEFAULT_MAX_FILES);
     let files = collect_source_files(target, max_files);
 
@@ -177,19 +226,28 @@ pub fn run_bench(target: &Path, pipeline: &InferencePipeline) -> Result<BenchRep
         report.skeleton_tokens += skeleton_tokens;
 
         // Round-trip every signature retained in the digest.
-        for symbol in symbols_in_digest(&digest) {
-            report.symbols_total += 1;
-            if expand_symbol(&source, &symbol).is_some() {
-                report.symbols_recovered += 1;
-            }
-        }
+        let kept = symbols_in_digest(&digest).len();
+        let failures = unrecovered_in_file(&source, &digest, path);
+        report.symbols_total += kept;
+        report.symbols_recovered += kept - failures.len();
+        report.unrecovered.extend(failures);
     }
 
-    print_report(target, &report);
+    print_report(target, &report, opts.verbose);
+
+    if opts.strict && !report.is_lossless() {
+        let failed = report.symbols_total - report.symbols_recovered;
+        let total = report.symbols_total;
+        println!("[bench] STRICT: {failed}/{total} signatures failed round-trip");
+        return Err(candle_core::Error::Msg(format!(
+            "bench --strict: {failed}/{total} signatures failed round-trip"
+        )));
+    }
+
     Ok(report)
 }
 
-fn print_report(target: &Path, r: &BenchReport) {
+fn print_report(target: &Path, r: &BenchReport, verbose: bool) {
     println!("[bench] target: {}", target.display());
     println!("[bench] files measured        : {}", r.files);
     println!("[bench] original tokens        : {}", r.original_tokens);
@@ -207,6 +265,11 @@ fn print_report(target: &Path, r: &BenchReport) {
         r.symbols_total,
         r.fidelity_ratio() * 100.0
     );
+    if verbose {
+        for u in &r.unrecovered {
+            println!("[bench] UNRECOVERED {}: {}", u.file.display(), u.symbol);
+        }
+    }
     println!(
         "[bench] note: token savings + structural fidelity are measured offline. \
          Answer-quality delta needs an upstream model and is not asserted here."
@@ -259,5 +322,26 @@ struct RealStruct { … }";
         let r = BenchReport::default();
         assert_eq!(r.savings_ratio(), 0.0);
         assert_eq!(r.fidelity_ratio(), 1.0); // no symbols → vacuously perfect
+    }
+
+    #[test]
+    fn unrecovered_symbols_carry_file_and_name() {
+        let source = "pub fn real_fn() {}\n";
+        let digest = "pub fn real_fn() { … }\nfn ghost_fn() { … }\n";
+        let failures = unrecovered_in_file(source, digest, Path::new("src/lib.rs"));
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].file, PathBuf::from("src/lib.rs"));
+        assert_eq!(failures[0].symbol, "ghost_fn");
+    }
+
+    #[test]
+    fn strict_decision_is_lossless_only() {
+        let mut r = BenchReport::default();
+        assert!(r.is_lossless()); // vacuously true with no signatures
+        r.symbols_total = 4;
+        r.symbols_recovered = 4;
+        assert!(r.is_lossless());
+        r.symbols_recovered = 3;
+        assert!(!r.is_lossless());
     }
 }
