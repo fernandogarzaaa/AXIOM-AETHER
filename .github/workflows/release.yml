@@ -170,6 +170,20 @@ jobs:
       - name: Train + validate checkpoint
         run: ./scripts/train_cpu_quickstart.sh
 
+      # Smoke test: the freshly trained checkpoint must load into the release
+      # binary. Catches architecture drift between the training script and the
+      # binary's production config (e.g. a d128/2L checkpoint shipped with a
+      # binary expecting d_model 256, which hard-errors on shape mismatch, as
+      # happened in v0.4.1). Fails the release before any checkpoint asset is
+      # published. Linux-only: the checkpoint asset is platform-independent,
+      # so one platform proving the pair is compatible is enough.
+      - name: Verify checkpoint loads in release binary
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --bin axiom_engine --manifest-path axiom_engine_rs/Cargo.toml
+          AXIOM_DEVICE=cpu AXIOM_PRODUCTION_BPE=1 \
+            ./axiom_engine_rs/target/release/axiom_engine bench axiom_engine_rs/src
+
       - name: Stage release assets
         run: |
           set -euo pipefail

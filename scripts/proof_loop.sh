@@ -3,7 +3,9 @@
 # markdown table. See docs/PROOF-LOOP.md.
 #
 #   ./scripts/proof_loop.sh            # human run: table to stdout + bench/results/
-#   ./scripts/proof_loop.sh --check    # CI: also exit non-zero if the repair gate fails
+#   ./scripts/proof_loop.sh --check    # CI: also exit non-zero if the repair
+#                                    gate or the bench --strict round-trip
+#                                    gate fails
 #
 # Metrics:
 #   1. Autonomous repair  — `axiom eval-agentic`         (deterministic, no LLM)
@@ -54,18 +56,21 @@ parse_bench() {
     printf '%s with %s' "$savings" "$roundtrip"
   fi
 }
-COMP_LEGACY_OUT="$(AXIOM_PRODUCTION_BPE=0 "$BIN" bench "$TREE" 2>&1)"
+COMP_LEGACY_OUT="$(AXIOM_PRODUCTION_BPE=0 "$BIN" bench --strict "$TREE" 2>&1)"
+LEGACY_RC=$?
 COMP_LEGACY="$(parse_bench "$COMP_LEGACY_OUT")"
 [ -n "$COMP_LEGACY" ] || COMP_LEGACY="parse-failed"
 
 CKPT="$CRATE/checkpoints/axiom_production_bpe.bin"
 TOK="$CRATE/checkpoints/axiom_bpe.json"
 if [ -f "$CKPT" ] && [ -f "$TOK" ]; then
-  COMP_BPE_OUT="$(AXIOM_PRODUCTION_BPE=1 AXIOM_BPE_CKPT="$CKPT" AXIOM_TOKENIZER="$TOK" "$BIN" bench "$TREE" 2>&1)"
+  COMP_BPE_OUT="$(AXIOM_PRODUCTION_BPE=1 AXIOM_BPE_CKPT="$CKPT" AXIOM_TOKENIZER="$TOK" "$BIN" bench --strict "$TREE" 2>&1)"
+  BPE_RC=$?
   COMP_BPE="$(parse_bench "$COMP_BPE_OUT")"
   [ -n "$COMP_BPE" ] || COMP_BPE="parse-failed"
 else
   COMP_BPE="skipped (no checkpoint at checkpoints/axiom_production_bpe.bin)"
+  BPE_RC=0
 fi
 
 # --- 3. grounding / trust gate --------------------------------------------- ---
@@ -100,4 +105,8 @@ if [ "$CHECK" = "1" ]; then
     *"= 100%") : ;;
     *) echo "PROOF LOOP FAIL: autonomous-repair gate is not 100% ($REPAIR)" >&2; exit 1 ;;
   esac
+  [ "$LEGACY_RC" -eq 0 ] \
+    || { echo "PROOF LOOP FAIL: legacy-tokenizer bench round-trip is not 100% (bench --strict exited $LEGACY_RC)" >&2; exit 1; }
+  [ "$BPE_RC" -eq 0 ] \
+    || { echo "PROOF LOOP FAIL: production-BPE bench round-trip is not 100% (bench --strict exited $BPE_RC)" >&2; exit 1; }
 fi
