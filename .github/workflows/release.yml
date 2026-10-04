@@ -171,12 +171,13 @@ jobs:
         run: ./scripts/train_cpu_quickstart.sh
 
       # Smoke test: the freshly trained checkpoint must load into the release
-      # binary. Catches architecture drift between the training script and the
-      # binary's production config (e.g. a d128/2L checkpoint shipped with a
-      # binary expecting d_model 256, which hard-errors on shape mismatch, as
-      # happened in v0.4.1). Fails the release before any checkpoint asset is
-      # published. Linux-only: the checkpoint asset is platform-independent,
-      # so one platform proving the pair is compatible is enough.
+      # binary. Dims are read from the checkpoint sidecar
+      # (axiom_production_bpe.meta.json), so any baked size loads; without
+      # the sidecar the binary falls back to its 256/4 production default
+      # and a mismatched checkpoint hard-errors on shape mismatch. This
+      # step fails the release before any checkpoint asset is published.
+      # Linux-only: the checkpoint asset is platform-independent, so one
+      # platform proving the pair is compatible is enough.
       - name: Verify checkpoint loads in release binary
         run: |
           set -euo pipefail
