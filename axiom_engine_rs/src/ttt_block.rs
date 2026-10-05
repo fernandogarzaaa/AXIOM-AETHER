@@ -217,15 +217,27 @@ impl NativeTTTBlock {
         } else {
             None
         };
+        let w_q = candle_nn::linear_no_bias(d, d, vs.pp("w_q"))?;
+        let w_k = candle_nn::linear_no_bias(d, d, vs.pp("w_k"))?;
+        let w_v = candle_nn::linear_no_bias(d, d, vs.pp("w_v"))?;
+        // Device for fallback init (backward compat with old checkpoints).
+        let device = w_q.weight().device().clone();
         // Learnable per-layer LR scale (scalar). Formula: η_eff = η_base * 2σ(lr_scale).
         // Default init gives values near 0 ⇒ factor ≈ 1.0 ⇒ starts close to the
         // unmodulated path. The optimizer tunes it during meta-training.
-        let lr_scale = vs.pp("lr_scale").get((), "lr_scale")?;
+        // Backward compat: old checkpoints lack lr_scale; init to 0.
+        let lr_scale = vs.pp("lr_scale").get((), "lr_scale").unwrap_or_else(|_| {
+            Tensor::zeros((), candle_core::DType::F32, &device).unwrap()
+        });
+        // Fast-weight bias. Backward compat: old checkpoints lack fast_bias; init to 0.
+        let fast_bias = vs.pp("fast_bias").get(d, "fast_bias").unwrap_or_else(|_| {
+            Tensor::zeros(d, candle_core::DType::F32, &device).unwrap()
+        });
         Ok(Self {
-            w_q: candle_nn::linear_no_bias(d, d, vs.pp("w_q"))?,
-            w_k: candle_nn::linear_no_bias(d, d, vs.pp("w_k"))?,
-            w_v: candle_nn::linear_no_bias(d, d, vs.pp("w_v"))?,
-            fast_bias: vs.pp("fast_bias").get(d, "fast_bias")?,
+            w_q,
+            w_k,
+            w_v,
+            fast_bias,
             layer_norm: candle_nn::layer_norm_no_bias(
                 d,
                 config.norm_eps as f64,

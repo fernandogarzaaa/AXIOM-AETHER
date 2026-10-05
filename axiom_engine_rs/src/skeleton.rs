@@ -633,7 +633,9 @@ fn extract_symbols_rust(heavy: &str) -> (Vec<String>, Vec<RankedSymbol>) {
     let mut captured: Vec<(usize, &'static str, Node)> = Vec::new();
     collect_rust_captures(tree.root_node(), &mut captured);
     captured.sort_by_key(|(start, _, _)| *start);
-    let mut seen: HashSet<String> = HashSet::new();
+    // Key dedup on node start byte, not signature text: methods with
+    // identical signatures in different impl blocks are distinct symbols.
+    let mut seen: HashSet<usize> = HashSet::new();
     for (_, kind, node) in captured {
         if kind == "import" {
             if let Some(t) = node_text(node, heavy) {
@@ -646,7 +648,7 @@ fn extract_symbols_rust(heavy: &str) -> (Vec<String>, Vec<RankedSymbol>) {
             let Some(signature) = render_rust_decl(node, heavy) else {
                 continue;
             };
-            if !seen.insert(signature.clone()) {
+            if !seen.insert(node.start_byte()) {
                 continue;
             }
             let name = rust_decl_name(node, heavy).unwrap_or_default();
@@ -815,8 +817,19 @@ pub fn skeletonize_ranked(
     let mut out: Vec<String> = Vec::new();
     let mut used = 0usize;
     let mut elided = 0usize;
+    // Cap imports at 25% of budget so declarations (the ranked content)
+    // always get room. Without a budget, emit all imports.
+    let import_budget = token_budget.map(|b| b / 4);
+    let mut import_used = 0usize;
     for imp in &imports {
         let t = approx_tokens(imp);
+        if let Some(ibudget) = import_budget {
+            if import_used + t > ibudget && !out.is_empty() {
+                elided += 1;
+                continue;
+            }
+            import_used += t;
+        }
         if let Some(budget) = token_budget {
             if used + t > budget && !out.is_empty() {
                 elided += 1;

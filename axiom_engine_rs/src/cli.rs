@@ -51,7 +51,7 @@ pub enum AxiomCommand {
         ranked: bool,
         /// Token budget for skeleton output (only with --ranked). Keeps
         /// highest-ranked symbols first.
-        #[arg(long)]
+        #[arg(long, requires = "ranked")]
         budget: Option<usize>,
     },
     /// Autonomy (Pillar 3): drive a failing verify command to green by chaining
