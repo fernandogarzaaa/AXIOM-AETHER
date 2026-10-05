@@ -317,7 +317,7 @@ impl AxiomTTTLM {
     /// `[1, T, vocab_size]`. Equivalent to `lm_head(forward_hidden(..))`; the
     /// hidden-state computation lives in [`Self::forward_hidden`].
     pub fn forward_lm(&self, input_ids: &Tensor, session_states: &mut [Tensor], training: bool, pos_offset: usize) -> Result<Tensor> {
-        let normed = self.forward_hidden(input_ids, session_states, training, 0)?;
+        let normed = self.forward_hidden(input_ids, session_states, training, pos_offset)?;
         self.lm_head.forward(&normed)
     }
 
