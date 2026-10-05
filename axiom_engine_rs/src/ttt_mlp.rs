@@ -132,7 +132,7 @@ impl NativeTTTMlpBlock {
     /// * `state` – the `[h,d]` / `[d,h]` MLP fast-weights, updated in place.
     ///
     /// Returns `[1, d_model]` after the update and embedded layer norm.
-    pub fn forward_native(&self, x: &Tensor, state: &mut MlpState) -> Result<Tensor> {
+    pub fn forward_native(&self, x: &Tensor, state: &mut MlpState, training: bool) -> Result<Tensor> {
         let q = self.w_q.forward(x)?; // [1,d]
         let k = self.w_k.forward(x)?; // [1,d]
         let v = self.w_v.forward(x)?; // [1,d]
@@ -161,10 +161,16 @@ impl NativeTTTMlpBlock {
         // dW1 = dz ⊗ k  ([h,1]·[1,d] = [h,d]).
         let dw1 = dz.unsqueeze(1)?.matmul(&k_vec.unsqueeze(0)?)?;
 
-        // One gradient-descent step on both layers; detach (inference cache, not
-        // a BPTT tape).
-        state.w2 = state.w2.sub(&dw2.broadcast_mul(&lr)?)?.detach();
-        state.w1 = state.w1.sub(&dw1.broadcast_mul(&lr)?)?.detach();
+        // One gradient-descent step on both layers. During meta-training
+        // (training=true), skip detach so gradients flow through the inner loop.
+        // Otherwise detach (inference cache, not a BPTT tape).
+        if training {
+            state.w2 = state.w2.sub(&dw2.broadcast_mul(&lr)?)?;
+            state.w1 = state.w1.sub(&dw1.broadcast_mul(&lr)?)?;
+        } else {
+            state.w2 = state.w2.sub(&dw2.broadcast_mul(&lr)?)?.detach();
+            state.w1 = state.w1.sub(&dw1.broadcast_mul(&lr)?)?.detach();
+        }
 
         // Output: read the (updated) MLP with the query. out = W2 tanh(W1 q).
         let q_col = q.squeeze(0)?.unsqueeze(1)?; // [d,1]
@@ -216,7 +222,7 @@ mod tests {
         let (block, device) = make_block(d, d);
         let mut st = block.init_state(&device).unwrap();
         let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
-        let out = block.forward_native(&x, &mut st).unwrap();
+        let out = block.forward_native(&x, &mut st, false).unwrap();
         assert_eq!(out.dims(), &[1, d]);
         let ov: Vec<f32> = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(ov.iter().all(|v| v.is_finite()));
@@ -230,7 +236,7 @@ mod tests {
         let w1_before = st.w1.clone();
         let w2_before = st.w2.clone();
         let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
-        let _ = block.forward_native(&x, &mut st).unwrap();
+        let _ = block.forward_native(&x, &mut st, false).unwrap();
         let d1 = st.w1.sub(&w1_before).unwrap().sqr().unwrap().sum_all().unwrap()
             .to_scalar::<f32>().unwrap();
         let d2 = st.w2.sub(&w2_before).unwrap().sqr().unwrap().sum_all().unwrap()
@@ -247,7 +253,7 @@ mod tests {
         assert_eq!(block.hidden(), 20);
         let mut st = block.init_state(&device).unwrap();
         let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
-        let out = block.forward_native(&x, &mut st).unwrap();
+        let out = block.forward_native(&x, &mut st, false).unwrap();
         assert_eq!(out.dims(), &[1, d]);
     }
 
@@ -273,7 +279,7 @@ mod tests {
 
         let before = recon_err(&block, &st);
         for _ in 0..40 {
-            let _ = block.forward_native(&x, &mut st).unwrap();
+            let _ = block.forward_native(&x, &mut st, false).unwrap();
         }
         let after = recon_err(&block, &st);
         assert!(

@@ -311,7 +311,7 @@ fn claim_ce(
     let input =
         candle_core::Tensor::from_vec(ids[..ids.len() - 1].to_vec(), (1, ids.len() - 1), dev)
             .ok()?;
-    let logits = pipeline.model().forward_lm(&input, &mut probe).ok()?;
+    let logits = pipeline.model().forward_lm(&input, &mut probe, false).ok()?;
     let (_, t, v) = logits.dims3().ok()?;
     let l2d = logits.squeeze(0).ok()?.reshape((t, v)).ok()?;
     let tgt = candle_core::Tensor::from_vec(ids[1..].to_vec(), (ids.len() - 1,), dev).ok()?;

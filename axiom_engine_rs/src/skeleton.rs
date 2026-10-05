@@ -11,6 +11,7 @@
 //! heavy context into its fast-weights (adapt_session), and the drift signal
 //! (recall_norm + state_hash) rides along as tiny attributes on the digest.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use tree_sitter::{Node, Parser, Query};
@@ -507,6 +508,343 @@ pub fn expand_symbol(source: &str, name: &str) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// PageRank-ranked skeletonization.
+//
+// `build_digest` keeps every declaration equally: under a token budget the
+// output truncates arbitrarily. The ranked variant below builds an intra-file
+// reference graph (symbol A -> symbol B when A's body mentions B) and orders
+// declarations by PageRank, so a budget keeps the most load-bearing symbols
+// first and the skeleton degrades gracefully instead of cutting off mid-file.
+// ---------------------------------------------------------------------------
+
+/// One extracted declaration: display signature, full body text (reference
+/// scanning only — never rendered), and its PageRank importance score.
+struct RankedSymbol {
+    name: String,
+    signature: String,
+    body: String,
+    score: f64,
+}
+
+/// Approximate token count, matching the Python prototype's chars/4 rule.
+fn approx_tokens(s: &str) -> usize {
+    (s.len() / 4).max(1)
+}
+
+/// PageRank over `adj` (adjacency lists, edge i -> j). Dangling nodes
+/// distribute their rank uniformly. Standard power iteration.
+fn pagerank(adj: &[Vec<usize>], damping: f64, iterations: usize) -> Vec<f64> {
+    let n = adj.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let nf = n as f64;
+    let mut rank = vec![1.0 / nf; n];
+    let teleport = (1.0 - damping) / nf;
+    for _ in 0..iterations {
+        let mut next = vec![teleport; n];
+        for (i, outs) in adj.iter().enumerate() {
+            if outs.is_empty() {
+                let share = damping * rank[i] / nf;
+                for r in next.iter_mut() {
+                    *r += share;
+                }
+            } else {
+                let share = damping * rank[i] / outs.len() as f64;
+                for &j in outs {
+                    next[j] += share;
+                }
+            }
+        }
+        rank = next;
+    }
+    rank
+}
+
+/// Edge i -> j when symbol i's body mentions symbol j's name as a whole
+/// identifier (heuristic reference extraction; v1, no type resolution).
+fn build_reference_graph(symbols: &[RankedSymbol]) -> Vec<Vec<usize>> {
+    let n = symbols.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for j in 0..n {
+            if i == j || symbols[j].name.is_empty() {
+                continue;
+            }
+            if contains_symbol(&symbols[i].body, &symbols[j].name) {
+                adj[i].push(j);
+            }
+        }
+    }
+    adj
+}
+
+/// Best-effort declaration name from a tree-sitter Rust node: the grammar's
+/// `name` field when present, else the first identifier-like direct child.
+/// For `impl` blocks, prefers the implemented type (`impl Trait for Type`
+/// yields `Type`).
+fn rust_decl_name(node: Node, source: &str) -> Option<String> {
+    if let Some(n) = node.child_by_field_name("name") {
+        if let Some(t) = node_text(n, source) {
+            let t = t.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    // Direct identifier-like children, in source order, stopping at the body.
+    let mut cands: Vec<String> = Vec::new();
+    for i in 0..node.named_child_count() {
+        let c = node.named_child(i as u32)?;
+        match c.kind() {
+            "declaration_list" | "block" | "field_declaration_list"
+            | "ordered_field_declaration_list" | "enum_variant_list" | "token_tree" => break,
+            "identifier" | "type_identifier" => {
+                if let Some(t) = node_text(c, source) {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        cands.push(t.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if node.kind() == "impl_item" {
+        // `impl Trait for Type` — the type is what other code references.
+        cands.pop()
+    } else {
+        cands.into_iter().next()
+    }
+}
+
+/// Extract (imports, declarations) from Rust via tree-sitter.
+fn extract_symbols_rust(heavy: &str) -> (Vec<String>, Vec<RankedSymbol>) {
+    let mut imports = Vec::new();
+    let mut symbols = Vec::new();
+    let mut parser = Parser::new();
+    let Ok(()) = parser.set_language(&tree_sitter_rust::LANGUAGE.into()) else {
+        return (imports, symbols);
+    };
+    let Some(tree) = parser.parse(heavy, None) else {
+        return (imports, symbols);
+    };
+    let mut captured: Vec<(usize, &'static str, Node)> = Vec::new();
+    collect_rust_captures(tree.root_node(), &mut captured);
+    captured.sort_by_key(|(start, _, _)| *start);
+    let mut seen: HashSet<String> = HashSet::new();
+    for (_, kind, node) in captured {
+        if kind == "import" {
+            if let Some(t) = node_text(node, heavy) {
+                let t = t.trim_end().to_string();
+                if !imports.contains(&t) {
+                    imports.push(t);
+                }
+            }
+        } else if kind == "decl" {
+            let Some(signature) = render_rust_decl(node, heavy) else {
+                continue;
+            };
+            if !seen.insert(signature.clone()) {
+                continue;
+            }
+            let name = rust_decl_name(node, heavy).unwrap_or_default();
+            let body = node_text(node, heavy).unwrap_or("").to_string();
+            symbols.push(RankedSymbol {
+                name,
+                signature,
+                body,
+                score: 0.0,
+            });
+        }
+    }
+    (imports, symbols)
+}
+
+/// Heuristic declaration name from a source line, mirroring `is_decl`'s
+/// prefix stripping. `fn add(a: i32)` -> `add`; `class Foo:` -> `Foo`.
+fn extract_decl_name(line: &str) -> Option<String> {
+    let mut s = line.trim_start();
+    // Strip stacked visibility/async prefixes (same as is_decl).
+    loop {
+        let mut changed = false;
+        for p in VIS_PREFIXES {
+            if let Some(rest) = s.strip_prefix(p) {
+                s = rest.trim_start();
+                changed = true;
+            }
+        }
+        if let Some(rest) = s.strip_prefix("pub(") {
+            if let Some(i) = rest.find(')') {
+                s = rest[i + 1..].trim_start();
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Case 1: parameter list present — name is the identifier before '('.
+    if let Some(paren) = s.find('(') {
+        let before = s[..paren].trim_end();
+        if let Some(tok) = before.split_whitespace().last() {
+            let name = tok.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+            if !name.is_empty() && !is_decl_keyword(name) {
+                return Some(name.to_string());
+            }
+        }
+        // Fell through: the pre-paren token was a keyword (e.g. `const f: fn()`).
+    }
+    // Case 2: no parens, or keyword fallback — first identifier after the
+    // declaration keyword. Skip `impl<...>` generics.
+    if let Some(rest) = s.strip_prefix("impl<") {
+        if let Some(gt) = rest.find('>') {
+            s = rest[gt + 1..].trim_start();
+        }
+    }
+    for kw in DECL_KEYWORDS {
+        if let Some(rest) = s.strip_prefix(kw) {
+            let mut toks = rest.split_whitespace();
+            let mut tok = toks.next()?;
+            if tok.starts_with('<') {
+                while !tok.contains('>') {
+                    tok = toks.next()?;
+                }
+                tok = toks.next()?;
+            }
+            let name = tok.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// True if `name` is itself a declaration keyword (so `const f: fn()` yields
+/// `f`, not `fn`).
+fn is_decl_keyword(name: &str) -> bool {
+    DECL_KEYWORDS
+        .iter()
+        .any(|k| k.trim_end() == name || k.trim_end_matches('<') == name)
+}
+
+/// Extract (imports, declarations) with the language-agnostic line heuristic
+/// used by `build_digest`'s non-Rust path. Bodies come from `capture_block`.
+fn extract_symbols_generic(heavy: &str) -> (Vec<String>, Vec<RankedSymbol>) {
+    let mut imports = Vec::new();
+    let mut symbols = Vec::new();
+    let lines: Vec<&str> = heavy.lines().collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if t.is_empty() {
+            continue;
+        }
+        if is_import(t) {
+            let s = line.trim_end().to_string();
+            if !imports.contains(&s) {
+                imports.push(s);
+            }
+        } else if is_decl(t) || looks_like_signature(t) {
+            let base = line.split('{').next().unwrap_or(line).trim_end();
+            let signature = if line.contains('{') {
+                format!("{base} {{ … }}")
+            } else {
+                base.to_string()
+            };
+            if !seen.insert(signature.clone()) {
+                continue;
+            }
+            let name = extract_decl_name(line).unwrap_or_default();
+            let body = capture_block(&lines, i);
+            symbols.push(RankedSymbol {
+                name,
+                signature,
+                body,
+                score: 0.0,
+            });
+        }
+    }
+    (imports, symbols)
+}
+
+/// Ranked skeletonization: declarations ordered by PageRank importance over the
+/// intra-file reference graph, so a token budget keeps the most load-bearing
+/// symbols first.
+///
+/// `language` selects the extractor: `"rust"` (or `"rs"`) uses tree-sitter;
+/// anything else uses the language-agnostic line heuristic. `token_budget`
+/// caps approximate output tokens (chars/4); `None` keeps everything.
+/// Imports always lead (deduped, source order); declarations follow sorted by
+/// score descending. At least one line is emitted whenever there is content.
+///
+/// This is additive: `build_digest` and `expand_symbol` are untouched.
+pub fn skeletonize_ranked(
+    text: &str,
+    language: &str,
+    token_budget: Option<usize>,
+) -> String {
+    let (imports, mut symbols) = if language.eq_ignore_ascii_case("rust")
+        || language.eq_ignore_ascii_case("rs")
+    {
+        extract_symbols_rust(text)
+    } else {
+        extract_symbols_generic(text)
+    };
+
+    if !symbols.is_empty() {
+        let adj = build_reference_graph(&symbols);
+        let scores = pagerank(&adj, 0.85, 20);
+        for (sym, sc) in symbols.iter_mut().zip(scores.iter()) {
+            sym.score = *sc;
+        }
+        symbols.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(Ordering::Equal)
+        });
+    }
+
+    // No code structure found: fall back to a prose excerpt like build_digest.
+    if imports.is_empty() && symbols.is_empty() {
+        return prose_excerpt(text, 1200, 500);
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut elided = 0usize;
+    for imp in &imports {
+        let t = approx_tokens(imp);
+        if let Some(budget) = token_budget {
+            if used + t > budget && !out.is_empty() {
+                elided += 1;
+                continue;
+            }
+            used += t;
+        }
+        out.push(imp.clone());
+    }
+    for sym in &symbols {
+        let t = approx_tokens(&sym.signature);
+        if let Some(budget) = token_budget {
+            if used + t > budget && !out.is_empty() {
+                elided += 1;
+                continue;
+            }
+            used += t;
+        }
+        out.push(sym.signature.clone());
+    }
+    if elided > 0 {
+        out.push(format!(
+            "// … {elided} lower-ranked lines elided by token budget …"
+        ));
+    }
+    out.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,5 +998,121 @@ impl Point {
         assert!(body.contains("fn add()"));
         assert!(body.contains("real()"));
         assert!(!body.contains("readd"));
+    }
+
+    // --- PageRank-ranked skeletonization -----------------------------------
+
+    #[test]
+    fn pagerank_orders_by_inbound_references() {
+        // 0 -> 1, 0 -> 2, 1 -> 2 : node 2 has the most inbound references.
+        let adj = vec![vec![1, 2], vec![2], vec![]];
+        let r = pagerank(&adj, 0.85, 20);
+        assert!(r[2] > r[1], "{r:?}");
+        assert!(r[1] > r[0], "{r:?}");
+        let sum: f64 = r.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "{sum}");
+    }
+
+    #[test]
+    fn pagerank_uniform_when_no_edges() {
+        let adj = vec![vec![], vec![], vec![]];
+        let r = pagerank(&adj, 0.85, 20);
+        for v in &r {
+            assert!((*v - 1.0 / 3.0).abs() < 1e-9, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn pagerank_empty_graph() {
+        let r = pagerank(&[], 0.85, 20);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn ranked_rust_skeleton_orders_callees_first() {
+        // util <- helper <- main : the most-depended-upon symbol leads.
+        let src = "fn util() -> i32 {\n    1\n}\nfn helper() -> i32 {\n    util() + util()\n}\nfn main() {\n    let x = helper();\n}\n";
+        let out = skeletonize_ranked(src, "rust", None);
+        let pu = out.find("fn util()").expect("util missing");
+        let ph = out.find("fn helper()").expect("helper missing");
+        let pm = out.find("fn main()").expect("main missing");
+        assert!(pu < ph && ph < pm, "{out}");
+    }
+
+    #[test]
+    fn ranked_rust_keeps_imports_first() {
+        let src = "use std::collections::HashMap;\nfn b() {\n    a();\n}\nfn a() {}\n";
+        let out = skeletonize_ranked(src, "rust", None);
+        let pi = out.find("use std::collections::HashMap;").unwrap();
+        let pa = out.find("fn a()").unwrap();
+        assert!(pi < pa, "{out}");
+        // a is referenced by b, so a outranks b
+        let pb = out.find("fn b()").unwrap();
+        assert!(pa < pb, "{out}");
+    }
+
+    #[test]
+    fn token_budget_keeps_top_symbols() {
+        let src = "fn aaa() {\n    bbb();\n}\nfn bbb() {\n    ccc();\n}\nfn ccc() -> i32 {\n    42\n}\n";
+        let out = skeletonize_ranked(src, "rust", Some(10));
+        assert!(out.contains("fn ccc()"), "{out}");
+        assert!(!out.contains("fn aaa()"), "{out}");
+        assert!(out.contains("elided by token budget"), "{out}");
+    }
+
+    #[test]
+    fn token_budget_none_keeps_everything() {
+        let src = "fn aaa() {\n    bbb();\n}\nfn bbb() {\n    ccc();\n}\nfn ccc() -> i32 {\n    42\n}\n";
+        let out = skeletonize_ranked(src, "rust", None);
+        assert!(out.contains("fn aaa()"));
+        assert!(out.contains("fn bbb()"));
+        assert!(out.contains("fn ccc()"));
+        assert!(!out.contains("elided by token budget"));
+    }
+
+    #[test]
+    fn ranked_generic_python_path() {
+        let src = "import os\nclass Foo:\n    def bar(self):\n        return baz()\ndef baz():\n    return 1\n";
+        let out = skeletonize_ranked(src, "python", None);
+        assert!(out.contains("import os"), "{out}");
+        let pb = out.find("def baz():").expect("baz missing");
+        let pf = out.find("def bar(self):").expect("bar missing");
+        assert!(pb < pf, "{out}");
+    }
+
+    #[test]
+    fn ranked_prose_falls_back_to_excerpt() {
+        let para = "The quarterly report shows revenue grew. ".repeat(80);
+        let out = skeletonize_ranked(&para, "english", None);
+        assert!(out.contains("quarterly report"), "{out}");
+    }
+
+    #[test]
+    fn extract_decl_name_cases() {
+        assert_eq!(
+            extract_decl_name("pub fn add(a: i32) -> i32 {"),
+            Some("add".to_string())
+        );
+        assert_eq!(
+            extract_decl_name("class Foo:"),
+            Some("Foo".to_string())
+        );
+        assert_eq!(
+            extract_decl_name("    async handle(req, res) {"),
+            Some("handle".to_string())
+        );
+        assert_eq!(
+            extract_decl_name("const MAX: usize = 5;"),
+            Some("MAX".to_string())
+        );
+        assert_eq!(
+            extract_decl_name("impl Point {"),
+            Some("Point".to_string())
+        );
+        // `fn` after a colon is a type, not the name.
+        assert_eq!(
+            extract_decl_name("const f: fn() = g;"),
+            Some("f".to_string())
+        );
     }
 }

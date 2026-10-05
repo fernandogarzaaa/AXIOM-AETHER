@@ -99,7 +99,7 @@ impl AxiomMlpLM {
             let token_emb = embeddings.narrow(1, t, 1)?.squeeze(1)?;
             let mut hidden = token_emb;
             for (i, block) in self.layers.iter().enumerate() {
-                hidden = block.forward_native(&hidden, &mut states[i])?;
+                hidden = block.forward_native(&hidden, &mut states[i], false)?;
             }
             token_outputs.push(hidden);
         }
@@ -161,7 +161,7 @@ pub fn mlp_vs_linear_reconstruction(
     let lin = NativeTTTBlock::new(lin_vb.pp("lin"), config.clone())?;
     let mut lin_state = Tensor::eye(d_model, DType::F32, &device)?;
     for _ in 0..steps {
-        let _ = lin.forward_native(&x, &mut lin_state)?;
+        let _ = lin.forward_native(&x, &mut lin_state, false)?;
     }
     let lin_res = lin.reconstruction_error(&x, &lin_state)?;
 
@@ -171,7 +171,7 @@ pub fn mlp_vs_linear_reconstruction(
     let mlp = NativeTTTMlpBlock::new(mlp_vb.pp("mlp"), config, hidden)?;
     let mut mlp_state = mlp.init_state(&device)?;
     for _ in 0..steps {
-        let _ = mlp.forward_native(&x, &mut mlp_state)?;
+        let _ = mlp.forward_native(&x, &mut mlp_state, false)?;
     }
     let mlp_res = mlp.reconstruction_error(&x, &mlp_state)?;
 

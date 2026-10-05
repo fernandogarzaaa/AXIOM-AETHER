@@ -154,6 +154,10 @@ pub struct BenchOptions {
     /// Return an error (after printing the report) when any signature failed
     /// to round-trip, so CI can gate on 100% fidelity.
     pub strict: bool,
+    /// Use PageRank-ranked skeletonization instead of the default unranked.
+    pub ranked: bool,
+    /// Token budget for ranked skeleton output. Keeps highest-ranked symbols.
+    pub budget: Option<usize>,
 }
 
 impl BenchReport {
@@ -218,7 +222,15 @@ pub fn run_bench(
             continue;
         }
         let original_tokens = pipeline.token_count(&source);
-        let digest = build_digest(&source, "bench", original_tokens, 0.0, "bench", 3);
+        let digest = if opts.ranked {
+            // PageRank-ranked skeletonization: symbols ordered by importance.
+            let lang = path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            crate::skeleton::skeletonize_ranked(&source, lang, opts.budget)
+        } else {
+            build_digest(&source, "bench", original_tokens, 0.0, "bench", 3)
+        };
         let skeleton_tokens = pipeline.token_count(&digest);
 
         report.files += 1;

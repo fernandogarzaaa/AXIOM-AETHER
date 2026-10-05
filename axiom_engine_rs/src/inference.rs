@@ -233,7 +233,7 @@ impl InferencePipeline {
         if !prompt_ids.is_empty() {
             let prompt_tensor =
                 Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &self.device)?;
-            let _ = self.model.forward_lm(&prompt_tensor, &mut states[..])?;
+            let _ = self.model.forward_lm(&prompt_tensor, &mut states[..], false)?;
         }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
@@ -243,7 +243,7 @@ impl InferencePipeline {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             // Snapshot states so a non-finite update can be discarded.
             let states_snapshot = states.clone();
-            let logits = self.model.forward_lm(&token_tensor, &mut states[..])?;
+            let logits = self.model.forward_lm(&token_tensor, &mut states[..], false)?;
             if !session_states_are_finite(&states)? {
                 eprintln!(
                     "[emergency] non-finite state detected during generate_with_session; \
@@ -284,7 +284,7 @@ impl InferencePipeline {
                 let tensor = Tensor::from_vec(token_ids, (1, len), &self.device)?;
                 // Snapshot for non-finite guard.
                 let snapshot = states.clone();
-                let _ = self.model.forward_lm(&tensor, &mut states[..])?;
+                let _ = self.model.forward_lm(&tensor, &mut states[..], false)?;
                 if !session_states_are_finite(&states)? {
                     eprintln!(
                         "[emergency] non-finite state detected during corpus adaptation; \
@@ -396,7 +396,7 @@ impl InferencePipeline {
         if !context_ids.is_empty() {
             let len = context_ids.len();
             let ctx = Tensor::from_vec(context_ids, (1, len), &self.device)?;
-            let _ = self.model.forward_lm(&ctx, &mut states[..])?;
+            let _ = self.model.forward_lm(&ctx, &mut states[..], false)?;
         }
 
         // Optional memory-vector injection: directly condition the initial fast-weight
@@ -429,7 +429,7 @@ impl InferencePipeline {
         if !prompt_ids.is_empty() {
             let prompt_tensor =
                 Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &self.device)?;
-            let _ = self.model.forward_lm(&prompt_tensor, &mut states[..])?;
+            let _ = self.model.forward_lm(&prompt_tensor, &mut states[..], false)?;
         }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
@@ -438,7 +438,7 @@ impl InferencePipeline {
         for _ in 0..max_new_tokens {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             let states_snapshot = states.clone();
-            let logits = self.model.forward_lm(&token_tensor, &mut states[..])?;
+            let logits = self.model.forward_lm(&token_tensor, &mut states[..], false)?;
             if !session_states_are_finite(&states)? {
                 eprintln!(
                     "[emergency] non-finite state detected during generate_with_memory; \
