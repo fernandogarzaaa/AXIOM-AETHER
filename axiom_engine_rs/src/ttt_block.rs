@@ -28,6 +28,11 @@ pub struct NativeTTTBlock {
     w_q: Linear,
     w_k: Linear,
     w_v: Linear,
+    /// Fast-weight bias vector `[d_model]`, added to the key→value prediction:
+    /// `pred = W~ @ k + b`. Initialized to zeros so the default path is
+    /// byte-identical to the unbiased version. Learned via outer-loop
+    /// meta-gradients (like the reference's `b1` parameter).
+    fast_bias: Tensor,
     layer_norm: LayerNorm,
     /// Inner test-time learning rate η, stored as raw f32 bits so it can be
     /// adjusted at runtime (e.g. cosine decay during meta-training) and
@@ -65,6 +70,15 @@ pub struct NativeTTTBlock {
     /// anti-forgetting anchor). Shared `Arc` like `inner_lr` so one call on the
     /// model retunes every layer at once. Default-disabled ⇒ byte-identical.
     guards: Arc<OnlineGuards>,
+    /// Learnable per-layer inner-LR modulation (finding #3). The effective
+    /// learning rate is `η_eff = η_base * 2 * σ(lr_scale)`, where `η_base` is
+    /// the global scheduled scalar from `inner_lr`. Initialized to 0.0 ⇒
+    /// `2*σ(0) = 1.0` ⇒ identical to the unmodulated path at start of training.
+    /// This is a per-layer (not per-token) gate: a minimal viable step toward
+    /// the reference's per-token learnable LR (`token_eta` + `ttt_lr_eta`).
+    /// Registered via `vs.pp("lr_scale")` so the optimizer updates it during
+    /// meta-training (unlike `inner_lr`, which is a non-differentiable atomic).
+    lr_scale: Tensor,
 }
 
 /// Lower bound on the learned forget gate, keeping α ∈ [GATE_FLOOR, 1) so a
@@ -203,10 +217,27 @@ impl NativeTTTBlock {
         } else {
             None
         };
+        let w_q = candle_nn::linear_no_bias(d, d, vs.pp("w_q"))?;
+        let w_k = candle_nn::linear_no_bias(d, d, vs.pp("w_k"))?;
+        let w_v = candle_nn::linear_no_bias(d, d, vs.pp("w_v"))?;
+        // Device for fallback init (backward compat with old checkpoints).
+        let device = w_q.weight().device().clone();
+        // Learnable per-layer LR scale (scalar). Formula: η_eff = η_base * 2σ(lr_scale).
+        // Default init gives values near 0 ⇒ factor ≈ 1.0 ⇒ starts close to the
+        // unmodulated path. The optimizer tunes it during meta-training.
+        // Backward compat: old checkpoints lack lr_scale; init to 0.
+        let lr_scale = vs.pp("lr_scale").get((), "lr_scale").unwrap_or_else(|_| {
+            Tensor::zeros((), candle_core::DType::F32, &device).unwrap()
+        });
+        // Fast-weight bias. Backward compat: old checkpoints lack fast_bias; init to 0.
+        let fast_bias = vs.pp("fast_bias").get(d, "fast_bias").unwrap_or_else(|_| {
+            Tensor::zeros(d, candle_core::DType::F32, &device).unwrap()
+        });
         Ok(Self {
-            w_q: candle_nn::linear_no_bias(d, d, vs.pp("w_q"))?,
-            w_k: candle_nn::linear_no_bias(d, d, vs.pp("w_k"))?,
-            w_v: candle_nn::linear_no_bias(d, d, vs.pp("w_v"))?,
+            w_q,
+            w_k,
+            w_v,
+            fast_bias,
             layer_norm: candle_nn::layer_norm_no_bias(
                 d,
                 config.norm_eps as f64,
@@ -217,19 +248,28 @@ impl NativeTTTBlock {
             forget_gate,
             learned_gate,
             guards,
+            lr_scale,
         })
     }
 
-    /// Mean-squared reconstruction error ‖pred − v‖² for `x` under the current
-    /// fast-weight `state`, *without* mutating anything. This is the inner
+    /// Mean-squared reconstruction error ‖LN(pred) − (v−k)‖² for `x` under the
+    /// current fast-weight `state`, *without* mutating anything. This is the inner
     /// self-supervised objective the per-token update minimizes; exposed so the
     /// TTT-MLP measurement harness can compare expressivity across block types.
+    /// Uses the residual target (v−k) and LayerNorm on the prediction, matching
+    /// the inner-loop loss in `forward_native`.
     pub fn reconstruction_error(&self, x: &Tensor, state: &Tensor) -> Result<f32> {
         let k = self.w_k.forward(x)?;
         let v = self.w_v.forward(x)?.squeeze(0)?;
-        let k_col = k.t()?.contiguous()?;
-        let pred = state.matmul(&k_col)?.squeeze(D::Minus1)?;
-        pred.sub(&v)?.sqr()?.sum_all()?.to_scalar::<f32>()
+        let k_vec = k.squeeze(0)?;
+        let target = v.sub(&k_vec)?;
+        let k_col = k_vec.unsqueeze(1)?.contiguous()?;
+        let pred = state
+            .matmul(&k_col)?
+            .squeeze(D::Minus1)?
+            .add(&self.fast_bias)?;
+        let pred_ln = self.layer_norm.forward(&pred.unsqueeze(0)?)?.squeeze(0)?;
+        pred_ln.sub(&target)?.sqr()?.sum_all()?.to_scalar::<f32>()
     }
 
     /// Autoregressive forward step for a single token.
@@ -246,13 +286,14 @@ impl NativeTTTBlock {
     ///
     /// ```text
     /// q, k, v  = W_q(x),  W_k(x),  W_v(x)          [1, d_model] each
-    /// pred     = W_tilde × k^T                       [d_model]
-    /// error    = pred − v                            [d_model]
+    /// pred     = W_tilde × k^T + b                   [d_model]  (b: fast bias, #7)
+    /// target   = v − k                               [d_model]  (residual, #4)
+    /// error    = LN(pred) − target                   [d_model]  (LN in loss, #2)
     /// grad     = error ⊗ k    (outer product)        [d_model, d_model]
     /// W_tilde  ← W_tilde − η · grad
-    /// output   = q × W_tilde                         [1, d_model]
+    /// output   = q + (q × W_tilde)                   [1, d_model]  (residual, #5)
     /// ```
-    pub fn forward_native(&self, x: &Tensor, session_state: &mut Tensor) -> Result<Tensor> {
+    pub fn forward_native(&self, x: &Tensor, session_state: &mut Tensor, training: bool) -> Result<Tensor> {
         // Project input to query, key, value: each [1, d_model].
         let q = self.w_q.forward(x)?;
         let k = self.w_k.forward(x)?;
@@ -276,28 +317,55 @@ impl NativeTTTBlock {
         let k_col = k_eff.t()?.contiguous()?;
 
         // pred: [d_model, d_model] × [d_model, 1] → [d_model, 1] → squeeze → [d_model]
-        let pred = session_state.matmul(&k_col)?.squeeze(D::Minus1)?;
+        // Plus the fast-weight bias vector (finding #7): pred = W~ @ k + b.
+        // Initialized to zeros ⇒ byte-identical to the unbiased path at init.
+        let pred = session_state
+            .matmul(&k_col)?
+            .squeeze(D::Minus1)?
+            .add(&self.fast_bias)?;
 
         // v_vec: [d_model]  (remove the leading batch-of-one dimension)
         let v_vec = v.squeeze(0)?;
 
+        // Finding #4 (residual reconstruction target): instead of reconstructing
+        // the raw value stream, the fast weight models the *innovation* over the
+        // key stream, matching ttt-lm-pytorch (`reconstruction_target = XV - XK`):
+        //   target = v - k
+        // k_vec uses the raw key (not k_eff) so the target is the true residual.
+        let k_vec = k.squeeze(0)?; // [d_model]
+        let target = v_vec.sub(&k_vec)?; // [d_model]
+
         // B.6 inner-loss ablation: when enabled, L2-normalize both views so the
         // objective aligns *directions* (cosine / contrastive multi-view) instead
         // of raw magnitudes (MSE reconstruction). Applied to both `pred` and
-        // `v_vec` so every downstream update path (ungated, scalar/learned gate)
+        // `target` so every downstream update path (ungated, scalar/learned gate)
         // stays consistent. Default off ⇒ exact reconstruction (byte-identical).
-        let (pred, v_vec) = if self.guards.aux_normalized() {
-            (l2_normalize(&pred)?, l2_normalize(&v_vec)?)
+        let (pred, target) = if self.guards.aux_normalized() {
+            (l2_normalize(&pred)?, l2_normalize(&target)?)
         } else {
-            (pred, v_vec)
+            (pred, target)
         };
 
+        // Finding #2 (LayerNorm inside inner-loop loss): the reference computes
+        // ||LN(Z1) - target||^2 with the gradient flowing THROUGH LayerNorm.
+        // We apply the block's LayerNorm to the prediction. During meta-training
+        // (training=true) the outer-loop gradient flows through it via autograd
+        // because session_state is not detached.
+        // pred_ln: [d_model]
+        let pred_ln = self.layer_norm.forward(&pred.unsqueeze(0)?)?.squeeze(0)?;
+
         // error: [d_model]
-        let error = pred.sub(&v_vec)?;
+        let error = pred_ln.sub(&target)?;
 
         // η is read live from the shared atomic so meta-training can decay it.
         let eta = f32::from_bits(self.inner_lr.load(Ordering::Relaxed));
-        let lr = Tensor::new(eta, session_state.device())?;
+        // Learnable per-layer LR modulation (finding #3): η_eff = η_base * 2σ(lr_scale).
+        // lr_scale is a registered parameter, so gradients flow through the sigmoid
+        // during meta-training (training=true preserves the graph via the detach fix).
+        // At init lr_scale ≈ 0 ⇒ factor ≈ 1.0 ⇒ η_eff ≈ η_base (near-identical start).
+        let lr_factor = candle_nn::ops::sigmoid(&self.lr_scale)?.affine(2.0, 0.0)?;
+        let base_lr = Tensor::new(eta, session_state.device())?;
+        let lr = base_lr.broadcast_mul(&lr_factor)?;
         // Gated-DeltaNet forget gate α ∈ (0, 1] read live from the shared atomic.
         let alpha = f32::from_bits(self.forget_gate.load(Ordering::Relaxed));
 
@@ -310,23 +378,24 @@ impl NativeTTTBlock {
             let logit = w_alpha.forward(x)?.affine(1.0, GATE_INIT_LOGIT)?; // [1, 1]
             let s = candle_nn::ops::sigmoid(&logit)?; // [1, 1] ∈ (0, 1)
             let alpha_t = s.affine(1.0 - GATE_FLOOR, GATE_FLOOR)?; // [1, 1]
-            let pred_outer = pred.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
-            let v_outer = v_vec.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
+            let pred_outer = pred_ln.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
+            let v_outer = target.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
             let memory = session_state.sub(&pred_outer.broadcast_mul(&lr)?)?;
             let write = v_outer.broadcast_mul(&lr)?;
             // alpha_t is [1,1] → broadcasts across the [d,d] memory term.
             memory.broadcast_mul(&alpha_t)?.add(&write)?
         } else if alpha >= 1.0 {
             // Ungated delta rule (default, byte-identical to the original path):
-            //   W̃ ← W̃ − η·(pred − v)⊗k = W̃(I − ηkkᵀ) + ηvkᵀ
+            //   W̃ ← W̃ − η·(LN(pred) − target)⊗k
+            // where target = v − k (residual) and pred is LayerNorm'd.
             let grad = error.unsqueeze(1)?.matmul(&k_eff)?;
             session_state.sub(&grad.broadcast_mul(&lr)?)?
         } else {
             // Scalar (parameter-free) gated delta rule: decay only the
             // retained-memory term by α, leaving the fresh write ηvkᵀ at full
             // strength. With normalized keys ‖I − ηkkᵀ‖ ≤ 1 ⇒ spectral radius ≤ α.
-            let pred_outer = pred.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
-            let v_outer = v_vec.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
+            let pred_outer = pred_ln.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
+            let v_outer = target.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
             let memory = session_state.sub(&pred_outer.broadcast_mul(&lr)?)?;
             let write = v_outer.broadcast_mul(&lr)?;
             let gate = Tensor::new(alpha, session_state.device())?;
@@ -378,11 +447,22 @@ impl NativeTTTBlock {
         }
         // The session state is an inference cache, not a BPTT tape. Detaching it
         // here prevents long prompts from retaining one Candle op node per token.
-        *session_state = updated_state.detach();
+        // During meta-training (training=true), we skip the detach so gradients
+        // flow through the inner loop to W_k and W_v.
+        *session_state = if training {
+            // Clone preserves the computation graph for BPTT; the original
+            // `updated_state` is used below for the output projection.
+            updated_state.clone()
+        } else {
+            updated_state.detach()
+        };
         // ------------------------------------------------------------------------
 
-        // output = q × W_tilde : [1, d_model] × [d_model, d_model] → [1, d_model]
-        let output = q.matmul(&updated_state)?;
+        // output = q + (q × W_tilde): residual connection (finding #5).
+        // [1, d_model] + ([1, d_model] × [d_model, d_model]) → [1, d_model].
+        // The skip path gives identity fallback if the fast-weight is poor,
+        // matching the reference's `XQW = XQ + Z1_bar`.
+        let output = q.add(&q.matmul(&updated_state)?)?;
 
         // Embedded LayerNorm.
         self.layer_norm.forward(&output)
@@ -416,7 +496,7 @@ mod tests {
         let (block, device) = make_block(d);
         let x = Tensor::zeros((1usize, d), DType::F32, &device).unwrap();
         let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
-        let output = block.forward_native(&x, &mut state).unwrap();
+        let output = block.forward_native(&x, &mut state, false).unwrap();
         assert_eq!(output.dims(), &[1, d]);
     }
 
@@ -427,7 +507,7 @@ mod tests {
         let x = Tensor::ones((1usize, d), DType::F32, &device).unwrap();
         let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
         let state_before: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let _ = block.forward_native(&x, &mut state).unwrap();
+        let _ = block.forward_native(&x, &mut state, false).unwrap();
         let state_after: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_ne!(
             state_before, state_after,
@@ -441,7 +521,7 @@ mod tests {
         let (block, device) = make_block(d);
         let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
         let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
-        let output = block.forward_native(&x, &mut state).unwrap();
+        let output = block.forward_native(&x, &mut state, false).unwrap();
         let values: Vec<f32> = output.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(values.iter().all(|v| v.is_finite()));
     }
@@ -481,7 +561,7 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
         let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
         let before: Vec<f32> = state.flatten_all().unwrap().to_vec1().unwrap();
-        let out = block.forward_native(&x, &mut state).unwrap();
+        let out = block.forward_native(&x, &mut state, false).unwrap();
         let ov: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
         assert!(ov.iter().all(|v| v.is_finite()), "learned-gate output must be finite");
         let after: Vec<f32> = state.flatten_all().unwrap().to_vec1().unwrap();
@@ -501,7 +581,7 @@ mod tests {
         let (learned, device) = make_learned_block(d);
         let x = Tensor::zeros((1usize, d), DType::F32, &device).unwrap();
         let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
-        let _ = learned.forward_native(&x, &mut state).unwrap();
+        let _ = learned.forward_native(&x, &mut state, false).unwrap();
         let nl = frobenius(&state);
         let alpha = nl / (d as f32).sqrt(); // state = α·I ⇒ ‖state‖_F = α·√d
         assert!(alpha.is_finite(), "state must stay finite");
@@ -520,10 +600,10 @@ mod tests {
         let mut s_default = Tensor::eye(d, DType::F32, &device).unwrap();
         let mut s_gate1 = Tensor::eye(d, DType::F32, &device).unwrap();
         // Default block: gate already 1.0.
-        let _ = block.forward_native(&x, &mut s_default).unwrap();
+        let _ = block.forward_native(&x, &mut s_default, false).unwrap();
         // Explicitly set 1.0 and run a fresh state from the same input.
         block.forget_gate.store(1.0f32.to_bits(), Ordering::Relaxed);
-        let _ = block.forward_native(&x, &mut s_gate1).unwrap();
+        let _ = block.forward_native(&x, &mut s_gate1, false).unwrap();
         let a: Vec<f32> = s_default.flatten_all().unwrap().to_vec1().unwrap();
         let b: Vec<f32> = s_gate1.flatten_all().unwrap().to_vec1().unwrap();
         assert_eq!(a, b, "α=1 must be bit-identical to the ungated path");
@@ -549,7 +629,7 @@ mod tests {
             block.forget_gate.store(alpha.to_bits(), Ordering::Relaxed);
             let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
             for _ in 0..256 {
-                let _ = block.forward_native(&x, &mut state).unwrap();
+                let _ = block.forward_native(&x, &mut state, false).unwrap();
             }
             frobenius(&state)
         };
@@ -573,7 +653,7 @@ mod tests {
         let x = Tensor::randn(0f32, 10f32, (1usize, d), &device).unwrap();
         let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
         for _ in 0..512 {
-            let out = block.forward_native(&x, &mut state).unwrap();
+            let out = block.forward_native(&x, &mut state, false).unwrap();
             let ov: Vec<f32> = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             assert!(
                 ov.iter().all(|v| v.is_finite()),
@@ -632,7 +712,7 @@ mod tests {
         let run = || -> Vec<f32> {
             let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
             for _ in 0..16 {
-                let _ = block.forward_native(&x, &mut state).unwrap();
+                let _ = block.forward_native(&x, &mut state, false).unwrap();
             }
             state.flatten_all().unwrap().to_vec1::<f32>().unwrap()
         };
@@ -650,7 +730,7 @@ mod tests {
         let init = Tensor::eye(d, DType::F32, &device).unwrap();
         let mut state = init.clone();
         for _ in 0..32 {
-            let _ = block.forward_native(&x, &mut state).unwrap();
+            let _ = block.forward_native(&x, &mut state, false).unwrap();
         }
         let moved = state.sub(&init).unwrap().sqr().unwrap().sum_all().unwrap()
             .to_scalar::<f32>().unwrap();
@@ -670,7 +750,7 @@ mod tests {
             let _ = device; // device captured via x already
             let mut state = Tensor::eye(d, DType::F32, &device_cpu()).unwrap();
             for _ in 0..64 {
-                let _ = block.forward_native(&x, &mut state).unwrap();
+                let _ = block.forward_native(&x, &mut state, false).unwrap();
             }
             let eye = Tensor::eye(d, DType::F32, &device_cpu()).unwrap();
             state.sub(&eye).unwrap().sqr().unwrap().sum_all().unwrap()
@@ -696,7 +776,7 @@ mod tests {
         let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
         let mut max_seen = 0f32;
         for _ in 0..256 {
-            let _ = block.forward_native(&x, &mut state).unwrap();
+            let _ = block.forward_native(&x, &mut state, false).unwrap();
             let fro = frobenius(&state);
             assert!(fro.is_finite(), "drift-reset state went non-finite");
             max_seen = max_seen.max(fro);
@@ -729,7 +809,7 @@ mod tests {
             guards.set_aux_loss_normalized(normalized);
             let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
             for _ in 0..16 {
-                let _ = block.forward_native(&x, &mut state).unwrap();
+                let _ = block.forward_native(&x, &mut state, false).unwrap();
             }
             state.flatten_all().unwrap().to_vec1::<f32>().unwrap()
         };

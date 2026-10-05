@@ -740,6 +740,8 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             path,
             verbose,
             strict,
+            ranked,
+            budget,
         } => {
             // Same model resolution as prime/server; bench only reads the
             // tokenizer for token counts, so a missing checkpoint is harmless.
@@ -759,7 +761,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             bench::run_bench(
                 &path,
                 &pipeline,
-                bench::BenchOptions { verbose, strict },
+                bench::BenchOptions { verbose, strict, ranked, budget },
             )?;
         }
         AxiomCommand::Solve {

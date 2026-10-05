@@ -176,7 +176,7 @@ fn sequence_ce(pipeline: &InferencePipeline, states: &[Tensor], ids: &[u32]) -> 
         }
         let m = w.len();
         let input = Tensor::from_vec(w[..m - 1].to_vec(), (1, m - 1), dev)?;
-        let logits = pipeline.model().forward_lm(&input, &mut probe)?;
+        let logits = pipeline.model().forward_lm(&input, &mut probe, false)?;
         let (_, t, v) = logits.dims3()?;
         let l2d = logits.squeeze(0)?.reshape((t, v))?;
         let tgt = Tensor::from_vec(w[1..].to_vec(), (m - 1,), dev)?;

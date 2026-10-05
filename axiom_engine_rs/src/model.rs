@@ -220,6 +220,7 @@ impl AxiomTTTLM {
         &self,
         input_ids: &Tensor,
         session_states: &mut [Tensor],
+        training: bool,
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
 
@@ -235,7 +236,7 @@ impl AxiomTTTLM {
             // Pass through all blocks sequentially, updating each layer's state.
             let mut hidden = token_emb;
             for (i, block) in self.layers.iter().enumerate() {
-                hidden = block.forward_native(&hidden, &mut session_states[i])?;
+                hidden = block.forward_native(&hidden, &mut session_states[i], training)?;
             }
 
             token_outputs.push(hidden);
@@ -272,7 +273,7 @@ impl AxiomTTTLM {
             let token_emb = embeddings.narrow(1, t, 1)?.squeeze(1)?;
             let mut hidden = token_emb;
             for (i, block) in self.layers.iter().enumerate() {
-                hidden = block.forward_native(&hidden, &mut session_states[i])?;
+                hidden = block.forward_native(&hidden, &mut session_states[i], false)?;
             }
             last_hidden = Some(hidden);
         }
@@ -303,7 +304,7 @@ impl AxiomTTTLM {
             let token_emb = embeddings.narrow(1, t, 1)?.squeeze(1)?;
             let mut hidden = token_emb;
             for (i, block) in self.layers.iter().enumerate() {
-                hidden = block.forward_native(&hidden, &mut session_states[i])?;
+                hidden = block.forward_native(&hidden, &mut session_states[i], false)?;
             }
             drop(hidden);
         }
@@ -314,8 +315,8 @@ impl AxiomTTTLM {
     /// Autoregressive forward pass over a token sequence to logits
     /// `[1, T, vocab_size]`. Equivalent to `lm_head(forward_hidden(..))`; the
     /// hidden-state computation lives in [`Self::forward_hidden`].
-    pub fn forward_lm(&self, input_ids: &Tensor, session_states: &mut [Tensor]) -> Result<Tensor> {
-        let normed = self.forward_hidden(input_ids, session_states)?;
+    pub fn forward_lm(&self, input_ids: &Tensor, session_states: &mut [Tensor], training: bool) -> Result<Tensor> {
+        let normed = self.forward_hidden(input_ids, session_states, training)?;
         self.lm_head.forward(&normed)
     }
 
@@ -367,7 +368,7 @@ mod tests {
         let (model, device) = make_model(2);
         let mut states = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 1usize), DType::U32, &device).unwrap();
-        let logits = model.forward_lm(&input_ids, &mut states[..]).unwrap();
+        let logits = model.forward_lm(&input_ids, &mut states[..], false).unwrap();
         assert_eq!(logits.dims(), &[1, 1, 32]);
     }
 
@@ -376,7 +377,7 @@ mod tests {
         let (model, device) = make_model(1);
         let mut states = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 5usize), DType::U32, &device).unwrap();
-        let logits = model.forward_lm(&input_ids, &mut states[..]).unwrap();
+        let logits = model.forward_lm(&input_ids, &mut states[..], false).unwrap();
         assert_eq!(logits.dims(), &[1, 5, 32]);
     }
 
@@ -386,7 +387,7 @@ mod tests {
         let mut states = model.init_states(&device).unwrap();
         let eye_data: Vec<f32> = states[0].flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let input_ids = Tensor::ones((1usize, 1usize), DType::U32, &device).unwrap();
-        let _ = model.forward_lm(&input_ids, &mut states[..]).unwrap();
+        let _ = model.forward_lm(&input_ids, &mut states[..], false).unwrap();
         let updated_data: Vec<f32> = states[0].flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_ne!(
             eye_data, updated_data,
@@ -399,7 +400,7 @@ mod tests {
         let (model, device) = make_model(2);
         let mut states = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 3usize), DType::U32, &device).unwrap();
-        let logits = model.forward_lm(&input_ids, &mut states[..]).unwrap();
+        let logits = model.forward_lm(&input_ids, &mut states[..], false).unwrap();
         let values: Vec<f32> = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(values.iter().all(|v| v.is_finite()));
     }
@@ -409,7 +410,7 @@ mod tests {
         let (model, device) = make_model(1);
         let mut states = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 1usize), DType::U32, &device).unwrap();
-        let logits = model.forward_lm(&input_ids, &mut states[..]).unwrap();
+        let logits = model.forward_lm(&input_ids, &mut states[..], false).unwrap();
         // logits: [1, 1, vocab_size] → squeeze(1) → [1, vocab_size] → argmax → [1]
         let next_id = logits
             .squeeze(1)
@@ -428,7 +429,7 @@ mod tests {
         let (model, device) = make_model(2);
         let mut states = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 4usize), DType::U32, &device).unwrap();
-        let hidden = model.forward_hidden(&input_ids, &mut states[..]).unwrap();
+        let hidden = model.forward_hidden(&input_ids, &mut states[..], false).unwrap();
         // [1, T, d_model] — d_model is 16 in make_model
         assert_eq!(hidden.dims(), &[1, 4, 16]);
     }
@@ -440,11 +441,11 @@ mod tests {
         let mut s1 = model.init_states(&device).unwrap();
         let mut s2 = model.init_states(&device).unwrap();
         let input_ids = Tensor::zeros((1usize, 3usize), DType::U32, &device).unwrap();
-        let logits = model.forward_lm(&input_ids, &mut s1[..]).unwrap();
+        let logits = model.forward_lm(&input_ids, &mut s1[..], false).unwrap();
         // vocab_size = 32
         assert_eq!(logits.dims(), &[1, 3, 32]);
         // hidden path produces values of the right shape
-        let hidden = model.forward_hidden(&input_ids, &mut s2[..]).unwrap();
+        let hidden = model.forward_hidden(&input_ids, &mut s2[..], false).unwrap();
         assert_eq!(hidden.dims(), &[1, 3, 16]);
     }
 
@@ -455,7 +456,7 @@ mod tests {
         let mut s2 = model.init_states(&device).unwrap();
         let input_ids = Tensor::from_vec(vec![0u32, 1, 2, 3], (1usize, 4usize), &device).unwrap();
 
-        let full = model.forward_lm(&input_ids, &mut s1[..]).unwrap();
+        let full = model.forward_lm(&input_ids, &mut s1[..], false).unwrap();
         let last = model.forward_last_logits(&input_ids, &mut s2[..]).unwrap();
 
         assert_eq!(last.dims(), &[1, 32]);
@@ -479,7 +480,7 @@ mod tests {
             Tensor::from_vec(vec![0u32, 1, 2, 3, 4], (1usize, 5usize), &device).unwrap();
 
         let _ = model
-            .forward_lm(&input_ids, &mut logits_states[..])
+            .forward_lm(&input_ids, &mut logits_states[..], false)
             .unwrap();
         model
             .adapt_tokens(&input_ids, &mut adapt_states[..])

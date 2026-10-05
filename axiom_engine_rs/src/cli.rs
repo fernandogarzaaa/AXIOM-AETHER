@@ -46,6 +46,13 @@ pub enum AxiomCommand {
         /// Exit non-zero when any signature failed to round-trip.
         #[arg(long)]
         strict: bool,
+        /// Use PageRank-ranked skeletonization (symbols ordered by importance).
+        #[arg(long)]
+        ranked: bool,
+        /// Token budget for skeleton output (only with --ranked). Keeps
+        /// highest-ranked symbols first.
+        #[arg(long, requires = "ranked")]
+        budget: Option<usize>,
     },
     /// Autonomy (Pillar 3): drive a failing verify command to green by chaining
     /// environment self-healing and Poly JIT / LLM source repair, then

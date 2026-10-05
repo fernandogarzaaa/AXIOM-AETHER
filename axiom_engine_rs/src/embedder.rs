@@ -62,7 +62,7 @@ pub fn embed_text(pipeline: &InferencePipeline, text: &str) -> Result<Vec<f32>> 
     let mut states = pipeline.init_session_states()?;
 
     // [1, T, d_model] final normed hidden states.
-    let hidden = pipeline.model().forward_hidden(&input, &mut states)?;
+    let hidden = pipeline.model().forward_hidden(&input, &mut states, false)?;
     pool_last_normalize(&hidden)
 }
 
