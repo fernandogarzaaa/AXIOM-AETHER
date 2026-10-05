@@ -77,12 +77,10 @@ impl Digestor for SkeletonDigestor {
 /// language-agnostic heuristic for everything else.
 fn detect_code_language(text: &str) -> &'static str {
     // Strong Rust signals: `fn ` definitions plus either `struct`/`impl`
-    // blocks or `use ...::` imports. Requiring `fn ` avoids false positives
-    // on prose that happens to mention "struct" or "impl".
+    // blocks or `use ...::` imports. Standalone `fn` (e.g. `fn main()`)
+    // is valid Rust; don't require struct/impl/use as well.
     let has_fn = text.contains("fn ");
-    let has_struct_or_impl = text.contains("struct ") || text.contains("impl ");
-    let has_use_path = text.contains("use ") && text.contains("::");
-    if has_fn && (has_struct_or_impl || has_use_path) {
+    if has_fn {
         "rust"
     } else {
         ""

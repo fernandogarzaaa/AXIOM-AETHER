@@ -246,17 +246,17 @@ impl NativeTTTBlock {
             Tensor::zeros(d, candle_core::DType::F32, &device).unwrap()
         });
         // Per-token learnable LR offset. Zeros init ⇒ token_scale starts as
-        // pure 1/(t+1). Backward compat: old checkpoints lack this key.
+        // pure 1/(t+1). Backward compat: old checkpoints lack this key;
+        // init to t/(t+1) so token_scale = 1/(t+1) + t/(t+1) = 1.0,
+        // preserving the old (unscaled) behavior.
         let learnable_token_idx = vs
             .pp("learnable_token_idx")
             .get(LEARNABLE_TOKEN_IDX_LEN, "learnable_token_idx")
             .unwrap_or_else(|_| {
-                Tensor::zeros(
-                    LEARNABLE_TOKEN_IDX_LEN,
-                    candle_core::DType::F32,
-                    &device,
-                )
-                .unwrap()
+                let vals: Vec<f32> = (0..LEARNABLE_TOKEN_IDX_LEN)
+                    .map(|t| t as f32 / (t as f32 + 1.0))
+                    .collect();
+                Tensor::from_vec(vals, LEARNABLE_TOKEN_IDX_LEN, &device).unwrap()
             });
         Ok(Self {
             w_q,
