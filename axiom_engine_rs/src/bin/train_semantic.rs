@@ -87,7 +87,7 @@ fn val_ce(model: &AxiomTTTLM, dev: &Device, ids: &[u32], vocab: usize, win: usiz
         let m = w.len();
         let mut states = model.init_states(dev).unwrap();
         let input = Tensor::from_vec(w[..m - 1].to_vec(), (1, m - 1), dev).unwrap();
-        let logits = model.forward_lm(&input, &mut states, false).unwrap();
+        let logits = model.forward_lm(&input, &mut states, false, 0).unwrap();
         let l2d = logits.squeeze(0).unwrap().reshape((m - 1, vocab)).unwrap();
         let tgt = Tensor::from_vec(w[1..].to_vec(), (m - 1,), dev).unwrap();
         total += candle_nn::loss::cross_entropy(&l2d, &tgt)
@@ -306,7 +306,7 @@ fn run() {
                     let tgt = Tensor::from_vec(vec![w[n - 1]], (1usize,), &device)?;
                     (logits.reshape((1usize, vocab))?, tgt)
                 } else {
-                    let logits = model.forward_lm(&input, &mut states, false)?;
+                    let logits = model.forward_lm(&input, &mut states, false, 0)?;
                     let l2d = logits.squeeze(0)?.reshape((n - 1, vocab))?;
                     let tgt = Tensor::from_vec(w[1..].to_vec(), (n - 1,), &device)?;
                     (l2d, tgt)

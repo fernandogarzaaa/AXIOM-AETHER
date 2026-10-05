@@ -450,7 +450,7 @@ impl MetaTrainer {
                     let input = inputs.narrow(0, batch_idx, 1)?;
                     let target = targets.narrow(0, batch_idx, 1)?;
                     let mut states = self.model.init_states(&self.device)?;
-                    let logits = self.model.forward_lm(&input, &mut states[..], true)?;
+                    let logits = self.model.forward_lm(&input, &mut states[..], true, 0)?;
                     batch_logits.push(logits);
                     batch_targets.push(target);
                 }

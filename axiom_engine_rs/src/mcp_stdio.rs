@@ -1579,7 +1579,7 @@ fn evaluate_drift_blocking(code: &str, ctx: &McpContext) -> Result<(String, bool
         Tensor::from_vec(ids[..n - 1].to_vec(), (1, n - 1), device).map_err(|e| e.to_string())?;
     let logits = pipeline
         .model()
-        .forward_lm(&input, &mut states, false)
+        .forward_lm(&input, &mut states, false, 0)
         .map_err(|e| e.to_string())?; // [1, n-1, vocab]
     let vocab = pipeline.model().config.vocab_size;
     let logits_2d = logits
@@ -1875,7 +1875,7 @@ fn drift_score(pipeline: &InferencePipeline, text: &str) -> Result<f32, String> 
         Tensor::from_vec(ids[..n - 1].to_vec(), (1, n - 1), device).map_err(|e| e.to_string())?;
     let logits = pipeline
         .model()
-        .forward_lm(&input, &mut states, false)
+        .forward_lm(&input, &mut states, false, 0)
         .map_err(|e| e.to_string())?;
     let vocab = pipeline.model().config.vocab_size;
     let logits_2d = logits
