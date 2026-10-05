@@ -41,10 +41,18 @@ const WRAPPER_MARKER: &str = "axiom-cvm-s3-digest-marker";
 
 impl Digestor for SkeletonDigestor {
     fn digest(&self, text: &str, budget_tokens: usize) -> String {
-        // Heuristic ceiling on how many doc-comment lines the structural
-        // skeleton keeps before falling back to pure truncation -- roughly
-        // one doc line per 8 tokens of budget, floor 4 so tiny budgets
-        // still get a little doc context.
+        // PageRank-ranked skeletonization: orders symbols by structural
+        // importance and keeps the highest-ranked ones within budget,
+        // instead of the old arbitrary word-truncation. Falls back to the
+        // legacy build_digest path if the ranked output is empty.
+        let lang = detect_code_language(text);
+        let ranked = crate::skeleton::skeletonize_ranked(text, lang, Some(budget_tokens));
+        if !ranked.trim().is_empty() {
+            // Safety net: the ranked budget uses chars/4 approximation, but
+            // this trait's contract is whitespace tokens. Truncate if needed.
+            return truncate_to_token_budget(&ranked, budget_tokens);
+        }
+        // Fallback: legacy build_digest + truncation path.
         let max_doc_lines = (budget_tokens / 8).max(4);
         let wrapped = crate::skeleton::build_digest(
             text,
@@ -60,6 +68,24 @@ impl Digestor for SkeletonDigestor {
 
     fn name(&self) -> &'static str {
         "skeleton"
+    }
+}
+
+/// Heuristic language detection for ranked skeletonization.
+/// Returns "rust" for Rust-like code, "" (generic path) otherwise.
+/// The ranked skeletonizer uses tree-sitter for Rust and a
+/// language-agnostic heuristic for everything else.
+fn detect_code_language(text: &str) -> &'static str {
+    // Strong Rust signals: `fn ` definitions plus either `struct`/`impl`
+    // blocks or `use ...::` imports. Requiring `fn ` avoids false positives
+    // on prose that happens to mention "struct" or "impl".
+    let has_fn = text.contains("fn ");
+    let has_struct_or_impl = text.contains("struct ") || text.contains("impl ");
+    let has_use_path = text.contains("use ") && text.contains("::");
+    if has_fn && (has_struct_or_impl || has_use_path) {
+        "rust"
+    } else {
+        ""
     }
 }
 

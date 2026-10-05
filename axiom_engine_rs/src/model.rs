@@ -236,7 +236,7 @@ impl AxiomTTTLM {
             // Pass through all blocks sequentially, updating each layer's state.
             let mut hidden = token_emb;
             for (i, block) in self.layers.iter().enumerate() {
-                hidden = block.forward_native(&hidden, &mut session_states[i], training)?;
+                hidden = block.forward_native(&hidden, &mut session_states[i], training, t)?;
             }
 
             token_outputs.push(hidden);
@@ -273,7 +273,7 @@ impl AxiomTTTLM {
             let token_emb = embeddings.narrow(1, t, 1)?.squeeze(1)?;
             let mut hidden = token_emb;
             for (i, block) in self.layers.iter().enumerate() {
-                hidden = block.forward_native(&hidden, &mut session_states[i], false)?;
+                hidden = block.forward_native(&hidden, &mut session_states[i], false, t)?;
             }
             last_hidden = Some(hidden);
         }
@@ -304,7 +304,7 @@ impl AxiomTTTLM {
             let token_emb = embeddings.narrow(1, t, 1)?.squeeze(1)?;
             let mut hidden = token_emb;
             for (i, block) in self.layers.iter().enumerate() {
-                hidden = block.forward_native(&hidden, &mut session_states[i], false)?;
+                hidden = block.forward_native(&hidden, &mut session_states[i], false, t)?;
             }
             drop(hidden);
         }

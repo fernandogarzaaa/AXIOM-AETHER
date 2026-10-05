@@ -161,7 +161,7 @@ pub fn mlp_vs_linear_reconstruction(
     let lin = NativeTTTBlock::new(lin_vb.pp("lin"), config.clone())?;
     let mut lin_state = Tensor::eye(d_model, DType::F32, &device)?;
     for _ in 0..steps {
-        let _ = lin.forward_native(&x, &mut lin_state, false)?;
+        let _ = lin.forward_native(&x, &mut lin_state, false, 0)?;
     }
     let lin_res = lin.reconstruction_error(&x, &lin_state)?;
 
