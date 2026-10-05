@@ -824,7 +824,9 @@ pub fn skeletonize_ranked(
     for imp in &imports {
         let t = approx_tokens(imp);
         if let Some(ibudget) = import_budget {
-            if import_used + t > ibudget && !out.is_empty() {
+            // Skip oversized imports even if first: don't let one long
+            // `use` line consume the budget needed for ranked declarations.
+            if import_used + t > ibudget {
                 elided += 1;
                 continue;
             }

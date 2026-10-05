@@ -32,7 +32,7 @@ fn chunked_ce(pipeline: &InferencePipeline, ids: &[u32], vocab: usize) -> f32 {
         let m = w.len();
         let mut states = pipeline.init_session_states().unwrap();
         let input = Tensor::from_vec(w[..m - 1].to_vec(), (1, m - 1), dev).unwrap();
-        let logits = pipeline.model().forward_lm(&input, &mut states, false).unwrap();
+        let logits = pipeline.model().forward_lm(&input, &mut states, false, 0).unwrap();
         let l2d = logits.squeeze(0).unwrap().reshape((m - 1, vocab)).unwrap();
         let tgt = Tensor::from_vec(w[1..].to_vec(), (m - 1,), dev).unwrap();
         total += candle_nn::loss::cross_entropy(&l2d, &tgt).unwrap().to_scalar::<f32>().unwrap()

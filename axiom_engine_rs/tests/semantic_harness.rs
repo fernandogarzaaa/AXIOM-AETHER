@@ -69,7 +69,7 @@ fn chunked_ce(model: &AxiomTTTLM, dev: &Device, ids: &[u32], vocab: usize) -> f3
         if chunk.len() < 2 { continue; }
         let n = chunk.len();
         let input = Tensor::from_vec(chunk[..n - 1].to_vec(), (1, n - 1), dev).unwrap();
-        let logits = model.forward_lm(&input, &mut states, false).unwrap();
+        let logits = model.forward_lm(&input, &mut states, false, 0).unwrap();
         let l2d = logits.squeeze(0).unwrap().reshape((n - 1, vocab)).unwrap();
         let tgt = Tensor::from_vec(chunk[1..].to_vec(), (n - 1,), dev).unwrap();
         let loss = candle_nn::loss::cross_entropy(&l2d, &tgt).unwrap().to_scalar::<f32>().unwrap();
@@ -153,7 +153,7 @@ fn run_harness() {
             let n = w.len();
             let mut states = model.init_states(&device).unwrap();
             let input = Tensor::from_vec(w[..n - 1].to_vec(), (1, n - 1), &device).unwrap();
-            let logits = model.forward_lm(&input, &mut states, true).unwrap();
+            let logits = model.forward_lm(&input, &mut states, true, 0).unwrap();
             let l2d = logits.squeeze(0).unwrap().reshape((n - 1, vocab)).unwrap();
             let tgt = Tensor::from_vec(w[1..].to_vec(), (n - 1,), &device).unwrap();
             let loss = candle_nn::loss::cross_entropy(&l2d, &tgt).unwrap();
