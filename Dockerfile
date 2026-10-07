@@ -1,4 +1,4 @@
-﻿# Dockerfile — multi-stage build for the Axiom-TTT engine.
+﻿﻿# Dockerfile — multi-stage build for the Axiom-TTT engine.
 #
 # Builds the Rust `axiom_engine` binary in a builder stage, then copies it into
 # a lean runtime image. The image ships WITHOUT trained weights (see
@@ -10,7 +10,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Builder — compile the Rust binary
 # ---------------------------------------------------------------------------
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.90-bookworm AS builder
 
 # Install build dependencies (tree-sitter needs a C compiler)
 RUN apt-get update && apt-get install -y --no-install-recommends \
