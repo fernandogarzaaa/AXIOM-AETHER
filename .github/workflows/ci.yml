@@ -165,6 +165,52 @@ jobs:
         working-directory: axiom_engine_rs
         run: cargo test --release --locked --features experimental
 
+  # Verify the crate builds and its unit tests pass on the Minimum Supported
+  # Rust Version declared in axiom_engine_rs/Cargo.toml (rust-version =
+  # "1.90"). Pins the exact toolchain (not stable) and uses --locked so the
+  # committed lockfile is proven MSRV-compatible. Scoped to the engine crate,
+  # which is the only workspace that declares a rust-version.
+  msrv:
+    name: MSRV (Rust 1.90)
+    # The protocol gate is cheap and its failure invalidates everything below.
+    needs: protocol
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.90 toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90
+
+      - name: Cache Cargo (MSRV)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            axiom_engine_rs/target
+          # Separate key from the stable-toolchain jobs: a shared target dir
+          # across toolchains would cause needless rebuilds at best.
+          key: ci-msrv-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+          restore-keys: ci-msrv-${{ runner.os }}-
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
+
+      - name: Build (MSRV)
+        working-directory: axiom_engine_rs
+        run: cargo build --locked
+
+      - name: Test (MSRV, library)
+        working-directory: axiom_engine_rs
+        run: cargo test --locked --lib
+
   # Validate the Docker image build on PRs. docker.yml only builds on pushes to
   # main / tags, so a broken Dockerfile (e.g. a missing build-context path) used
   # to escape review and only surface post-merge. This builds the image (no
