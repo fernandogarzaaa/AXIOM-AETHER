@@ -59,7 +59,7 @@ impl AgentTask {
     ///
     /// `files` selects paths to restore on abort; it does not restrict proposals.
     /// Snapshot read errors are treated as absent files, so this always returns
-    /// `Ok`. `max_attempts` is stored with a minimum of one but is not enforced.
+    /// `Ok`. `max_attempts` is stored with a minimum of one and enforced in `propose`.
     /// `verify_cmd` is a shell command run in the process's working directory.
     pub fn start(
         task_id: String,
@@ -101,13 +101,24 @@ impl AgentTask {
     ///
     /// # Panics
     ///
-    /// Panics if verifier output truncation splits a UTF-8 character at byte 8000.
+    /// Output is truncated at a UTF-8 character boundary to avoid panics.
     pub fn propose(&mut self, edits: Vec<FileEdit>) -> ProposeOutcome {
         if self.finished {
             return ProposeOutcome {
                 passed: false,
                 attempt: self.attempt,
                 output: "task already finished".to_string(),
+                fingerprint: String::new(),
+            };
+        }
+        if self.attempt >= self.max_attempts {
+            return ProposeOutcome {
+                passed: false,
+                attempt: self.attempt,
+                output: format!(
+                    "max attempts ({}) exceeded; task finished",
+                    self.max_attempts
+                ),
                 fingerprint: String::new(),
             };
         }
@@ -210,10 +221,15 @@ impl AgentTask {
                     combined.push_str("\n--- stderr ---\n");
                     combined.push_str(&stderr);
                 }
-                // Truncate to keep responses bounded.
+                // Truncate to keep responses bounded. Find a char boundary
+                // to avoid panicking on multi-byte UTF-8 sequences.
                 const MAX: usize = 8000;
                 if combined.len() > MAX {
-                    combined.truncate(MAX);
+                    let mut end = MAX;
+                    while !combined.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    combined.truncate(end);
                     combined.push_str("\n...[truncated]");
                 }
                 (out.status.success(), combined)
