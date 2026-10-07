@@ -100,21 +100,26 @@ fn err(id: &Value, code: i32, message: String) -> String {
     serde_json::to_string(&json!({"jsonrpc":"2.0","id":id,"error":e})).unwrap()
 }
 
-/// Build a task ID from hexadecimal nanoseconds since the Unix epoch.
-/// Use zero for a clock before the epoch; IDs are not guaranteed to be unique.
+/// Build a unique task ID from nanoseconds since the Unix epoch plus a
+/// process-wide sequence number. The counter guards against coarse clocks
+/// (e.g. Windows) returning the same timestamp for rapid successive calls.
 fn new_task_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("task-{nanos:x}")
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("task-{nanos:x}-{seq}")
 }
 
 /// Dispatch nonblank stdin lines as JSON-RPC requests and write one response per line.
 ///
-/// Parse errors produce code -32700; unknown methods produce -32601. Missing
-/// request IDs are returned as null. EOF or a read error ends the loop without
+/// Parse errors produce code -32700; unknown methods produce -32601. Requests
+/// without an "id" member are notifications and receive no response. EOF or a
+/// read error ends the loop without
 /// aborting active tasks; stdout write and flush errors are ignored.
 ///
 /// # Panics
@@ -142,6 +147,7 @@ fn main() {
                 continue;
             }
         };
+        let has_id = msg.get("id").is_some();
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -153,8 +159,10 @@ fn main() {
             "task_finish" => handle_finish(&registry, &id, params),
             _ => err(&id, -32601, format!("unknown method: {method}")),
         };
-        let _ = writeln!(stdout, "{response}");
-        let _ = stdout.flush();
+        if has_id {
+            let _ = writeln!(stdout, "{response}");
+            let _ = stdout.flush();
+        }
     }
 }
 
@@ -244,11 +252,13 @@ fn handle_finish(registry: &TaskRegistry, id: &Value, params: Value) -> String {
         Ok(p) => p,
         Err(e) => return err(id, -32602, format!("invalid params: {e}")),
     };
-    match registry.remove(&p.task_id) {
-        Some(mut task) => {
-            task.finish(p.commit);
+    let result = registry.with_task(&p.task_id, |task| task.finish(p.commit));
+    match result {
+        Some(Ok(())) => {
+            registry.remove(&p.task_id);
             ok(id, json!({"committed": p.commit}))
         }
+        Some(Err(e)) => err(id, -32002, format!("finish failed, task retained for retry: {e}")),
         None => err(id, -32001, format!("unknown task_id: {}", p.task_id)),
     }
 }

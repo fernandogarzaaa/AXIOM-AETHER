@@ -195,7 +195,7 @@ fn abort_restores_initial_snapshot_after_multiple_successes() {
         .propose(vec![edit(&path, "v2"), edit(&created, "new")])
         .passed);
 
-    task.finish(false);
+    task.finish(false).unwrap();
     assert_eq!(fs::read(&path).unwrap(), original);
     assert!(!created.exists());
     assert_eq!(task.history().len(), 2);
@@ -210,7 +210,7 @@ fn finish_is_idempotent_and_rejects_further_proposals() {
         let mut task = task(&[path.clone()], "exit 0");
         let accepted = task.propose(vec![edit(&path, "accepted")]);
         assert!(accepted.passed);
-        task.finish(commit);
+        task.finish(commit).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             if commit { "accepted" } else { "initial" }
@@ -218,7 +218,7 @@ fn finish_is_idempotent_and_rejects_further_proposals() {
 
         // A second finish must not undo external work, even with the opposite flag.
         fs::write(&path, "external change").unwrap();
-        task.finish(!commit);
+        task.finish(!commit).unwrap();
         let rejected = task.propose(vec![edit(&path, "too late")]);
         assert!(!rejected.passed);
         assert_eq!(rejected.output, "task already finished");

@@ -64,8 +64,10 @@ impl AgentTask {
     ///
     /// `files` is the allowlist: only these paths can be edited via `propose`.
     /// They are also snapshotted for restoration on `finish(false)`.
-    /// Snapshot read errors are treated as absent files, so this always returns
-    /// `Ok`. `max_attempts` is stored with a minimum of one and enforced in `propose`.
+    /// Returns an error if an existing allowlisted file cannot be read, so that
+    /// `finish(false)` never deletes a file it could not snapshot. Missing files
+    /// are recorded as `None` and deleted on abort. `max_attempts` is stored
+    /// with a minimum of one and enforced in `propose`.
     /// `verify_cmd` is a shell command run in the process's working directory.
     pub fn start(
         task_id: String,
@@ -76,7 +78,17 @@ impl AgentTask {
     ) -> std::io::Result<Self> {
         let mut originals = HashMap::new();
         for f in &files {
-            originals.insert(f.clone(), std::fs::read(f).ok());
+            match std::fs::read(f) {
+                Ok(bytes) => {
+                    originals.insert(f.clone(), Some(bytes));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    originals.insert(f.clone(), None);
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
         }
         Ok(Self {
             task_id,
@@ -199,26 +211,32 @@ impl AgentTask {
 
     /// Mark the task finished, keeping current edits when `commit` is true.
     ///
-    /// When false, attempt to restore only the paths snapshotted at task start,
-    /// removing those whose initial read failed. Write and removal errors are
-    /// ignored. Repeated calls have no effect, even with a different `commit`.
-    pub fn finish(&mut self, commit: bool) {
+    /// When false, restore the paths snapshotted at task start, removing those
+    /// that did not exist. Returns an error and leaves the task unfinished if
+    /// restoration fails, so the caller can retry. Repeated calls have no effect,
+    /// even with a different `commit`.
+    pub fn finish(&mut self, commit: bool) -> std::io::Result<()> {
         if self.finished {
-            return;
+            return Ok(());
         }
-        self.finished = true;
         if !commit {
             for (path, original) in &self.originals {
                 match original {
                     Some(bytes) => {
-                        let _ = std::fs::write(path, bytes);
+                        std::fs::write(path, bytes)?;
                     }
                     None => {
-                        let _ = std::fs::remove_file(path);
+                        match std::fs::remove_file(path) {
+                            Ok(()) => {},
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
             }
         }
+        self.finished = true;
+        Ok(())
     }
 
     /// Run `verify_cmd` through the platform shell in the current working directory.
@@ -227,9 +245,6 @@ impl AgentTask {
     /// Output over 8000 bytes is truncated to that length and given a truncation
     /// marker. Process execution errors return false with an error message.
     ///
-    /// # Panics
-    ///
-    /// Panics if byte 8000 is inside a UTF-8 character when truncating output.
     fn run_verifier(&self) -> (bool, String) {
         let output = if cfg!(windows) {
             Command::new("cmd").args(["/C", &self.verify_cmd]).output()
@@ -481,7 +496,7 @@ mod tests {
             content: "v2".into(),
         }]);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
-        task.finish(false);
+        task.finish(false).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1");
     }
 }
