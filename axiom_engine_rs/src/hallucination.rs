@@ -1203,7 +1203,7 @@ mod tests {
         }
     }
 
-    #[test]
+#[test]
     fn token_entropy_uniform_is_max() {
         // Uniform distribution over N outcomes has entropy ln(N).
         let n = 8usize;
