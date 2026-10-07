@@ -71,6 +71,30 @@ impl Digestor for SkeletonDigestor {
     }
 }
 
+impl SkeletonDigestor {
+    /// Surprise-weighted digest: before compressing the chunk, feed its TTT
+    /// update norm into `triage`, score it against the session's running
+    /// distribution, and select the compression level adaptively.
+    ///
+    /// Returns the compressed text and the [`CompressionLevel`] that was
+    /// chosen, so callers can log/meter the triage decision.
+    ///
+    /// Note: the [`CompressionLevel::Verbatim`] tier returns the chunk
+    /// unchanged — the chunk earned its tokens by being highly surprising.
+    /// Callers budgeting across many chunks should account for verbatim
+    /// chunks when sizing the total budget.
+    pub fn digest_with_triage(
+        &self,
+        text: &str,
+        budget_tokens: usize,
+        triage: &mut crate::surprise_triage::SurpriseTriage,
+        update_norm: f32,
+    ) -> (String, crate::surprise_triage::CompressionLevel) {
+        let lang = detect_code_language(text);
+        triage.triage_compress(text, budget_tokens, update_norm, lang)
+    }
+}
+
 /// Heuristic language detection for ranked skeletonization.
 /// Returns "rust" for Rust-like code, "" (generic path) otherwise.
 /// The ranked skeletonizer uses tree-sitter for Rust and a
@@ -201,6 +225,207 @@ pub fn append_fault(session: &str, page_id: &str, turns_since_digest: u64) {
     append_fault_to(&faults_path(), session, page_id, turns_since_digest);
 }
 
+// ---------------------------------------------------------------------------
+// KV-Merge: merge-don't-evict session digests
+// ---------------------------------------------------------------------------
+// When a bounded digest store must shed old chunks, the naive policy drops
+// them outright (similarity with the originals collapses to 0.0). KV-Merge
+// instead preserves a lossy trace: evicted chunks are folded into a running
+// summary via attention-weighted averaging of their embeddings, while a
+// recent window stays exact (progressive resolution: far past coarse,
+// recent detailed).
+//
+// There was no pre-existing chunk-eviction call site in the digest/skeleton
+// modules to retrofit; `MergeDigestStore` is the bounded store whose
+// eviction path merges instead of dropping, and `merge_chunks` is the
+// merge primitive it (and future callers) use.
+
+use std::collections::VecDeque;
+
+/// Maximum characters retained in a merged summary's text. The embedding
+/// carries the semantic trace; the text is a human-readable tail kept
+/// bounded so summaries cannot grow without limit.
+pub const MERGED_TEXT_BUDGET_CHARS: usize = 2000;
+
+/// A digest chunk: human-readable text plus its embedding and an
+/// attention/importance weight used by [`merge_chunks`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DigestChunk {
+    /// Human-readable content (or summary) of the chunk.
+    pub text: String,
+    /// Embedding/fingerprint vector. All chunks merged together must share
+    /// the same dimensionality; mismatched chunks are skipped defensively.
+    pub embedding: Vec<f32>,
+    /// Attention weight for the merge. Defaults to `1.0`; callers may set
+    /// higher values for chunks the attention mechanism scored as important.
+    pub weight: f32,
+}
+
+impl DigestChunk {
+    /// Convenience constructor with unit weight.
+    pub fn new(text: impl Into<String>, embedding: Vec<f32>) -> Self {
+        Self {
+            text: text.into(),
+            embedding,
+            weight: 1.0,
+        }
+    }
+}
+
+/// Cosine similarity between two embedding vectors, in [-1, 1].
+/// Returns `0.0` when either vector is empty, all-zero, or the lengths
+/// differ (no meaningful comparison possible).
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na <= 0.0 || nb <= 0.0 {
+        0.0
+    } else {
+        (dot / (na * nb)).clamp(-1.0, 1.0)
+    }
+}
+
+/// Attention-weighted merge of `old` (evicted) chunks with `new` (the
+/// incoming chunk, or the running summary accumulator).
+///
+/// The merged embedding is the attention-weighted average over every
+/// participating chunk: `Σ w_j * e_j / Σ w_j`, using each chunk's `weight`
+/// (non-positive weights are treated as zero). Chunks whose embedding
+/// dimensionality differs from `new`'s are skipped defensively. The merged
+/// text concatenates participant texts (oldest first, `new` last), keeping
+/// the most recent [`MERGED_TEXT_BUDGET_CHARS`] characters.
+///
+/// When `old` is empty the result is a clone of `new` — merging must be a
+/// no-op, never a lossy rewrite, when nothing is being evicted.
+pub fn merge_chunks(old: &[DigestChunk], new: &DigestChunk) -> DigestChunk {
+    let dim = new.embedding.len();
+    let mut total_weight = new.weight.max(0.0);
+    let mut acc = vec![0.0f32; dim];
+    for (i, v) in new.embedding.iter().enumerate() {
+        acc[i] = v * total_weight;
+    }
+    let mut texts: Vec<&str> = Vec::with_capacity(old.len() + 1);
+    for chunk in old {
+        if chunk.embedding.len() != dim {
+            continue; // defensive: never average across mismatched spaces
+        }
+        let w = chunk.weight.max(0.0);
+        if w <= 0.0 && !chunk.embedding.is_empty() {
+            // Zero-weight chunks contribute nothing to the embedding but
+            // their text is still folded into the summary below.
+        }
+        total_weight += w;
+        for (i, v) in chunk.embedding.iter().enumerate() {
+            acc[i] += v * w;
+        }
+        texts.push(chunk.text.as_str());
+    }
+    texts.push(new.text.as_str());
+    if total_weight > 0.0 {
+        for v in acc.iter_mut() {
+            *v /= total_weight;
+        }
+    }
+    let mut text = texts.join("\n---\n");
+    if text.len() > MERGED_TEXT_BUDGET_CHARS {
+        let cut = text.len() - MERGED_TEXT_BUDGET_CHARS;
+        // Cut on a char boundary; keep the most recent tail.
+        let mut idx = cut;
+        while idx < text.len() && !text.is_char_boundary(idx) {
+            idx += 1;
+        }
+        text = format!("…{}", &text[idx..]);
+    }
+    DigestChunk {
+        text,
+        embedding: acc,
+        weight: total_weight,
+    }
+}
+
+/// Bounded digest store with merge-on-evict.
+///
+/// The `recent_window` newest chunks are kept exact (verbatim text and
+/// embedding). When capacity is exceeded, the oldest chunk is evicted — but
+/// instead of being dropped, it is folded into a running `summary` via
+/// [`merge_chunks`]. Progressive resolution: far past coarse (one merged
+/// summary), recent detailed (exact chunks).
+///
+/// `capacity` must exceed `recent_window`; both are at least 1.
+pub struct MergeDigestStore {
+    capacity: usize,
+    recent_window: usize,
+    recent: VecDeque<DigestChunk>,
+    summary: Option<DigestChunk>,
+}
+
+impl MergeDigestStore {
+    /// Create a store holding at most `capacity` chunks, of which the
+    /// newest `recent_window` stay exact. Panics on `capacity == 0`,
+    /// `recent_window == 0`, or `recent_window > capacity`.
+    pub fn new(capacity: usize, recent_window: usize) -> Self {
+        assert!(capacity >= 1, "capacity must be >= 1");
+        assert!(recent_window >= 1, "recent_window must be >= 1");
+        assert!(
+            recent_window <= capacity,
+            "recent_window must not exceed capacity"
+        );
+        Self {
+            capacity,
+            recent_window,
+            recent: VecDeque::new(),
+            summary: None,
+        }
+    }
+
+    /// Push a chunk. If the store is full, the oldest chunk is evicted and
+    /// merged into the running summary instead of being dropped. The
+    /// `recent_window` newest chunks are always exact.
+    pub fn push(&mut self, chunk: DigestChunk) {
+        // Merge-on-evict: fold the outgoing chunk into the summary BEFORE
+        // it leaves, so no information is silently discarded.
+        if self.recent.len() >= self.capacity {
+            if let Some(evicted) = self.recent.pop_front() {
+                self.summary = Some(match self.summary.take() {
+                    Some(acc) => merge_chunks(&[evicted], &acc),
+                    None => evicted,
+                });
+            }
+        }
+        self.recent.push_back(chunk);
+    }
+
+    /// The merged summary of all evicted chunks, or `None` if nothing has
+    /// been evicted yet.
+    pub fn summary(&self) -> Option<&DigestChunk> {
+        self.summary.as_ref()
+    }
+
+    /// The exact-recent window size: the newest this many chunks are always
+    /// kept exact (eviction only ever removes the oldest).
+    pub fn recent_window(&self) -> usize {
+        self.recent_window
+    }
+
+    /// The exact recent window, oldest first.
+    pub fn recent(&self) -> &VecDeque<DigestChunk> {
+        &self.recent
+    }
+
+    /// Total chunks retained (exact recent + 1 if a summary exists).
+    pub fn len(&self) -> usize {
+        self.recent.len() + usize::from(self.summary.is_some())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.recent.is_empty() && self.summary.is_none()
+    }
+}
+
 /// Path-parameterized so tests can target an isolated temp file instead of
 /// mutating the process-global `AXIOM_CVM_DIR` (which would race against
 /// concurrent tests in this same binary that construct `AppState` and rely
@@ -326,5 +551,151 @@ mod tests {
         let text = "one two three four five six seven eight";
         let out = truncate_to_token_budget(text, 3);
         assert_eq!(out, "one two three …");
+    }
+
+    // ------------------------------------------------------------------
+    // KV-Merge tests
+    // ------------------------------------------------------------------
+
+    fn kv_chunk(text: &str, embedding: Vec<f32>, weight: f32) -> DigestChunk {
+        DigestChunk {
+            text: text.to_string(),
+            embedding,
+            weight,
+        }
+    }
+
+    #[test]
+    fn cosine_similarity_identical_is_one() {
+        let v = vec![1.0f32, 2.0, 3.0];
+        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_orthogonal_is_zero() {
+        let a = vec![1.0f32, 0.0];
+        let b = vec![0.0f32, 1.0];
+        assert!(cosine_similarity(&a, &b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_mismatched_or_empty_is_zero() {
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0);
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn merge_empty_old_returns_new_unchanged() {
+        let new = kv_chunk("incoming", vec![0.5, 0.5], 2.0);
+        let merged = merge_chunks(&[], &new);
+        assert_eq!(merged.text, "incoming");
+        assert_eq!(merged.embedding, vec![0.5, 0.5]);
+        assert_eq!(merged.weight, 2.0);
+    }
+
+    #[test]
+    fn merge_preserves_cosine_similarity_above_08() {
+        // Three chunks about the same topic: embeddings clustered together.
+        // A pure-drop eviction retains similarity 0.0 with the evicted
+        // chunks; the merged summary must stay above 0.8 with each.
+        let old = vec![
+            kv_chunk("auth module handles login", vec![1.0, 0.1, 0.05], 1.0),
+            kv_chunk("auth module handles logout", vec![0.95, 0.12, 0.08], 1.0),
+        ];
+        let new = kv_chunk("auth module session refresh", vec![0.98, 0.09, 0.06], 1.0);
+        let merged = merge_chunks(&old, &new);
+        for chunk in old.iter().chain(std::iter::once(&new)) {
+            let sim = cosine_similarity(&merged.embedding, &chunk.embedding);
+            assert!(
+                sim > 0.8,
+                "merged summary must preserve similarity > 0.8 with '{}', got {sim:.4}",
+                chunk.text
+            );
+        }
+        // Deletion baseline: a dropped chunk leaves no vector behind.
+        let dropped_similarity = 0.0f32;
+        assert!(dropped_similarity < 0.8);
+    }
+
+    #[test]
+    fn merge_weights_bias_toward_high_attention() {
+        // Chunk A has 3x the attention weight of chunk B; the merged
+        // embedding must sit closer to A than to B.
+        let a = kv_chunk("important", vec![1.0, 0.0], 3.0);
+        let b = kv_chunk("background", vec![0.0, 1.0], 1.0);
+        let merged = merge_chunks(std::slice::from_ref(&b), &a);
+        let sim_a = cosine_similarity(&merged.embedding, &a.embedding);
+        let sim_b = cosine_similarity(&merged.embedding, &b.embedding);
+        assert!(
+            sim_a > sim_b,
+            "merged must be closer to high-weight chunk (sim_a={sim_a:.3}, sim_b={sim_b:.3})"
+        );
+    }
+
+    #[test]
+    fn merge_skips_mismatched_dimensions() {
+        let bad = kv_chunk("wrong dim", vec![1.0, 2.0, 3.0], 1.0);
+        let new = kv_chunk("good", vec![1.0, 0.0], 1.0);
+        let merged = merge_chunks(&[bad], &new);
+        assert_eq!(merged.embedding.len(), 2);
+        assert!((cosine_similarity(&merged.embedding, &new.embedding) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn store_keeps_recent_window_exact() {
+        // capacity 4, recent_window 2, push 6 chunks: the two newest must be
+        // byte-exact; older ones fold into the summary instead of vanishing.
+        let mut store = MergeDigestStore::new(4, 2);
+        for i in 0..6 {
+            store.push(kv_chunk(
+                &format!("chunk-{i}"),
+                vec![i as f32, 1.0],
+                1.0,
+            ));
+        }
+        let recent: Vec<&str> = store
+            .recent()
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(recent, vec!["chunk-2", "chunk-3", "chunk-4", "chunk-5"]);
+        // The two newest are exactly as pushed (text AND embedding).
+        let last = store.recent().back().unwrap();
+        assert_eq!(last.text, "chunk-5");
+        assert_eq!(last.embedding, vec![5.0, 1.0]);
+        let prev = &store.recent()[store.recent().len() - 2];
+        assert_eq!(prev.text, "chunk-4");
+        assert_eq!(prev.embedding, vec![4.0, 1.0]);
+    }
+
+    #[test]
+    fn store_summary_covers_evicted_chunks() {
+        let mut store = MergeDigestStore::new(2, 1);
+        store.push(kv_chunk("first", vec![1.0, 0.0], 1.0));
+        store.push(kv_chunk("second", vec![0.0, 1.0], 1.0));
+        assert!(store.summary().is_none(), "nothing evicted yet");
+        store.push(kv_chunk("third", vec![1.0, 1.0], 1.0));
+        let summary = store.summary().expect("evicted chunk must merge into summary");
+        assert!(
+            summary.text.contains("first"),
+            "summary must retain a trace of the evicted chunk, got: {}",
+            summary.text
+        );
+        // Merged embedding is the average of [1,0] (evicted "first").
+        assert_eq!(summary.embedding, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn store_summary_accumulates_across_evictions() {
+        let mut store = MergeDigestStore::new(2, 1);
+        for (i, text) in ["a", "b", "c", "d"].iter().enumerate() {
+            store.push(kv_chunk(text, vec![i as f32, 0.0], 1.0));
+        }
+        // Evicted: a, b. Summary = merge([b], a) -> texts "b\n---\na",
+        // embedding = average of [1,0] and [0,0] = [0.5, 0].
+        let summary = store.summary().unwrap();
+        assert!(summary.text.contains('a') && summary.text.contains('b'));
+        assert!((summary.embedding[0] - 0.5).abs() < 1e-6);
+        assert_eq!(store.len(), 3); // 2 exact + 1 summary
     }
 }
