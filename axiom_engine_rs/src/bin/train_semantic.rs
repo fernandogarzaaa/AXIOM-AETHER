@@ -24,8 +24,9 @@ use std::path::{Path, PathBuf};
 use axiom_engine::config::AxiomConfig;
 use axiom_engine::model::AxiomTTTLM;
 use axiom_engine::model_meta::{default_ladder, pick_config, ModelMeta};
+use axiom_engine::resumable_adamw::{optim_state_path, ResumableAdamW};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::optim::{AdamW, ParamsAdamW};
+use candle_nn::optim::ParamsAdamW;
 use candle_nn::{Optimizer, VarBuilder, VarMap};
 use tokenizers::Tokenizer;
 
@@ -268,16 +269,34 @@ fn run() {
     let split = (toks.len() as f64 * 0.95) as usize;
     let (train_toks, val_toks) = toks.split_at(split);
 
-    // --- Train: AdamW + early-stop on val CE; OOM-safe steps; bake best -------
+    // --- Train: ResumableAdamW + early-stop on val CE; OOM-safe steps; bake best -------
     let windows: Vec<&[u32]> = train_toks.chunks(win).filter(|c| c.len() >= 2).collect();
-    let mut opt = AdamW::new(
-        varmap.all_vars(),
+    let mut opt = ResumableAdamW::from_varmap(
+        &varmap,
         ParamsAdamW {
             lr,
             ..Default::default()
         },
     )
     .unwrap();
+    // If resuming, restore optimizer moments + step counter so Adam does not
+    // restart cold (which caused loss spikes across VM-reboot restarts).
+    {
+        let opt_path = optim_state_path(&ckpt);
+        if opt_path.exists() {
+            match opt.load_state(&opt_path, &device) {
+                Ok(n) => eprintln!(
+                    "[train] resumed optimizer state for {n} params (step_t={}) from {}",
+                    opt.step_count(),
+                    opt_path.display()
+                ),
+                Err(e) => eprintln!(
+                    "[train] WARN: could not load optimizer state ({}); Adam restarts cold",
+                    e
+                ),
+            }
+        }
+    }
     let t0 = std::time::Instant::now();
     let mut best_val = f32::INFINITY;
     let mut since_improve = 0usize;
@@ -382,8 +401,17 @@ fn run() {
         if v + 1e-3 < best_val {
             best_val = v;
             since_improve = 0;
-            // Save the BEST checkpoint + sidecar.
+            // Save the BEST checkpoint + sidecar + optimizer state.
             varmap.save(&ckpt).expect("save checkpoint");
+            // Save Adam moments + step counter so a resume continues with
+            // warm optimizer state instead of restarting cold.
+            let opt_path = optim_state_path(&ckpt);
+            if let Err(e) = opt.save_state(&opt_path) {
+                eprintln!(
+                    "[train] WARN: could not save optimizer state to {} ({e})",
+                    opt_path.display()
+                );
+            }
             let _ = ModelMeta {
                 d_model,
                 n_layers,
