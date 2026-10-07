@@ -57,7 +57,8 @@ pub struct AgentTask {
 impl AgentTask {
     /// Start a task and snapshot `files` for a later `finish(false)`.
     ///
-    /// `files` selects paths to restore on abort; it does not restrict proposals.
+    /// `files` is the allowlist: only these paths can be edited via `propose`.
+    /// They are also snapshotted for restoration on `finish(false)`.
     /// Snapshot read errors are treated as absent files, so this always returns
     /// `Ok`. `max_attempts` is stored with a minimum of one and enforced in `propose`.
     /// `verify_cmd` is a shell command run in the process's working directory.
@@ -97,7 +98,7 @@ impl AgentTask {
     /// Apply and verifier execution errors become failed outcomes. Verifier
     /// failures trigger best-effort rollback of edited paths; restoration errors
     /// are ignored. Apply errors can leave partial changes if directory creation
-    /// fails. Edits are not restricted to the files snapshotted at task start.
+    /// fails. Edits are restricted to the `files` allowlist from task start.
     ///
     /// # Panics
     ///
@@ -124,6 +125,23 @@ impl AgentTask {
         }
         self.attempt += 1;
         let attempt_no = self.attempt;
+
+        // Enforce the file allowlist: edits are restricted to paths
+        // declared in `files` at task start. This prevents the agent
+        // from modifying files outside the task scope.
+        for e in &edits {
+            if !self.originals.contains_key(&e.path) {
+                return self.record(
+                    attempt_no,
+                    String::new(),
+                    false,
+                    format!(
+                        "path '{}' not in task file allowlist;                          declare it in `files` at task_start to edit it",
+                        e.path
+                    ),
+                );
+            }
+        }
 
         let mut edit_set = EditSet::new();
         for e in edits {
@@ -286,36 +304,30 @@ impl TaskRegistry {
 
     /// Store a task under its ID, replacing any existing task without finishing it.
     ///
-    /// # Panics
-    ///
-    /// Panics if the registry mutex is poisoned.
+    /// Recovers the lock if a previous panic poisoned the mutex.
     pub fn insert(&self, task: AgentTask) {
-        self.tasks.lock().unwrap().insert(task.task_id.clone(), task);
+        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).insert(task.task_id.clone(), task);
     }
 
     /// Call `f` with the matching task while holding the registry lock.
     /// Return `None` without calling `f` if the ID is unknown.
     /// The callback must not try to lock this registry again.
     ///
-    /// # Panics
-    ///
-    /// Panics if the registry mutex is poisoned. A panic from `f` propagates
+    /// Recovers the lock if a previous panic poisoned the mutex. A panic from `f` propagates
     /// and poisons the mutex.
     pub fn with_task<F, R>(&self, task_id: &str, f: F) -> Option<R>
     where
         F: FnOnce(&mut AgentTask) -> R,
     {
-        let mut guard = self.tasks.lock().unwrap();
+        let mut guard = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         guard.get_mut(task_id).map(f)
     }
 
     /// Remove and return a task without finishing it, or `None` for an unknown ID.
     ///
-    /// # Panics
-    ///
-    /// Panics if the registry mutex is poisoned.
+    /// Recovers the lock if a previous panic poisoned the mutex.
     pub fn remove(&self, task_id: &str) -> Option<AgentTask> {
-        self.tasks.lock().unwrap().remove(task_id)
+        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).remove(task_id)
     }
 }
 
