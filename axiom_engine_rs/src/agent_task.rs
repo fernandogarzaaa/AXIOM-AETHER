@@ -116,7 +116,7 @@ impl AgentTask {
         }
 
         // Apply as all-or-nothing transaction.
-        let tx = match Transaction::apply(&edit_set) {
+        let mut tx = match Transaction::apply(&edit_set) {
             Ok(tx) => tx,
             Err(e) => {
                 return self.record(attempt_no, fingerprint, false, format!("apply failed: {e}"));
