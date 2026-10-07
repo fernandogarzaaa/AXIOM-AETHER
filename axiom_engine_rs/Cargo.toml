@@ -38,6 +38,10 @@ path = "src/main.rs"
 name = "axiom"
 path = "src/bin/axiom.rs"
 
+[[bin]]
+name = "axiom-agent-task"
+path = "src/bin/agent_task_mcp.rs"
+
 [features]
 default = []
 # Enable NVIDIA CUDA GPU backend (requires CUDA toolkit).

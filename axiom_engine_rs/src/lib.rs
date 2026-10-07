@@ -1,4 +1,5 @@
 pub mod adaptive;
+pub mod agent_task;
 pub mod agentic;
 pub mod agentic_eval;
 pub mod alignment_loop;
