@@ -24,12 +24,8 @@ WORKDIR /build
 # Copy the crate source first (better layer caching — dependencies change less
 # often than the application code).
 #
-# axiom_engine_rs has a path dependency on ../axiom_engine_rs/src/mesh_core (vendored) (the
-# Kinetic Neural Mesh crate, wired in for local-SLM routing). axiom_core inherits
-# from the axiom_mesh_rs workspace manifest, so the whole workspace directory
-# must be present for `cargo build --locked` to resolve it — copying only
-# axiom_engine_rs makes the build fail at manifest resolution.
-COPY axiom_mesh_rs/ ./axiom_mesh_rs/
+# The mesh networking code is vendored into axiom_engine_rs/src/mesh_core/,
+# so the engine is fully self-contained and only axiom_engine_rs is needed.
 COPY axiom_engine_rs/ ./axiom_engine_rs/
 
 # Build the release binary. We build from the crate directory so Cargo.toml
