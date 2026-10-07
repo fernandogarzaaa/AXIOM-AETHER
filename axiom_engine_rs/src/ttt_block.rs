@@ -91,6 +91,17 @@ pub struct NativeTTTBlock {
     /// optimizer updates it. Backward compat: old checkpoints lack this key;
     /// falls back to zeros.
     learnable_token_idx: Tensor,
+    /// Data-dependent inner-LR gate (adapted from ttt-lm-pytorch's
+    /// `ttt_lr_eta`). Computes `gate = 2*sigmoid(x @ w_lr + b_lr)`,
+    /// 1.0 at init (neutral). `w_lr`: [d_model, 1], `b_lr`: scalar.
+    /// Registered so optimizer updates them. Backward compat: zeros fallback.
+    w_lr: Tensor,
+    b_lr: Tensor,
+    /// Titans surprise-gating parameters. The fast-weight update is scaled by
+    /// `gate = sigmoid(alpha * (||error|| - beta))`. Init alpha=1.0, beta=0.0.
+    /// Registered so optimizer tunes them. Backward compat: fallback to init.
+    surprise_alpha: Tensor,
+    surprise_beta: Tensor,
 }
 
 /// Lower bound on the learned forget gate, keeping α ∈ [GATE_FLOOR, 1) so a
@@ -258,6 +269,26 @@ impl NativeTTTBlock {
                     .collect();
                 Tensor::from_vec(vals, LEARNABLE_TOKEN_IDX_LEN, &device).unwrap()
             });
+        // Data-dependent LR gate (Task 1). w_lr: [d_model, 1], b_lr: scalar.
+        // Zeros init ⇒ gate = 2*sigmoid(0) = 1.0 (neutral). Backward compat:
+        // old checkpoints lack these keys; falls back to zeros.
+        let w_lr = vs
+            .pp("w_lr")
+            .get((d, 1), "weight")
+            .unwrap_or_else(|_| {
+                Tensor::zeros((d, 1), candle_core::DType::F32, &device).unwrap()
+            });
+        let b_lr = vs.pp("w_lr").get((), "bias").unwrap_or_else(|_| {
+            Tensor::zeros((), candle_core::DType::F32, &device).unwrap()
+        });
+        // Titans surprise-gating params (Task 3). Init alpha=1.0, beta=0.0.
+        // Backward compat: old checkpoints lack these keys.
+        let surprise_alpha = vs.pp("surprise").get((), "alpha").unwrap_or_else(|_| {
+            Tensor::new(1.0f32, &device).unwrap()
+        });
+        let surprise_beta = vs.pp("surprise").get((), "beta").unwrap_or_else(|_| {
+            Tensor::new(0.0f32, &device).unwrap()
+        });
         Ok(Self {
             w_q,
             w_k,
@@ -275,6 +306,10 @@ impl NativeTTTBlock {
             guards,
             lr_scale,
             learnable_token_idx,
+            w_lr,
+            b_lr,
+            surprise_alpha,
+            surprise_beta,
         })
     }
 
@@ -412,6 +447,36 @@ impl NativeTTTBlock {
         let lr = base_lr
             .broadcast_mul(&lr_factor)?
             .broadcast_mul(&token_scale)?;
+        // Task 1: Data-dependent LR gate. Computes `gate = 2*sigmoid(x @ w_lr + b_lr)`,
+        // 1.0 at init (neutral). The gate is data-dependent: the network learns
+        // to modulate the inner LR based on the input token.
+        // w_lr: [d_model, 1], x: [1, d_model] → logit: [1, 1].
+        let gate_logit = x.matmul(&self.w_lr)?.broadcast_add(&self.b_lr)?;
+        let data_gate = candle_nn::ops::sigmoid(&gate_logit)?.affine(2.0, 0.0)?;
+        let lr = lr.broadcast_mul(&data_gate)?;
+        // Task 3: Titans surprise-gating. Scale the update by
+        // `gate = sigmoid(alpha * (||error|| - beta))`. High surprise
+        // (large reconstruction error) → gate near 1 (full update);
+        // low surprise → gate near 0.5 (attenuated update).
+        let surprise = error.sqr()?.sum_all()?.sqrt()?;
+        let surprise_logit = self
+            .surprise_alpha
+            .broadcast_mul(&surprise.sub(&self.surprise_beta)?)?;
+        let surprise_gate = candle_nn::ops::sigmoid(&surprise_logit)?;
+        let lr = lr.broadcast_mul(&surprise_gate)?;
+        // Task 2: LayerNorm Jacobian first-order correction. The inner loss is
+        // ||LN(pred) - target||^2, and the manual `error ⊗ k` gradient ignores
+        // the LayerNorm Jacobian. The dominant term is the 1/sigma scaling
+        // (where sigma = sqrt(var(pred) + eps)). We scale the error by 1/sigma.
+        let d_model_f = pred.dims()[0] as f64;
+        let pred_mean = (pred.sum_all()? / d_model_f)?;
+        let pred_var = (pred
+            .broadcast_sub(&pred_mean)?
+            .sqr()?
+            .sum_all()?
+            / d_model_f)?;
+        let inv_sigma = (pred_var + 1e-5)?.sqrt()?.recip()?;
+        let error_corrected = error.broadcast_mul(&inv_sigma)?;
         // Gated-DeltaNet forget gate α ∈ (0, 1] read live from the shared atomic.
         let alpha = f32::from_bits(self.forget_gate.load(Ordering::Relaxed));
 
@@ -424,7 +489,8 @@ impl NativeTTTBlock {
             let logit = w_alpha.forward(x)?.affine(1.0, GATE_INIT_LOGIT)?; // [1, 1]
             let s = candle_nn::ops::sigmoid(&logit)?; // [1, 1] ∈ (0, 1)
             let alpha_t = s.affine(1.0 - GATE_FLOOR, GATE_FLOOR)?; // [1, 1]
-            let pred_outer = pred_ln.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
+            // Use error_corrected for the LayerNorm Jacobian correction.
+            let pred_outer = error_corrected.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
             let v_outer = target.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
             let memory = session_state.sub(&pred_outer.broadcast_mul(&lr)?)?;
             let write = v_outer.broadcast_mul(&lr)?;
@@ -434,13 +500,15 @@ impl NativeTTTBlock {
             // Ungated delta rule (default, byte-identical to the original path):
             //   W̃ ← W̃ − η·(LN(pred) − target)⊗k
             // where target = v − k (residual) and pred is LayerNorm'd.
-            let grad = error.unsqueeze(1)?.matmul(&k_eff)?;
+            // Use error_corrected (1/sigma scaled) for the LayerNorm Jacobian.
+            let grad = error_corrected.unsqueeze(1)?.matmul(&k_eff)?;
             session_state.sub(&grad.broadcast_mul(&lr)?)?
         } else {
             // Scalar (parameter-free) gated delta rule: decay only the
             // retained-memory term by α, leaving the fresh write ηvkᵀ at full
             // strength. With normalized keys ‖I − ηkkᵀ‖ ≤ 1 ⇒ spectral radius ≤ α.
-            let pred_outer = pred_ln.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
+            // Use error_corrected for the LayerNorm Jacobian correction.
+            let pred_outer = error_corrected.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
             let v_outer = target.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
             let memory = session_state.sub(&pred_outer.broadcast_mul(&lr)?)?;
             let write = v_outer.broadcast_mul(&lr)?;
@@ -870,5 +938,91 @@ mod tests {
             recon != contrastive,
             "normalized inner loss must change the update trajectory"
         );
+    }
+
+    /// Gradient flow through the inner loop during meta-training
+    /// (`training=true`): W_k, W_v, the learnable LR scale, and the per-token
+    /// LR index must all receive non-zero gradients from a dummy loss.
+    #[test]
+    fn test_gradient_flow_training_true() {
+        let d = 8usize;
+        let (block, device) = make_block(d);
+        // Deterministic input (not randn) so gradient magnitudes are stable
+        // across runs.
+        let x_vals: Vec<f32> = (0..d).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let x = Tensor::from_vec(x_vals, (1usize, d), &device).unwrap();
+        let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+        let output = block.forward_native(&x, &mut state, true, 0).unwrap();
+        // Loss = dot(output, c) with a fixed NON-UNIFORM weight vector. This
+        // matters: the block ends with a LayerNorm, and any symmetric function
+        // of its output (plain sum, sum of squares) is ~constant w.r.t. the
+        // pre-norm activations, which would make every gradient ~0 for a
+        // bogus reason. The non-uniform weights break that symmetry so the
+        // loss genuinely depends on the parameters.
+        let c_vals: Vec<f32> = (1..=d).map(|i| i as f32).collect();
+        let c = Tensor::from_vec(c_vals, (1usize, d), &device).unwrap();
+        let loss = output.broadcast_mul(&c).unwrap().sum_all().unwrap();
+        let grads = loss.backward().unwrap();
+        for (name, param) in [
+            ("w_k", block.w_k.weight()),
+            ("w_v", block.w_v.weight()),
+            ("lr_scale", &block.lr_scale),
+            ("learnable_token_idx", &block.learnable_token_idx),
+        ] {
+            let norm = grads
+                .get(param)
+                .map(|g| {
+                    g.sqr()
+                        .unwrap()
+                        .sum_all()
+                        .unwrap()
+                        .to_scalar::<f32>()
+                        .unwrap()
+                        .sqrt()
+                })
+                .unwrap_or_else(|| {
+                    panic!("{name} must receive a gradient with training=true")
+                });
+            assert!(
+                norm > 1e-6,
+                "{name} gradient norm {norm} must be non-zero with training=true"
+            );
+        }
+    }
+
+    /// Detach behavior during inference (`training=false`): the forward pass
+    /// works, but the persisted session state is detached, so backpropagating
+    /// from a loss built purely on the stored state yields no gradients on
+    /// the block parameters (no BPTT tape is retained across tokens).
+    #[test]
+    fn test_detach_training_false() {
+        let d = 8usize;
+        let (block, device) = make_block(d);
+        let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
+        let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+        let output = block.forward_native(&x, &mut state, false, 0).unwrap();
+        assert_eq!(output.dims(), &[1, d]);
+        let state_loss = state.sum_all().unwrap();
+        let grads = state_loss.backward().unwrap();
+        for (name, param) in [
+            ("w_k", block.w_k.weight()),
+            ("w_v", block.w_v.weight()),
+            ("lr_scale", &block.lr_scale),
+            ("learnable_token_idx", &block.learnable_token_idx),
+        ] {
+            let norm = grads.get(param).map(|g| {
+                g.sqr()
+                    .unwrap()
+                    .sum_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap()
+                    .sqrt()
+            });
+            assert!(
+                norm.map(|n| n == 0.0).unwrap_or(true),
+                "{name} must have no gradient through the detached session state"
+            );
+        }
     }
 }
