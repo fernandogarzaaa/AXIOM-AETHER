@@ -106,7 +106,7 @@ impl AgentTask {
         }
 
         let fingerprint = edit_set.fingerprint();
-        if self.memory.was_rejected(&fingerprint) {
+        if self.memory.was_rejected(&self.goal, &edit_set) {
             return self.record(
                 attempt_no,
                 fingerprint,
@@ -136,7 +136,7 @@ impl AgentTask {
             self.record(attempt_no, fingerprint, true, output)
         } else {
             tx.rollback();
-            self.memory.remember_rejected(&fingerprint);
+            self.memory.record_rejected(&self.goal, &edit_set);
             self.record(attempt_no, fingerprint, false, output)
         }
     }
