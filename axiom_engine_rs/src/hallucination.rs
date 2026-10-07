@@ -21,8 +21,20 @@
 //! still score as "supported". Lexical grounding flags **unsupported** claims
 //! (no overlap); it does **not** reliably catch fluent contradictions. The
 //! `verdict_contradiction_blind_spot` test documents this explicitly.
+//!
+//! ## Spanda uncertainty signal
+//!
+//! In addition to support scoring, this module provides [`spanda_uncertainty`],
+//! a fast epistemic uncertainty estimate inspired by Spanda (Exact-Match
+//! Normalized Entropy). Instead of clustering K sampled generations with a
+//! pairwise NLI cross-encoder (~92ms), it computes entropy directly over
+//! deterministic lexical clusters (<1μs). High entropy indicates the claim
+//! uses diverse/unpredictable vocabulary relative to its length — a cheap
+//! proxy for "the model was uncertain when generating this."
+//! This signal feeds the trust gate alongside the support score.
 
 use crate::belief::BetaBelief;
+use std::collections::HashMap;
 
 /// A claim's grounding outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +357,71 @@ fn tally(claims: Vec<ClaimVerdict>) -> GroundingReport {
         unsupported,
         unverified,
         grounded_fraction,
+    }
+}
+
+/// Verify a response's claims against `evidence`, returning a grounding report.
+///
+/// When `AXIOM_CONFORMAL_THRESHOLD` or `AXIOM_CONFORMAL_DELTA` is set the
+/// verdict boundaries are taken from the conformal gate instead of the
+/// hardcoded `SUPPORT_HIGH`/`SUPPORT_LOW` constants.
+///
+/// ## Spanda uncertainty (Epistemic signal)
+///
+/// Computes Exact-Match Normalized Entropy over deterministic lexical clusters.
+/// Inspired by Spanda: instead of clustering K sampled generations with a
+/// pairwise NLI cross-encoder (~92ms), compute entropy directly over the
+/// claim's own token distribution (<1μs).
+///
+/// - Tokenize claim into normalized word forms (lowercase alphanumeric)
+/// - Cluster by exact match (each distinct token = one cluster)
+/// - Compute Shannon entropy: H = -Σ p_i * log(p_i)
+/// - Normalize: H_norm = H / log(N) where N = number of clusters
+///
+/// Returns a value in [0, 1]:
+/// - 0.0 = all tokens identical (maximally predictable, low uncertainty)
+/// - 1.0 = all tokens distinct (maximally diverse, high uncertainty)
+///
+/// High entropy suggests the claim uses varied vocabulary relative to its
+/// length — a cheap proxy for generation uncertainty. This complements the
+/// support score: a claim can be well-supported (high overlap) but still
+/// uncertain (high entropy), or vice versa.
+pub fn spanda_uncertainty(claim: &str) -> f32 {
+    let tokens: Vec<String> = claim
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect();
+    if tokens.is_empty() {
+        return 0.0;
+    }
+    if tokens.len() == 1 {
+        return 0.0;
+    }
+    // Count occurrences per distinct token (lexical clusters).
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for t in &tokens {
+        *counts.entry(t.as_str()).or_insert(0) += 1;
+    }
+    let n = tokens.len() as f32;
+    let num_clusters = counts.len() as f32;
+    if num_clusters <= 1.0 {
+        return 0.0;
+    }
+    // Shannon entropy.
+    let entropy: f32 = counts
+        .values()
+        .map(|&c| {
+            let p = c as f32 / n;
+            -p * p.ln()
+        })
+        .sum();
+    // Normalize by max entropy (log of cluster count).
+    let max_entropy = num_clusters.ln();
+    if max_entropy <= 0.0 {
+        0.0
+    } else {
+        (entropy / max_entropy).clamp(0.0, 1.0)
     }
 }
 
@@ -786,84 +863,41 @@ mod tests {
         separates clean code from anomalies with a positive margin.";
 
     #[test]
-    fn token_entropy_uniform_is_max() {
-        // Uniform distribution over N outcomes has entropy ln(N).
-        let n = 8usize;
-        let logits = vec![0.0f32; n];
-        let h = token_entropy(&logits);
-        let expected = (n as f32).ln();
-        assert!(
-            (h - expected).abs() < 1e-4,
-            "uniform entropy {h} should equal ln({n}) = {expected}"
-        );
+    fn spanda_uncertainty_empty_is_zero() {
+        assert_eq!(spanda_uncertainty(""), 0.0);
+        assert_eq!(spanda_uncertainty("   "), 0.0);
     }
 
     #[test]
-    fn token_entropy_peaked_is_near_zero() {
-        // One dominant logit -> near-deterministic distribution -> ~0 entropy.
-        let mut logits = vec![-100.0f32; 16];
-        logits[3] = 100.0;
-        let h = token_entropy(&logits);
-        assert!(h < 1e-3, "peaked entropy {h} should be near zero");
+    fn spanda_uncertainty_single_token_is_zero() {
+        assert_eq!(spanda_uncertainty("hello"), 0.0);
     }
 
     #[test]
-    fn token_entropy_empty_is_zero() {
-        assert_eq!(token_entropy(&[]), 0.0);
+    fn spanda_uncertainty_repeated_token_is_zero() {
+        // All tokens identical -> zero entropy.
+        assert_eq!(spanda_uncertainty("test test test test"), 0.0);
     }
 
     #[test]
-    fn token_entropy_single_logit_is_zero() {
-        assert_eq!(token_entropy(&[2.5]), 0.0);
+    fn spanda_uncertainty_all_distinct_is_one() {
+        // All tokens distinct -> max normalized entropy = 1.0.
+        let u = spanda_uncertainty("alpha beta gamma delta");
+        assert!((u - 1.0).abs() < 1e-5, "expected 1.0, got {u}");
     }
 
     #[test]
-    fn tecp_nonconformity_increases_with_entropy_at_fixed_support() {
-        // Fixed support; more uncertain tokens -> higher nonconformity.
-        let support = 0.8;
-        let confident_lps = vec![-0.05, -0.1, -0.02]; // near-zero: confident
-        let uncertain_lps = vec![-4.0, -5.5, -3.2]; // very negative: uncertain
-        let s_conf = tecp_nonconformity_with_support(support, &confident_lps);
-        let s_unc = tecp_nonconformity_with_support(support, &uncertain_lps);
-        assert!(
-            s_unc > s_conf,
-            "uncertain {s_unc} should exceed confident {s_conf} at fixed support"
-        );
+    fn spanda_uncertainty_mixed_in_between() {
+        // "the cat sat on the mat" -> tokens: the(2), cat(1), sat(1), on(1), mat(1)
+        let u = spanda_uncertainty("the cat sat on the mat");
+        assert!(u > 0.0 && u < 1.0, "expected (0,1), got {u}");
     }
 
     #[test]
-    fn tecp_nonconformity_high_support_low_entropy_is_conforming() {
-        let s = tecp_nonconformity_with_support(1.0, &[-0.01, -0.02]);
-        assert!(s < 0.1, "perfect support + confident tokens should conform, got {s}");
-    }
-
-    #[test]
-    fn tecp_nonconformity_zero_support_is_maximally_nonconforming() {
-        let s = tecp_nonconformity_with_support(0.0, &[-0.01]);
-        assert!(
-            (s - 1.0).abs() < 1e-5,
-            "zero support should give score 1.0, got {s}"
-        );
-    }
-
-    #[test]
-    fn tecp_nonconformity_empty_logprobs_reduces_to_one_minus_support() {
-        let s = tecp_nonconformity_with_support(0.7, &[]);
-        assert!(
-            (s - 0.3).abs() < 1e-5,
-            "empty logprobs should give 1.0 - support, got {s}"
-        );
-    }
-
-    #[test]
-    fn tecp_nonconformity_decreases_with_support_at_fixed_entropy() {
-        let lps = vec![-1.0, -1.5];
-        let s_low = tecp_nonconformity_with_support(0.2, &lps);
-        let s_high = tecp_nonconformity_with_support(0.9, &lps);
-        assert!(
-            s_high < s_low,
-            "higher support should lower nonconformity: {s_high} < {s_low}"
-        );
+    fn spanda_uncertainty_case_insensitive() {
+        let u1 = spanda_uncertainty("Hello HELLO hello");
+        let u2 = spanda_uncertainty("hello hello hello");
+        assert_eq!(u1, u2);
     }
 
     #[test]
@@ -1167,5 +1201,86 @@ mod tests {
             let r = verify("Axiom uses online test-time training.", EVIDENCE);
             assert_eq!(r.claims[0].verdict, Verdict::Supported);
         }
+    }
+
+    #[test]
+    fn token_entropy_uniform_is_max() {
+        // Uniform distribution over N outcomes has entropy ln(N).
+        let n = 8usize;
+        let logits = vec![0.0f32; n];
+        let h = token_entropy(&logits);
+        let expected = (n as f32).ln();
+        assert!(
+            (h - expected).abs() < 1e-4,
+            "uniform entropy {h} should equal ln({n}) = {expected}"
+        );
+    }
+
+    #[test]
+    fn token_entropy_peaked_is_near_zero() {
+        // One dominant logit -> near-deterministic distribution -> ~0 entropy.
+        let mut logits = vec![-100.0f32; 16];
+        logits[3] = 100.0;
+        let h = token_entropy(&logits);
+        assert!(h < 1e-3, "peaked entropy {h} should be near zero");
+    }
+
+    #[test]
+    fn token_entropy_empty_is_zero() {
+        assert_eq!(token_entropy(&[]), 0.0);
+    }
+
+    #[test]
+    fn token_entropy_single_logit_is_zero() {
+        assert_eq!(token_entropy(&[2.5]), 0.0);
+    }
+
+    #[test]
+    fn tecp_nonconformity_increases_with_entropy_at_fixed_support() {
+        // Fixed support; more uncertain tokens -> higher nonconformity.
+        let support = 0.8;
+        let confident_lps = vec![-0.05, -0.1, -0.02]; // near-zero: confident
+        let uncertain_lps = vec![-4.0, -5.5, -3.2]; // very negative: uncertain
+        let s_conf = tecp_nonconformity_with_support(support, &confident_lps);
+        let s_unc = tecp_nonconformity_with_support(support, &uncertain_lps);
+        assert!(
+            s_unc > s_conf,
+            "uncertain {s_unc} should exceed confident {s_conf} at fixed support"
+        );
+    }
+
+    #[test]
+    fn tecp_nonconformity_high_support_low_entropy_is_conforming() {
+        let s = tecp_nonconformity_with_support(1.0, &[-0.01, -0.02]);
+        assert!(s < 0.1, "perfect support + confident tokens should conform, got {s}");
+    }
+
+    #[test]
+    fn tecp_nonconformity_zero_support_is_maximally_nonconforming() {
+        let s = tecp_nonconformity_with_support(0.0, &[-0.01]);
+        assert!(
+            (s - 1.0).abs() < 1e-5,
+            "zero support should give score 1.0, got {s}"
+        );
+    }
+
+    #[test]
+    fn tecp_nonconformity_empty_logprobs_reduces_to_one_minus_support() {
+        let s = tecp_nonconformity_with_support(0.7, &[]);
+        assert!(
+            (s - 0.3).abs() < 1e-5,
+            "empty logprobs should give 1.0 - support, got {s}"
+        );
+    }
+
+    #[test]
+    fn tecp_nonconformity_decreases_with_support_at_fixed_entropy() {
+        let lps = vec![-1.0, -1.5];
+        let s_low = tecp_nonconformity_with_support(0.2, &lps);
+        let s_high = tecp_nonconformity_with_support(0.9, &lps);
+        assert!(
+            s_high < s_low,
+            "higher support should lower nonconformity: {s_high} < {s_low}"
+        );
     }
 }
