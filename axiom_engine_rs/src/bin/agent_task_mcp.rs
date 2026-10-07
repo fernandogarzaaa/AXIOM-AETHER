@@ -49,6 +49,7 @@ struct TaskStartParams {
     max_attempts: usize,
 }
 
+/// Use four as the stored attempt limit when omitted from start parameters.
 fn default_max_attempts() -> usize {
     4
 }
@@ -77,6 +78,7 @@ struct TaskFinishParams {
     commit: bool,
 }
 
+/// Keep edits when finish parameters omit `commit`.
 fn default_commit() -> bool {
     true
 }
@@ -87,15 +89,19 @@ struct RpcError {
     message: String,
 }
 
+/// Serialize a JSON-RPC success response with the supplied request ID and result.
 fn ok(id: &Value, result: Value) -> String {
     serde_json::to_string(&json!({"jsonrpc":"2.0","id":id,"result":result})).unwrap()
 }
 
+/// Serialize a JSON-RPC error response with the supplied request ID, code, and message.
 fn err(id: &Value, code: i32, message: String) -> String {
     let e = RpcError { code, message };
     serde_json::to_string(&json!({"jsonrpc":"2.0","id":id,"error":e})).unwrap()
 }
 
+/// Build a task ID from hexadecimal nanoseconds since the Unix epoch.
+/// Use zero for a clock before the epoch; IDs are not guaranteed to be unique.
 fn new_task_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -105,6 +111,15 @@ fn new_task_id() -> String {
     format!("task-{nanos:x}")
 }
 
+/// Dispatch nonblank stdin lines as JSON-RPC requests and write one response per line.
+///
+/// Parse errors produce code -32700; unknown methods produce -32601. Missing
+/// request IDs are returned as null. EOF or a read error ends the loop without
+/// aborting active tasks; stdout write and flush errors are ignored.
+///
+/// # Panics
+///
+/// Panics from request handlers propagate and terminate the server.
 fn main() {
     let registry = TaskRegistry::new();
     let stdin = std::io::stdin();
@@ -143,6 +158,12 @@ fn main() {
     }
 }
 
+/// Snapshot and register a task, returning its ID in a JSON-RPC response.
+/// Invalid parameters produce code -32602; snapshot read failures are suppressed.
+///
+/// # Panics
+///
+/// Panics if the registry mutex is poisoned.
 fn handle_start(registry: &TaskRegistry, id: &Value, params: Value) -> String {
     let p: TaskStartParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -159,6 +180,14 @@ fn handle_start(registry: &TaskRegistry, id: &Value, params: Value) -> String {
     }
 }
 
+/// Submit edits and return the proposal outcome in a JSON-RPC response.
+/// Invalid parameters produce code -32602; an unknown task produces -32001.
+/// Apply and verifier execution failures are returned as unsuccessful results.
+///
+/// # Panics
+///
+/// Panics if the registry mutex is poisoned or verifier output truncation splits
+/// a UTF-8 character at byte 8000.
 fn handle_propose(registry: &TaskRegistry, id: &Value, params: Value) -> String {
     let p: TaskProposeParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -186,6 +215,12 @@ fn handle_propose(registry: &TaskRegistry, id: &Value, params: Value) -> String 
     }
 }
 
+/// Return recorded attempts in order in a JSON-RPC response.
+/// Invalid parameters produce code -32602; an unknown task produces -32001.
+///
+/// # Panics
+///
+/// Panics if the registry mutex is poisoned.
 fn handle_history(registry: &TaskRegistry, id: &Value, params: Value) -> String {
     let p: TaskHistoryParams = match serde_json::from_value(params) {
         Ok(p) => p,
@@ -197,6 +232,13 @@ fn handle_history(registry: &TaskRegistry, id: &Value, params: Value) -> String 
     }
 }
 
+/// Remove and finish a task, returning the requested `commit` value as `committed`.
+/// Abort restoration is best effort; the response does not confirm restoration.
+/// Invalid parameters produce code -32602; an unknown task produces -32001.
+///
+/// # Panics
+///
+/// Panics if the registry mutex is poisoned.
 fn handle_finish(registry: &TaskRegistry, id: &Value, params: Value) -> String {
     let p: TaskFinishParams = match serde_json::from_value(params) {
         Ok(p) => p,

@@ -55,8 +55,12 @@ pub struct AgentTask {
 }
 
 impl AgentTask {
-    /// Start a new task. Snapshots the listed files so `finish(commit=false)`
-    /// can restore the workspace to its pre-task state.
+    /// Start a task and snapshot `files` for a later `finish(false)`.
+    ///
+    /// `files` selects paths to restore on abort; it does not restrict proposals.
+    /// Snapshot read errors are treated as absent files, so this always returns
+    /// `Ok`. `max_attempts` is stored with a minimum of one but is not enforced.
+    /// `verify_cmd` is a shell command run in the process's working directory.
     pub fn start(
         task_id: String,
         goal: String,
@@ -82,8 +86,22 @@ impl AgentTask {
         })
     }
 
-    /// Propose an edit-set. Applies it as a transaction, runs the verifier,
-    /// commits on pass or rolls back on failure. Returns the outcome.
+    /// Apply full replacement file contents and keep them if the verifier passes.
+    ///
+    /// Returns the attempt number, edit fingerprint, pass status, and verifier
+    /// output or rejection reason. Empty edits and edit-sets previously rejected
+    /// by the verifier for this goal are recorded without applying them. Each
+    /// call counts as an attempt unless the task is finished; finished tasks
+    /// return a rejection without changing history.
+    ///
+    /// Apply and verifier execution errors become failed outcomes. Verifier
+    /// failures trigger best-effort rollback of edited paths; restoration errors
+    /// are ignored. Apply errors can leave partial changes if directory creation
+    /// fails. Edits are not restricted to the files snapshotted at task start.
+    ///
+    /// # Panics
+    ///
+    /// Panics if verifier output truncation splits a UTF-8 character at byte 8000.
     pub fn propose(&mut self, edits: Vec<FileEdit>) -> ProposeOutcome {
         if self.finished {
             return ProposeOutcome {
@@ -139,13 +157,17 @@ impl AgentTask {
         }
     }
 
-    /// History of all attempts this task.
+    /// Return recorded attempts in order, including empty and duplicate proposals.
+    /// Calls made after the task is finished are not recorded.
     pub fn history(&self) -> &[AttemptRecord] {
         &self.history
     }
 
-    /// Finish the task. If `commit` is false, restore all files to their
-    /// pre-task state.
+    /// Mark the task finished, keeping current edits when `commit` is true.
+    ///
+    /// When false, attempt to restore only the paths snapshotted at task start,
+    /// removing those whose initial read failed. Write and removal errors are
+    /// ignored. Repeated calls have no effect, even with a different `commit`.
     pub fn finish(&mut self, commit: bool) {
         if self.finished {
             return;
@@ -165,6 +187,15 @@ impl AgentTask {
         }
     }
 
+    /// Run `verify_cmd` through the platform shell in the current working directory.
+    ///
+    /// Return exit success and lossily decoded stdout followed by labeled stderr.
+    /// Output over 8000 bytes is truncated to that length and given a truncation
+    /// marker. Process execution errors return false with an error message.
+    ///
+    /// # Panics
+    ///
+    /// Panics if byte 8000 is inside a UTF-8 character when truncating output.
     fn run_verifier(&self) -> (bool, String) {
         let output = if cfg!(windows) {
             Command::new("cmd").args(["/C", &self.verify_cmd]).output()
@@ -191,6 +222,7 @@ impl AgentTask {
         }
     }
 
+    /// Append an attempt to history and return the matching proposal outcome.
     fn record(
         &mut self,
         attempt: usize,
@@ -229,16 +261,30 @@ pub struct TaskRegistry {
 }
 
 impl TaskRegistry {
+    /// Create an empty registry shared through reference counting.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             tasks: Mutex::new(HashMap::new()),
         })
     }
 
+    /// Store a task under its ID, replacing any existing task without finishing it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry mutex is poisoned.
     pub fn insert(&self, task: AgentTask) {
         self.tasks.lock().unwrap().insert(task.task_id.clone(), task);
     }
 
+    /// Call `f` with the matching task while holding the registry lock.
+    /// Return `None` without calling `f` if the ID is unknown.
+    /// The callback must not try to lock this registry again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry mutex is poisoned. A panic from `f` propagates
+    /// and poisons the mutex.
     pub fn with_task<F, R>(&self, task_id: &str, f: F) -> Option<R>
     where
         F: FnOnce(&mut AgentTask) -> R,
@@ -247,6 +293,11 @@ impl TaskRegistry {
         guard.get_mut(task_id).map(f)
     }
 
+    /// Remove and return a task without finishing it, or `None` for an unknown ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry mutex is poisoned.
     pub fn remove(&self, task_id: &str) -> Option<AgentTask> {
         self.tasks.lock().unwrap().remove(task_id)
     }
