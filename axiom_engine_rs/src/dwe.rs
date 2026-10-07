@@ -236,7 +236,7 @@ pub fn extract_delta_fragment(
 }
 
 pub fn serialize_fragment(fragment: &DweFragment) -> Result<Vec<u8>, String> {
-    let encoded = bincode::serialize(fragment).map_err(|e| e.to_string())?;
+    let encoded = crate::bincode_compat::serialize(fragment).map_err(|e| e.to_string())?;
     if encoded.len() > MAX_DWE_FRAGMENT_BYTES {
         return Err(format!(
             "fragment too large: {} > {}",
@@ -255,7 +255,7 @@ pub fn deserialize_fragment(bytes: &[u8]) -> Result<DweFragment, String> {
             MAX_DWE_FRAGMENT_BYTES
         ));
     }
-    bincode::deserialize(bytes).map_err(|e| e.to_string())
+    crate::bincode_compat::deserialize(bytes).map_err(|e| e.to_string())
 }
 
 /// Deterministic HMAC preimage over the authenticated fields (everything but
@@ -269,7 +269,7 @@ pub fn fragment_preimage(fragment: &DweFragment) -> Vec<u8> {
         &fragment.layers,
         &fragment.state_hash,
     );
-    bincode::serialize(&shadow).unwrap_or_default()
+    crate::bincode_compat::serialize(&shadow).unwrap_or_default()
 }
 
 /// Sign a fragment in place with the fleet key (reuses the provenance HMAC).

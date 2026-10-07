@@ -7,6 +7,7 @@ pub mod anthropic_forwarder;
 pub mod backend_live;
 pub mod backend_router;
 pub mod belief;
+pub mod bincode_compat;
 pub mod bench;
 pub mod bootstrap;
 pub mod cache_safety;
