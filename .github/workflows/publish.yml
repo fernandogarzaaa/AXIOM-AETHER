@@ -48,7 +48,7 @@ jobs:
         # repo + workflow file, and id-token: write above.
         run: |
           set -euo pipefail
-          oidc_resp=$(curl -sS --fail -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://crates.io")
+          oidc_resp=$(curl -sS --fail -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=crates.io")
           jwt=$(echo "$oidc_resp" | jq -r '.value')
           if [ -z "$jwt" ] || [ "$jwt" = "null" ]; then
             echo "::error::Failed to obtain OIDC JWT from GitHub"
