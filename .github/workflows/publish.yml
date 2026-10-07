@@ -40,10 +40,17 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
+      - name: Authenticate to crates.io (Trusted Publishing)
+        id: crates_auth
+        uses: rust-lang/crates.io-auth-action@v1
       - name: cargo publish
         working-directory: axiom_engine_rs
-        # No CARGO_REGISTRY_TOKEN: cargo uses the OIDC token via the
-        # crates.io trusted publisher configured for this repo + workflow.
+        # Trusted Publishing: the auth action exchanges the GitHub OIDC token
+        # for a short-lived crates.io API token (cargo itself cannot do the
+        # OIDC exchange). Requires the trusted publisher configured on
+        # crates.io for this repo + workflow, and id-token: write above.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token }}
         run: cargo publish --locked
 
   wheels:
