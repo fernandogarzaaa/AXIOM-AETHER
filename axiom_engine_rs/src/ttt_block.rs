@@ -134,6 +134,17 @@ pub struct OnlineGuards {
     /// update, `W̃ ← (1−λ)·W̃ + λ·I` pulls the state weakly back toward the
     /// meta-trained init. λ ∈ [0,1]; `0.0` disables anchoring.
     pub anchor_strength: AtomicU32,
+    /// **ttt_ssm_eval safety gate**: max gradient norm. Before applying the
+    /// inner-loop update, compute ‖grad‖ where grad = error⊗k_eff. If it
+    /// exceeds this threshold, veto the update entirely (keep prior W̃).
+    /// `0.0` disables the check. Prevents destabilizing steps from
+    /// outlier tokens.
+    pub max_grad_norm: AtomicU32,
+    /// **ttt_ssm_eval rollback**: when `true`, check the updated state for
+    /// NaN/inf after the inner-loop update. If found, revert to the pre-update
+    /// state instead of poisoning the session. Default false (rely on the
+    /// stabilize clamp); enable for extra safety on long streams.
+    pub nan_rollback: AtomicBool,
     /// **B.6 inner-loss ablation** (separate from the guards above). When `true`,
     /// the self-supervised inner objective L2-normalizes both the predicted and
     /// the value view before taking the error, turning the MSE reconstruction
@@ -171,6 +182,15 @@ impl OnlineGuards {
         self.anchor_strength
             .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
+    /// Set the max gradient norm for pre-update veto (`0.0` disables).
+    /// Updates with ‖grad‖ above this threshold are skipped.
+    pub fn set_max_grad_norm(&self, v: f32) {
+        self.max_grad_norm.store(v.to_bits(), Ordering::Relaxed);
+    }
+    /// Enable/disable NaN rollback on post-update state.
+    pub fn set_nan_rollback(&self, on: bool) {
+        self.nan_rollback.store(on, Ordering::Relaxed);
+    }
     /// Select the inner-loss form: `true` = normalized/contrastive multi-view,
     /// `false` (default) = exact MSE reconstruction (byte-identical).
     pub fn set_aux_loss_normalized(&self, on: bool) {
@@ -188,10 +208,20 @@ impl OnlineGuards {
     fn anchor(&self) -> f32 {
         f32::from_bits(self.anchor_strength.load(Ordering::Relaxed))
     }
+    fn max_grad_norm(&self) -> f32 {
+        f32::from_bits(self.max_grad_norm.load(Ordering::Relaxed))
+    }
+    fn nan_rollback(&self) -> bool {
+        self.nan_rollback.load(Ordering::Relaxed)
+    }
     /// True when every guard is at its disabled default — lets `forward_native`
     /// skip the guard block (and its device syncs) entirely on the hot path.
     fn all_disabled(&self) -> bool {
-        self.drift() == 0.0 && self.min_error() == 0.0 && self.anchor() == 0.0
+        self.drift() == 0.0
+            && self.min_error() == 0.0
+            && self.anchor() == 0.0
+            && self.max_grad_norm() == 0.0
+            && !self.nan_rollback()
     }
 }
 
@@ -467,6 +497,17 @@ impl NativeTTTBlock {
                     updated_state = session_state.clone();
                 }
             }
+            // (1b) ttt_ssm_eval pre-update gradient veto: if ‖error⊗k_eff‖
+            //      exceeds max_grad_norm, the update is destabilizing — veto it
+            //      entirely and keep the prior state.
+            let max_gn = self.guards.max_grad_norm();
+            if max_gn > 0.0 {
+                let grad = error.unsqueeze(1)?.matmul(&k_eff)?;
+                let gn = grad.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+                if gn > max_gn {
+                    updated_state = session_state.clone();
+                }
+            }
             // (2) Anti-forgetting anchor (EATA Fisher / CoTTA restore): pull the
             //     kept state weakly toward the meta-trained init (identity):
             //     W̃ ← (1−λ)·W̃ + λ·I.
@@ -488,6 +529,19 @@ impl NativeTTTBlock {
                     let d = updated_state.dim(0)?;
                     updated_state =
                         Tensor::eye(d, updated_state.dtype(), updated_state.device())?;
+                }
+            }
+            // (4) ttt_ssm_eval NaN rollback: if the updated state contains
+            //     NaN/inf, revert to the pre-update state instead of poisoning
+            //     the session. Catches numerical blowups the clamp missed.
+            if self.guards.nan_rollback() {
+                let flat = updated_state.flatten_all()?;
+                let has_bad = flat
+                    .to_vec1::<f32>()?
+                    .iter()
+                    .any(|&x| !x.is_finite());
+                if has_bad {
+                    updated_state = session_state.clone();
                 }
             }
         }
@@ -870,5 +924,40 @@ mod tests {
             recon != contrastive,
             "normalized inner loss must change the update trajectory"
         );
+    }
+
+    #[test]
+    fn max_grad_norm_veto_skips_destabilizing_update() {
+        // With a tiny max_grad_norm, even a normal update's gradient exceeds
+        // the threshold, so the state must remain exactly at init.
+        let d = 16usize;
+        let (block, device, guards) = make_block_with_guards(d);
+        guards.set_max_grad_norm(1e-9); // effectively zero tolerance
+        let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
+        let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+        let before: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let _ = block.forward_native(&x, &mut state, false, 0).unwrap();
+        let after: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(before, after, "vetoed update must leave state unchanged");
+    }
+
+    #[test]
+    fn max_grad_norm_disabled_by_default() {
+        // Default (0.0) must not veto: state changes after a normal update.
+        let d = 16usize;
+        let (block, device, guards) = make_block_with_guards(d);
+        assert_eq!(guards.max_grad_norm(), 0.0);
+        let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
+        let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+        let before: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let _ = block.forward_native(&x, &mut state, false, 0).unwrap();
+        let after: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_ne!(before, after, "default must allow updates");
+    }
+
+    #[test]
+    fn nan_rollback_disabled_by_default() {
+        let (_block, _device, guards) = make_block_with_guards(16);
+        assert!(!guards.nan_rollback());
     }
 }
