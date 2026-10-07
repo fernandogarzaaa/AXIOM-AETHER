@@ -181,6 +181,15 @@ async fn compressed_messages_path(
         ));
     }
 
+    // Auto-inject cache breakpoint: if the client didn't set cache_control
+    // but the prefix is long enough to benefit, add an ephemeral breakpoint
+    // so the provider caches the stable prefix. This compounds AXIOM's
+    // compression savings with the provider's cache-read discount.
+    // The injected breakpoint is then respected by the cache-safety logic below.
+    let mut owned_body = body.clone();
+    crate::cache_safety::maybe_inject_cache_breakpoint(&mut owned_body);
+    let body = &owned_body;
+
     let messages = body
         .get("messages")
         .and_then(Value::as_array)
