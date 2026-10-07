@@ -215,11 +215,11 @@ fn normal_cdf(z: f32) -> f32 {
 
 fn erf_approx(x: f32) -> f32 {
     // Abramowitz & Stegun 7.1.26
-    let a1 = 0.254829592f32;
-    let a2 = -0.284496736f32;
-    let a3 = 1.421413741f32;
-    let a4 = -1.453152027f32;
-    let a5 = 1.061405429f32;
+    let a1 = 0.2548296f32;
+    let a2 = -0.2844967f32;
+    let a3 = 1.4214137f32;
+    let a4 = -1.453152f32;
+    let a5 = 1.0614054f32;
     let p = 0.3275911f32;
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
