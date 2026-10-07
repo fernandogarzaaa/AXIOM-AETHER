@@ -8,9 +8,9 @@ use sha2::{Digest, Sha256};
 
 pub const DEFAULT_CHECKPOINT_PATH: &str = "axiom_kernel_v1.safetensors";
 pub const DEFAULT_EOS_TOKEN: u32 = 2;
-pub const DEFAULT_BASE_MODEL_FILE: &str = "axiom-base-d256.safetensors";
+pub const DEFAULT_BASE_MODEL_FILE: &str = "axiom_production_bpe.bin";
 pub const DEFAULT_MODEL_URL: &str =
-    "https://huggingface.co/fernandogarzaaa/AXIOM-AETHER/resolve/main/axiom-base-d256.safetensors";
+    "https://huggingface.co/fggg23/axiom-aether-v0.4.1/resolve/main/axiom_production_bpe.bin";
 
 /// Static hyper-parameters for the Axiom-TTT inference engine.
 #[derive(Debug, Clone)]
