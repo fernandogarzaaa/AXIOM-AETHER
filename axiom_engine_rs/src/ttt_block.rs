@@ -145,6 +145,12 @@ pub struct OnlineGuards {
     /// update, `W̃ ← (1−λ)·W̃ + λ·I` pulls the state weakly back toward the
     /// meta-trained init. λ ∈ [0,1]; `0.0` disables anchoring.
     pub anchor_strength: AtomicU32,
+    /// Pre-update gradient veto: skip the TTT update when `||g||_2 > max_grad_norm`.
+    /// `0.0` disables the veto.
+    pub max_grad_norm: AtomicU32,
+    /// Post-update NaN/Inf rollback: when `true`, snapshot the state before the
+    /// update and restore it if any element becomes non-finite.
+    pub nan_rollback: AtomicBool,
     /// **B.6 inner-loss ablation** (separate from the guards above). When `true`,
     /// the self-supervised inner objective L2-normalizes both the predicted and
     /// the value view before taking the error, turning the MSE reconstruction
@@ -182,6 +188,14 @@ impl OnlineGuards {
         self.anchor_strength
             .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
+    /// Set the pre-update gradient-norm veto threshold (`0.0` disables).
+    pub fn set_max_grad_norm(&self, v: f32) {
+        self.max_grad_norm.store(v.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+    /// Enable/disable post-update NaN/Inf rollback.
+    pub fn set_nan_rollback(&self, v: bool) {
+        self.nan_rollback.store(v, Ordering::Relaxed);
+    }
     /// Select the inner-loss form: `true` = normalized/contrastive multi-view,
     /// `false` (default) = exact MSE reconstruction (byte-identical).
     pub fn set_aux_loss_normalized(&self, on: bool) {
@@ -199,10 +213,16 @@ impl OnlineGuards {
     fn anchor(&self) -> f32 {
         f32::from_bits(self.anchor_strength.load(Ordering::Relaxed))
     }
+    fn max_grad_norm_val(&self) -> f32 {
+        f32::from_bits(self.max_grad_norm.load(Ordering::Relaxed))
+    }
+    fn nan_rollback_on(&self) -> bool {
+        self.nan_rollback.load(Ordering::Relaxed)
+    }
     /// True when every guard is at its disabled default — lets `forward_native`
     /// skip the guard block (and its device syncs) entirely on the hot path.
     fn all_disabled(&self) -> bool {
-        self.drift() == 0.0 && self.min_error() == 0.0 && self.anchor() == 0.0
+        self.drift() == 0.0 && self.min_error() == 0.0 && self.anchor() == 0.0 && self.max_grad_norm_val() == 0.0
     }
 }
 
@@ -538,6 +558,14 @@ impl NativeTTTBlock {
             // (2) Anti-forgetting anchor (EATA Fisher / CoTTA restore): pull the
             //     kept state weakly toward the meta-trained init (identity):
             //     W̃ ← (1−λ)·W̃ + λ·I.
+            let max_gn = self.guards.max_grad_norm_val();
+            if max_gn > 0.0 {
+                let grad = error_corrected.unsqueeze(1)?.matmul(&k_eff)?;
+                let gn = grad.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+                if gn > max_gn {
+                    updated_state = session_state.clone();
+                }
+            }
             let lambda = self.guards.anchor();
             if lambda > 0.0 {
                 let d = updated_state.dim(0)?;
@@ -556,6 +584,13 @@ impl NativeTTTBlock {
                     let d = updated_state.dim(0)?;
                     updated_state =
                         Tensor::eye(d, updated_state.dtype(), updated_state.device())?;
+                }
+            }
+            if self.guards.nan_rollback_on() {
+                let flat = updated_state.flatten_all()?;
+                let has_bad = flat.to_vec1::<f32>()?.iter().any(|&x| !x.is_finite());
+                if has_bad {
+                    updated_state = session_state.clone();
                 }
             }
         }
@@ -1024,5 +1059,31 @@ mod tests {
                 "{name} must have no gradient through the detached session state"
             );
         }
+    }
+
+    #[test]
+    fn max_grad_norm_veto_skips_destabilizing_update() {
+        let d = 16usize;
+        let (block, device, guards) = make_block_with_guards(d);
+        guards.set_max_grad_norm(1e-9);
+        let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
+        let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+        let before: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let _ = block.forward_native(&x, &mut state, false, 0).unwrap();
+        let after: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(before, after, "vetoed update must leave state unchanged");
+    }
+    #[test]
+    fn max_grad_norm_disabled_by_default() {
+        let d = 16usize;
+        let (block, device, _guards) = make_block_with_guards(d);
+        let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
+        let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
+        let _ = block.forward_native(&x, &mut state, false, 0).unwrap();
+    }
+    #[test]
+    fn nan_rollback_disabled_by_default() {
+        let (_block, _device, guards) = make_block_with_guards(16);
+        assert!(guards.all_disabled(), "fresh guards must be disabled");
     }
 }
