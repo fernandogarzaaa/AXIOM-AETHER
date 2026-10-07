@@ -6,8 +6,7 @@ name: Publish packages
 # artifacts.
 #
 # One-time setup required (see docs/PUBLISHING.md):
-#   * crates.io: configure Trusted Publishing for this repo + workflow (OIDC),
-#     so no token is needed; the `crates-io` job requests an id-token below.
+#   * crates.io: set the CARGO_REGISTRY_TOKEN repo secret (crates.io API token).
 #   * PyPI: configure Trusted Publishing for this repo + workflow (OIDC), so no
 #     token is needed; the `pypi` job requests an id-token below.
 on:
@@ -30,7 +29,6 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: read
-      id-token: write # Trusted Publishing (OIDC) — no API token needed.
     steps:
       - uses: actions/checkout@v5
         with:
@@ -40,13 +38,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
-      - name: Exchange OIDC token for crates.io publish token
-        id: crates_auth
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
       - name: cargo publish
         working-directory: axiom_engine_rs
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --locked
 
   wheels:
