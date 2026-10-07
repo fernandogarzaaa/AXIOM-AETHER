@@ -86,6 +86,7 @@ pub mod tool_defer;
 pub mod train;
 pub mod trajectory_sampler;
 pub mod ttt_block;
+pub mod resumable_adamw;
 pub mod ttt_mlp;
 pub mod ttt_mlp_model;
 pub mod tui;
