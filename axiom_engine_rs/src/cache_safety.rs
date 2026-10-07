@@ -88,34 +88,41 @@ pub fn maybe_inject_cache_breakpoint(body: &mut Value) -> bool {
     if request_uses_cache(body) {
         return false;
     }
-    let messages = match body.get("messages").and_then(Value::as_array) {
-        Some(m) if m.len() > 1 => m,
+    let msg_len = match body.get("messages").and_then(Value::as_array) {
+        Some(m) if m.len() > 1 => m.len(),
         _ => return false,
     };
     // Estimate prefix tokens (all but last message). Rough: chars / 4.
-    let prefix_chars: usize = messages[..messages.len() - 1]
-        .iter()
-        .map(|m| {
-            m.get("content")
-                .map(|c| match c {
-                    Value::String(s) => s.len(),
-                    Value::Array(arr) => arr
-                        .iter()
-                        .filter_map(|b| b.get("text").and_then(Value::as_str))
-                        .map(str::len)
-                        .sum(),
-                    _ => 0,
-                })
-                .unwrap_or(0)
-        })
-        .sum();
+    // Scope the immutable borrow so it drops before the mutable borrow below.
+    let prefix_chars: usize = {
+        let messages = body.get("messages").and_then(Value::as_array).unwrap();
+        messages[..messages.len() - 1]
+            .iter()
+            .map(|m| {
+                m.get("content")
+                    .map(|c| match c {
+                        Value::String(s) => s.len(),
+                        Value::Array(arr) => arr
+                            .iter()
+                            .filter_map(|b| b.get("text").and_then(Value::as_str))
+                            .map(str::len)
+                            .sum(),
+                        _ => 0,
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
     if prefix_chars / 4 < MIN_CACHEABLE_TOKENS {
         return false;
     }
     // Inject breakpoint on the last message of the prefix (index len-2).
     // For string content, convert to content-block array form.
-    let idx = messages.len() - 2;
-    let msgs = body.get_mut("messages").and_then(Value::as_array_mut).unwrap();
+    let idx = msg_len - 2;
+    let msgs = match body.get_mut("messages").and_then(Value::as_array_mut) {
+        Some(m) => m,
+        None => return false,
+    };
     let target = &mut msgs[idx];
     let content_val = target.get("content").cloned();
     match content_val {
