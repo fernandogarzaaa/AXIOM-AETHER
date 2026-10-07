@@ -1075,11 +1075,9 @@ mod tests {
 
     #[test]
     fn max_grad_norm_veto_skips_destabilizing_update() {
-        // With a tiny max_grad_norm, even a normal update's gradient exceeds
-        // the threshold, so the state must remain exactly at init.
         let d = 16usize;
         let (block, device, guards) = make_block_with_guards(d);
-        guards.set_max_grad_norm(1e-9); // effectively zero tolerance
+        guards.set_max_grad_norm(1e-9);
         let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
         let mut state = Tensor::eye(d, DType::F32, &device).unwrap();
         let before: Vec<f32> = state.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -1090,7 +1088,6 @@ mod tests {
 
     #[test]
     fn max_grad_norm_disabled_by_default() {
-        // Default (0.0) must not veto: state changes after a normal update.
         let d = 16usize;
         let (block, device, _guards) = make_block_with_guards(d);
         let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
@@ -1103,7 +1100,6 @@ mod tests {
 
     #[test]
     fn nan_rollback_disabled_by_default() {
-        // Fresh guards have nan_rollback off (verified via all_disabled).
         let (_block, _device, guards) = make_block_with_guards(16);
         assert!(guards.all_disabled(), "fresh guards must be disabled");
     }
