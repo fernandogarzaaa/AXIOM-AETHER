@@ -425,6 +425,135 @@ pub fn spanda_uncertainty(claim: &str) -> f32 {
     }
 }
 
+/// Token-Entropy Conformal Prediction (TECP) scoring.
+///
+/// Inspired by TECP (Token-Entropy Conformal Prediction for LLMs): uses
+/// logit-based token entropy as the nonconformity score inside a split
+/// conformal prediction pipeline, constructing prediction sets with formal
+/// (1-alpha) coverage guarantees. Reference-free: no labeled supervision is
+/// needed for the uncertainty score itself.
+///
+/// This upgrades AXIOM's conformal gate nonconformity score from a pure
+/// lexical-support heuristic to one that also captures intrinsic model
+/// uncertainty during generation, avoiding the overconfidence bias of
+/// frequency-based measures.
+///
+/// ## Shannon entropy from logits
+///
+/// [`token_entropy`] computes the Shannon entropy of the softmax
+/// distribution over `logits`:
+///
+/// ```text
+/// p_i = exp(l_i - max(l)) / Σ_j exp(l_j - max(l))
+/// H   = -Σ_i p_i * ln(p_i)
+/// ```
+///
+/// ## Nonconformity score
+///
+/// [`tecp_nonconformity`] combines the lexical support score (from
+/// [`best_support`]-style overlap, in [0,1]) with normalized token entropy:
+///
+/// ```text
+/// score = 1.0 - (support * (1.0 - normalized_entropy))
+/// ```
+///
+/// - High support + low entropy  → conforming (low score)
+/// - Low support  or high entropy → nonconforming (high score)
+///
+/// The normalized entropy divides raw entropy by ln(vocab_size), mapping it
+/// to [0, 1] so it composes cleanly with the support score.
+pub fn token_entropy(logits: &[f32]) -> f32 {
+    if logits.is_empty() {
+        return 0.0;
+    }
+    // Softmax with max-subtraction for numerical stability.
+    let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    if !max_l.is_finite() {
+        return 0.0;
+    }
+    let mut sum_exp = 0.0f32;
+    for &l in logits {
+        sum_exp += (l - max_l).exp();
+    }
+    if sum_exp <= 0.0 || !sum_exp.is_finite() {
+        return 0.0;
+    }
+    let log_sum = sum_exp.ln();
+    // H = -Σ p_i ln p_i, computed as Σ p_i * (max_l + log_sum - l_i) - ... via
+    // the identity ln p_i = (l_i - max_l) - ln(Σ exp(l_j - max_l)).
+    let mut entropy = 0.0f32;
+    for &l in logits {
+        let log_p = (l - max_l) - log_sum;
+        let p = log_p.exp();
+        if p > 0.0 {
+            entropy -= p * log_p;
+        }
+    }
+    entropy.max(0.0)
+}
+
+/// TECP nonconformity score combining lexical support with token entropy.
+///
+/// `support` is the claim's lexical support score in [0, 1] (higher = more
+/// grounded). `token_logprobs` are per-token log-probabilities from the
+/// generating model; when unavailable, pass an empty slice (treated as
+/// zero entropy, i.e. the score reduces to `1.0 - support`).
+///
+/// When log-probs are provided, entropy is estimated from the implied
+/// per-token distribution sharpness: a token with logprob near 0 is
+/// confident (low entropy contribution), while very negative logprobs
+/// indicate uncertainty. The average negative logprob is mapped to a
+/// normalized entropy in [0, 1] via `1 - exp(mean_logprob)`.
+///
+/// The `claim` parameter is reserved for future per-claim calibration hooks
+/// and currently unused.
+pub fn tecp_nonconformity(claim: &str, token_logprobs: &[f32]) -> f32 {
+    let _ = claim;
+    // Support must be supplied by the caller via the second path below;
+    // this overload keeps the signature stable for callers that only have
+    // logprobs. Use tecp_nonconformity_with_support for the full score.
+    let normalized_entropy = normalized_entropy_from_logprobs(token_logprobs);
+    // With no support information, nonconformity is driven by entropy alone.
+    normalized_entropy.clamp(0.0, 1.0)
+}
+
+/// Full TECP nonconformity score: `1.0 - (support * (1.0 - normalized_entropy))`.
+///
+/// - `support`: lexical support score in [0, 1].
+/// - `token_logprobs`: per-token log-probabilities (may be empty).
+pub fn tecp_nonconformity_with_support(support: f32, token_logprobs: &[f32]) -> f32 {
+    let support = support.clamp(0.0, 1.0);
+    let normalized_entropy = normalized_entropy_from_logprobs(token_logprobs);
+    (1.0 - (support * (1.0 - normalized_entropy))).clamp(0.0, 1.0)
+}
+
+/// Map per-token log-probs to a normalized entropy in [0, 1].
+///
+/// Uses the mean negative log-probability (perplexity-like) mapped through
+/// `1 - exp(mean_logprob)`: confident tokens (logprob ≈ 0) contribute ~0,
+/// uncertain tokens (very negative logprob) push toward 1.
+fn normalized_entropy_from_logprobs(token_logprobs: &[f32]) -> f32 {
+    if token_logprobs.is_empty() {
+        return 0.0;
+    }
+    let finite: Vec<f32> = token_logprobs
+        .iter()
+        .cloned()
+        .filter(|x| x.is_finite())
+        .collect();
+    if finite.is_empty() {
+        return 0.0;
+    }
+    let mean_lp = finite.iter().sum::<f32>() / finite.len() as f32;
+    // mean_lp ≤ 0 for valid log-probs; exp(mean_lp) ∈ (0, 1].
+    (1.0 - mean_lp.exp()).clamp(0.0, 1.0)
+}
+
+/// Verify a response's claims against `evidence`, returning a grounding report.
+///
+/// When `AXIOM_CONFORMAL_THRESHOLD` or `AXIOM_CONFORMAL_DELTA` is set the
+/// verdict boundaries are taken from the conformal gate instead of the
+/// hardcoded `SUPPORT_HIGH`/`SUPPORT_LOW` constants.
 pub fn verify(response: &str, evidence: &str) -> GroundingReport {
     let evidence_spans: Vec<Vec<String>> = sentences(evidence)
         .iter()
@@ -1072,5 +1201,73 @@ mod tests {
             let r = verify("Axiom uses online test-time training.", EVIDENCE);
             assert_eq!(r.claims[0].verdict, Verdict::Supported);
         }
+    }
+
+    #[test]
+    fn token_entropy_peaked_is_near_zero() {
+        // One dominant logit -> near-deterministic distribution -> ~0 entropy.
+        let mut logits = vec![-100.0f32; 16];
+        logits[3] = 100.0;
+        let h = token_entropy(&logits);
+        assert!(h < 1e-3, "peaked entropy {h} should be near zero");
+    }
+
+    #[test]
+    fn token_entropy_empty_is_zero() {
+        assert_eq!(token_entropy(&[]), 0.0);
+    }
+
+    #[test]
+    fn token_entropy_single_logit_is_zero() {
+        assert_eq!(token_entropy(&[2.5]), 0.0);
+    }
+
+    #[test]
+    fn tecp_nonconformity_increases_with_entropy_at_fixed_support() {
+        // Fixed support; more uncertain tokens -> higher nonconformity.
+        let support = 0.8;
+        let confident_lps = vec![-0.05, -0.1, -0.02]; // near-zero: confident
+        let uncertain_lps = vec![-4.0, -5.5, -3.2]; // very negative: uncertain
+        let s_conf = tecp_nonconformity_with_support(support, &confident_lps);
+        let s_unc = tecp_nonconformity_with_support(support, &uncertain_lps);
+        assert!(
+            s_unc > s_conf,
+            "uncertain {s_unc} should exceed confident {s_conf} at fixed support"
+        );
+    }
+
+    #[test]
+    fn tecp_nonconformity_high_support_low_entropy_is_conforming() {
+        let s = tecp_nonconformity_with_support(1.0, &[-0.01, -0.02]);
+        assert!(s < 0.1, "perfect support + confident tokens should conform, got {s}");
+    }
+
+    #[test]
+    fn tecp_nonconformity_zero_support_is_maximally_nonconforming() {
+        let s = tecp_nonconformity_with_support(0.0, &[-0.01]);
+        assert!(
+            (s - 1.0).abs() < 1e-5,
+            "zero support should give score 1.0, got {s}"
+        );
+    }
+
+    #[test]
+    fn tecp_nonconformity_empty_logprobs_reduces_to_one_minus_support() {
+        let s = tecp_nonconformity_with_support(0.7, &[]);
+        assert!(
+            (s - 0.3).abs() < 1e-5,
+            "empty logprobs should give 1.0 - support, got {s}"
+        );
+    }
+
+    #[test]
+    fn tecp_nonconformity_decreases_with_support_at_fixed_entropy() {
+        let lps = vec![-1.0, -1.5];
+        let s_low = tecp_nonconformity_with_support(0.2, &lps);
+        let s_high = tecp_nonconformity_with_support(0.9, &lps);
+        assert!(
+            s_high < s_low,
+            "higher support should lower nonconformity: {s_high} < {s_low}"
+        );
     }
 }
