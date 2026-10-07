@@ -7,7 +7,7 @@
 use ndarray::Array1;
 
 /// A point in the system's state space. Produced by sensor fusion
-/// ([`crate::idc`]) and by goal encoding.
+/// ([`crate::mesh_core::idc`]) and by goal encoding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateVector(pub Array1<f32>);
 
