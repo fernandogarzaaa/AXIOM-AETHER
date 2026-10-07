@@ -164,7 +164,7 @@ fn apply_error_rolls_back_prior_writes_and_allows_retry() {
     let blocked = dir.path().join("directory");
     fs::write(&path, "original").unwrap();
     fs::create_dir(&blocked).unwrap();
-    let mut task = task(&[path.clone()], "echo verifier-ran");
+    let mut task = task(&[path.clone(), blocked.clone()], "echo verifier-ran");
     let edits = vec![edit(&path, "changed"), edit(&blocked, "new file")];
     let failed = task.propose(edits.clone());
     assert!(!failed.passed);
