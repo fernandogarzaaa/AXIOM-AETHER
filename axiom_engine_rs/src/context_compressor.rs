@@ -347,6 +347,38 @@ fn adapt_session_window_blocking(
     Ok(())
 }
 
+/// Surprise-weighted variant of [`adapt_session_blocking`].
+///
+/// Behaves identically, but after each adaptation window it computes the
+/// per-window fast-weight update norm `||ΔW̃||` and feeds it into `triage`.
+/// That norm is the model's own measure of how much new information the
+/// window carried — the relevance signal that
+/// [`crate::surprise_triage::SurpriseTriage`] later uses to allocate
+/// compression budget across chunks.
+///
+/// **Must also be called from inside `tokio::task::spawn_blocking`.**
+pub fn adapt_session_with_triage(
+    pipeline: &InferencePipeline,
+    states: &mut [Tensor],
+    token_ids: &[u32],
+    triage: &mut crate::surprise_triage::SurpriseTriage,
+) -> CResult<()> {
+    if token_ids.is_empty() {
+        return Ok(());
+    }
+    for window in token_ids.chunks(MAX_ADAPT_CHUNK_TOKENS) {
+        // Snapshot pre-update states so the window's update norm can be
+        // measured. One clone per layer; at d128/2L this is ~128KB.
+        let before: Vec<Tensor> = states.to_vec();
+        adapt_session_window_blocking(pipeline, states, window)?;
+        // Feed ||Δ|| into the triage distribution. Errors here must never
+        // break adaptation: a failed norm measurement just skips the
+        // observation for this window.
+        let _ = triage.observe_tensors(&before, states);
+    }
+    Ok(())
+}
+
 /// Run the associative recall pass and extract the fingerprint.
 ///
 /// The query tokens are streamed through the adapted state — same

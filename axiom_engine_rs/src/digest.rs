@@ -71,6 +71,30 @@ impl Digestor for SkeletonDigestor {
     }
 }
 
+impl SkeletonDigestor {
+    /// Surprise-weighted digest: before compressing the chunk, feed its TTT
+    /// update norm into `triage`, score it against the session's running
+    /// distribution, and select the compression level adaptively.
+    ///
+    /// Returns the compressed text and the [`CompressionLevel`] that was
+    /// chosen, so callers can log/meter the triage decision.
+    ///
+    /// Note: the [`CompressionLevel::Verbatim`] tier returns the chunk
+    /// unchanged — the chunk earned its tokens by being highly surprising.
+    /// Callers budgeting across many chunks should account for verbatim
+    /// chunks when sizing the total budget.
+    pub fn digest_with_triage(
+        &self,
+        text: &str,
+        budget_tokens: usize,
+        triage: &mut crate::surprise_triage::SurpriseTriage,
+        update_norm: f32,
+    ) -> (String, crate::surprise_triage::CompressionLevel) {
+        let lang = detect_code_language(text);
+        triage.triage_compress(text, budget_tokens, update_norm, lang)
+    }
+}
+
 /// Heuristic language detection for ranked skeletonization.
 /// Returns "rust" for Rust-like code, "" (generic path) otherwise.
 /// The ranked skeletonizer uses tree-sitter for Rust and a

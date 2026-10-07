@@ -77,6 +77,7 @@ pub mod session_awareness;
 pub mod skeleton;
 pub mod state_predictor;
 pub mod surprisal;
+pub mod surprise_triage;
 pub mod swarm_route;
 pub mod mesh_router;
 pub mod swarm_router;
