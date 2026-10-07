@@ -44,9 +44,10 @@ training toolchain. Build the dev tools with `cargo build --features tools`.
 
 ## One-time setup
 
-- **crates.io:** create an API token and add it as the repo secret
-  `CARGO_REGISTRY_TOKEN`. Verify the crate name `axiom_engine` is available (or
-  pick another and update `Cargo.toml`).
+- **crates.io:** configure
+  [Trusted Publishing](https://crates.io/docs/trusted-publishing) for this repo +
+  the `publish.yml` workflow (no API token needed). Verify the crate name
+  `axiom_engine` is available (or pick another and update `Cargo.toml`).
 - **PyPI:** verify the name `axiom-aether` is free, then configure
   [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) for this repo +
   the `publish.yml` workflow + a `pypi` environment (no API token needed). As a
