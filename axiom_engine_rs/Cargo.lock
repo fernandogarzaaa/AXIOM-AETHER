@@ -169,7 +169,6 @@ name = "axiom_engine"
 version = "0.4.2"
 dependencies = [
  "anyhow",
- "axiom_core",
  "axum",
  "bincode",
  "candle-core",
@@ -192,6 +191,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "thiserror",
  "sha2",
  "tempfile",
  "tokenizers 0.15.2",
