@@ -19,9 +19,9 @@ use ndarray::{Array1, Array2, Axis};
 use rand::Rng;
 use thiserror::Error;
 
-use crate::mesh_core::gumbel::gumbel_softmax;
-use crate::mesh_core::node::{NodeId, WorkerNode};
-use crate::mesh_core::residual::Residual;
+use crate::gumbel::gumbel_softmax;
+use crate::node::{NodeId, WorkerNode};
+use crate::residual::Residual;
 
 #[derive(Debug, Error)]
 pub enum MeshError {
@@ -490,8 +490,8 @@ impl KineticNeuralMesh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh_core::node::NodeKind;
-    use crate::mesh_core::residual::StateVector;
+    use crate::node::NodeKind;
+    use crate::residual::StateVector;
     use ndarray::array;
     use rand::{rngs::StdRng, SeedableRng};
 

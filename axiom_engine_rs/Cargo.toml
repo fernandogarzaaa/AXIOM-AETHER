@@ -148,7 +148,8 @@ candle-nn = "0.10.2"
 tokio = { version = "1.35", features = ["full"] }
 sha2 = "0.10.8"
 rand = "0.8.5"
-# (axiom_core vendored as crate::mesh_core; see src/mesh_core/)
+# Mesh primitives (KNM/IDC) live in the canonical axiom_mesh_core crate.
+axiom_mesh_core = { path = "../axiom_mesh_core" }
 ndarray = "0.16"
 indicatif = "0.17.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }

@@ -1,0 +1,21 @@
+[package]
+name = "axiom_mesh_core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+description = "Kinetic Neural Mesh (KNM) and Intent-Driven Convergence (IDC) primitives for AXIOM"
+license = "MIT"
+repository = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
+homepage = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
+authors = ["Fernando Garza <fernandogarzaaa@users.noreply.github.com>"]
+keywords = ["neural", "mesh", "routing", "agents"]
+categories = ["science"]
+
+[dependencies]
+ndarray = "0.16"
+rand = "0.8.5"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[dev-dependencies]
+proptest = "1"

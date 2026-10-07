@@ -21,12 +21,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Copy the crate source first (better layer caching — dependencies change less
+# Copy the crate sources first (better layer caching — dependencies change less
 # often than the application code).
 #
-# The mesh networking code is vendored into axiom_engine_rs/src/mesh_core/,
-# so the engine is fully self-contained and only axiom_engine_rs is needed.
+# The engine depends on the canonical axiom_mesh_core crate via path, so both
+# directories are needed.
 COPY axiom_engine_rs/ ./axiom_engine_rs/
+COPY axiom_mesh_core/ ./axiom_mesh_core/
 
 # Build the release binary. We build from the crate directory so Cargo.toml
 # paths resolve correctly. The `--locked` flag uses the committed Cargo.lock

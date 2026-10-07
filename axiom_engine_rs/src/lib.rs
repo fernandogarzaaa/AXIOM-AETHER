@@ -80,8 +80,10 @@ pub mod state_predictor;
 pub mod surprisal;
 pub mod surprise_triage;
 pub mod swarm_route;
-#[allow(dead_code)]
-mod mesh_core;
+// Canonical mesh crate (path dependency). Kept under the historic `mesh_core`
+// name so existing `crate::mesh_core::…` paths keep resolving; the module
+// stays private exactly as before.
+use axiom_mesh_core as mesh_core;
 pub mod mesh_router;
 pub mod swarm_router;
 pub mod task_board;
