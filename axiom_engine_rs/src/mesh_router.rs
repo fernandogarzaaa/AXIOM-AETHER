@@ -24,8 +24,8 @@
 
 use std::sync::Mutex;
 
-use axiom_core::mesh::{KineticNeuralMesh, MeshConfig};
-use axiom_core::node::{NodeId, NodeKind, WorkerNode};
+use crate::mesh_core::mesh::{KineticNeuralMesh, MeshConfig};
+use crate::mesh_core::node::{NodeId, NodeKind, WorkerNode};
 use ndarray::Array1;
 use rand::{rngs::StdRng, SeedableRng};
 
