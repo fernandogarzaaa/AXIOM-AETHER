@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 //! # mesh_core — the "brain" of Axiom Mesh
 //!
 //! This crate owns the two load-bearing abstractions of the system:
