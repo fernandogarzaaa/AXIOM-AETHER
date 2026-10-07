@@ -40,15 +40,32 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
-      - name: Authenticate to crates.io (Trusted Publishing)
+      - name: Exchange OIDC token for crates.io publish token
         id: crates_auth
-        uses: rust-lang/crates.io-auth-action@v1.0.5
+        # Trusted Publishing without third-party actions: fetch GitHub's OIDC
+        # JWT, exchange it with crates.io for a short-lived publish token.
+        # Requires the trusted publisher configured on crates.io for this
+        # repo + workflow file, and id-token: write above.
+        run: |
+          set -euo pipefail
+          oidc_resp=$(curl -sS --fail -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://crates.io")
+          jwt=$(echo "$oidc_resp" | jq -r '.value')
+          if [ -z "$jwt" ] || [ "$jwt" = "null" ]; then
+            echo "::error::Failed to obtain OIDC JWT from GitHub"
+            exit 1
+          fi
+          echo "::add-mask::$jwt"
+          exchange_resp=$(curl -sS --fail -X POST https://crates.io/api/v1/trusted_publishing/tokens             -H "Content-Type: application/json"             -d "$(jq -n --arg jwt "$jwt" '{jwt: $jwt}')")
+          token=$(echo "$exchange_resp" | jq -r '.token')
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "::error::crates.io refused the OIDC exchange"
+            echo "$exchange_resp" >&2
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
       - name: cargo publish
         working-directory: axiom_engine_rs
-        # Trusted Publishing: the auth action exchanges the GitHub OIDC token
-        # for a short-lived crates.io API token (cargo itself cannot do the
-        # OIDC exchange). Requires the trusted publisher configured on
-        # crates.io for this repo + workflow, and id-token: write above.
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth.outputs.token }}
         run: cargo publish --locked
