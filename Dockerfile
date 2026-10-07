@@ -1,4 +1,4 @@
-﻿# Dockerfile — multi-stage build for the Axiom-TTT engine.
+# Dockerfile — multi-stage build for the Axiom-TTT engine.
 #
 # Builds the Rust `axiom_engine` binary in a builder stage, then copies it into
 # a lean runtime image. The image ships WITHOUT trained weights (see
@@ -10,7 +10,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Builder — compile the Rust binary
 # ---------------------------------------------------------------------------
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.90-bookworm AS builder
 
 # Install build dependencies (tree-sitter needs a C compiler)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,12 +24,8 @@ WORKDIR /build
 # Copy the crate source first (better layer caching — dependencies change less
 # often than the application code).
 #
-# axiom_engine_rs has a path dependency on ../axiom_mesh_rs/axiom_core (the
-# Kinetic Neural Mesh crate, wired in for local-SLM routing). axiom_core inherits
-# from the axiom_mesh_rs workspace manifest, so the whole workspace directory
-# must be present for `cargo build --locked` to resolve it — copying only
-# axiom_engine_rs makes the build fail at manifest resolution.
-COPY axiom_mesh_rs/ ./axiom_mesh_rs/
+# The mesh networking code is vendored into axiom_engine_rs/src/mesh_core/,
+# so the engine is fully self-contained and only axiom_engine_rs is needed.
 COPY axiom_engine_rs/ ./axiom_engine_rs/
 
 # Build the release binary. We build from the crate directory so Cargo.toml

@@ -2,6 +2,7 @@
 name = "axiom_engine"
 version = "0.4.2"
 edition = "2021"
+rust-version = "1.90"
 description = "Axiom-TTT Inference Engine â€“ Rust implementation using candle"
 license = "MIT"
 repository = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
@@ -143,12 +144,13 @@ candle-nn = "0.10.2"
 tokio = { version = "1.35", features = ["full"] }
 sha2 = "0.10.8"
 rand = "0.8.5"
-axiom_core = { version = "0.1.0", path = "../axiom_mesh_rs/axiom_core" }
+# (axiom_core vendored as crate::mesh_core; see src/mesh_core/)
 ndarray = "0.16"
 indicatif = "0.17.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+thiserror = "1"
 tokenizers = "0.15"
 scraper = "0.27"
 tree-sitter = "0.26.9"
@@ -191,6 +193,7 @@ candle-transformers = { version = "0.10.2", optional = true }
 hf-hub = { version = "0.4", optional = true }
 
 [dev-dependencies]
+proptest = "1"
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"

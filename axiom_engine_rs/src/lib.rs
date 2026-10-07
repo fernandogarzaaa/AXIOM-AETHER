@@ -79,6 +79,8 @@ pub mod state_predictor;
 pub mod surprisal;
 pub mod surprise_triage;
 pub mod swarm_route;
+#[allow(dead_code)]
+mod mesh_core;
 pub mod mesh_router;
 pub mod swarm_router;
 pub mod task_board;
