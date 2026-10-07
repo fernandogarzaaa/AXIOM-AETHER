@@ -446,14 +446,21 @@ mod tests {
             2,
         )
         .unwrap();
-        let edit = || FileEdit {
-            path: path.clone(),
-            content: "v2".into(),
-        };
-        // Two attempts allowed (both fail the verifier).
-        assert!(!task.propose(vec![edit()]).passed);
+        // Two attempts allowed (both fail the verifier). Use distinct
+        // contents so the second isn't rejected as a duplicate.
+        for i in 0..2 {
+            let out = task.propose(vec![FileEdit {
+                path: path.clone(),
+                content: format!("v{}", i + 2),
+            }]);
+            assert!(!out.passed);
+            assert!(!out.output.contains("max attempts"));
+        }
         // Third attempt exceeds max_attempts=2.
-        let out = task.propose(vec![edit()]);
+        let out = task.propose(vec![FileEdit {
+            path: path.clone(),
+            content: "v4".into(),
+        }]);
         assert!(!out.passed);
         assert!(out.output.contains("max attempts"));
     }
