@@ -128,11 +128,9 @@ impl AgentTask {
 
         if passed {
             tx.commit();
-            // Update originals so a later abort doesn't clobber the good state.
-            for edit in &edit_set.edits {
-                self.originals
-                    .insert(edit.path.clone(), std::fs::read(&edit.path).ok());
-            }
+            // Note: `originals` keeps the pre-task snapshot so that
+            // `finish(commit=false)` restores the true initial state,
+            // not the last-committed state.
             self.record(attempt_no, fingerprint, true, output)
         } else {
             tx.rollback();
