@@ -406,6 +406,54 @@ mod tests {
     }
 
     #[test]
+    fn propose_rejects_path_outside_allowlist() {
+        let (_tmp, path) = tmp_file("v1");
+        let (_tmp2, other) = tmp_file("other");
+        let mut task = AgentTask::start(
+            "t1".into(),
+            "test".into(),
+            "exit 0".into(),
+            vec![path.clone()],
+            4,
+        )
+        .unwrap();
+        // Proposing an edit to a path not in the allowlist is rejected
+        // without running the verifier or touching the file.
+        let out = task.propose(vec![FileEdit {
+            path: other.clone(),
+            content: "hacked".into(),
+        }]);
+        assert!(!out.passed);
+        assert!(out.output.contains("not in task file allowlist"));
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "other");
+        // The allowlisted file is untouched too.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1");
+    }
+
+    #[test]
+    fn propose_rejects_after_max_attempts() {
+        let (_tmp, path) = tmp_file("v1");
+        let mut task = AgentTask::start(
+            "t1".into(),
+            "test".into(),
+            "exit 1".into(),
+            vec![path.clone()],
+            2,
+        )
+        .unwrap();
+        let edit = || FileEdit {
+            path: path.clone(),
+            content: "v2".into(),
+        };
+        // Two attempts allowed (both fail the verifier).
+        assert!(!task.propose(vec![edit()]).passed);
+        // Third attempt exceeds max_attempts=2.
+        let out = task.propose(vec![edit()]);
+        assert!(!out.passed);
+        assert!(out.output.contains("max attempts"));
+    }
+
+    #[test]
     fn finish_abort_restores_originals() {
         let (_tmp, path) = tmp_file("v1");
         let mut task = AgentTask::start(
