@@ -27,7 +27,12 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::agentic::{AttemptMemory, EditSet, FileEdit, Transaction};
+use crate::agentic::{AttemptMemory, EditSet, Transaction};
+
+/// A single file edit: full replacement content for a path.
+///
+/// Re-exported from [`crate::agentic`] for use by the MCP server binary.
+pub use crate::agentic::FileEdit;
 
 /// A single recorded attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
