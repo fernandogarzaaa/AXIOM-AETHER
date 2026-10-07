@@ -137,7 +137,7 @@ impl AgentTask {
                     false,
                     format!(
                         "path '{}' not in task file allowlist;                          declare it in `files` at task_start to edit it",
-                        e.path
+                        e.path.display()
                     ),
                 );
             }
