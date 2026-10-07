@@ -82,10 +82,17 @@ impl AgentTask {
                 Ok(bytes) => {
                     originals.insert(f.clone(), Some(bytes));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.kind() == std::io::ErrorKind::IsADirectory =>
+                {
+                    // Missing file, or a directory (cannot be snapshotted as
+                    // bytes). Abort will not delete directories.
                     originals.insert(f.clone(), None);
                 }
                 Err(e) => {
+                    // The file exists but cannot be read (permissions, etc.).
+                    // Failing here prevents finish(false) from deleting it.
                     return Err(e);
                 }
             }
@@ -228,7 +235,9 @@ impl AgentTask {
                     None => {
                         match std::fs::remove_file(path) {
                             Ok(()) => {},
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                            Err(e)
+                                if e.kind() == std::io::ErrorKind::NotFound
+                                    || e.kind() == std::io::ErrorKind::IsADirectory => {},
                             Err(e) => return Err(e),
                         }
                     }
