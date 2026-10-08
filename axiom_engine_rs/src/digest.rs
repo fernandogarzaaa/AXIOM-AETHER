@@ -135,32 +135,6 @@ fn truncate_to_token_budget(text: &str, budget_tokens: usize) -> String {
     out
 }
 
-/// P0 safety gate: only digest when the agent can actually expand.
-///
-/// A digest replaces heavy content with a stub pointing at `axiom_expand`.
-/// If the client never registered the Axiom MCP server, that tool doesn't
-/// exist and the digest is misleading with no recovery path. The proxy sees
-/// the `tools` array in each `/v1/messages` request, so gate on the expand
-/// tool being present there.
-///
-/// Matching is suffix-aware: exact `axiom_expand` or an MCP-namespaced
-/// variant ending in `__axiom_expand` (e.g. Claude Code exposes it as
-/// `mcp__axiom__axiom_expand`). A bare substring check would false-positive
-/// on unrelated tools like `other_axiom_expand_helper`.
-pub fn expand_tool_available(outbound: &Value) -> bool {
-    outbound
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|tools| {
-            tools.iter().any(|t| {
-                t.get("name").and_then(Value::as_str).map(|n| {
-                    n == "axiom_expand" || n.ends_with("__axiom_expand")
-                }).unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
-}
-
 /// Errors from the opt-in Haiku digestor -- always recoverable by falling
 /// back to [`SkeletonDigestor`], never fatal to the request.
 #[derive(Debug)]
@@ -282,53 +256,6 @@ fn append_fault_to(path: &std::path::Path, session: &str, page_id: &str, turns_s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn expand_gate_allows_direct_tool_name() {
-        let outbound = json!({"tools": [{"name": "axiom_expand"}, {"name": "Read"}]});
-        assert!(expand_tool_available(&outbound));
-    }
-
-    #[test]
-    fn expand_gate_allows_mcp_namespaced_tool_name() {
-        // Claude Code exposes MCP tools as mcp__<server>__<tool>.
-        let outbound = json!({"tools": [{"name": "mcp__axiom__axiom_expand"}]});
-        assert!(expand_tool_available(&outbound));
-    }
-
-    #[test]
-    fn expand_gate_denies_when_tool_absent() {
-        let outbound = json!({"tools": [{"name": "Read"}, {"name": "Bash"}]});
-        assert!(!expand_tool_available(&outbound));
-    }
-
-    #[test]
-    fn expand_gate_denies_on_empty_tools() {
-        let outbound = json!({"tools": []});
-        assert!(!expand_tool_available(&outbound));
-    }
-
-    #[test]
-    fn expand_gate_denies_on_missing_tools_array() {
-        // Fail closed: no tools array means no expand path, so no digest.
-        let outbound = json!({"messages": []});
-        assert!(!expand_tool_available(&outbound));
-    }
-
-    #[test]
-    fn expand_gate_denies_unrelated_names() {
-        let outbound = json!({"tools": [{"name": "expand"}, {"name": "axiom_compress"}]});
-        assert!(!expand_tool_available(&outbound));
-    }
-
-    #[test]
-    fn expand_gate_rejects_substring_false_positives() {
-        // `other_axiom_expand_helper` contains "axiom_expand" but is not the
-        // expand tool -- must not match.
-        let outbound = json!({"tools": [{"name": "other_axiom_expand_helper"}]});
-        assert!(!expand_tool_available(&outbound));
-    }
 
     #[test]
     fn append_fault_writes_a_well_formed_jsonl_row() {

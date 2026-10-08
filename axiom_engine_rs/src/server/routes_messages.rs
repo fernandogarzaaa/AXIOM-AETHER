@@ -1792,14 +1792,6 @@ async fn apply_digest_admission(
     forwarder: Option<&AnthropicForwarder>,
     client_auth: &ClientAuth,
 ) {
-    // P0 safety gate: a digest points the agent at `axiom_expand` for the
-    // full text. If that tool isn't in this request's tools array (client
-    // never registered the Axiom MCP server), the digest is misleading with
-    // no recovery path -- fail closed and pass the full text through.
-    if !crate::digest::expand_tool_available(outbound) {
-        eprintln!("[axiom-cvm] digest skipped: axiom_expand not in tools[]");
-        return;
-    }
     let Some(messages) = outbound.get("messages").and_then(Value::as_array) else {
         return;
     };
