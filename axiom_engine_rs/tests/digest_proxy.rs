@@ -148,6 +148,8 @@ async fn digest_replaces_heavy_tool_result_with_stub_and_original_is_expandable(
         "model": "claude-sonnet-5",
         "max_tokens": 16,
         "session_id": session_id,
+        // P0 safety gate: digesting requires axiom_expand in tools[].
+        "tools": [{"name": "axiom_expand"}],
         "messages": [
             {"role": "user", "content": "please read this file"},
             tool_result_message(&heavy),
@@ -243,6 +245,8 @@ async fn digest_default_unset_env_var_digests_since_skeleton_is_now_the_default(
         "model": "claude-sonnet-5",
         "max_tokens": 16,
         "session_id": "digest-default-unset",
+        // P0 safety gate: digesting requires axiom_expand in tools[].
+        "tools": [{"name": "axiom_expand"}],
         "messages": [
             {"role": "user", "content": "please read this file"},
             tool_result_message(&heavy),
@@ -282,6 +286,8 @@ async fn digest_only_touches_the_newest_turn_when_cache_control_present() {
         "model": "claude-sonnet-5",
         "max_tokens": 16,
         "session_id": "digest-newest-turn",
+        // P0 safety gate: digesting requires axiom_expand in tools[].
+        "tools": [{"name": "axiom_expand"}],
         "messages": [
             {"role": "user", "content": "first turn"},
             tool_result_message(&heavy_old),
@@ -304,6 +310,83 @@ async fn digest_only_touches_the_newest_turn_when_cache_control_present() {
     assert!(
         !sent_str.contains("newer_function_1199"),
         "newest-turn tool_result (after cache_control) must have been digested"
+    );
+
+    let _ = fs::remove_dir_all(&cvm_dir);
+}
+
+#[tokio::test]
+async fn digest_skipped_when_expand_tool_absent() {
+    // P0 safety gate: if axiom_expand is not in the request's tools[], the
+    // digest would point at a nonexistent tool. Fail closed: pass through.
+    let _guard = env_lock().lock().await;
+    std::env::set_var("AXIOM_CVM_DIGEST", "skeleton");
+    let _cleanup = EnvVarGuard(&["AXIOM_CVM_DIGEST", "AXIOM_CVM_DIGEST_THRESHOLD_TOKENS"]);
+
+    let cvm_dir = cvm_tempdir("no-expand-tool");
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream, &cvm_dir).await;
+    let app = create_router(state);
+
+    let heavy = heavy_tool_result_text();
+    let body = json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 16,
+        "session_id": "digest-no-expand",
+        // NOTE: no axiom_expand here -- only unrelated tools.
+        "tools": [{"name": "Read"}, {"name": "Bash"}],
+        "messages": [
+            {"role": "user", "content": "please read this file"},
+            tool_result_message(&heavy),
+        ],
+    });
+    let status = post_json(&app, "/v1/messages", body).await.0;
+    assert_eq!(status, StatusCode::OK);
+
+    let captured = capture.requests.lock().unwrap();
+    let sent_str = captured[0].to_string();
+    assert!(
+        sent_str.contains("generated_function_1199"),
+        "without axiom_expand in tools[], heavy text must pass through undigested"
+    );
+    assert!(
+        !sent_str.contains("AXIOM-PAGE"),
+        "no digest stub must be emitted when expansion is unavailable"
+    );
+
+    let _ = fs::remove_dir_all(&cvm_dir);
+}
+
+#[tokio::test]
+async fn digest_skipped_when_tools_array_missing() {
+    // P0 safety gate: missing tools[] also fails closed.
+    let _guard = env_lock().lock().await;
+    std::env::set_var("AXIOM_CVM_DIGEST", "skeleton");
+    let _cleanup = EnvVarGuard(&["AXIOM_CVM_DIGEST", "AXIOM_CVM_DIGEST_THRESHOLD_TOKENS"]);
+
+    let cvm_dir = cvm_tempdir("no-tools-array");
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream, &cvm_dir).await;
+    let app = create_router(state);
+
+    let heavy = heavy_tool_result_text();
+    let body = json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 16,
+        "session_id": "digest-no-tools",
+        "messages": [
+            {"role": "user", "content": "please read this file"},
+            tool_result_message(&heavy),
+        ],
+    });
+    let status = post_json(&app, "/v1/messages", body).await.0;
+    assert_eq!(status, StatusCode::OK);
+
+    let captured = capture.requests.lock().unwrap();
+    let sent_str = captured[0].to_string();
+    assert!(
+        sent_str.contains("generated_function_1199"),
+        "without tools[] the heavy text must pass through undigested"
     );
 
     let _ = fs::remove_dir_all(&cvm_dir);
