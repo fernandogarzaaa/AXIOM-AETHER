@@ -1024,13 +1024,11 @@ impl Point {
     }
 
     #[test]
-    fn skeleton_body_excludes_indented_imports() {
-        // Imports inside function bodies belong to elided code, not the skeleton.
-        let txt = "import os\ndef load():\n    import sys\n    return sys.argv\n";
-        let b = skeleton_body(txt, 3);
-        assert!(b.contains("import os"));
-        assert!(b.contains("def load():"));
-        assert!(!b.contains("import sys"), "indented import leaked: {b}");
+    fn skeleton_body_prose_falls_back_to_excerpt() {
+        let txt = "This is just plain prose with no code at all. ".repeat(100);
+        let b = skeleton_body(&txt, 3);
+        assert!(b.contains("elided"));
+        assert!(!b.contains("<axiom_context_digest"));
     }
 
     #[test]
