@@ -236,20 +236,77 @@ impl CvmStore {
 
 /// Build the canonical single-line stub for a digested page. Must survive
 /// model round-trips verbatim: no embedded newlines.
-/// Format: `[AXIOM-PAGE <page_id> <orig_tokens>tok <kind>] <first 120 chars>...`
-pub fn build_stub(page_id: &str, orig_tokens: usize, kind: &str, original_text: &str) -> String {
+/// Format: `[AXIOM-PAGE <page_id> session="<session_id>" <orig_tokens>tok <kind>] <first 120 chars>...`
+///
+/// The `session="..."` attribute is what `axiom_expand`'s `session_id`
+/// parameter reads (see its tool schema in `mcp_stdio.rs`): without it the
+/// agent cannot recover the full text from the stub alone.
+pub fn build_stub(
+    page_id: &str,
+    session_id: &str,
+    orig_tokens: usize,
+    kind: &str,
+    original_text: &str,
+) -> String {
     let snippet: String = original_text.chars().take(120).collect();
     let snippet = snippet.replace(['\n', '\r'], " ");
-    format!("[AXIOM-PAGE {page_id} {orig_tokens}tok {kind}] {snippet}...")
+    // JSON-encode the session id so quotes, backslashes, and brackets in a
+    // hostile value round-trip instead of breaking the stub grammar.
+    let session_attr =
+        serde_json::to_string(session_id).expect("session IDs are serializable");
+    format!("[AXIOM-PAGE {page_id} session={session_attr} {orig_tokens}tok {kind}] {snippet}...")
 }
 
 /// The fields recovered by parsing a stub line built by [`build_stub`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StubInfo {
     pub page_id: String,
+    /// `None` for stubs built before the `session="..."` attribute existed.
+    pub session_id: Option<String>,
     pub orig_tokens: usize,
     pub kind: String,
     pub snippet: String,
+}
+
+/// Split an optional `session=<json-string>` attribute out of a stub header,
+/// returning `(header_without_attribute, session_value)`. Old-format stubs
+/// without the attribute round-trip as `(header, None)`. The value is a
+/// JSON string (see [`build_stub`]); it is decoded so escaped quotes and
+/// backslashes resolve to the original session id.
+fn split_session_attr(header: &str) -> (String, Option<String>) {
+    const MARKER: &str = "session=\"";
+    let Some(start) = header.find(MARKER) else {
+        return (header.to_string(), None);
+    };
+    let val_start = start + MARKER.len();
+    // Scan for the closing quote, skipping JSON escapes (\" and \\).
+    let bytes = header.as_bytes();
+    let mut i = val_start;
+    let mut end = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2, // skip the escaped char
+            b'"' => {
+                end = Some(i);
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(end) = end else {
+        return (header.to_string(), None);
+    };
+    // The raw JSON string including quotes, e.g. `"a\"b"`.
+    let raw = &header[val_start - 1..=end];
+    let session: String = match serde_json::from_str(raw) {
+        Ok(s) => s,
+        Err(_) => return (header.to_string(), None),
+    };
+    let mut cleaned = String::with_capacity(header.len());
+    cleaned.push_str(header[..start].trim_end());
+    cleaned.push(' ');
+    cleaned.push_str(header[end + 1..].trim_start());
+    (cleaned, Some(session))
 }
 
 /// Parse a stub line built by [`build_stub`]. `None` if `line` isn't a
@@ -258,6 +315,7 @@ pub fn parse_stub(line: &str) -> Option<StubInfo> {
     let line = line.trim();
     let rest = line.strip_prefix("[AXIOM-PAGE ")?;
     let (header, tail) = rest.split_once(']')?;
+    let (header, session_id) = split_session_attr(header);
     let mut parts = header.split_whitespace();
     let page_id = parts.next()?.to_string();
     let tok_part = parts.next()?;
@@ -271,6 +329,7 @@ pub fn parse_stub(line: &str) -> Option<StubInfo> {
         .to_string();
     Some(StubInfo {
         page_id,
+        session_id,
         orig_tokens,
         kind,
         snippet,
@@ -374,13 +433,20 @@ mod tests {
 
     #[test]
     fn stub_build_parse_round_trip() {
-        let stub = build_stub("a1b2c3d4e5f60718", 4231, "tool_result", "line one of output");
+        let stub = build_stub(
+            "a1b2c3d4e5f60718",
+            "sess-abc-123",
+            4231,
+            "tool_result",
+            "line one of output",
+        );
         assert_eq!(
             stub,
-            "[AXIOM-PAGE a1b2c3d4e5f60718 4231tok tool_result] line one of output..."
+            "[AXIOM-PAGE a1b2c3d4e5f60718 session=\"sess-abc-123\" 4231tok tool_result] line one of output..."
         );
         let parsed = parse_stub(&stub).unwrap();
         assert_eq!(parsed.page_id, "a1b2c3d4e5f60718");
+        assert_eq!(parsed.session_id, Some("sess-abc-123".to_string()));
         assert_eq!(parsed.orig_tokens, 4231);
         assert_eq!(parsed.kind, "tool_result");
         assert_eq!(parsed.snippet, "line one of output");
@@ -389,14 +455,44 @@ mod tests {
     #[test]
     fn stub_build_parse_round_trip_with_unicode_and_truncation() {
         let original = "caf\u{e9} \u{2192} \u{5317}\u{4eac} ".repeat(20);
-        let stub = build_stub("00112233445566aa", 999, "output", &original);
+        let stub = build_stub("00112233445566aa", "s1", 999, "output", &original);
         let parsed = parse_stub(&stub).unwrap();
         assert_eq!(parsed.page_id, "00112233445566aa");
+        assert_eq!(parsed.session_id, Some("s1".to_string()));
         assert_eq!(parsed.orig_tokens, 999);
         assert_eq!(parsed.kind, "output");
         let expected_snippet: String = original.chars().take(120).collect();
         assert_eq!(parsed.snippet, expected_snippet);
         assert!(!stub.contains('\n'));
+    }
+
+    #[test]
+    fn parse_stub_accepts_legacy_stubs_without_session() {
+        // Stubs built before the session="..." attribute existed must still
+        // parse, with session_id == None.
+        let parsed =
+            parse_stub("[AXIOM-PAGE a1b2c3d4e5f60718 4231tok tool_result] line one...").unwrap();
+        assert_eq!(parsed.page_id, "a1b2c3d4e5f60718");
+        assert_eq!(parsed.session_id, None);
+        assert_eq!(parsed.orig_tokens, 4231);
+    }
+
+    #[test]
+    fn parse_stub_session_value_may_contain_spaces() {
+        let stub = build_stub("a1b2c3d4e5f60718", "my session 42", 10, "tool_result", "x");
+        let parsed = parse_stub(&stub).unwrap();
+        assert_eq!(parsed.session_id, Some("my session 42".to_string()));
+        assert_eq!(parsed.orig_tokens, 10);
+        assert_eq!(parsed.kind, "tool_result");
+    }
+
+    #[test]
+    fn build_stub_json_encodes_session_id_with_quotes() {
+        // A hostile session id must round-trip through JSON encoding.
+        let stub = build_stub("a1b2c3d4e5f60718", "se\"ss", 10, "tool_result", "x");
+        assert!(stub.contains("session=\"se\\\"ss\""));
+        let parsed = parse_stub(&stub).unwrap();
+        assert_eq!(parsed.session_id, Some("se\"ss".to_string()));
     }
 
     #[test]

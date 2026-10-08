@@ -106,6 +106,8 @@ fn body_with_old_heavy(session_id: &str, prefix_text: &str) -> Value {
         "model": "claude-sonnet-5",
         "max_tokens": 16,
         "session_id": session_id,
+        // P0 gate: rebase digest requires axiom_expand in tools[].
+        "tools": [{"name": "axiom_expand"}],
         "messages": [
             {"role":"user","content":[
                 {"type":"text","text": prefix_text,
@@ -131,6 +133,7 @@ async fn growing_frozen_prefix_is_not_a_break_and_never_rebases() {
     // Turn 1: frozen prefix = [P1]; heavy old block + newest in the tail.
     let turn1 = json!({
         "model":"claude-sonnet-5","max_tokens":16,"session_id":"rebase-grow",
+        "tools": [{"name": "axiom_expand"}],
         "messages":[
             {"role":"user","content":[
                 {"type":"text","text":"P1","cache_control":{"type":"ephemeral"}}]},
@@ -144,6 +147,7 @@ async fn growing_frozen_prefix_is_not_a_break_and_never_rebases() {
     // is normal cached operation, NOT a break: nothing may be rebased.
     let turn2 = json!({
         "model":"claude-sonnet-5","max_tokens":16,"session_id":"rebase-grow",
+        "tools": [{"name": "axiom_expand"}],
         "messages":[
             {"role":"user","content":[
                 {"type":"text","text":"P1","cache_control":{"type":"ephemeral"}}]},

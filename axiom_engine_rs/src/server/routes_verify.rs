@@ -184,6 +184,26 @@ async fn expand_symbol_handler(State(state): State<AppState>, Json(body): Json<V
             }))
             .into_response();
         }
+        // The symbol is a well-formed page id but this session's store has
+        // no such page. Fall-through would produce a misleading
+        // "symbol not found in stored source"; fail here with an actionable
+        // message instead.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "session_id": session_id,
+                "symbol": symbol,
+                "found": false,
+                "error": format!(
+                    "no stored page '{symbol}' for session '{session_id}': \
+                     the session may have expired, the page may have been evicted, \
+                     or the session_id may be wrong. Check the digest stub's \
+                     session=\"...\" attribute and pass its value as session_id \
+                     when calling axiom_expand."
+                ),
+            })),
+        )
+            .into_response();
     }
 
     let source = state

@@ -327,9 +327,14 @@ async fn compressed_messages_path(
     // exists to shrink all live in the frozen prefix.
     // Default ON since the 2026-07-16 live eval; opt out with
     // AXIOM_REBASE_ON_BREAK=off.
+    // P0 safety gate (see apply_digest_admission): rebase_transcript creates
+    // new stubs via store.put. If axiom_expand is not in this request's tools
+    // array, those stubs would be misleading with no recovery path, so skip
+    // the digest work entirely and pass the full text through.
     if std::env::var("AXIOM_REBASE_ON_BREAK").as_deref() != Ok("off")
         && state.pss_detect_break(&session_id, &frozen_messages)
         && frozen_messages.len() + mutable_messages.len() > 1
+        && crate::digest::expand_tool_available(body)
     {
         let old_turns = frozen_messages.len() + mutable_messages.len() - 1;
         // rebase_transcript does synchronous L2-store writes + digest work
@@ -1792,6 +1797,14 @@ async fn apply_digest_admission(
     forwarder: Option<&AnthropicForwarder>,
     client_auth: &ClientAuth,
 ) {
+    // P0 safety gate: a digest points the agent at `axiom_expand` for the
+    // full text. If that tool isn't in this request's tools array (client
+    // never registered the Axiom MCP server), the digest is misleading with
+    // no recovery path -- fail closed and pass the full text through.
+    if !crate::digest::expand_tool_available(outbound) {
+        eprintln!("[axiom-cvm] digest skipped: axiom_expand not in tools[]");
+        return;
+    }
     let Some(messages) = outbound.get("messages").and_then(Value::as_array) else {
         return;
     };
@@ -1850,9 +1863,9 @@ async fn apply_digest_admission(
             }
         };
         state.digest_page_turn_set(session_id, &page_id, turn);
-        let stub = crate::cvm_store::build_stub(&page_id, orig_tokens, "tool_result", &text);
+        let stub = crate::cvm_store::build_stub(&page_id, session_id, orig_tokens, "tool_result", &text);
         let replacement =
-            format!("{stub}\n{digest_text}\n[AXIOM-PAGE-END expand with axiom_expand(\"{page_id}\")]");
+            format!("{stub}\n{digest_text}\n[AXIOM-PAGE-END expand with axiom_expand(symbol=\"{page_id}\", session_id=\"{session_id}\")]");
         bytes_in += text.len();
         bytes_out += replacement.len();
         replacements.push((i, replacement));

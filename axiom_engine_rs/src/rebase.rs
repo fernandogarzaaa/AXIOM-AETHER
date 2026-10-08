@@ -136,15 +136,17 @@ fn token_estimate(text: &str) -> usize {
 }
 
 /// Build the deterministic replacement string for a paged `tool_result`.
-/// MUST be a pure function of `text`: [`reapply_stubs`] regenerates it on
-/// every later turn and the bytes have to match what [`rebase_transcript`]
-/// forwarded (and Anthropic cached) at the break turn exactly.
-fn stub_replacement(page_id: &str, text: &str) -> String {
+/// MUST be a pure function of `(page_id, session_id, text)`:
+/// [`reapply_stubs`] regenerates it on every later turn and the bytes have
+/// to match what [`rebase_transcript`] forwarded (and Anthropic cached) at
+/// the break turn exactly. Both callers pass the request's session id, which
+/// is stable for the life of the session, so determinism holds.
+fn stub_replacement(page_id: &str, session_id: &str, text: &str) -> String {
     let orig_tokens = token_estimate(text);
     let budget = ((orig_tokens as f64) * 0.15).round() as usize;
-    let stub = build_stub(page_id, orig_tokens, "tool_result", text);
+    let stub = build_stub(page_id, session_id, orig_tokens, "tool_result", text);
     let digest = SkeletonDigestor.digest(text, budget);
-    format!("{stub}\n{digest}\n[AXIOM-PAGE-END expand with axiom_expand(\"{page_id}\")]")
+    format!("{stub}\n{digest}\n[AXIOM-PAGE-END expand with axiom_expand(symbol=\"{page_id}\", session_id=\"{session_id}\")]")
 }
 
 /// A block whose text is itself a stub must never be paged again (a
@@ -215,7 +217,7 @@ pub fn rebase_transcript(messages: &[Value], store: &CvmStore, session_id: &str)
             rewrite_heavy_blocks(msg, &mut |text| match store
                 .put(session_id, "tool_result", text)
             {
-                Ok(page_id) => Some(stub_replacement(&page_id, text)),
+                Ok(page_id) => Some(stub_replacement(&page_id, session_id, text)),
                 Err(e) => {
                     eprintln!("[axiom-pss] rebase store.put failed: {e}");
                     None
@@ -259,7 +261,7 @@ pub fn reapply_stubs(
                 let page_id = CvmStore::page_id_for(text);
                 store
                     .get(session_id, &page_id)
-                    .map(|_| stub_replacement(&page_id, text))
+                    .map(|_| stub_replacement(&page_id, session_id, text))
             })
         })
         .collect()
@@ -503,6 +505,36 @@ mod tests {
         let once = reapply_stubs(&rebase_transcript(&original, &store, "s1"), &store, "s1", false);
         let twice = reapply_stubs(&once, &store, "s1", false);
         assert_eq!(once, twice, "reapplying to an already-stubbed transcript is a no-op");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reapply_with_different_session_leaves_stubbed_blocks_byte_identical() {
+        // Cache-safety with session ids embedded in stubs: a stub minted
+        // under session "s1" must NOT be regenerated with "s2" on a later
+        // turn (that would break Anthropic's byte-exact prefix cache). The
+        // session-scoped store lookup fails closed, and is_already_stubbed
+        // skips the block, so bytes are preserved verbatim.
+        let dir = tempdir("reapply-cross-session");
+        let store = CvmStore::open(&dir).unwrap();
+        let big = "t ".repeat(9000);
+        let original = vec![
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"a","content": big.clone()}]}),
+            json!({"role":"assistant","content":"ack"}),
+        ];
+        let rebased = rebase_transcript(&original, &store, "s1");
+        let stub_text = rebased[0]["content"][0]["content"].as_str().unwrap();
+        assert!(
+            stub_text.contains("session=\"s1\""),
+            "rebased stub must carry the storing session"
+        );
+        // Later turn arrives under a different (e.g. transient) session.
+        let reapplied = reapply_stubs(&rebased, &store, "s2", false);
+        assert_eq!(
+            reapplied, rebased,
+            "cross-session reapply must not rewrite stub bytes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
