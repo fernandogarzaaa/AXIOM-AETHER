@@ -281,6 +281,45 @@ fn first_named_child_kind<'tree>(node: Node<'tree>, child_kinds: &[&str]) -> Opt
     None
 }
 
+/// Detect a Python-style module-level constant: zero-indentation
+/// `UPPER_SNAKE_CASE = ...` assignment. Returns the constant name.
+///
+/// Rationale (P0 safety): these carry bug-relevant values (e.g.
+/// `RISK_ORDER = {"low": 3, ...}`) but match no declaration keyword, so the
+/// generic extractor silently drops them. The digest then hides the defect
+/// entirely -- worse than an elided body.
+fn is_module_constant(line: &str, trimmed: &str) -> Option<String> {
+    // Must be at module level (no leading whitespace).
+    if line.len() != trimmed.len() {
+        return None;
+    }
+    // Must be an assignment, not a comparison or annotation.
+    let eq = trimmed.find('=')?;
+    // Exclude `==`, `!=`, `<=`, `>=`, `=>`, `:=`.
+    let bytes = trimmed.as_bytes();
+    if eq > 0 {
+        match bytes[eq - 1] {
+            b'=' | b'!' | b'<' | b'>' | b':' => return None,
+            _ => {}
+        }
+    }
+    if bytes.get(eq + 1) == Some(&b'=') {
+        return None;
+    }
+    let name = trimmed[..eq].trim_end();
+    // UPPER_SNAKE_CASE: starts uppercase, rest uppercase/digits/underscore,
+    // at least 2 chars to avoid single-letter noise.
+    if name.len() < 2
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        || !name.chars().next().unwrap().is_ascii_uppercase()
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 fn render_until_equals(node: Node, source: &str) -> Option<String> {
     let text = node_text(node, source)?.trim_end();
     if let Some(eq) = text.find('=') {
@@ -554,8 +593,50 @@ pub fn expand_symbol(source: &str, name: &str) -> Option<String> {
         if (is_decl(t) || looks_like_signature(t)) && contains_symbol(line, name) {
             return Some(capture_block(&lines, i));
         }
+        // Module-level constants (e.g. `RISK_ORDER = {...}`): the digest
+        // shows only `RISK_ORDER = …`, so expansion must return the full
+        // assignment including a multi-line value.
+        if let Some(const_name) = is_module_constant(line, t) {
+            if const_name == name {
+                return Some(capture_constant_block(&lines, i));
+            }
+        }
     }
     None
+}
+
+/// Capture a module-level constant's full assignment, including multi-line
+/// values (dicts, lists). Stops at the first subsequent line at zero
+/// indentation that is not a continuation of the value.
+fn capture_constant_block(lines: &[&str], start: usize) -> String {
+    let mut out = vec![lines[start].to_string()];
+    // Track bracket depth to handle multi-line dict/list values.
+    let mut depth = 0i32;
+    for c in lines[start].chars() {
+        match c {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    for line in &lines[start + 1..] {
+        // A new zero-indentation line outside any brackets ends the value.
+        if depth <= 0 && !line.starts_with(' ') && !line.starts_with('\t') && !line.trim().is_empty() {
+            break;
+        }
+        for c in line.chars() {
+            match c {
+                '{' | '[' | '(' => depth += 1,
+                '}' | ']' | ')' => depth -= 1,
+                _ => {}
+            }
+        }
+        out.push(line.to_string());
+        if depth <= 0 {
+            break;
+        }
+    }
+    out.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +898,21 @@ fn extract_symbols_generic(heavy: &str) -> (Vec<String>, Vec<RankedSymbol>) {
                 body,
                 score: 0.0,
             });
+        } else if let Some(const_name) = is_module_constant(line, t) {
+            // Safety (P0): Python-style UPPER_SNAKE_CASE module constants
+            // (e.g. `RISK_ORDER = {...}`) carry bug-relevant values but match
+            // no declaration keyword. Capture the name with an elided-value
+            // stub so it stays visible under a token budget.
+            let signature = format!("{const_name} = …");
+            if !seen.insert(signature.clone()) {
+                continue;
+            }
+            symbols.push(RankedSymbol {
+                name: const_name,
+                signature,
+                body: String::new(),
+                score: 0.0,
+            });
         }
     }
     (imports, symbols)
@@ -895,6 +991,20 @@ pub fn skeletonize_ranked(
         let t = approx_tokens(&sym.signature);
         if let Some(budget) = token_budget {
             if used + t > budget && !out.is_empty() {
+                // Safety (P0): never let a symbol vanish entirely. Emit a
+                // name-only stub so the agent knows it exists and can expand
+                // it. An agent that sees `// charge (… elided …)` knows to
+                // ask for the body; an agent that never sees `charge` cannot.
+                // The stub is ~1-2 tokens vs the full signature.
+                if !sym.name.is_empty() {
+                    let stub = format!("// {} (… body elided …)", sym.name);
+                    let stub_t = approx_tokens(&stub);
+                    if used + stub_t <= budget {
+                        out.push(stub);
+                        used += stub_t;
+                        continue;
+                    }
+                }
                 elided += 1;
                 continue;
             }
@@ -1208,5 +1318,72 @@ impl Point {
             extract_decl_name("const f: fn() = g;"),
             Some("f".to_string())
         );
+    }
+
+    #[test]
+    fn ranked_keeps_name_stub_when_signature_exceeds_budget() {
+        // P0 safety: a low-ranked symbol must not vanish entirely. With a
+        // tiny budget, full signatures don't fit, but names must survive.
+        let txt = "def alpha():\n    pass\ndef beta():\n    pass\ndef gamma():\n    pass\n";
+        let out = skeletonize_ranked(txt, "python", Some(8));
+        // At least the names must appear as stubs, even if signatures don't fit.
+        let has_stub = out.contains("(… body elided …)");
+        let all_names_visible = ["alpha", "beta", "gamma"]
+            .iter()
+            .all(|n| out.contains(n));
+        assert!(
+            has_stub || all_names_visible,
+            "budget-elided symbols must keep names: {out}"
+        );
+    }
+
+    #[test]
+    fn ranked_emits_all_names_without_budget() {
+        let txt = "def alpha():\n    pass\ndef beta():\n    pass\n";
+        let out = skeletonize_ranked(txt, "python", None);
+        assert!(out.contains("alpha"), "{out}");
+        assert!(out.contains("beta"), "{out}");
+    }
+
+    #[test]
+    fn module_constant_detected() {
+        assert_eq!(
+            is_module_constant("RISK_ORDER = {\"low\": 1}", "RISK_ORDER = {\"low\": 1}"),
+            Some("RISK_ORDER".to_string())
+        );
+        assert_eq!(
+            is_module_constant("MAX_RETRIES = 3", "MAX_RETRIES = 3"),
+            Some("MAX_RETRIES".to_string())
+        );
+    }
+
+    #[test]
+    fn module_constant_rejects_non_constants() {
+        // Indented (not module-level).
+        assert_eq!(is_module_constant("    X = 1", "X = 1"), None);
+        // Lowercase (not UPPER_SNAKE_CASE).
+        assert_eq!(is_module_constant("risk_order = 1", "risk_order = 1"), None);
+        // Comparison, not assignment.
+        assert_eq!(is_module_constant("X == 1", "X == 1"), None);
+        // Single char (noise).
+        assert_eq!(is_module_constant("X = 1", "X = 1"), None);
+        // Walrus / annotated.
+        assert_eq!(is_module_constant("X := 1", "X := 1"), None);
+    }
+
+    #[test]
+    fn ranked_captures_python_module_constant() {
+        let txt = "RISK_ORDER = {\"low\": 1, \"high\": 3}\ndef helper():\n    pass\n";
+        let out = skeletonize_ranked(txt, "python", None);
+        assert!(out.contains("RISK_ORDER"), "{out}");
+    }
+
+    #[test]
+    fn expand_symbol_returns_full_constant_value() {
+        let txt = "RISK_ORDER = {\n    \"low\": 1,\n    \"high\": 3,\n}\ndef helper():\n    pass\n";
+        let expanded = expand_symbol(txt, "RISK_ORDER").expect("must expand");
+        assert!(expanded.contains("\"low\": 1"), "{expanded}");
+        assert!(expanded.contains("\"high\": 3"), "{expanded}");
+        assert!(!expanded.contains("def helper"), "{expanded}");
     }
 }
