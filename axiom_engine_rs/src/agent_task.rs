@@ -508,4 +508,94 @@ mod tests {
         task.finish(false).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1");
     }
+
+    #[test]
+    fn start_missing_file_snapshots_none_and_deletes_on_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.txt");
+        assert!(!missing.exists());
+
+        // A missing file must not fail task start: it is snapshotted as None.
+        let mut task = AgentTask::start(
+            "t1".into(),
+            "test".into(),
+            "exit 0".into(),
+            vec![missing.clone()],
+            4,
+        )
+        .unwrap();
+
+        // The agent may create the file during the task.
+        let out = task.propose(vec![FileEdit {
+            path: missing.clone(),
+            content: "created".into(),
+        }]);
+        assert!(out.passed);
+        assert_eq!(std::fs::read_to_string(&missing).unwrap(), "created");
+
+        // Abort removes files that did not exist at task start.
+        task.finish(false).unwrap();
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn start_directory_snapshots_none_and_keeps_on_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+
+        // A directory cannot be snapshotted as bytes, but must not fail
+        // task start either: it is recorded as None.
+        let mut task = AgentTask::start(
+            "t1".into(),
+            "test".into(),
+            "exit 0".into(),
+            vec![subdir.clone()],
+            4,
+        )
+        .unwrap();
+
+        // Abort must not delete directories, only files created during the task.
+        task.finish(false).unwrap();
+        assert!(subdir.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn start_unreadable_file_returns_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, path) = tmp_file("secret");
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        // If the file is still readable (e.g., tests running as root bypass
+        // permission checks), the test premise doesn't hold: restore and skip.
+        if std::fs::read(&path).is_ok() {
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms).unwrap();
+            return;
+        }
+
+        // The file exists but cannot be read: start must fail so that
+        // finish(false) never deletes a file it could not snapshot.
+        match AgentTask::start(
+            "t1".into(),
+            "test".into(),
+            "exit 0".into(),
+            vec![path.clone()],
+            4,
+        ) {
+            Ok(_) => panic!("expected start to fail on unreadable file"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+        }
+
+        // Restore permissions so the temp file can be cleaned up.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
 }
