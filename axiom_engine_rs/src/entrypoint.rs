@@ -625,16 +625,15 @@ fn run_skeleton(path: &std::path::Path, format: &str, max_doc_lines: usize) -> R
 
     match format {
         "json" => {
-            #[derive(serde::Serialize)]
-            struct SkeletonEntry<'a> {
-                path: &'a str,
-                skeleton: &'a str,
-            }
-            let entries_json: Vec<SkeletonEntry> = entries
+            // Build JSON manually via serde_json::Value to avoid derive-macro
+            // scope issues; escapes all control characters correctly.
+            let arr: Vec<serde_json::Value> = entries
                 .iter()
-                .map(|(p, s)| SkeletonEntry { path: p, skeleton: s })
+                .map(|(p, s)| {
+                    serde_json::json!({"path": p, "skeleton": s})
+                })
                 .collect();
-            let json = serde_json::to_string_pretty(&entries_json)
+            let json = serde_json::to_string_pretty(&arr)
                 .map_err(|e| candle_core::Error::Msg(format!("axiom skeleton: json: {e}")))?;
             println!("{json}");
         }
