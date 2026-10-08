@@ -72,7 +72,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
       - name: Wait for axiom_mesh_core on crates.io
         run: |
-          MESH_VERSION=$(grep 'axiom_mesh_core' axiom_engine_rs/Cargo.toml | grep -o 'version = "[^"]*"' | cut -d'"' -f2)
+          MESH_VERSION=$(grep '^version' axiom_mesh_core/Cargo.toml | head -1 | cut -d'"' -f2)
           echo "Waiting for axiom_mesh_core $MESH_VERSION on crates.io..."
           for i in $(seq 1 30); do
             if curl -sf "https://crates.io/api/v1/crates/axiom_mesh_core/$MESH_VERSION" > /dev/null; then
