@@ -13,6 +13,11 @@
 //!  "params":{"goal":"...","verify_cmd":"...","files":["a.rs"],"max_attempts":4}}
 //! // → {"jsonrpc":"2.0","id":1,"result":{"task_id":"..."}}
 //!
+//! If `verify_cmd` looks like a test command and a mutation testing tool is
+//! available (testteeth for Python, cargo-mutants for Rust), the start response
+//! may also include `"verifier_warning"` when the mutation score is low. This
+//! is advisory only; the task always starts.
+//!
 //! // propose
 //! {"jsonrpc":"2.0","id":2,"method":"task_propose",
 //!  "params":{"task_id":"...","edits":[{"path":"a.rs","content":"..."}]}}
@@ -38,6 +43,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use axiom_engine::agent_task::{AgentTask, FileEdit, TaskRegistry};
+use axiom_engine::verifier_strength::check_verifier_strength;
 
 #[derive(Deserialize)]
 struct TaskStartParams {
@@ -179,10 +185,17 @@ fn handle_start(registry: &TaskRegistry, id: &Value, params: Value) -> String {
     };
     let task_id = new_task_id();
     let files: Vec<PathBuf> = p.files.into_iter().map(PathBuf::from).collect();
+    // Best-effort verifier strength check: warn if the test suite looks weak.
+    // Never blocks task creation; skips silently when mutation tools are absent.
+    let verifier_warning = check_verifier_strength(&p.verify_cmd);
     match AgentTask::start(task_id.clone(), p.goal, p.verify_cmd, files, p.max_attempts) {
         Ok(task) => {
             registry.insert(task);
-            ok(id, json!({"task_id": task_id}))
+            let mut result = json!({"task_id": task_id});
+            if let Some(warning) = verifier_warning {
+                result["verifier_warning"] = json!(warning);
+            }
+            ok(id, result)
         }
         Err(e) => err(id, -32000, format!("task_start failed: {e}")),
     }
