@@ -17,7 +17,7 @@
 use ndarray::Array1;
 use serde::{Deserialize, Serialize};
 
-use crate::mesh_core::residual::{Residual, StateVector};
+use crate::residual::{Residual, StateVector};
 
 /// Raw sensor data flowing into the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]

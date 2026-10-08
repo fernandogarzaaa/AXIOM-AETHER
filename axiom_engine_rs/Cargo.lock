@@ -159,6 +159,7 @@ name = "axiom_engine"
 version = "0.4.2"
 dependencies = [
  "anyhow",
+ "axiom_mesh_core",
  "axum",
  "bincode",
  "candle-core",
@@ -197,6 +198,16 @@ dependencies = [
  "urlencoding",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "axiom_mesh_core"
+version = "0.1.0"
+dependencies = [
+ "ndarray 0.16.1",
+ "rand 0.8.6",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
