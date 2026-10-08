@@ -349,14 +349,7 @@ state_hash={state_hash}\n\
         if t.is_empty() {
             continue;
         }
-        // Only keep top-level imports: an indented `import` inside a function
-        // body belongs to elided code, not the structural skeleton.
-        let is_top_level = line
-            .chars()
-            .next()
-            .map(|c| !c.is_whitespace())
-            .unwrap_or(false);
-        if is_import(t) && is_top_level {
+        if is_import(t) {
             push_unique_structural(line.trim_end(), &mut out, &mut seen_structural, &mut elided);
             code_lines += 1;
         } else if is_decl(t) || looks_like_signature(t) {
