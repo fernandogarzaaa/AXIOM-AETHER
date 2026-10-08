@@ -13,7 +13,7 @@
 //! - `PersistedCompressionCache` blobs are written to disk and read back;
 //!   byte-identical encoding means old cache files keep decoding.
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::Deserialize, Serialize};
 
 /// Serialize `value`, mirroring the old `bincode::serialize` signature.
 pub fn serialize<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, bincode::error::EncodeError> {
@@ -21,8 +21,11 @@ pub fn serialize<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, bincode::e
 }
 
 /// Deserialize from `bytes`, mirroring the old `bincode::deserialize` signature.
-pub fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::error::DecodeError> {
-    bincode::serde::decode_from_slice(bytes, bincode::config::legacy()).map(|(value, _)| value)
+///
+/// Accepts borrowed types like `&str` (via `Deserialize<'a>`), matching the
+/// bincode 1.3 API. The returned value borrows from `bytes`.
+pub fn deserialize<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, bincode::error::DecodeError> {
+    bincode::serde::borrow_decode_from_slice(bytes, bincode::config::legacy()).map(|(value, _)| value)
 }
 
 #[cfg(test)]
@@ -97,5 +100,9 @@ mod tests {
         ];
         let bytes = serialize(&sample()).unwrap();
         assert_eq!(bytes, expected, "wire format drifted from bincode 1.3");
+        // Decode the independently fixed 1.3 bytes to prove the decoder
+        // reads them, not just that our encoder reproduces them.
+        let back: Sample = deserialize(&expected).unwrap();
+        assert_eq!(back, sample(), "decoder failed on bincode 1.3 golden bytes");
     }
 }
