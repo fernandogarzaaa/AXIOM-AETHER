@@ -599,11 +599,14 @@ fn parse_multifile_response(text: &str, targets: &[PathBuf]) -> agentic::EditSet
 
 /// Strip a single pair of surrounding ``` fences (with optional language tag)
 /// from a model response; leaves unfenced text untouched.
-/// `axiom skeleton <path> [--format readable|json]` — print structural
-/// skeletons for source files: signatures kept, bodies elided. Readable
-/// format delimits each file with `=== path ===` headers for agent
-/// navigation; JSON emits an array of {path, skeleton} objects for tooling.
-fn run_skeleton(path: &std::path::Path, format: &str, max_doc_lines: usize) -> Result<()> {
+/// `axiom skeleton <path> [--format readable|json] [--diagnostic]` — print
+/// structural skeletons for source files: signatures kept, bodies elided.
+/// With `--diagnostic`, function bodies keep diagnostic signal (error paths,
+/// boundary conditions, suspicious patterns, complex conditionals, return
+/// values) instead of being dropped entirely. Readable format delimits each
+/// file with `=== path ===` headers for agent navigation; JSON emits an
+/// array of {path, skeleton} objects for tooling.
+fn run_skeleton(path: &std::path::Path, format: &str, max_doc_lines: usize, diagnostic: bool) -> Result<()> {
     let files: Vec<PathBuf> = if path.is_file() {
         vec![path.to_path_buf()]
     } else if path.is_dir() {
@@ -619,7 +622,11 @@ fn run_skeleton(path: &std::path::Path, format: &str, max_doc_lines: usize) -> R
     for file in &files {
         let text = std::fs::read_to_string(file)
             .map_err(|e| candle_core::Error::Msg(format!("axiom skeleton: {}: {e}", file.display())))?;
-        let body = skeleton::skeleton_body(&text, max_doc_lines);
+        let body = if diagnostic {
+            skeleton::skeleton_body_diagnostic(&text, max_doc_lines)
+        } else {
+            skeleton::skeleton_body(&text, max_doc_lines)
+        };
         entries.push((file.display().to_string(), body));
     }
 
@@ -816,8 +823,8 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 bench::BenchOptions { verbose, strict, ranked, budget },
             )?;
         }
-        AxiomCommand::Skeleton { path, format, max_doc_lines } => {
-            run_skeleton(&path, &format, max_doc_lines)?;
+        AxiomCommand::Skeleton { path, format, max_doc_lines, diagnostic } => {
+            run_skeleton(&path, &format, max_doc_lines, diagnostic)?;
         }
         AxiomCommand::Solve {
             max_rounds,

@@ -328,9 +328,9 @@ fn render_until_equals(node: Node, source: &str) -> Option<String> {
     Some(text.to_string())
 }
 
-fn is_decl(t: &str) -> bool {
-    let mut s = t;
-    // Strip stacked visibility/async prefixes (e.g. "pub async fn").
+/// Strip stacked visibility/async prefixes (e.g. "pub async fn") so keyword
+/// tests see the real declaration kind.
+fn strip_decl_prefix(mut s: &str) -> &str {
     loop {
         let mut changed = false;
         for p in VIS_PREFIXES {
@@ -350,7 +350,36 @@ fn is_decl(t: &str) -> bool {
             break;
         }
     }
+    s
+}
+
+fn is_decl(t: &str) -> bool {
+    let s = strip_decl_prefix(t);
     DECL_KEYWORDS.iter().any(|k| s.starts_with(k))
+}
+
+/// Function/method declarations: the units diagnostic elision filters.
+/// Classes, structs, enums, etc. stay dumb signatures even in diagnostic mode
+/// (their interesting content lives in the methods, which are handled
+/// separately — this also avoids duplicating method bodies inside the
+/// class/impl rendering).
+fn is_function_decl(t: &str) -> bool {
+    let s = strip_decl_prefix(t);
+    const FN_KEYWORDS: [&str; 4] = ["fn ", "func ", "def ", "function "];
+    if FN_KEYWORDS.iter().any(|k| s.starts_with(k)) {
+        return true;
+    }
+    looks_like_signature(t)
+}
+
+/// True if `t` starts with keyword `kw` followed by a word boundary
+/// (so "except" doesn't match "exceptional").
+fn starts_with_kw(t: &str, kw: &str) -> bool {
+    if let Some(rest) = t.strip_prefix(kw) {
+        rest.is_empty() || !is_ident_byte(rest.as_bytes()[0])
+    } else {
+        false
+    }
 }
 
 /// Build the compact readable digest from heavy context text.
@@ -1020,8 +1049,577 @@ pub fn skeletonize_ranked(
     out.join("\n")
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostic elision.
+//
+// Dumb skeletons drop every function body, which erases diagnostic signal:
+// an agent fixing a bug inside a body must read the full file anyway. Diagnostic
+// mode keeps the lines that carry diagnostic signal and elides the rest:
+//
+//   1. Error handling paths: try/except/catch/finally, raise/throw,
+//      panic!/unwrap()/expect()/unreachable!, Rust's `?` operator, Err.
+//   2. Boundary conditions: comparisons (<,>,<=,>=,==,!=) on values.
+//   3. Suspicious patterns: TODO/FIXME/XXX/HACK comments, bare `except:`,
+//      asserts, todo!/unimplemented!.
+//   4. Complex conditionals: if/while with 3+ conditions (and/or/&&/||).
+//   5. Return statements (and Rust tail expressions): a function's contract.
+//
+// A kept line that opens a block keeps its whole block (the except body, the
+// if body, the returned dict literal). Target: 40-60% of source — noticeably
+// larger than a dumb skeleton (~20%), still far from full source.
+// ---------------------------------------------------------------------------
+
+/// True when the trimmed line carries diagnostic signal worth keeping.
+fn is_interesting_line(t: &str) -> bool {
+    is_error_handling(t)
+        || is_suspicious(t)
+        || is_boundary_condition(t)
+        || is_complex_conditional(t)
+        || is_return_stmt(t)
+}
+
+fn is_error_handling(t: &str) -> bool {
+    // Python
+    if starts_with_kw(t, "try") || starts_with_kw(t, "except") || starts_with_kw(t, "finally") {
+        return true;
+    }
+    if starts_with_kw(t, "raise") {
+        return true;
+    }
+    // JS/TS/Java/C#
+    if starts_with_kw(t, "catch") || starts_with_kw(t, "throw") {
+        return true;
+    }
+    // Rust
+    if t.contains("panic!") || t.contains("unreachable!") {
+        return true;
+    }
+    if t.contains(".unwrap()") || t.contains(".expect(") {
+        return true;
+    }
+    if t.contains("bail!") || t.contains("ensure!") {
+        return true;
+    }
+    if t.starts_with("Err(") || t.contains("=> Err(") || t.contains("return Err(") {
+        return true;
+    }
+    // Rust `?` try operator: a line ending in `?`. (A `?` inside a comment is
+    // a harmless false positive; other languages don't end lines with `?`.)
+    if t.ends_with('?') || t.ends_with("?,") || t.ends_with("?;") {
+        return true;
+    }
+    false
+}
+
+fn is_suspicious(t: &str) -> bool {
+    for m in [
+        "TODO",
+        "FIXME",
+        "XXX",
+        "HACK",
+        "BUG",
+        "KLUDGE",
+        "WORKAROUND",
+    ] {
+        if contains_symbol(t, m) {
+            return true;
+        }
+    }
+    // Bare `except:` swallows everything — always worth a look.
+    if t == "except:" {
+        return true;
+    }
+    if starts_with_kw(t, "assert") || t.starts_with("debug_assert") {
+        return true;
+    }
+    if t.contains("todo!") || t.contains("unimplemented!") {
+        return true;
+    }
+    false
+}
+
+/// If `b[i]` is `<` opening a generic type argument list (e.g. `Vec<T>`,
+/// `HashMap<String, Vec<u8>>`, `foo::<T>`), return the index of the matching
+/// `>`. None otherwise. Only type-like content may appear between the
+/// brackets; anything else (a `;`, `{`, …) means this is not a generic.
+fn generic_close(b: &[u8], i: usize) -> Option<usize> {
+    // A generic `<` follows an identifier, a nested `>`, or `::` (turbofish).
+    let prev = if i > 0 { b[i - 1] } else { return None };
+    if !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'>' || prev == b':') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut j = i;
+    while j < b.len() {
+        match b[j] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            b if b.is_ascii_alphanumeric()
+                || b == b'_'
+                || b == b' '
+                || b == b'\t'
+                || b == b','
+                || b == b':'
+                || b == b'&'
+                || b == b'\''
+                || b == b'['
+                || b == b']'
+                || b == b'('
+                || b == b')'
+                || b == b'*'
+                || b == b'+'
+                || b == b'.'
+                || b == b'?'
+                || b == b'!'
+                || b == b'|' => {}
+            _ => return None,
+        }
+        j += 1;
+    }
+    None
+}
+
+/// True if the line contains a `<` or `>` that is a comparison, not part of
+/// `->`, `=>`, `>>`, `<<`, `>=`, `<=`, `<-`, or a generic type argument list
+/// like `Vec<T>`.
+fn has_bare_comparison(t: &str) -> bool {
+    let b = t.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'<' || c == b'>' {
+            let prev = if i > 0 { b[i - 1] } else { 0 };
+            let next = if i + 1 < b.len() { b[i + 1] } else { 0 };
+            let prev_ok = !(prev == b'<' || prev == b'>' || prev == b'-' || prev == b'=');
+            let next_ok = !(next == b'<' || next == b'>' || next == b'=');
+            if prev_ok && next_ok {
+                if c == b'<' {
+                    // Skip generic type argument lists entirely.
+                    if let Some(close) = generic_close(b, i) {
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_boundary_condition(t: &str) -> bool {
+    t.contains("<=")
+        || t.contains(">=")
+        || t.contains("==")
+        || t.contains("!=")
+        || has_bare_comparison(t)
+}
+
+/// Count boolean connectors with word boundaries for and/or
+/// (so "candle" doesn't count as "and").
+fn count_bool_connectors(t: &str) -> usize {
+    let mut count = t.matches("&&").count() + t.matches("||").count();
+    for tok in t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if tok == "and" || tok == "or" {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn is_complex_conditional(t: &str) -> bool {
+    let is_cond =
+        starts_with_kw(t, "if") || starts_with_kw(t, "elif") || starts_with_kw(t, "while");
+    if !is_cond {
+        return false;
+    }
+    // 3+ conditions joined by boolean connectors.
+    count_bool_connectors(t) >= 2
+}
+
+fn is_return_stmt(t: &str) -> bool {
+    if !starts_with_kw(t, "return") {
+        return false;
+    }
+    // Bare `return` is structural noise; `return <expr>` is the contract.
+    t.len() > "return".len()
+}
+
+/// If the trimmed line at `lines[start]` opens a block, return the index one
+/// past the block's last line. Python-style `:` blocks use indentation;
+/// brace blocks use brace balance. None for single-line statements.
+fn block_end(lines: &[&str], start: usize) -> Option<usize> {
+    let t = lines[start].trim();
+    if t.is_empty() || t.starts_with('#') || t.starts_with("//") {
+        return None;
+    }
+    let n = lines.len();
+    if t.ends_with(':') {
+        // Python-style indent block. (A `:` inside brackets, e.g. slices or
+        // dict displays, is never line-final — acceptable approximation.)
+        let base = indent_of(lines[start]);
+        let mut i = start + 1;
+        while i < n {
+            let l = lines[i];
+            if !l.trim().is_empty() && indent_of(l) <= base {
+                break;
+            }
+            i += 1;
+        }
+        if i > start + 1 {
+            Some(i)
+        } else {
+            None
+        }
+    } else if t.contains('{') {
+        let mut depth = 0i32;
+        let mut i = start;
+        loop {
+            for ch in lines[i].chars() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                }
+            }
+            i += 1;
+            if depth <= 0 || i >= n {
+                break;
+            }
+        }
+        if i > start + 1 {
+            Some(i)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+
+}
+
+
+/// Filter one function/method body: keep the signature header, interesting
+/// lines (plus their blocks), and the closing brace; collapse boring runs
+/// into elision markers.
+fn diagnostic_symbol_body(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let n = lines.len();
+    if n == 0 {
+        return String::new();
+    }
+    let mut keep = vec![false; n];
+
+    // Header: signature lines up to and including the block opener.
+    let mut idx = 0;
+    let mut header_end = 0;
+    while idx < n {
+        keep[idx] = true;
+        header_end = idx + 1;
+        let te = lines[idx].trim_end();
+        if te.ends_with('{') || te.ends_with(':') {
+            break;
+        }
+        idx += 1;
+        if idx > 8 {
+            break;
+        }
+    }
+
+    // Mark interesting lines.
+    for (i, line) in lines.iter().enumerate() {
+        if keep[i] {
+            continue;
+        }
+        if is_interesting_line(line.trim_start()) {
+            keep[i] = true;
+        }
+    }
+
+    // Interesting block-openers keep their whole block (the except body, the
+    // if body, the returned dict literal).
+    let mut i = header_end;
+    while i < n {
+        if keep[i] {
+            if let Some(end) = block_end(&lines, i) {
+                let end = end.min(n);
+                for k in keep.iter_mut().take(end).skip(i) {
+                    *k = true;
+                }
+                // The absorbed block's own nested openers are subsumed.
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // Always keep the final closing brace — it balances the header's opener.
+    // (Python bodies have no closing brace; this is a no-op for them.)
+    if n >= 1 && lines[n - 1].trim_start().starts_with('}') {
+        keep[n - 1] = true;
+    }
+
+    // Rust tail expression: the last value before the closing brace is the
+    // return value. Keep it when it's a bare expression, not a statement.
+    // (Python uses explicit `return`, already covered above.)
+    if n >= 2 {
+        let last = lines[n - 1].trim();
+        if last == "}" || last == "};" {
+            let prev_trimmed = lines[n - 2].trim();
+            if !prev_trimmed.is_empty()
+                && !prev_trimmed.ends_with(';')
+                && !prev_trimmed.ends_with('{')
+                && !prev_trimmed.ends_with('}')
+                && !keep[n - 2]
+                && !is_decl(lines[n - 2].trim_start())
+            {
+                keep[n - 2] = true;
+            }
+        }
+    }
+
+    // Render, collapsing boring runs into markers.
+    let mut out: Vec<String> = Vec::new();
+    let mut boring = 0usize;
+    let mut boring_indent = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if keep[i] {
+            if boring > 0 {
+                let pad = " ".repeat(boring_indent);
+                out.push(format!("{pad}// … [{boring} lines elided] …"));
+                boring = 0;
+            }
+            out.push(line.to_string());
+        } else if boring == 0 {
+            boring_indent = indent_of(line);
+            boring = 1;
+        } else {
+            boring += 1;
+        }
+    }
+    // Trailing boring lines drop silently — the function just ends.
+    out.join("\n")
+}
+
+/// Diagnostic skeleton for Rust via tree-sitter: function bodies keep diagnostic
+/// signal; other declarations stay dumb signatures. None when no functions
+/// are found (caller falls back to the generic path).
+fn rust_diagnostic_body(heavy: &str, max_doc_lines: usize) -> Option<String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(heavy, None)?;
+
+    let mut captured: Vec<(usize, &'static str, Node)> = Vec::new();
+    collect_rust_captures(tree.root_node(), &mut captured);
+    captured.sort_by_key(|(start, _, _)| *start);
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut doc_budget = max_doc_lines;
+    let mut elided = 0usize;
+    let mut fn_count = 0usize;
+
+    for (_, capture_name, node) in captured {
+        let rendered = match capture_name {
+            "import" => node_text(node, heavy)
+                .map(str::trim_end)
+                .map(str::to_string),
+            "doc" => {
+                let text = node_text(node, heavy)?.trim();
+                if !is_doc(text) || doc_budget == 0 {
+                    elided += 1;
+                    None
+                } else {
+                    doc_budget -= 1;
+                    Some(text.to_string())
+                }
+            }
+            "decl" => {
+                if node.kind() == "function_item" {
+                    fn_count += 1;
+                    node_text(node, heavy).map(diagnostic_symbol_body)
+                } else {
+                    render_rust_decl(node, heavy)
+                }
+            }
+            _ => None,
+        };
+        if let Some(line) = rendered {
+            push_unique_structural(&line, &mut out, &mut seen, &mut elided);
+        } else {
+            elided += 1;
+        }
+    }
+
+    if out.is_empty() || fn_count == 0 {
+        return None;
+    }
+    if elided > 0 {
+        out.push(format!("// … {elided} fully-elided lines …"));
+    }
+    Some(out.join("\n"))
+}
+
+/// Diagnostic skeleton via the language-agnostic line heuristic (Python, JS/TS,
+/// Go, …): function/method bodies keep diagnostic signal; classes and other
+/// declarations stay dumb signatures.
+fn generic_diagnostic_body(heavy: &str, max_doc_lines: usize) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen_structural: HashSet<String> = HashSet::new();
+    let mut doc_budget = max_doc_lines as i32;
+    let mut elided = 0usize;
+    let mut code_lines = 0usize;
+
+    let lines: Vec<&str> = heavy.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let t = line.trim_start();
+        if t.is_empty() {
+            i += 1;
+            continue;
+        }
+        if is_import(t) {
+            push_unique_structural(line.trim_end(), &mut out, &mut seen_structural, &mut elided);
+            code_lines += 1;
+            i += 1;
+        } else if is_decl(t) || looks_like_signature(t) {
+            if is_function_decl(t) {
+                // Fold leading decorators into the diagnostic body.
+                let mut start = i;
+                while start > 0 && lines[start - 1].trim_start().starts_with('@') {
+                    start -= 1;
+                }
+                let block = capture_block(&lines, i);
+                let consumed = block.lines().count();
+                let body = if start < i {
+                    format!("{}\n{block}", lines[start..i].join("\n"))
+                } else {
+                    block
+                };
+                let diagnostic = diagnostic_symbol_body(&body);
+                push_unique_structural(&diagnostic, &mut out, &mut seen_structural, &mut elided);
+                code_lines += 1;
+                i += consumed.max(1);
+            } else {
+                let sig = line.split('{').next().unwrap_or(line).trim_end();
+                let suffix = if line.contains('{') { " { … }" } else { "" };
+                let structural = format!("{sig}{suffix}");
+                push_unique_structural(&structural, &mut out, &mut seen_structural, &mut elided);
+                code_lines += 1;
+                i += 1;
+            }
+        } else if is_doc(t) && doc_budget > 0 {
+            let before = seen_structural.len();
+            push_unique_structural(line.trim_end(), &mut out, &mut seen_structural, &mut elided);
+            if seen_structural.len() > before {
+                doc_budget -= 1;
+            }
+            i += 1;
+        } else {
+            elided += 1;
+            i += 1;
+        }
+    }
+
+    if code_lines == 0 {
+        prose_excerpt(heavy, 1200, 500)
+    } else {
+        if elided > 0 {
+            out.push(format!("// … {elided} fully-elided lines …"));
+        }
+        out.join("\n")
+    }
+}
+
+/// Diagnostic skeleton body (no XML wrapper) for `axiom skeleton --diagnostic`: like
+/// [`skeleton_body`] but function/method bodies keep diagnostic signal
+/// (error paths, boundary conditions, suspicious patterns, complex
+/// conditionals, return values) instead of being fully elided.
+pub fn skeleton_body_diagnostic(heavy: &str, max_doc_lines: usize) -> String {
+    if let Some(body) = rust_diagnostic_body(heavy, max_doc_lines) {
+        return body;
+    }
+    generic_diagnostic_body(heavy, max_doc_lines)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ranked_keeps_name_stub_when_signature_exceeds_budget() {
+        // P0 safety: a low-ranked symbol must not vanish entirely. With a
+        // tiny budget, full signatures don't fit, but names must survive.
+        let txt = "def alpha():\n    pass\ndef beta():\n    pass\ndef gamma():\n    pass\n";
+        let out = skeletonize_ranked(txt, "python", Some(8));
+        // At least the names must appear as stubs, even if signatures don't fit.
+        let has_stub = out.contains("(… body elided …)");
+        let all_names_visible = ["alpha", "beta", "gamma"]
+            .iter()
+            .all(|n| out.contains(n));
+        assert!(
+            has_stub || all_names_visible,
+            "budget-elided symbols must keep names: {out}"
+        );
+    }
+
+    #[test]
+    fn ranked_emits_all_names_without_budget() {
+        let txt = "def alpha():\n    pass\ndef beta():\n    pass\n";
+        let out = skeletonize_ranked(txt, "python", None);
+        assert!(out.contains("alpha"), "{out}");
+        assert!(out.contains("beta"), "{out}");
+    }
+
+    #[test]
+    fn module_constant_detected() {
+        assert_eq!(
+            is_module_constant("RISK_ORDER = {\"low\": 1}", "RISK_ORDER = {\"low\": 1}"),
+            Some("RISK_ORDER".to_string())
+        );
+        assert_eq!(
+            is_module_constant("MAX_RETRIES = 3", "MAX_RETRIES = 3"),
+            Some("MAX_RETRIES".to_string())
+        );
+    }
+
+    #[test]
+    fn module_constant_rejects_non_constants() {
+        // Indented (not module-level).
+        assert_eq!(is_module_constant("    X = 1", "X = 1"), None);
+        // Lowercase (not UPPER_SNAKE_CASE).
+        assert_eq!(is_module_constant("risk_order = 1", "risk_order = 1"), None);
+        // Comparison, not assignment.
+        assert_eq!(is_module_constant("X == 1", "X == 1"), None);
+        // Single char (noise).
+        assert_eq!(is_module_constant("X = 1", "X = 1"), None);
+        // Walrus / annotated.
+        assert_eq!(is_module_constant("X := 1", "X := 1"), None);
+    }
+
+    #[test]
+    fn ranked_captures_python_module_constant() {
+        let txt = "RISK_ORDER = {\"low\": 1, \"high\": 3}\ndef helper():\n    pass\n";
+        let out = skeletonize_ranked(txt, "python", None);
+        assert!(out.contains("RISK_ORDER"), "{out}");
+    }
+
+    #[test]
+    fn expand_symbol_returns_full_constant_value() {
+        let txt = "RISK_ORDER = {\n    \"low\": 1,\n    \"high\": 3,\n}\ndef helper():\n    pass\n";
+        let expanded = expand_symbol(txt, "RISK_ORDER").expect("must expand");
+        assert!(expanded.contains("\"low\": 1"), "{expanded}");
+        assert!(expanded.contains("\"high\": 3"), "{expanded}");
+        assert!(!expanded.contains("def helper"), "{expanded}");
+    }
     use super::*;
 
     const SAMPLE: &str = r#"
@@ -1320,70 +1918,208 @@ impl Point {
         );
     }
 
+    // --- Diagnostic elision --------------------------------------------------------
+
+    const DIAGNOSTIC_PY: &str = r#"import os
+
+class Loader:
+    def load(self, path):
+        # TODO: support remote paths
+        count = 0
+        total = 0
+        try:
+            data = read(path)
+        except OSError as e:
+            log(e)
+            raise
+        if count > total and total != 0:
+            count += 1
+        name = "loader"
+        return data
+"#;
+
     #[test]
-    fn ranked_keeps_name_stub_when_signature_exceeds_budget() {
-        // P0 safety: a low-ranked symbol must not vanish entirely. With a
-        // tiny budget, full signatures don't fit, but names must survive.
-        let txt = "def alpha():\n    pass\ndef beta():\n    pass\ndef gamma():\n    pass\n";
-        let out = skeletonize_ranked(txt, "python", Some(8));
-        // At least the names must appear as stubs, even if signatures don't fit.
-        let has_stub = out.contains("(… body elided …)");
-        let all_names_visible = ["alpha", "beta", "gamma"]
-            .iter()
-            .all(|n| out.contains(n));
+    fn diagnostic_keeps_error_paths() {
+        let b = skeleton_body_diagnostic(DIAGNOSTIC_PY, 3);
+        assert!(b.contains("try:"), "{b}");
+        assert!(b.contains("except OSError as e:"), "{b}");
+        assert!(b.contains("log(e)"), "{b}"); // except-block extension
+        assert!(b.contains("raise"), "{b}");
+    }
+
+    #[test]
+    fn diagnostic_keeps_todo_and_boundary_condition() {
+        let b = skeleton_body_diagnostic(DIAGNOSTIC_PY, 3);
+        assert!(b.contains("TODO"), "{b}");
+        assert!(b.contains("if count > total and total != 0:"), "{b}");
+        assert!(b.contains("count += 1"), "{b}"); // if-block extension
+    }
+
+    #[test]
+    fn diagnostic_elides_boring_assignments() {
+        let b = skeleton_body_diagnostic(DIAGNOSTIC_PY, 3);
+        assert!(!b.contains("total = 0"), "{b}");
+        assert!(!b.contains("name = \"loader\""), "{b}");
+        assert!(b.contains("lines elided"), "{b}");
+    }
+
+    #[test]
+    fn diagnostic_keeps_return_value() {
+        let b = skeleton_body_diagnostic(DIAGNOSTIC_PY, 3);
+        assert!(b.contains("return data"), "{b}");
+    }
+
+    #[test]
+    fn diagnostic_keeps_returned_dict_literal() {
+        // The SSRF case: a missing key hides inside a returned dict literal.
+        let src = "class P:\n    def to_dict(self):\n        tmp = 1\n        return {\n            \"allowed\": self.allowed,\n            \"blocked\": self.blocked,\n        }\n";
+        let b = skeleton_body_diagnostic(src, 3);
+        assert!(b.contains("\"allowed\": self.allowed"), "{b}");
+        assert!(b.contains("\"blocked\": self.blocked"), "{b}");
+        assert!(!b.contains("tmp = 1"), "{b}");
+    }
+
+    #[test]
+    fn diagnostic_keeps_complex_conditional() {
+        let src = "def f(a, b, c, d):\n    x = 1\n    if a and b or c and d:\n        return 1\n    return 0\n";
+        let b = skeleton_body_diagnostic(src, 3);
+        assert!(b.contains("if a and b or c and d:"), "{b}");
+        assert!(!b.contains("x = 1"), "{b}");
+    }
+
+    #[test]
+    fn diagnostic_and_or_need_word_boundaries() {
+        // "candle" contains "and" but is not a boolean connector.
+        assert_eq!(count_bool_connectors("if candle and wax:"), 1);
+        assert_eq!(count_bool_connectors("if a && b || c:"), 2);
+    }
+
+    #[test]
+    fn diagnostic_keeps_assert_and_bare_except() {
+        let src = "def f(x):\n    assert x > 0\n    try:\n        g()\n    except:\n        pass\n    return x\n";
+        let b = skeleton_body_diagnostic(src, 3);
+        assert!(b.contains("assert x > 0"), "{b}");
+        assert!(b.contains("except:"), "{b}");
+    }
+
+    #[test]
+    fn diagnostic_rust_keeps_unwrap_and_try_operator() {
+        let src = "use std::collections::HashMap;\nfn get(m: &HashMap<String, i32>, k: &str) -> i32 {\n    let v = m.get(k).unwrap();\n    let w = v + 1;\n    w\n}\nfn load(path: &str) -> Result<String, std::io::Error> {\n    let s = std::fs::read_to_string(path)?;\n    Ok(s)\n}\n";
+        let b = skeleton_body_diagnostic(src, 3);
+        assert!(b.contains(".unwrap()"), "{b}");
+        assert!(b.contains("?;"), "{b}");
+        assert!(!b.contains("let w = v + 1;"), "{b}");
+    }
+
+    #[test]
+    fn diagnostic_rust_keeps_tail_expression() {
+        // Rust's tail expression is the return value.
+        let src = "fn inc(x: i32) -> i32 {\n    let y = x + 1;\n    y\n}\n";
+        let b = skeleton_body_diagnostic(src, 3);
+        assert!(b.contains("\n    y\n"), "{b}");
+        assert!(!b.contains("let y = x + 1;"), "{b}");
+    }
+
+    #[test]
+    fn diagnostic_rust_keeps_err_and_panic() {
+        let src = "fn div(a: i32, b: i32) -> Result<i32, String> {\n    let q = a / b;\n    if b == 0 {\n        return Err(\"zero\".to_string());\n    }\n    if q < 0 {\n        panic!(\"negative\");\n    }\n    Ok(q)\n}\n";
+        let b = skeleton_body_diagnostic(src, 3);
+        assert!(b.contains("return Err("), "{b}");
+        assert!(b.contains("panic!"), "{b}");
+        assert!(b.contains("if b == 0 {"), "{b}");
+        assert!(!b.contains("let q = a / b;"), "{b}");
+    }
+
+    #[test]
+    fn diagnostic_bare_comparison_ignores_arrows() {
+        assert!(!has_bare_comparison("let f = |x| x -> i32;"));
+        assert!(!has_bare_comparison("Some(x) => foo(),"));
+        assert!(has_bare_comparison("if x < limit {"));
+        assert!(has_bare_comparison("while n > 0:"));
+    }
+
+    #[test]
+    fn diagnostic_generics_are_not_comparisons() {
+        assert!(!has_bare_comparison("let x: Vec<u8> = Vec::new();"));
+        assert!(!has_bare_comparison("let r: Result<T, E> = foo();"));
+        assert!(!has_bare_comparison(
+            "let m: HashMap<String, Vec<u8>> = HashMap::new();"
+        ));
+        assert!(!has_bare_comparison("let y = foo::<T>(a);"));
+        // Real comparisons still fire, even unspaced.
+        assert!(has_bare_comparison("if x<y {"));
+        assert!(has_bare_comparison("while n>0 {"));
+        assert!(has_bare_comparison("if x < y {"));
+    }
+
+    #[test]
+    fn diagnostic_non_function_decls_stay_signatures() {
+        let b = skeleton_body_diagnostic(DIAGNOSTIC_PY, 3);
+        assert!(b.contains("class Loader:"), "{b}");
+        assert!(b.contains("import os"), "{b}");
+        // No method bodies leak into the class rendering.
+        assert_eq!(b.matches("def load").count(), 1);
+    }
+
+    // Boring-heavy sample: realistic code where most lines are assignments
+    // and straightforward logic, with a few diagnostic hot spots.
+    const DIAGNOSTIC_SIZE_PY: &str = r#"import os
+import sys
+
+CONFIG_PATH = "/etc/app.conf"
+DEFAULT_TIMEOUT = 30
+
+class Processor:
+    def __init__(self, name):
+        self.name = name
+        self.count = 0
+        self.items = []
+        self.cache = {}
+        self.enabled = True
+        self.retries = 3
+
+    def process(self, items, limit):
+        results = []
+        batch = []
+        seen = set()
+        mapping = {}
+        for item in items:
+            batch.append(item)
+            seen.add(item.id)
+            transformed = item.value * 2
+            mapping[item.id] = transformed
+        if len(results) > limit:
+            raise ValueError("over limit")
+        total = sum(batch)
+        average = total / max(1, len(batch))
+        summary = f"{average:.2f}"
+        return results
+"#;
+
+    #[test]
+    fn diagnostic_size_between_dumb_and_full() {
+        let dumb = skeleton_body(DIAGNOSTIC_SIZE_PY, 3);
+        let diagnostic = skeleton_body_diagnostic(DIAGNOSTIC_SIZE_PY, 3);
         assert!(
-            has_stub || all_names_visible,
-            "budget-elided symbols must keep names: {out}"
+            dumb.len() < diagnostic.len(),
+            "dumb={} diagnostic={}",
+            dumb.len(),
+            diagnostic.len()
         );
-    }
-
-    #[test]
-    fn ranked_emits_all_names_without_budget() {
-        let txt = "def alpha():\n    pass\ndef beta():\n    pass\n";
-        let out = skeletonize_ranked(txt, "python", None);
-        assert!(out.contains("alpha"), "{out}");
-        assert!(out.contains("beta"), "{out}");
-    }
-
-    #[test]
-    fn module_constant_detected() {
-        assert_eq!(
-            is_module_constant("RISK_ORDER = {\"low\": 1}", "RISK_ORDER = {\"low\": 1}"),
-            Some("RISK_ORDER".to_string())
+        assert!(
+            diagnostic.len() < DIAGNOSTIC_SIZE_PY.len(),
+            "diagnostic={} full={}",
+            diagnostic.len(),
+            DIAGNOSTIC_SIZE_PY.len()
         );
-        assert_eq!(
-            is_module_constant("MAX_RETRIES = 3", "MAX_RETRIES = 3"),
-            Some("MAX_RETRIES".to_string())
-        );
+        let ratio = diagnostic.len() as f64 / DIAGNOSTIC_SIZE_PY.len() as f64;
+        assert!(ratio < 0.8, "diagnostic/full ratio={ratio:.2}");
     }
 
     #[test]
-    fn module_constant_rejects_non_constants() {
-        // Indented (not module-level).
-        assert_eq!(is_module_constant("    X = 1", "X = 1"), None);
-        // Lowercase (not UPPER_SNAKE_CASE).
-        assert_eq!(is_module_constant("risk_order = 1", "risk_order = 1"), None);
-        // Comparison, not assignment.
-        assert_eq!(is_module_constant("X == 1", "X == 1"), None);
-        // Single char (noise).
-        assert_eq!(is_module_constant("X = 1", "X = 1"), None);
-        // Walrus / annotated.
-        assert_eq!(is_module_constant("X := 1", "X := 1"), None);
-    }
-
-    #[test]
-    fn ranked_captures_python_module_constant() {
-        let txt = "RISK_ORDER = {\"low\": 1, \"high\": 3}\ndef helper():\n    pass\n";
-        let out = skeletonize_ranked(txt, "python", None);
-        assert!(out.contains("RISK_ORDER"), "{out}");
-    }
-
-    #[test]
-    fn expand_symbol_returns_full_constant_value() {
-        let txt = "RISK_ORDER = {\n    \"low\": 1,\n    \"high\": 3,\n}\ndef helper():\n    pass\n";
-        let expanded = expand_symbol(txt, "RISK_ORDER").expect("must expand");
-        assert!(expanded.contains("\"low\": 1"), "{expanded}");
-        assert!(expanded.contains("\"high\": 3"), "{expanded}");
-        assert!(!expanded.contains("def helper"), "{expanded}");
+    fn diagnostic_prose_falls_back_to_excerpt() {
+        let txt = "Just plain prose, no code here. ".repeat(100);
+        let b = skeleton_body_diagnostic(&txt, 3);
+        assert!(b.contains("elided"), "{b}");
     }
 }

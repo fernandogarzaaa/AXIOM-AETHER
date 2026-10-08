@@ -68,6 +68,15 @@ pub enum AxiomCommand {
         /// Max doc-comment lines kept per file.
         #[arg(long, default_value_t = 20)]
         max_doc_lines: usize,
+        /// Diagnostic elision: keep diagnostic signal inside function bodies
+        /// (error paths, boundary conditions, suspicious patterns, complex
+        /// conditionals, return values) instead of dropping bodies entirely.
+        /// Output is larger than a dumb skeleton but still much smaller
+        /// than full source.
+        /// Heuristic representation. Does not guarantee preservation of
+        /// information relevant to a particular debugging task.
+        #[arg(long, alias = "smart")]
+        diagnostic: bool,
     },
     /// Autonomy (Pillar 3): drive a failing verify command to green by chaining
     /// environment self-healing and Poly JIT / LLM source repair, then
