@@ -1,6 +1,6 @@
 ﻿[package]
 name = "axiom_engine"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version = "1.90"
 description = "Axiom-TTT Inference Engine â€“ Rust implementation using candle"
@@ -149,7 +149,7 @@ tokio = { version = "1.35", features = ["full"] }
 sha2 = "0.10.8"
 rand = "0.8.5"
 # Mesh primitives (KNM/IDC) live in the canonical axiom_mesh_core crate.
-axiom_mesh_core = { path = "../axiom_mesh_core" }
+axiom_mesh_core = { version = "0.1", path = "../axiom_mesh_core" }
 ndarray = "0.16"
 indicatif = "0.17.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
