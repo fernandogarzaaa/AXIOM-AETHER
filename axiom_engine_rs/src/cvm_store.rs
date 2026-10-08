@@ -250,10 +250,11 @@ pub fn build_stub(
 ) -> String {
     let snippet: String = original_text.chars().take(120).collect();
     let snippet = snippet.replace(['\n', '\r'], " ");
-    // Session ids are header/UUID shaped, but strip quotes defensively so a
-    // hostile value can never break the stub grammar.
-    let session_id = session_id.replace('"', "");
-    format!("[AXIOM-PAGE {page_id} session=\"{session_id}\" {orig_tokens}tok {kind}] {snippet}...")
+    // JSON-encode the session id so quotes, backslashes, and brackets in a
+    // hostile value round-trip instead of breaking the stub grammar.
+    let session_attr =
+        serde_json::to_string(session_id).expect("session IDs are serializable");
+    format!("[AXIOM-PAGE {page_id} session={session_attr} {orig_tokens}tok {kind}] {snippet}...")
 }
 
 /// The fields recovered by parsing a stub line built by [`build_stub`].
@@ -267,23 +268,44 @@ pub struct StubInfo {
     pub snippet: String,
 }
 
-/// Split an optional `session="<value>"` attribute out of a stub header,
+/// Split an optional `session=<json-string>` attribute out of a stub header,
 /// returning `(header_without_attribute, session_value)`. Old-format stubs
-/// without the attribute round-trip as `(header, None)`.
+/// without the attribute round-trip as `(header, None)`. The value is a
+/// JSON string (see [`build_stub`]); it is decoded so escaped quotes and
+/// backslashes resolve to the original session id.
 fn split_session_attr(header: &str) -> (String, Option<String>) {
     const MARKER: &str = "session=\"";
     let Some(start) = header.find(MARKER) else {
         return (header.to_string(), None);
     };
     let val_start = start + MARKER.len();
-    let Some(end_rel) = header[val_start..].find('"') else {
+    // Scan for the closing quote, skipping JSON escapes (\" and \\).
+    let bytes = header.as_bytes();
+    let mut i = val_start;
+    let mut end = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2, // skip the escaped char
+            b'"' => {
+                end = Some(i);
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(end) = end else {
         return (header.to_string(), None);
     };
-    let session = header[val_start..val_start + end_rel].to_string();
+    // The raw JSON string including quotes, e.g. `"a\"b"`.
+    let raw = &header[val_start - 1..=end];
+    let session: String = match serde_json::from_str(raw) {
+        Ok(s) => s,
+        Err(_) => return (header.to_string(), None),
+    };
     let mut cleaned = String::with_capacity(header.len());
     cleaned.push_str(header[..start].trim_end());
     cleaned.push(' ');
-    cleaned.push_str(header[val_start + end_rel + 1..].trim_start());
+    cleaned.push_str(header[end + 1..].trim_start());
     (cleaned, Some(session))
 }
 
@@ -465,12 +487,12 @@ mod tests {
     }
 
     #[test]
-    fn build_stub_strips_quotes_from_session_id() {
-        // A hostile session id must not break the stub grammar.
+    fn build_stub_json_encodes_session_id_with_quotes() {
+        // A hostile session id must round-trip through JSON encoding.
         let stub = build_stub("a1b2c3d4e5f60718", "se\"ss", 10, "tool_result", "x");
-        assert!(!stub.contains("se\"ss"));
+        assert!(stub.contains("session=\"se\\\"ss\""));
         let parsed = parse_stub(&stub).unwrap();
-        assert_eq!(parsed.session_id, Some("sess".to_string()));
+        assert_eq!(parsed.session_id, Some("se\"ss".to_string()));
     }
 
     #[test]

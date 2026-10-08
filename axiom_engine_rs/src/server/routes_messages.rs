@@ -327,9 +327,14 @@ async fn compressed_messages_path(
     // exists to shrink all live in the frozen prefix.
     // Default ON since the 2026-07-16 live eval; opt out with
     // AXIOM_REBASE_ON_BREAK=off.
+    // P0 safety gate (see apply_digest_admission): rebase_transcript creates
+    // new stubs via store.put. If axiom_expand is not in this request's tools
+    // array, those stubs would be misleading with no recovery path, so skip
+    // the digest work entirely and pass the full text through.
     if std::env::var("AXIOM_REBASE_ON_BREAK").as_deref() != Ok("off")
         && state.pss_detect_break(&session_id, &frozen_messages)
         && frozen_messages.len() + mutable_messages.len() > 1
+        && crate::digest::expand_tool_available(body)
     {
         let old_turns = frozen_messages.len() + mutable_messages.len() - 1;
         // rebase_transcript does synchronous L2-store writes + digest work
