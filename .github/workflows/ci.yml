@@ -280,3 +280,48 @@ jobs:
 
       - name: Pytest
         run: python -m pytest tests/ -q
+
+  # Dry-run `cargo publish` for both publishable crates so publish failures
+  # (path-only dependencies, missing metadata, unresolvable version
+  # requirements) are caught on PRs instead of at release-tag time. The real
+  # publish workflow (publish.yml) runs `cargo publish --locked` on tags; this
+  # job mirrors those exact commands with --dry-run added, so anything that
+  # would break the release is visible before merge. No registry token is
+  # needed: --dry-run never uploads.
+  publish-dry-run:
+    name: Publish dry-run (crates.io)
+    # The protocol gate is cheap and its failure invalidates everything below.
+    needs: protocol
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            axiom_engine_rs/target
+            axiom_mesh_core/target
+          key: ci-publish-dry-run-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock', 'axiom_mesh_core/Cargo.lock') }}
+          restore-keys: ci-publish-dry-run-${{ runner.os }}-
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
+
+      - name: Dry-run publish (axiom_mesh_core)
+        working-directory: axiom_mesh_core
+        run: cargo publish --dry-run --locked
+
+      - name: Dry-run publish (axiom_engine)
+        working-directory: axiom_engine_rs
+        run: cargo publish --dry-run --locked
