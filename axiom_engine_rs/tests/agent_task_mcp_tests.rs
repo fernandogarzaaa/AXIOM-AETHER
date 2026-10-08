@@ -300,3 +300,171 @@ fn finishing_one_task_does_not_remove_another() {
     );
     server.result("task_finish", json!({"task_id": second, "commit": true}));
 }
+
+/// MCP client helper: call a tool via tools/call and unwrap the text content.
+fn mcp_call(server: &mut Server, id: i64, name: &str, arguments: Value) -> Value {
+    let response = server.request(
+        json!(id),
+        "tools/call",
+        json!({"name": name, "arguments": arguments}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].get("isError").is_none(), "{response}");
+    let content = &response["result"]["content"];
+    assert_eq!(content.as_array().unwrap().len(), 1, "{response}");
+    assert_eq!(content[0]["type"], "text", "{response}");
+    let text = content[0]["text"].as_str().unwrap();
+    serde_json::from_str(text).expect("tool result text is JSON")
+}
+
+/// MCP client helper: call a tool expected to fail at the tool level;
+/// returns the error text from the isError result.
+fn mcp_call_error(server: &mut Server, id: i64, name: &str, arguments: Value) -> String {
+    let response = server.request(
+        json!(id),
+        "tools/call",
+        json!({"name": name, "arguments": arguments}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    response["result"]["content"][0]["text"].as_str().unwrap().to_owned()
+}
+
+fn mcp_initialize(server: &mut Server) {
+    let response = server.request(
+        json!("init"),
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "test-client", "version": "1.0"},
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let result = &response["result"];
+    assert_eq!(result["protocolVersion"], "2024-11-05", "{response}");
+    assert!(result["capabilities"]["tools"].is_object(), "{response}");
+    assert_eq!(result["serverInfo"]["name"], "axiom-agent-task", "{response}");
+    assert!(result["serverInfo"]["version"].is_string(), "{response}");
+    // MCP lifecycle: client sends notifications/initialized, server stays alive.
+    server.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+}
+
+#[test]
+fn mcp_initialize_returns_protocol_version_and_server_info() {
+    let mut server = Server::new();
+    mcp_initialize(&mut server);
+    // Server still responsive after the notification (which got no response).
+    let response = server.request(json!(1), "tools/list", json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+    server.finish_input();
+}
+
+#[test]
+fn mcp_tools_list_exposes_four_task_tools_with_schemas() {
+    let mut server = Server::new();
+    mcp_initialize(&mut server);
+    let response = server.request(json!(1), "tools/list", json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+    let tools = response["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["task_start", "task_propose", "task_history", "task_finish"]);
+    for tool in tools {
+        assert!(tool["description"].is_string(), "{tool}");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["type"], "object", "{tool}");
+        assert!(schema["properties"].is_object(), "{tool}");
+        assert!(schema["required"].is_array(), "{tool}");
+    }
+    // Spot-check required fields.
+    let start = &tools[0]["inputSchema"];
+    assert!(start["required"].as_array().unwrap().contains(&json!("goal")));
+    assert!(start["required"].as_array().unwrap().contains(&json!("verify_cmd")));
+    server.finish_input();
+}
+
+#[test]
+fn mcp_full_task_lifecycle_via_tools_call() {
+    let mut server = Server::new();
+    mcp_initialize(&mut server);
+
+    let path = server.workspace.path().join("mcp.txt");
+    fs::write(&path, "original").unwrap();
+
+    let started = mcp_call(
+        &mut server,
+        10,
+        "task_start",
+        json!({"goal": "mcp lifecycle", "verify_cmd": "exit 0", "files": ["mcp.txt"]}),
+    );
+    let task_id = started["task_id"].as_str().unwrap().to_owned();
+    assert!(!task_id.is_empty());
+
+    let proposed = mcp_call(
+        &mut server,
+        11,
+        "task_propose",
+        json!({"task_id": task_id, "edits": [{"path": "mcp.txt", "content": "via mcp"}]}),
+    );
+    assert_eq!(proposed["passed"], true);
+    assert_eq!(proposed["attempt"], 1);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "via mcp");
+
+    let history = mcp_call(&mut server, 12, "task_history", json!({"task_id": task_id}));
+    assert_eq!(history["attempts"].as_array().unwrap().len(), 1);
+
+    let finished = mcp_call(
+        &mut server,
+        13,
+        "task_finish",
+        json!({"task_id": task_id, "commit": true}),
+    );
+    assert_eq!(finished["committed"], true);
+    server.finish_input();
+}
+
+#[test]
+fn mcp_unknown_tool_is_a_jsonrpc_error() {
+    let mut server = Server::new();
+    mcp_initialize(&mut server);
+    let response = server.request(
+        json!(1),
+        "tools/call",
+        json!({"name": "does_not_exist", "arguments": {}}),
+    );
+    assert_error(&response, -32602, "unknown tool");
+    server.finish_input();
+}
+
+#[test]
+fn mcp_tool_level_failures_use_is_error_not_jsonrpc_error() {
+    let mut server = Server::new();
+    mcp_initialize(&mut server);
+    // Unknown task_id is a tool-level failure, not a protocol error.
+    let msg = mcp_call_error(
+        &mut server,
+        1,
+        "task_history",
+        json!({"task_id": "absent"}),
+    );
+    assert!(msg.contains("unknown task_id: absent"), "{msg}");
+    // Invalid arguments are also tool-level failures.
+    let msg = mcp_call_error(&mut server, 2, "task_start", json!({"goal": "g"}));
+    assert!(msg.contains("invalid arguments"), "{msg}");
+    server.finish_input();
+}
+
+#[test]
+fn mcp_notifications_without_id_receive_no_response() {
+    let mut server = Server::new();
+    // Send a notification (no id), then a normal request. Only one response
+    // should arrive, for the request.
+    server.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    let response = server.request(json!(7), "tools/list", json!({}));
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["id"], 7);
+    // Legacy methods also work alongside MCP on the same stream.
+    let started = server.result("task_start", json!({"goal": "g", "verify_cmd": "exit 0"}));
+    assert!(started["task_id"].is_string());
+    server.finish_input();
+}
