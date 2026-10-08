@@ -607,7 +607,7 @@ fn run_skeleton(path: &std::path::Path, format: &str, max_doc_lines: usize) -> R
     let files: Vec<PathBuf> = if path.is_file() {
         vec![path.to_path_buf()]
     } else if path.is_dir() {
-        prime::collect_source_files(path, 2000)
+        prime::collect_source_files(path, usize::MAX)
     } else {
         bail!("axiom skeleton: path does not exist: {}", path.display());
     };
@@ -625,25 +625,18 @@ fn run_skeleton(path: &std::path::Path, format: &str, max_doc_lines: usize) -> R
 
     match format {
         "json" => {
-            let mut out = String::from("[\n");
-            for (i, (p, s)) in entries.iter().enumerate() {
-                let esc_path = p.replace('\\', "\\\\").replace('"', "\\\"");
-                let esc_skel = s
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r")
-                    .replace('\t', "\\t");
-                out.push_str(&format!(
-                    "  {{\"path\": \"{esc_path}\", \"skeleton\": \"{esc_skel}\"}}"
-                ));
-                if i + 1 < entries.len() {
-                    out.push(',');
-                }
-                out.push('\n');
+            #[derive(serde::Serialize)]
+            struct SkeletonEntry<'a> {
+                path: &'a str,
+                skeleton: &'a str,
             }
-            out.push_str("]\n");
-            print!("{out}");
+            let entries_json: Vec<SkeletonEntry> = entries
+                .iter()
+                .map(|(p, s)| SkeletonEntry { path: p, skeleton: s })
+                .collect();
+            let json = serde_json::to_string_pretty(&entries_json)
+                .map_err(|e| candle_core::Error::Msg(format!("axiom skeleton: json: {e}")))?;
+            println!("{json}");
         }
         "readable" => {
             for (p, s) in &entries {

@@ -349,7 +349,14 @@ state_hash={state_hash}\n\
         if t.is_empty() {
             continue;
         }
-        if is_import(t) {
+        // Only keep top-level imports: an indented `import` inside a function
+        // body belongs to elided code, not the structural skeleton.
+        let is_top_level = line
+            .chars()
+            .next()
+            .map(|c| !c.is_whitespace())
+            .unwrap_or(false);
+        if is_import(t) && is_top_level {
             push_unique_structural(line.trim_end(), &mut out, &mut seen_structural, &mut elided);
             code_lines += 1;
         } else if is_decl(t) || looks_like_signature(t) {
@@ -1014,6 +1021,16 @@ impl Point {
         let b = skeleton_body(&txt, 3);
         assert!(b.contains("elided"));
         assert!(!b.contains("<axiom_context_digest"));
+    }
+
+    #[test]
+    fn skeleton_body_excludes_indented_imports() {
+        // Imports inside function bodies belong to elided code, not the skeleton.
+        let txt = "import os\ndef load():\n    import sys\n    return sys.argv\n";
+        let b = skeleton_body(txt, 3);
+        assert!(b.contains("import os"));
+        assert!(b.contains("def load():"));
+        assert!(!b.contains("import sys"), "indented import leaked: {b}");
     }
 
     #[test]
