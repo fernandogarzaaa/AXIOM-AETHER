@@ -143,23 +143,19 @@ fn truncate_to_token_budget(text: &str, budget_tokens: usize) -> String {
 /// the `tools` array in each `/v1/messages` request, so gate on the expand
 /// tool being present there.
 ///
-/// Matching is substring-based (`contains("axiom_expand")`) because MCP
-/// clients namespace tool names (e.g. Claude Code exposes it as
-/// `mcp__axiom__axiom_expand`). Missing or empty tools array fails closed:
-/// no digest.
-///
-/// Applies to all digest modes (skeleton, haiku) -- the issue is the missing
-/// expansion path, not the digest method.
+/// Matching is suffix-aware: exact `axiom_expand` or an MCP-namespaced
+/// variant ending in `__axiom_expand` (e.g. Claude Code exposes it as
+/// `mcp__axiom__axiom_expand`). A bare substring check would false-positive
+/// on unrelated tools like `other_axiom_expand_helper`.
 pub fn expand_tool_available(outbound: &Value) -> bool {
     outbound
         .get("tools")
         .and_then(Value::as_array)
         .map(|tools| {
             tools.iter().any(|t| {
-                t.get("name")
-                    .and_then(Value::as_str)
-                    .map(|n| n.contains("axiom_expand"))
-                    .unwrap_or(false)
+                t.get("name").and_then(Value::as_str).map(|n| {
+                    n == "axiom_expand" || n.ends_with("__axiom_expand")
+                }).unwrap_or(false)
             })
         })
         .unwrap_or(false)
@@ -323,6 +319,14 @@ mod tests {
     #[test]
     fn expand_gate_denies_unrelated_names() {
         let outbound = json!({"tools": [{"name": "expand"}, {"name": "axiom_compress"}]});
+        assert!(!expand_tool_available(&outbound));
+    }
+
+    #[test]
+    fn expand_gate_rejects_substring_false_positives() {
+        // `other_axiom_expand_helper` contains "axiom_expand" but is not the
+        // expand tool -- must not match.
+        let outbound = json!({"tools": [{"name": "other_axiom_expand_helper"}]});
         assert!(!expand_tool_available(&outbound));
     }
 

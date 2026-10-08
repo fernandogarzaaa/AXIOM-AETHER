@@ -593,8 +593,50 @@ pub fn expand_symbol(source: &str, name: &str) -> Option<String> {
         if (is_decl(t) || looks_like_signature(t)) && contains_symbol(line, name) {
             return Some(capture_block(&lines, i));
         }
+        // Module-level constants (e.g. `RISK_ORDER = {...}`): the digest
+        // shows only `RISK_ORDER = …`, so expansion must return the full
+        // assignment including a multi-line value.
+        if let Some(const_name) = is_module_constant(line, t) {
+            if const_name == name {
+                return Some(capture_constant_block(&lines, i));
+            }
+        }
     }
     None
+}
+
+/// Capture a module-level constant's full assignment, including multi-line
+/// values (dicts, lists). Stops at the first subsequent line at zero
+/// indentation that is not a continuation of the value.
+fn capture_constant_block(lines: &[&str], start: usize) -> String {
+    let mut out = vec![lines[start].to_string()];
+    // Track bracket depth to handle multi-line dict/list values.
+    let mut depth = 0i32;
+    for c in lines[start].chars() {
+        match c {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    for line in &lines[start + 1..] {
+        // A new zero-indentation line outside any brackets ends the value.
+        if depth <= 0 && !line.starts_with(' ') && !line.starts_with('\t') && !line.trim().is_empty() {
+            break;
+        }
+        for c in line.chars() {
+            match c {
+                '{' | '[' | '(' => depth += 1,
+                '}' | ']' | ')' => depth -= 1,
+                _ => {}
+            }
+        }
+        out.push(line.to_string());
+        if depth <= 0 {
+            break;
+        }
+    }
+    out.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,5 +1376,14 @@ impl Point {
         let txt = "RISK_ORDER = {\"low\": 1, \"high\": 3}\ndef helper():\n    pass\n";
         let out = skeletonize_ranked(txt, "python", None);
         assert!(out.contains("RISK_ORDER"), "{out}");
+    }
+
+    #[test]
+    fn expand_symbol_returns_full_constant_value() {
+        let txt = "RISK_ORDER = {\n    \"low\": 1,\n    \"high\": 3,\n}\ndef helper():\n    pass\n";
+        let expanded = expand_symbol(txt, "RISK_ORDER").expect("must expand");
+        assert!(expanded.contains("\"low\": 1"), "{expanded}");
+        assert!(expanded.contains("\"high\": 3"), "{expanded}");
+        assert!(!expanded.contains("def helper"), "{expanded}");
     }
 }
