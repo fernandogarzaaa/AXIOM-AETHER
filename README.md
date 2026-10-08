@@ -551,6 +551,64 @@ Useful environment variables:
 | `AXIOM_CONFORMAL_THRESHOLD` | Pre-calibrated support threshold τ for the conformal factuality gate; replaces the shipped default of 0.75 (`SHIPPED_CONFORMAL_THRESHOLD` in `hallucination.rs`; 0.60 is a separate internal tier constant, `SUPPORT_HIGH`, not the default cutoff). |
 | `AXIOM_CONFORMAL_DELTA` | Coverage tolerance δ (default 0.10 → 90% coverage); pair with `AXIOM_CONFORMAL_THRESHOLD` or calibrate via `calibrate_conformal_threshold`. |
 
+## Agent Task Loop (axiom-agent-task)
+
+Transactional safety for agent edits. `axiom-agent-task` is a JSON-RPC 2.0
+server over stdio that lets an external agent propose file edits without an
+LLM API key: the agent does its own reasoning, proposes edits, and AXIOM
+applies them transactionally — running a verifier command after each proposal
+and rolling back automatically on failure.
+
+Build it with `cargo build --release --bin axiom-agent-task`, then speak
+line-delimited JSON-RPC on stdin/stdout.
+
+### Methods
+
+| Method | Purpose |
+|---|---|
+| `task_start {goal, verify_cmd, files[], max_attempts}` | Open a task. `files` is the allowlist: only these paths can be edited. `verify_cmd` is a shell command run in the working directory after each proposal. Returns `{task_id}`. |
+| `task_propose {task_id, edits[{path, content}]}` | Propose a set of file edits (full replacement content per path). AXIOM applies them, runs the verifier, and keeps or rolls back the result. Returns `{passed, output, attempt}`. |
+| `task_history {task_id}` | List every attempt so far in order. Returns `{attempts[{attempt, fingerprint, passed, output}]}`. |
+| `task_finish {task_id, commit: bool}` | Close the task. `commit: true` keeps applied edits; `commit: false` restores the pre-task file state. |
+
+Standard MCP protocol support (`initialize`, `tools/list`, `tools/call`) is
+in [PR #199](https://github.com/fernandogarzaaa/AXIOM-AETHER/pull/199)
+(open, under review). The binary currently speaks plain JSON-RPC over stdio.
+
+### What it guarantees
+
+- **Verifier-gated commits.** A proposal is kept only if `verify_cmd` exits 0
+  after the edits are applied. A non-zero exit rolls the files back
+  byte-for-byte.
+- **Automatic rollback on failure.** Failed proposals never leave partial
+  edits behind; the file allowlist is snapshotted at `task_start`.
+- **Deduplication.** A proposal with an edit-set identical to an already
+  rejected one is refused without re-running the verifier (matched by
+  fingerprint).
+- **Complete attempt history.** Every proposal, its fingerprint, pass/fail
+  status, and verifier output is recorded in order and retrievable via
+  `task_history`.
+
+### What it does not do
+
+- It does not make agents smarter. The agent does all the reasoning; AXIOM is
+  a transactional harness around the agent's judgment, not a source of
+  insight.
+- It does not write verifiers for you. The safety guarantee is only as strong
+  as the `verify_cmd` you provide — a weak verifier means AXIOM will
+  confidently commit weak edits. `axiom verify-suggest`
+  ([PR #198](https://github.com/fernandogarzaaa/AXIOM-AETHER/pull/198), open,
+  under review) is a helper that suggests verifier commands for a given
+  change.
+- It does not guarantee correctness beyond what your verifier checks. A green
+  verifier means "the checks you chose passed," nothing more.
+
+This loop is exercised end-to-end by
+[axiom-rag](https://github.com/fernandogarzaaa/axiom-rag),
+[axiom-task-deep-test](https://github.com/fernandogarzaaa/axiom-task-deep-test),
+and
+[axiom-prompt-shield](https://github.com/fernandogarzaaa/axiom-prompt-shield).
+
 ## Docker
 
 ```bash
