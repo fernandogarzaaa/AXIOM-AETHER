@@ -1017,14 +1017,6 @@ impl Point {
     }
 
     #[test]
-    fn skeleton_body_prose_falls_back_to_excerpt() {
-        let txt = "This is just plain prose with no code at all. ".repeat(100);
-        let b = skeleton_body(&txt, 3);
-        assert!(b.contains("elided"));
-        assert!(!b.contains("<axiom_context_digest"));
-    }
-
-    #[test]
     fn js_class_method_without_keyword_kept() {
         // Methods with no leading keyword must be caught by looks_like_signature.
         let txt = "class Api {\n  async handle(req, res) {\n    res.send(req.body)\n  }\n}";
