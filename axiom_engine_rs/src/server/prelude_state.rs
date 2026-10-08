@@ -883,7 +883,7 @@ impl AppState {
             version: 1,
             entries,
         };
-        let bytes = bincode::serialize(&payload)
+        let bytes = crate::bincode_compat::serialize(&payload)
             .map_err(|e| format!("compression cache serialize failed: {e}"))?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -900,7 +900,7 @@ impl AppState {
             return Ok(0);
         }
         let bytes = fs::read(path).map_err(|e| format!("compression cache read failed: {e}"))?;
-        let payload: PersistedCompressionCache = bincode::deserialize(&bytes)
+        let payload: PersistedCompressionCache = crate::bincode_compat::deserialize(&bytes)
             .map_err(|e| format!("compression cache decode failed: {e}"))?;
         if payload.version != 1 {
             return Err(format!(

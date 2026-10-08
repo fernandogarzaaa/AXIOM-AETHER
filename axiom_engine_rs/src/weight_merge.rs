@@ -139,7 +139,7 @@ pub fn merge_checkpoint_files_with(
     let mut sessions = Vec::new();
     for input in inputs {
         let bytes = fs::read(input).map_err(|e| format!("read {} failed: {e}", input.display()))?;
-        let cache: PersistedCompressionCache = bincode::deserialize(&bytes)
+        let cache: PersistedCompressionCache = crate::bincode_compat::deserialize(&bytes)
             .map_err(|e| format!("decode {} failed: {e}", input.display()))?;
         if cache.version != 1 {
             return Err(format!(
@@ -179,7 +179,7 @@ pub fn merge_checkpoint_files_with(
             .map_err(|e| format!("mkdir {} failed: {e}", parent.display()))?;
     }
     let bytes =
-        bincode::serialize(&payload).map_err(|e| format!("encode merged cache failed: {e}"))?;
+        crate::bincode_compat::serialize(&payload).map_err(|e| format!("encode merged cache failed: {e}"))?;
     fs::write(output, bytes).map_err(|e| format!("write {} failed: {e}", output.display()))?;
 
     Ok(MergeSummary {
@@ -472,7 +472,7 @@ pub fn write_test_cache(path: &Path, session_id: &str, layers: Vec<LayerWeights>
             },
         }],
     };
-    let bytes = bincode::serialize(&payload).unwrap();
+    let bytes = crate::bincode_compat::serialize(&payload).unwrap();
     fs::write(path, bytes).unwrap();
 }
 
