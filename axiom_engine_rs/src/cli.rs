@@ -54,6 +54,21 @@ pub enum AxiomCommand {
         #[arg(long, requires = "ranked")]
         budget: Option<usize>,
     },
+    /// Print readable structural skeletons for source files: signatures kept,
+    /// bodies elided. For agents and humans to navigate a codebase without
+    /// reading every file in full.
+    Skeleton {
+        /// File or directory to skeletonize (defaults to the current directory).
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Output format: `readable` (default, `=== path ===` delimited) or
+        /// `json` (array of {path, skeleton} objects).
+        #[arg(long, default_value = "readable")]
+        format: String,
+        /// Max doc-comment lines kept per file.
+        #[arg(long, default_value_t = 20)]
+        max_doc_lines: usize,
+    },
     /// Autonomy (Pillar 3): drive a failing verify command to green by chaining
     /// environment self-healing and Poly JIT / LLM source repair, then
     /// remembering what worked. With no --source, the faulty file is localized

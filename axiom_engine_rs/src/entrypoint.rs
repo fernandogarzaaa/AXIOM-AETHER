@@ -1,7 +1,7 @@
 use crate::{
     agentic, agentic_eval, bench, bootstrap, claude_backend, cli, config, daemon, fault_locate,
     hardware, heal_memory, inference, lsp, mcp_stdio, meta_train, patch_memory, prime, provenance,
-    self_heal, server, solve, train, tui, vibe_memory,
+    self_heal, server, skeleton, solve, train, tui, vibe_memory,
 };
 // Experimental: compiled only with `--features experimental` (docs/EXPERIMENTAL.md).
 #[cfg(feature = "experimental")]
@@ -599,6 +599,66 @@ fn parse_multifile_response(text: &str, targets: &[PathBuf]) -> agentic::EditSet
 
 /// Strip a single pair of surrounding ``` fences (with optional language tag)
 /// from a model response; leaves unfenced text untouched.
+/// `axiom skeleton <path> [--format readable|json]` — print structural
+/// skeletons for source files: signatures kept, bodies elided. Readable
+/// format delimits each file with `=== path ===` headers for agent
+/// navigation; JSON emits an array of {path, skeleton} objects for tooling.
+fn run_skeleton(path: &std::path::Path, format: &str, max_doc_lines: usize) -> Result<()> {
+    let files: Vec<PathBuf> = if path.is_file() {
+        vec![path.to_path_buf()]
+    } else if path.is_dir() {
+        prime::collect_source_files(path, 2000)
+    } else {
+        bail!("axiom skeleton: path does not exist: {}", path.display());
+    };
+    if files.is_empty() {
+        bail!("axiom skeleton: no source files found under {}", path.display());
+    }
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| candle_core::Error::Msg(format!("axiom skeleton: {}: {e}", file.display())))?;
+        let body = skeleton::skeleton_body(&text, max_doc_lines);
+        entries.push((file.display().to_string(), body));
+    }
+
+    match format {
+        "json" => {
+            let mut out = String::from("[\n");
+            for (i, (p, s)) in entries.iter().enumerate() {
+                let esc_path = p.replace('\\', "\\\\").replace('"', "\\\"");
+                let esc_skel = s
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\t', "\\t");
+                out.push_str(&format!(
+                    "  {{\"path\": \"{esc_path}\", \"skeleton\": \"{esc_skel}\"}}"
+                ));
+                if i + 1 < entries.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str("]\n");
+            print!("{out}");
+        }
+        "readable" => {
+            for (p, s) in &entries {
+                println!("=== {p} ===");
+                println!("{s}");
+                println!();
+            }
+        }
+        other => {
+            bail!("axiom skeleton: unknown --format '{other}' (expected 'readable' or 'json')");
+        }
+    }
+    Ok(())
+}
+
 fn strip_fences(text: &str) -> String {
     let trimmed = text.trim();
     if let Some(after) = trimmed.strip_prefix("```") {
@@ -763,6 +823,9 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 &pipeline,
                 bench::BenchOptions { verbose, strict, ranked, budget },
             )?;
+        }
+        AxiomCommand::Skeleton { path, format, max_doc_lines } => {
+            run_skeleton(&path, &format, max_doc_lines)?;
         }
         AxiomCommand::Solve {
             max_rounds,

@@ -391,6 +391,56 @@ state_hash={state_hash}\n\
     )
 }
 
+/// Build just the skeleton body (no XML wrapper) for direct human/agent
+/// consumption. Returns the structural skeleton: imports, doc comments, and
+/// declaration signatures with bodies elided. For prose, returns a head+tail
+/// excerpt. This is what `axiom skeleton` prints per file.
+pub fn skeleton_body(heavy: &str, max_doc_lines: usize) -> String {
+    if let Some((body, _)) = rust_ast_body(heavy, max_doc_lines) {
+        return body;
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen_structural: HashSet<String> = HashSet::new();
+    let mut doc_budget = max_doc_lines as i32;
+    let mut elided = 0usize;
+    let mut code_lines = 0usize;
+
+    for line in heavy.lines() {
+        let t = line.trim_start();
+        if t.is_empty() {
+            continue;
+        }
+        if is_import(t) {
+            push_unique_structural(line.trim_end(), &mut out, &mut seen_structural, &mut elided);
+            code_lines += 1;
+        } else if is_decl(t) || looks_like_signature(t) {
+            let sig = line.split('{').next().unwrap_or(line).trim_end();
+            let suffix = if line.contains('{') { " { … }" } else { "" };
+            let structural = format!("{sig}{suffix}");
+            push_unique_structural(&structural, &mut out, &mut seen_structural, &mut elided);
+            code_lines += 1;
+        } else if is_doc(t) && doc_budget > 0 {
+            let before = seen_structural.len();
+            push_unique_structural(line.trim_end(), &mut out, &mut seen_structural, &mut elided);
+            if seen_structural.len() > before {
+                doc_budget -= 1;
+            }
+        } else {
+            elided += 1;
+        }
+    }
+
+    if code_lines == 0 {
+        prose_excerpt(heavy, 1200, 500)
+    } else {
+        if elided > 0 {
+            out.push(format!("// … {elided} implementation lines elided …"));
+        }
+        out.join("\n")
+    }
+}
+
 fn push_unique_structural(
     line: &str,
     out: &mut Vec<String>,
@@ -935,6 +985,35 @@ impl Point {
         assert!(d.contains("class Foo:"));
         assert!(d.contains("def bar(self, x):"));
         assert!(!d.contains("return x * 2"));
+    }
+
+    #[test]
+    fn skeleton_body_has_no_xml_wrapper() {
+        // The CLI-readable body must not include the digest XML envelope.
+        let b = skeleton_body(SAMPLE, 3);
+        assert!(!b.contains("<axiom_context_digest"));
+        assert!(!b.contains("recall_norm="));
+        assert!(b.contains("pub fn add(a: i32, b: i32) -> i32 { … }"));
+        assert!(b.contains("struct Point { … }"));
+        assert!(!b.contains("let s = a + b"));
+    }
+
+    #[test]
+    fn skeleton_body_python_readable() {
+        let txt = "import os\nclass Foo:\n    def bar(self, x):\n        return x * 2\n";
+        let b = skeleton_body(txt, 3);
+        assert!(b.contains("class Foo:"));
+        assert!(b.contains("def bar(self, x):"));
+        assert!(!b.contains("return x * 2"));
+        assert!(!b.contains("<axiom_context_digest"));
+    }
+
+    #[test]
+    fn skeleton_body_prose_falls_back_to_excerpt() {
+        let txt = "This is just plain prose with no code at all. ".repeat(100);
+        let b = skeleton_body(&txt, 3);
+        assert!(b.contains("elided"));
+        assert!(!b.contains("<axiom_context_digest"));
     }
 
     #[test]
