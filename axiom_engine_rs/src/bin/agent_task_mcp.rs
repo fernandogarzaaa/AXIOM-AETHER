@@ -39,8 +39,14 @@
 //! ```json
 //! // start
 //! {"jsonrpc":"2.0","id":1,"method":"task_start",
-//!  "params":{"goal":"...","verify_cmd":"...","files":["a.rs"],"max_attempts":4}}
+//!  "params":{"goal":"...","verify_cmd":"...","files":["a.rs"],"max_attempts":4,
+//!            "min_mutation_score":0.8}}
 //! // → {"jsonrpc":"2.0","id":1,"result":{"task_id":"..."}}
+//!
+//! // min_mutation_score is optional. When set, task_start measures the
+//! // verifier's mutation score (testteeth/cargo-mutants) and refuses the
+//! // task when the score is below the threshold. The gate is skipped
+//! // gracefully when mutation tools are unavailable.
 //!
 //! If `verify_cmd` looks like a test command and a mutation testing tool is
 //! available (testteeth for Python, cargo-mutants for Rust), the start response
@@ -91,6 +97,11 @@ struct TaskStartParams {
     files: Vec<String>,
     #[serde(default = "default_max_attempts")]
     max_attempts: usize,
+    /// Optional mutation gate: refuse task_start when the verifier's
+    /// mutation score falls below this threshold (0.0-1.0). Skipped
+    /// gracefully when mutation tools are unavailable.
+    #[serde(default)]
+    min_mutation_score: Option<f64>,
 }
 
 /// Use four as the stored attempt limit when omitted from start parameters.
@@ -217,8 +228,37 @@ fn main() {
     }
 }
 
+/// Report the mutation gate outcome for a `task_start` result.
+///
+/// Returns `None` when the caller did not request a gate
+/// (`min_mutation_score` was absent). Otherwise reports `measured` with the
+/// score, tool, and threshold, or `skipped` when the verifier strength could
+/// not be measured (tool unavailable or score unparsable).
+fn mutation_gate_result(task: &AgentTask) -> Option<Value> {
+    let threshold = task.min_mutation_score?;
+    Some(match &task.mutation_score {
+        Some(score) => json!({
+            "status": "measured",
+            "threshold": threshold,
+            "score": score.score,
+            "tool": score.tool,
+        }),
+        None => json!({
+            "status": "skipped",
+            "threshold": threshold,
+        }),
+    })
+}
+
 /// Snapshot and register a task, returning its ID in a JSON-RPC response.
-/// Invalid parameters produce code -32602; snapshot read failures are suppressed.
+/// Invalid parameters (including an out-of-range `min_mutation_score`)
+/// produce code -32602; other start failures produce -32000. Snapshot read
+/// failures are suppressed.
+///
+/// When `min_mutation_score` was supplied, the result also carries a
+/// `mutation_gate` object reporting whether the gate measured the verifier
+/// (`{"status":"measured",...}`) or skipped (`{"status":"skipped"}`), so
+/// clients can tell a skipped gate apart from a passed one.
 ///
 /// # Panics
 ///
@@ -233,16 +273,35 @@ fn handle_start(registry: &TaskRegistry, id: &Value, params: Value) -> String {
     // Best-effort verifier strength check: warn if the test suite looks weak.
     // Never blocks task creation; skips silently when mutation tools are absent.
     let verifier_warning = check_verifier_strength(&p.verify_cmd);
-    match AgentTask::start(task_id.clone(), p.goal, p.verify_cmd, files, p.max_attempts) {
+    match AgentTask::start(
+        task_id.clone(),
+        p.goal,
+        p.verify_cmd,
+        files,
+        p.max_attempts,
+        p.min_mutation_score,
+    ) {
         Ok(task) => {
-            registry.insert(task);
             let mut result = json!({"task_id": task_id});
             if let Some(warning) = verifier_warning {
                 result["verifier_warning"] = json!(warning);
             }
+            if let Some(gate) = mutation_gate_result(&task) {
+                result["mutation_gate"] = gate;
+            }
+            registry.insert(task);
             ok(id, result)
         }
-        Err(e) => err(id, -32000, format!("task_start failed: {e}")),
+        Err(e) => {
+            // Threshold validation failures are client errors: map them to
+            // invalid-params (-32602) instead of a generic server error.
+            let code = if e.kind() == std::io::ErrorKind::InvalidInput {
+                -32602
+            } else {
+                -32000
+            };
+            err(id, code, format!("task_start failed: {e}"))
+        }
     }
 }
 
@@ -442,10 +501,15 @@ fn handle_tools_call(registry: &TaskRegistry, id: &Value, params: Value) -> Stri
                     sp.verify_cmd,
                     files,
                     sp.max_attempts,
+                    sp.min_mutation_score,
                 ) {
                     Ok(task) => {
+                        let mut result = json!({"task_id": task_id});
+                        if let Some(gate) = mutation_gate_result(&task) {
+                            result["mutation_gate"] = gate;
+                        }
                         registry.insert(task);
-                        json!({"task_id": task_id})
+                        result
                     }
                     Err(e) => return tool_error(id, format!("task_start failed: {e}")),
                 }

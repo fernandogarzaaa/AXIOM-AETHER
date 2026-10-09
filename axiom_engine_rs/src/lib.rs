@@ -58,6 +58,7 @@ pub mod metrics;
 pub mod model;
 pub mod model_meta;
 pub mod model_router;
+pub mod mutation_gate;
 pub mod openai_forwarder;
 pub mod pairs;
 pub mod patch_memory;

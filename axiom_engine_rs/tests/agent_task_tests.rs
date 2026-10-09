@@ -14,6 +14,7 @@ fn task(files: &[PathBuf], verifier: &str) -> AgentTask {
         verifier.into(),
         files.to_vec(),
         4,
+        None,
     )
     .unwrap()
 }
@@ -37,7 +38,7 @@ fn assert_history(task: &AgentTask, outcomes: &[ProposeOutcome]) {
 
 #[test]
 fn starts_with_empty_history_and_normalizes_zero_budget() {
-    let task = AgentTask::start("id".into(), "goal".into(), "exit 0".into(), vec![], 0)
+    let task = AgentTask::start("id".into(), "goal".into(), "exit 0".into(), vec![], 0, None)
         .unwrap();
     assert_eq!(task.task_id, "id");
     assert_eq!(task.goal, "goal");
@@ -241,6 +242,7 @@ fn attempt_budget_prevents_additional_file_changes() {
             "exit 1".into(),
             vec![path.clone()],
             budget,
+            None,
         )
         .unwrap();
         for attempt in 0..budget.max(1) {

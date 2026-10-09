@@ -45,6 +45,7 @@ pub struct AttemptRecord {
 }
 
 /// An active agent-driven task.
+#[derive(Debug)]
 pub struct AgentTask {
     pub task_id: String,
     pub goal: String,
@@ -52,6 +53,10 @@ pub struct AgentTask {
     pub files: Vec<PathBuf>,
     pub max_attempts: usize,
     pub attempt: usize,
+    /// Minimum mutation score required at task start, if any.
+    pub min_mutation_score: Option<f64>,
+    /// Measured mutation score at task start, if measurement succeeded.
+    pub mutation_score: Option<crate::mutation_gate::MutationScore>,
     memory: AttemptMemory,
     history: Vec<AttemptRecord>,
     /// Snapshot of original file contents for full abort.
@@ -69,13 +74,45 @@ impl AgentTask {
     /// are recorded as `None` and deleted on abort. `max_attempts` is stored
     /// with a minimum of one and enforced in `propose`.
     /// `verify_cmd` is a shell command run in the process's working directory.
+    ///
+    /// `min_mutation_score`, when `Some`, gates task creation on verifier
+    /// strength: the verifier command is measured with mutation testing
+    /// (testteeth for Python, cargo-mutants for Rust) and the task is refused
+    /// when the measured score falls below the threshold. When the mutation
+    /// tool is unavailable or the score can't be measured, the gate is skipped
+    /// gracefully and the task proceeds. The threshold must be in 0.0..=1.0.
     pub fn start(
         task_id: String,
         goal: String,
         verify_cmd: String,
         files: Vec<PathBuf>,
         max_attempts: usize,
+        min_mutation_score: Option<f64>,
     ) -> std::io::Result<Self> {
+        // Mutation gate: refuse weak verifiers before snapshotting anything.
+        let mut measured: Option<crate::mutation_gate::MutationScore> = None;
+        if let Some(threshold) = min_mutation_score {
+            if !(0.0..=1.0).contains(&threshold) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("min_mutation_score must be between 0.0 and 1.0, got {threshold}"),
+                ));
+            }
+            match crate::mutation_gate::measure_verifier_strength(&verify_cmd) {
+                Some(score) => {
+                    if let Err(msg) = crate::mutation_gate::evaluate(&score, threshold) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            msg,
+                        ));
+                    }
+                    measured = Some(score);
+                }
+                None => {
+                    // Tool unavailable or score unmeasurable: skip gracefully.
+                }
+            }
+        }
         let mut originals = HashMap::new();
         for f in &files {
             match std::fs::read(f) {
@@ -104,6 +141,8 @@ impl AgentTask {
             files,
             max_attempts: max_attempts.max(1),
             attempt: 0,
+            min_mutation_score,
+            mutation_score: measured,
             memory: AttemptMemory::new(),
             history: Vec::new(),
             originals,
@@ -381,6 +420,7 @@ mod tests {
             "exit 0".into(),
             vec![path.clone()],
             4,
+            None,
         )
         .unwrap();
         let out = task.propose(vec![FileEdit {
@@ -400,6 +440,7 @@ mod tests {
             "exit 1".into(),
             vec![path.clone()],
             4,
+            None,
         )
         .unwrap();
         let out = task.propose(vec![FileEdit {
@@ -419,6 +460,7 @@ mod tests {
             "exit 1".into(),
             vec![path.clone()],
             4,
+            None,
         )
         .unwrap();
         let edit = FileEdit {
@@ -444,6 +486,7 @@ mod tests {
             "exit 0".into(),
             vec![path.clone()],
             4,
+            None,
         )
         .unwrap();
         // Proposing an edit to a path not in the allowlist is rejected
@@ -468,6 +511,7 @@ mod tests {
             "exit 1".into(),
             vec![path.clone()],
             2,
+            None,
         )
         .unwrap();
         // Two attempts allowed (both fail the verifier). Use distinct
@@ -498,6 +542,7 @@ mod tests {
             "exit 0".into(),
             vec![path.clone()],
             4,
+            None,
         )
         .unwrap();
         let _ = task.propose(vec![FileEdit {
@@ -522,6 +567,7 @@ mod tests {
             "exit 0".into(),
             vec![missing.clone()],
             4,
+            None,
         )
         .unwrap();
 
@@ -553,6 +599,7 @@ mod tests {
             "exit 0".into(),
             vec![subdir.clone()],
             4,
+            None,
         )
         .unwrap();
 
@@ -588,6 +635,7 @@ mod tests {
             "exit 0".into(),
             vec![path.clone()],
             4,
+            None,
         ) {
             Ok(_) => panic!("expected start to fail on unreadable file"),
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
@@ -597,5 +645,69 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o600);
         std::fs::set_permissions(&path, perms).unwrap();
+    }
+
+    #[test]
+    fn start_rejects_invalid_mutation_threshold() {
+        let (_tmp, path) = tmp_file("v1");
+        let err = AgentTask::start(
+            "t1".into(),
+            "test".into(),
+            "exit 0".into(),
+            vec![path.clone()],
+            4,
+            Some(1.5),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("between 0.0 and 1.0"));
+        let err = AgentTask::start(
+            "t2".into(),
+            "test".into(),
+            "exit 0".into(),
+            vec![path.clone()],
+            4,
+            Some(-0.1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("between 0.0 and 1.0"));
+    }
+
+    #[test]
+    fn start_gate_handles_tool_presence_gracefully() {
+        // Whether or not testteeth/cargo-mutants is installed, the task must
+        // start: with the tool absent the gate skips, with it present the gate
+        // measures and start succeeds because a measured score below the
+        // threshold would have returned an error instead.
+        let (_tmp, path) = tmp_file("v1");
+        let task = AgentTask::start(
+            "t1".into(),
+            "test".into(),
+            "pytest tests/".into(),
+            vec![path.clone()],
+            4,
+            Some(0.8),
+        )
+        .unwrap();
+        assert_eq!(task.min_mutation_score, Some(0.8));
+        if let Some(score) = &task.mutation_score {
+            assert!((0.0..=1.0).contains(&score.score));
+            assert!(score.score >= 0.8);
+        }
+    }
+
+    #[test]
+    fn start_without_gate_leaves_score_unset() {
+        let (_tmp, path) = tmp_file("v1");
+        let task = AgentTask::start(
+            "t1".into(),
+            "test".into(),
+            "exit 0".into(),
+            vec![path.clone()],
+            4,
+            None,
+        )
+        .unwrap();
+        assert_eq!(task.min_mutation_score, None);
+        assert!(task.mutation_score.is_none());
     }
 }
