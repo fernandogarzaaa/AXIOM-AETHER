@@ -1607,9 +1607,12 @@ def test_stats_counts():
 
     #[test]
     fn dogfood_response_cache_weak_spots() {
-        // Dogfood: the detectors must flag the known testteeth gaps in the
-        // repo's own `axiom_engine/response_cache.py` (62.2% mutation score:
-        // untested exception handlers, unpinned hit-rate arithmetic).
+        // Dogfood: the detectors must not flag well-tested code. The repo's
+        // own `axiom_engine/response_cache.py` had its exception handlers and
+        // hit-rate arithmetic hardened by PR #202 (mutation score 62.2% to
+        // 77.8%: OSError/ValueError handlers now exercised by dedicated tests,
+        // to_dict hit-rate pinned with pytest.approx). The detectors should
+        // recognize the tested handlers and pinned arithmetic, not flag them.
         // Skipped when the repo files are absent (e.g. vendored builds).
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1629,15 +1632,16 @@ def test_stats_counts():
             None,
         ));
         assert!(
-            s.weak_spots
-                .iter()
-                .any(|w| w.issue.contains("OSError") && w.confidence == Confidence::High),
-            "must flag untested OSError handler: {:?}",
+            !s.weak_spots.iter().any(|w| w.issue
+                .contains("exception handler for OSError")),
+            "must not flag tested OSError handler: {:?}",
             s.weak_spots
         );
         assert!(
-            s.weak_spots.iter().any(|w| w.issue.contains("to_dict")),
-            "must flag unpinned hit-rate arithmetic in to_dict: {:?}",
+            !s.weak_spots
+                .iter()
+                .any(|w| w.issue.contains("to_dict") && w.issue.contains("not pinned")),
+            "must not flag pinned hit-rate arithmetic in to_dict: {:?}",
             s.weak_spots
         );
     }
