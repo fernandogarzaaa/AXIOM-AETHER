@@ -1,7 +1,7 @@
 use crate::{
     agentic, agentic_eval, bench, bootstrap, claude_backend, cli, config, daemon, fault_locate,
     hardware, heal_memory, inference, lsp, mcp_stdio, meta_train, patch_memory, prime, provenance,
-    self_heal, server, skeleton, solve, train, tui, vibe_memory,
+    self_heal, server, skeleton, solve, train, tui, verify_suggest, vibe_memory,
 };
 // Experimental: compiled only with `--features experimental` (docs/EXPERIMENTAL.md).
 #[cfg(feature = "experimental")]
@@ -1033,6 +1033,49 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             );
             if report.solved() != report.total() {
                 std::process::exit(1);
+            }
+        }
+        AxiomCommand::VerifySuggest {
+            files,
+            diff,
+            explain,
+            root,
+        } => {
+            // Lightweight: pure heuristics, no model needed.
+            let root = match root {
+                Some(r) => r,
+                None => std::env::current_dir()
+                    .map_err(|e| candle_core::Error::Msg(format!("verify-suggest: cwd: {e}")))?,
+            };
+            let diff_text = match diff.as_deref() {
+                None => None,
+                Some(p) if p.as_os_str() == "-" => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .map_err(|e| candle_core::Error::Msg(format!("verify-suggest: stdin: {e}")))?;
+                    Some(buf)
+                }
+                Some(p) => Some(std::fs::read_to_string(p).map_err(|e| {
+                    candle_core::Error::Msg(format!("verify-suggest: read {}: {e}", p.display()))
+                })?),
+            };
+            let suggestions = verify_suggest::suggest_verifiers(&verify_suggest::SuggestInput {
+                files: files.clone(),
+                diff_text,
+                root,
+            });
+            if explain {
+                print!("{}", verify_suggest::explain(&suggestions));
+            } else {
+                let json = serde_json::to_string_pretty(&suggestions).map_err(|e| {
+                    candle_core::Error::Msg(format!("verify-suggest: serialize: {e}"))
+                })?;
+                println!("{json}");
+            }
+            if suggestions.suggested_verifiers.is_empty() {
+                std::process::exit(2);
             }
         }
         AxiomCommand::Run {
