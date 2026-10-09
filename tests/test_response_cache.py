@@ -135,6 +135,170 @@ def test_cache_from_env_persistent(monkeypatch, tmp_path: Path):
     assert cache.persist_path == tmp_path / "c.json"
 
 
+def test_stats_hit_rate_value_is_pinned():
+    """Mutation: hits/total -> hits*total must not survive."""
+    cache = ResponseCache(max_entries=4)
+    cache.put("k", "v")
+    cache.get("k")
+    cache.get("k")
+    cache.get("missing")
+    d = cache.stats().to_dict()
+    assert d["hit_rate"] == pytest.approx(2 / 3)
+    assert d["hit_rate"] != 2 * 3  # guards against hits*total mutant
+
+
+def test_stats_hit_rate_zero_when_no_requests():
+    d = ResponseCache(max_entries=4).stats().to_dict()
+    assert d["hit_rate"] == 0.0
+    assert d["hits"] == 0
+    assert d["misses"] == 0
+
+
+def test_fingerprint_nested_key_order_independent():
+    """Mutation: sort_keys=True -> False must not survive.
+
+    Nested message dicts with keys in different insertion orders must
+    fingerprint identically; only sort_keys=True guarantees that.
+    """
+    a = fingerprint(
+        model="m", max_tokens=10,
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    b = fingerprint(
+        model="m", max_tokens=10,
+        messages=[{"content": "hello", "role": "user"}],
+    )
+    assert a == b
+
+
+def test_lru_put_existing_key_promotes():
+    """Mutation: removing move_to_end from put() must not survive.
+
+    Re-putting an existing key must promote it to most-recently-used.
+    """
+    cache = ResponseCache(max_entries=2)
+    cache.put("k1", "v1")
+    cache.put("k2", "v2")
+    cache.put("k1", "v1-updated")  # re-put promotes k1
+    cache.put("k3", "v3")          # must evict k2, not k1
+    assert cache.get("k1") == "v1-updated"
+    assert cache.get("k2") is None
+    assert cache.get("k3") == "v3"
+
+
+def test_clear_persists_empty_to_disk(tmp_path: Path):
+    """Mutation: removing _persist_locked() from clear() must not survive."""
+    path = tmp_path / "cache.json"
+    cache = ResponseCache(max_entries=4, persist_path=path)
+    cache.put("k1", "v1")
+    assert json.loads(path.read_text()) == {"k1": "v1"}
+    cache.clear()
+    assert path.exists()
+    assert json.loads(path.read_text()) == {}
+
+
+def test_load_corrupt_file_starts_empty(tmp_path: Path):
+    """Mutation: except (OSError, JSONDecodeError) must not survive."""
+    path = tmp_path / "cache.json"
+    path.write_text("this is not json{{{", encoding="utf-8")
+    cache = ResponseCache(max_entries=4, persist_path=path)
+    assert cache.stats().entries == 0
+    assert cache.get("anything") is None
+
+
+def test_load_unreadable_file_starts_empty(tmp_path: Path, monkeypatch):
+    """Mutation: except OSError in _load_from_disk must not survive."""
+    path = tmp_path / "cache.json"
+    path.write_text('{"k": "v"}', encoding="utf-8")
+
+    def _boom(*args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+    cache = ResponseCache(max_entries=4, persist_path=path)
+    assert cache.stats().entries == 0
+
+
+def test_persist_failure_is_swallowed(tmp_path: Path, monkeypatch):
+    """Mutation: except OSError in _persist_locked must not survive."""
+    path = tmp_path / "cache.json"
+    cache = ResponseCache(max_entries=4, persist_path=path)
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", _boom)
+    cache.put("k", "v")  # must not raise
+    assert cache.get("k") == "v"  # in-memory copy still works
+
+
+def test_cache_from_env_invalid_max_entries_falls_back(monkeypatch):
+    """Mutation: except ValueError in cache_from_env must not survive."""
+    from axiom_engine.response_cache import DEFAULT_MAX_ENTRIES
+
+    monkeypatch.setenv("AXIOM_CACHE", "1")
+    monkeypatch.setenv("AXIOM_CACHE_MAX_ENTRIES", "not-a-number")
+    monkeypatch.delenv("AXIOM_CACHE_PATH", raising=False)
+    cache = cache_from_env()
+    assert cache is not None
+    assert cache.max_entries == DEFAULT_MAX_ENTRIES
+
+
+def test_max_entries_zero_clamped_to_one():
+    """Mutation: max(1, max_entries) -> max(2, max_entries) must not survive."""
+    cache = ResponseCache(max_entries=0)
+    assert cache.max_entries == 1
+    cache.put("k", "v")
+    assert cache.get("k") == "v"
+
+
+def test_clear_resets_hit_miss_counters():
+    """Mutation: hits=0 -> 1 / misses=0 -> 1 in clear() must not survive."""
+    cache = ResponseCache(max_entries=4)
+    cache.put("k", "v")
+    cache.get("k")
+    cache.get("missing")
+    assert cache.stats().hits == 1
+    assert cache.stats().misses == 1
+    cache.clear()
+    d = cache.stats().to_dict()
+    assert d["hits"] == 0
+    assert d["misses"] == 0
+    assert d["hit_rate"] == 0.0
+
+
+def test_load_skips_non_string_entries(tmp_path: Path):
+    """Mutation: isinstance and->or in _load_from_disk must not survive.
+
+    JSON object keys always deserialize as str, so the value check is the
+    live one: {"k3": 456} must be skipped while {"k1": "v1"} loads.
+    """
+    path = tmp_path / "cache.json"
+    path.write_text(json.dumps({"k1": "v1", "k3": 456}), encoding="utf-8")
+    cache = ResponseCache(max_entries=4, persist_path=path)
+    assert cache.get("k1") == "v1"
+    assert cache.get("k3") is None  # non-str value skipped
+    assert cache.stats().entries == 1
+
+
+def test_fingerprint_non_ascii_stable():
+    """Mutation: ensure_ascii=False -> True must not survive."""
+    a = fingerprint(model="m", max_tokens=10, prompt="héllo wörld 🎉")
+    b = fingerprint(model="m", max_tokens=10, prompt="héllo wörld 🎉")
+    assert a == b
+    # ensure_ascii=True would produce a different (escaped) encoding
+    import hashlib
+
+    canonical = {
+        "model": "m", "max_tokens": 10, "prompt": "héllo wörld 🎉",
+        "messages": None, "system": None,
+    }
+    escaped = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, ensure_ascii=True, default=str).encode("utf-8")
+    ).hexdigest()
+    assert a != escaped
+
+
 # ----------------------------------------------------------------------
 # Integration — cache routing via the FastAPI server
 # ----------------------------------------------------------------------
