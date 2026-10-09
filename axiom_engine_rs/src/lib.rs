@@ -1,5 +1,6 @@
 pub mod adaptive;
 pub mod agent_task;
+pub mod verifier_strength;
 pub mod agentic;
 pub mod agentic_eval;
 #[cfg(feature = "experimental")]
