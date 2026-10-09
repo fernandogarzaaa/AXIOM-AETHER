@@ -27,7 +27,12 @@ case "$os:$arch" in
     ext="tar.gz"
     ;;
   *)
-    echo "axiom installer: unsupported platform ${os}/${arch}" >&2
+    echo "axiom installer: no prebuilt binary for ${os}/${arch}" >&2
+    echo "  Prebuilt releases cover linux/x86_64, macOS/arm64 and Windows/x86_64." >&2
+    echo "  Build from source instead (Rust >= 1.90 plus a C toolchain):" >&2
+    echo "    Debian/Ubuntu: sudo apt-get install -y build-essential pkg-config libssl-dev" >&2
+    echo "    curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal" >&2
+    echo "    cargo install axiom_engine        # or: cargo build --release in axiom_engine_rs/" >&2
     exit 1
     ;;
 esac
