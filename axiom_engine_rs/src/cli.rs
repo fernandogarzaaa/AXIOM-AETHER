@@ -125,6 +125,29 @@ pub enum AxiomCommand {
     /// built-in seeded broken-repo fixtures through the real solve loop and report
     /// how many it repairs end-to-end (deterministic, no LLM required).
     EvalAgentic {},
+    /// Suggest verifier commands for a change: analyzes changed files (and an
+    /// optional unified diff) and proposes the compile checks, test commands,
+    /// lints, and security callouts an agent should use as its task-loop
+    /// verifier. Heuristic, not magic: when nothing confident can be
+    /// suggested it says so instead of guessing. Prints JSON by default,
+    /// human-readable text with --explain.
+    /// `axiom verify-suggest [FILES]... [--diff PATH] [--explain]`
+    VerifySuggest {
+        /// Changed file paths (repeatable). At least one of FILES or --diff
+        /// is required.
+        #[arg()]
+        files: Vec<PathBuf>,
+        /// Path to a unified diff file to scan for security-sensitive
+        /// patterns. Use `-` to read the diff from stdin.
+        #[arg(long)]
+        diff: Option<PathBuf>,
+        /// Print human-readable suggestions instead of JSON.
+        #[arg(long)]
+        explain: bool,
+        /// Project root for language detection (defaults to cwd).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Run a program under self-healing supervision: failures are absorbed into
     /// the TTT fast-weights, the environment is repaired (e.g. missing
     /// directories created), and the program is restarted until it succeeds.
