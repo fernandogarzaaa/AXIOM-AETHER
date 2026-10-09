@@ -212,11 +212,23 @@ Windows PowerShell:
 iwr https://raw.githubusercontent.com/fernandogarzaaa/AXIOM-AETHER/main/scripts/install.ps1 -UseB | iex
 ```
 
+> **Platforms.** Prebuilt binaries (pip wheel and `install.sh`) exist for Linux
+> x86-64, macOS arm64, and Windows x86-64 only. On anything else — e.g. Linux
+> arm64 (Graviton, Raspberry Pi, Ampere) or Intel Macs — `pip install
+> axiom-aether` reports "no wheels with a matching platform tag"; build from
+> source as below.
+>
 > `pip install axiom-aether` ships the precompiled `axiom` engine binary — it is
 > **not** the same as the pure-Python `axiom-engine` reference package. Publishing
 > is automated on version tags; see [`docs/PUBLISHING.md`](docs/PUBLISHING.md).
 
 ### Build from source
+
+Needs Rust ≥ 1.90 and a C toolchain (`cc` is required to link; on
+Debian/Ubuntu: `sudo apt-get install -y build-essential pkg-config libssl-dev`).
+The release build compiles ~400 crates (candle, tokenizers, axum, tree-sitter);
+expect several minutes on a fast machine. On small boxes (≤ 8 GB RAM) build with
+`-j1` or `-j2` to avoid the OOM killer.
 
 ```bash
 git clone https://github.com/fernandogarzaaa/AXIOM-AETHER
