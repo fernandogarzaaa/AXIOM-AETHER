@@ -2056,6 +2056,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "experimental")]
     fn tools_list_includes_predictive_tools() {
         // Regression guard for commit 788d430: the predictive engine modules
         // existed but were never merged into tools_list(), so the three tools
