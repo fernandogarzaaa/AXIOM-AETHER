@@ -1,5 +1,15 @@
 # Axiom upgrade roadmap (2024–2026 research synthesis)
 
+## Research landing gate (Phase 7)
+
+No item below lands in the default build without a **pre-registered benchmark**:
+spec committed before the run, frozen code, one test run, null and negative
+results reported as they are. The query-conditioned retrieval work continues
+under its own frozen-ranker rules (ranker pinned, no tuning on test; see
+`docs/research/`). This gate is enforced by review, not by tooling: any PR
+landing a research upgrade must link its pre-registered spec and its results
+document, including the cases where the result was null or negative.
+
 Distilled from a deep-research sweep across Axiom's four pillars. Each item lists
 the method, what it improves, a practicality verdict for a Rust/candle CPU/modest-GPU
 engine, and a citation. Status: ✅ implemented · 🚧 scaffolded · ⬜ planned.
@@ -43,6 +53,12 @@ engine, and a citation. Status: ✅ implemented · 🚧 scaffolded · ⬜ planne
 - ⬜ **LLMLingua-2 second-stage squeeze** (encoder-only, candle-portable,
   arXiv:2403.12968) + **query-aware expansion ranking** (LongLLMLingua,
   arXiv:2310.06839; "Beyond RAG", arXiv:2503.04973) on the compression path.
+  Honest caveat: LLMLingua-style compression is lossy with no recovery path,
+  which directly conflicts with this project's invariant
+  (LOSSY_CONTEXT implies RECOVERY_CAPABILITY_PRESENT). Any adoption must keep
+  the digest/expand round-trip or an equivalent recovery mechanism; a bare
+  token-drop stage is out of scope. Also note LLMLingua-2 measures <5% savings
+  on code/JSON-heavy prompts and adds 0.5-2s latency per call.
 - ⬜ **FLTrust root-of-trust + centered-clipping w/ momentum** Byzantine gate —
   survives 40–60% malicious peers and provably resists ALIE/IPM
   (arXiv:2012.13995; PMLR v139 karimireddy21a).

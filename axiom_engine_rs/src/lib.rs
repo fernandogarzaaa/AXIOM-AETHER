@@ -2,6 +2,7 @@ pub mod adaptive;
 pub mod agent_task;
 pub mod agentic;
 pub mod agentic_eval;
+#[cfg(feature = "experimental")]
 pub mod alignment_loop;
 pub mod anthropic_forwarder;
 pub mod backend_live;
@@ -60,6 +61,7 @@ pub mod openai_forwarder;
 pub mod pairs;
 pub mod patch_memory;
 pub mod poly_jit;
+#[cfg(feature = "experimental")]
 pub mod predictive_tools;
 pub mod prefix_diet;
 pub mod prime;
@@ -77,6 +79,7 @@ pub mod server;
 pub mod session_recorder;
 pub mod session_awareness;
 pub mod skeleton;
+#[cfg(feature = "experimental")]
 pub mod state_predictor;
 pub mod surprisal;
 pub mod surprise_triage;
@@ -91,6 +94,7 @@ pub mod task_board;
 pub mod test_time_adapter;
 pub mod tool_defer;
 pub mod train;
+#[cfg(feature = "experimental")]
 pub mod trajectory_sampler;
 pub mod ttt_block;
 pub mod resumable_adamw;

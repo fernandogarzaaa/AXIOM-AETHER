@@ -82,6 +82,8 @@ pub struct McpContext {
     /// In-flight `axiom_align_generation` loop state, keyed by the caller's
     /// `session_id`. Process-lifetime only (not persisted to disk); grows
     /// with the number of distinct session_ids used, same as `awareness`.
+    /// Experimental: only present with `--features experimental`.
+    #[cfg(feature = "experimental")]
     align_states: Arc<Mutex<std::collections::HashMap<String, crate::alignment_loop::AlignmentLoopState>>>,
 }
 
@@ -184,6 +186,7 @@ pub async fn build_context(
             }
         ),
         awareness: Arc::new(AwarenessStore::new()),
+        #[cfg(feature = "experimental")]
         align_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
     })
 }
@@ -553,6 +556,8 @@ fn tools_list() -> Value {
     // Predictive Reasoning Engine tools (state prediction, trajectory sampling,
     // alignment checking). Merged in separately from `predictive_tools.rs` so
     // that module owns its own schemas; see handle_tools_call for dispatch.
+    // Experimental: these tools are wired but untrained; see docs/EXPERIMENTAL.md.
+    #[cfg(feature = "experimental")]
     if let Some(tools) = catalogue["tools"].as_array_mut() {
         tools.extend(crate::predictive_tools::predictive_tool_definitions());
     }
@@ -1148,6 +1153,7 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             let text = record_and_annotate(&ctx.awareness, &session_id, "axiom_channels", &text);
             success_response(id, tool_text_result(&text, false))
         }
+        #[cfg(feature = "experimental")]
         "axiom_predict_states" => {
             // Reject blank/whitespace-only summaries here, not just inside
             // handle_predict_states: otherwise this still spawns a blocking
@@ -1178,6 +1184,7 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             record_and_annotate(&awareness, &session_id, "axiom_predict_states", &mirror);
             success_response(id, tool_structured_result(result, is_error))
         }
+        #[cfg(feature = "experimental")]
         "axiom_sample_trajectories" => {
             if args.get("state_map_json").and_then(Value::as_str).is_none() {
                 return error_response(id, -32602, "axiom_sample_trajectories requires string 'state_map_json'");
@@ -1194,6 +1201,7 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             record_and_annotate(&awareness, &session_id, "axiom_sample_trajectories", &mirror);
             success_response(id, tool_structured_result(result, is_error))
         }
+        #[cfg(feature = "experimental")]
         "axiom_align_generation" => {
             if args.get("state_map_json").and_then(Value::as_str).is_none()
                 || args.get("generation_state").and_then(Value::as_str).is_none()
@@ -1335,6 +1343,8 @@ fn status_blocking(session_id: &str, ctx: &McpContext) -> Result<String, String>
 /// `predictive_tools`'s hash-of-text proxy if embedding fails or the pipeline
 /// lock is unavailable. Runs on a blocking thread: `embed_text` drives a full
 /// forward pass through the model.
+/// Experimental: only compiled with `--features experimental`.
+#[cfg(feature = "experimental")]
 fn predict_states_blocking(args: &Value, ctx: &McpContext) -> Value {
     let context_summary = args
         .get("context_summary")
@@ -1972,7 +1982,12 @@ mod tests {
     fn tools_list_exposes_tools_with_schemas() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
+        // 20 tools with --features experimental (3 predictive-reasoning tools),
+        // 17 without.
+        #[cfg(feature = "experimental")]
         assert_eq!(tools.len(), 20);
+        #[cfg(not(feature = "experimental"))]
+        assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"axiom_compress_path"));
         assert!(names.contains(&"axiom_evaluate_drift"));
