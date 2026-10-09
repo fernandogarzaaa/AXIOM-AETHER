@@ -35,5 +35,17 @@ experimentation, and readability, and is published to PyPI as **`axiom-engine`**
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -e ".[server,dev]"
 pytest tests/ -q
-axiom-server            # OpenAI-compatible server (see pyproject [project.scripts])
+axiom-server --preset tiny   # OpenAI-compatible server on :8080 with a toy model
+```
+
+The default `AxiomConfig` is a ~4.6B-parameter model (~17 GiB of fp32 weights),
+so a bare `axiom-server` will exhaust RAM on most machines. Use
+`--preset tiny` (or `small`) to try the API, or size it yourself with
+`AXIOM_PY_PRESET` / `AXIOM_PY_<FIELD>` env vars (e.g. `AXIOM_PY_D_MODEL=256`).
+The model is untrained, so completions are placeholder tokens — this package
+demonstrates the API and the TTT session mechanics, not answer quality.
+
+```bash
+curl -s localhost:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"axiom-ttt-v1","messages":[{"role":"user","content":"hi"}],"max_tokens":8}'
 ```
