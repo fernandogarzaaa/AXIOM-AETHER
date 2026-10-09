@@ -1,11 +1,40 @@
 //! `axiom-agent-task` — agent-driven autonomous coding without an LLM API key.
 //!
 //! Exposes AXIOM's verifier-gated [`agentic`](axiom_engine::agentic) machinery
-//! as JSON-RPC 2.0 tools over stdio. An external agent (which *is* a language
+//! as tools over stdio. An external agent (which *is* a language
 //! model) drives the loop: it proposes edit-sets, axiom verifies them with
 //! all-or-nothing transactions and byte-for-byte rollback on failure.
 //!
-//! Protocol (each line is one JSON-RPC message):
+//! Two protocol surfaces are served on the same stdio stream:
+//!
+//! ## Model Context Protocol (MCP)
+//!
+//! Standard MCP JSON-RPC 2.0 over stdio. Handshake, then tools:
+//!
+//! ```json
+//! // initialize
+//! {"jsonrpc":"2.0","id":1,"method":"initialize",
+//!  "params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}
+//! // → {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05",
+//! //     "capabilities":{"tools":{}},"serverInfo":{"name":"axiom-agent-task","version":"..."}}}
+//! // client then sends the notifications/initialized notification (no response)
+//!
+//! // tools/list
+//! {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+//! // → {"jsonrpc":"2.0","id":2,"result":{"tools":[
+//! //     {"name":"task_start","description":"...",
+//! //      "inputSchema":{"type":"object","properties":{...},"required":[...]}},
+//! //     ...]}}
+//!
+//! // tools/call
+//! {"jsonrpc":"2.0","id":3,"method":"tools/call",
+//!  "params":{"name":"task_start","arguments":{"goal":"...","verify_cmd":"...","files":[],"max_attempts":4}}}
+//! // → {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"task_id\":\"...\"}"}]}}
+//! ```
+//!
+//! ## Legacy direct methods (backward compatible)
+//!
+//! The original method names still work unchanged:
 //!
 //! ```json
 //! // start
@@ -30,6 +59,9 @@
 //! ```
 //!
 //! Errors follow JSON-RPC 2.0 `{"jsonrpc":"2.0","id":..,"error":{"code":..,"message":..}}`.
+//! MCP `tools/call` results wrap the tool output as text content; tool-level
+//! failures are returned inside the result (with `"isError":true`) rather than
+//! as JSON-RPC errors, per the MCP specification.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -38,6 +70,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use axiom_engine::agent_task::{AgentTask, FileEdit, TaskRegistry};
+
+/// MCP protocol version this server speaks.
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Crate version, surfaced as the MCP server version.
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Deserialize)]
 struct TaskStartParams {
@@ -153,6 +191,13 @@ fn main() {
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
         let response = match method {
+            // MCP protocol methods.
+            "initialize" => handle_initialize(&id, params),
+            "tools/list" => handle_tools_list(&id),
+            "tools/call" => handle_tools_call(&registry, &id, params),
+            // MCP lifecycle notification; no response (handled by has_id check).
+            "notifications/initialized" => String::new(),
+            // Legacy direct methods (backward compatible).
             "task_start" => handle_start(&registry, &id, params),
             "task_propose" => handle_propose(&registry, &id, params),
             "task_history" => handle_history(&registry, &id, params),
@@ -261,4 +306,203 @@ fn handle_finish(registry: &TaskRegistry, id: &Value, params: Value) -> String {
         Some(Err(e)) => err(id, -32002, format!("finish failed, task retained for retry: {e}")),
         None => err(id, -32001, format!("unknown task_id: {}", p.task_id)),
     }
+}
+
+/// Handle MCP `initialize`. Returns the protocol version this server speaks,
+/// its tool capability, and server info. The client-declared protocol version
+/// is accepted as-is; this server only implements 2024-11-05.
+fn handle_initialize(id: &Value, _params: Value) -> String {
+    ok(
+        id,
+        json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "axiom-agent-task", "version": SERVER_VERSION},
+        }),
+    )
+}
+
+/// Describe one MCP tool with its JSON input schema.
+fn tool_def(name: &str, description: &str, schema: Value) -> Value {
+    json!({"name": name, "description": description, "inputSchema": schema})
+}
+
+/// Handle MCP `tools/list`. Exposes the four task operations as MCP tools.
+fn handle_tools_list(id: &Value) -> String {
+    let tools = vec![
+        tool_def(
+            "task_start",
+            "Start a verifier-gated agent task. Snapshots the listed files and returns a task_id.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "What the task should achieve."},
+                    "verify_cmd": {"type": "string", "description": "Shell command run to verify each proposal; exit 0 means pass."},
+                    "files": {"type": "array", "items": {"type": "string"}, "description": "File paths the task may modify."},
+                    "max_attempts": {"type": "integer", "description": "Maximum distinct proposals before the task refuses more.", "default": 4},
+                },
+                "required": ["goal", "verify_cmd"],
+            }),
+        ),
+        tool_def(
+            "task_propose",
+            "Propose an edit-set for a task. The edits are applied transactionally and the verifier runs; failures roll back byte-for-byte.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task ID from task_start."},
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                        },
+                        "description": "Edits to apply atomically.",
+                    },
+                },
+                "required": ["task_id", "edits"],
+            }),
+        ),
+        tool_def(
+            "task_history",
+            "Return all recorded attempts for a task in order.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task ID from task_start."},
+                },
+                "required": ["task_id"],
+            }),
+        ),
+        tool_def(
+            "task_finish",
+            "Finish a task. commit=true keeps the last passing edits; commit=false restores the pre-task snapshot.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task ID from task_start."},
+                    "commit": {"type": "boolean", "description": "Keep edits (true) or restore snapshot (false).", "default": true},
+                },
+                "required": ["task_id"],
+            }),
+        ),
+    ];
+    ok(id, json!({"tools": tools}))
+}
+
+/// Parameters for MCP `tools/call`: a tool name plus its arguments object.
+#[derive(Deserialize)]
+struct ToolsCallParams {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+/// Handle MCP `tools/call` by routing to the existing task operation
+/// implementations. The inner result is wrapped as MCP text content.
+/// Tool-level failures (bad params, unknown task) are returned inside the
+/// result with `"isError": true`, per the MCP specification, rather than as
+/// JSON-RPC errors.
+fn handle_tools_call(registry: &TaskRegistry, id: &Value, params: Value) -> String {
+    let p: ToolsCallParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return err(id, -32602, format!("invalid params: {e}")),
+    };
+    let arguments = if p.arguments.is_null() {
+        json!({})
+    } else {
+        p.arguments
+    };
+    // Run the underlying operation and capture its result or error payload.
+    let inner: Value = match p.name.as_str() {
+        "task_start" => match serde_json::from_value::<TaskStartParams>(arguments) {
+            Ok(sp) => {
+                let task_id = new_task_id();
+                let files: Vec<PathBuf> = sp.files.into_iter().map(PathBuf::from).collect();
+                match AgentTask::start(
+                    task_id.clone(),
+                    sp.goal,
+                    sp.verify_cmd,
+                    files,
+                    sp.max_attempts,
+                ) {
+                    Ok(task) => {
+                        registry.insert(task);
+                        json!({"task_id": task_id})
+                    }
+                    Err(e) => return tool_error(id, format!("task_start failed: {e}")),
+                }
+            }
+            Err(e) => return tool_error(id, format!("invalid arguments: {e}")),
+        },
+        "task_propose" => match serde_json::from_value::<TaskProposeParams>(arguments) {
+            Ok(pp) => {
+                let edits: Vec<FileEdit> = pp
+                    .edits
+                    .into_iter()
+                    .map(|e| FileEdit {
+                        path: PathBuf::from(e.path),
+                        content: e.content,
+                    })
+                    .collect();
+                match registry.with_task(&pp.task_id, |t| t.propose(edits)) {
+                    Some(outcome) => json!({
+                        "passed": outcome.passed,
+                        "attempt": outcome.attempt,
+                        "output": outcome.output,
+                        "fingerprint": outcome.fingerprint,
+                    }),
+                    None => return tool_error(id, format!("unknown task_id: {}", pp.task_id)),
+                }
+            }
+            Err(e) => return tool_error(id, format!("invalid arguments: {e}")),
+        },
+        "task_history" => match serde_json::from_value::<TaskHistoryParams>(arguments) {
+            Ok(hp) => match registry.with_task(&hp.task_id, |t| t.history().to_vec()) {
+                Some(history) => json!({"attempts": history}),
+                None => return tool_error(id, format!("unknown task_id: {}", hp.task_id)),
+            },
+            Err(e) => return tool_error(id, format!("invalid arguments: {e}")),
+        },
+        "task_finish" => match serde_json::from_value::<TaskFinishParams>(arguments) {
+            Ok(fp) => {
+                let result = registry.with_task(&fp.task_id, |task| task.finish(fp.commit));
+                match result {
+                    Some(Ok(())) => {
+                        registry.remove(&fp.task_id);
+                        json!({"committed": fp.commit})
+                    }
+                    Some(Err(e)) => {
+                        return tool_error(
+                            id,
+                            format!("finish failed, task retained for retry: {e}"),
+                        )
+                    }
+                    None => return tool_error(id, format!("unknown task_id: {}", fp.task_id)),
+                }
+            }
+            Err(e) => return tool_error(id, format!("invalid arguments: {e}")),
+        },
+        other => return err(id, -32602, format!("unknown tool: {other}")),
+    };
+    ok(
+        id,
+        json!({"content": [{"type": "text", "text": inner.to_string()}]}),
+    )
+}
+
+/// Serialize an MCP `tools/call` tool-level error: a normal result whose
+/// content carries the message and `"isError": true`.
+fn tool_error(id: &Value, message: String) -> String {
+    ok(
+        id,
+        json!({
+            "content": [{"type": "text", "text": message}],
+            "isError": true,
+        }),
+    )
 }
