@@ -25,7 +25,7 @@ general answer-quality claims that are not proven by the repository.
 | Context compression proxy | Accepts Anthropic Messages and OpenAI Chat Completions style traffic, absorbs heavy context locally, and forwards a smaller readable payload. | `server/routes_messages.rs`, `server/routes_chat.rs`, `context_compressor.rs`, `skeleton.rs`, `anthropic_forwarder.rs`, `openai_forwarder.rs` |
 | Responses input compression | **On by default.** Replaces old, text-only assistant turns in the safe prefix of `/v1/responses` transcripts with a dense recall fingerprint — each contiguous run collapses in place, so every user/tool/structural item keeps its position. Disable with `AXIOM_RESPONSES_COMPRESS=0`. | `responses_compressor.rs`, `server/routes_responses.rs` |
 | Session recording & receipts | Opt-in scrubbed per-session request/response JSONL (`AXIOM_SESSION_RECORD=1`, `~/.axiom/sessions/`), plus always-on token-savings receipts: `axiom_savings_*` counters on `/metrics` and a one-line receipt when a session drops. | `session_recorder.rs`, `server/routes_responses.rs`, `server/routes_hypervisor.rs` |
-| MCP server | Exposes Axiom as 20 stdio/HTTP JSON-RPC tools: compression, drift, expansion, memory, grounding, epistemic validation, immunity, status, a multi-agent task board, ChatGPT connector `search`/`fetch`, and (experimental, untrained) predictive-reasoning tools. | `mcp_stdio.rs`, `predictive_tools.rs` |
+| MCP server | Exposes Axiom as 17 stdio/HTTP JSON-RPC tools (20 with `--features experimental`, which adds the untrained predictive-reasoning tools): compression, drift, expansion, memory, grounding, epistemic validation, immunity, status, a multi-agent task board, ChatGPT connector `search`/`fetch`. | `mcp_stdio.rs`, `predictive_tools.rs` |
 | Self-healing runner | Runs a command, detects supported environment failures, applies bounded heals, and records learned immunity. | `self_heal.rs`, `heal_memory.rs`, `entrypoint.rs` |
 | Autonomous solve loop | Uses the runner plus source repair attempts to drive a verifier command toward green. | `solve.rs`, `poly_jit.rs`, `sandbox.rs` |
 | Grounding verification | Checks whether response claims are supported by supplied evidence and can expand dropped symbols when a session digest is available. | `hallucination.rs`, `/v1/verify` in `server/routes_verify.rs` |
@@ -409,7 +409,9 @@ Run Axiom as an MCP server:
 axiom_engine --mode mcp --checkpoint checkpoints/axiom_production_bpe.bin
 ```
 
-Tool catalog (20 tools):
+Tool catalog (17 tools; 20 with `--features experimental`, which adds the
+untrained predictive-reasoning tools `axiom_predict_states`,
+`axiom_sample_trajectories`, `axiom_align_generation`):
 
 **Compression & drift**
 
@@ -453,11 +455,12 @@ Tool catalog (20 tools):
 | `search` | Search entrypoint for the ChatGPT connector contract. |
 | `fetch` | Retrieve a document body by id for the ChatGPT connector contract. |
 
-**Predictive reasoning engine** — ⚠️ experimental, **untrained**
+**Predictive reasoning engine** — ⚠️ experimental, **untrained**, requires
+`--features experimental` (absent from default builds)
 
 Wired and reachable, but the state-prediction head has **no trained checkpoint
 yet**, so output is not a calibrated forecast: responses carry `trained: false`
-and an explicit `state_source`. Treat as scaffolding, not inference. Moving
+and an explicit `state_source`. Treat as scaffolding, not inference. Gated
 behind the `experimental` feature — see
 [`docs/EXPERIMENTAL.md`](docs/EXPERIMENTAL.md) and
 [`docs/UPGRADES.md`](docs/UPGRADES.md).
@@ -607,7 +610,7 @@ File-by-file plan: [`docs/EXPERIMENTAL.md`](docs/EXPERIMENTAL.md).
 | **ChimeraLang DSL** | `axiom chimera check\|run\|prove\|verify`, `POST /v1/chimera/run` (`chimera.rs`) | In-tree interpreter for the [ChimeraLang](https://github.com/fernandogarzaaa/ChimeraLang) cognition language on the `BetaBelief` + provenance substrate, with tamper-evident certificates. Runs; no evaluation harness. |
 | **VFS hypervisor** | `axiom daemon\|mount`, `GET/POST /v1/hypervisor/*` (`daemon.rs`, `vfs.rs`) | User-mode "neural VFS" prototype. `jit_run` executes a caller-supplied command and can overwrite files — separately gated by `AXIOM_ENABLE_JIT_EXEC`; see [`docs/SECURITY-AUDIT.md`](docs/SECURITY-AUDIT.md). |
 | **DWE swarm / fleet** | `axiom swarm\|fleet`, `/v1/fleet/status`, `/v1/cluster/{sync,merge}`, `/v1/swarm/matrix_state`, `POST /v1/immunity/merge` (`dwe.rs`, `cluster.rs`, `swarm_*.rs`, `mesh_router.rs`, `server/routes_fleet.rs`) | Distributed Weight Exchange: signed fast-weight fragments + verified-patch gossip. Safety model is sound (Byzantine-robust, provenance-gated, fleet-key HMAC); cross-node behaviour is smoke-tested only (n=2, [`RESULTS.md`](RESULTS.md)). |
-| **Predictive reasoning** (MCP) | `axiom_predict_states`, `axiom_sample_trajectories`, `axiom_align_generation` (`predictive_tools.rs`, `state_predictor.rs`) | Scaffolding — the state-prediction head has **no trained checkpoint**; responses carry `trained: false`. |
+| **Predictive reasoning** (MCP) | `axiom_predict_states`, `axiom_sample_trajectories`, `axiom_align_generation` (`predictive_tools.rs`, `state_predictor.rs`) | Scaffolding — the state-prediction head has **no trained checkpoint**; responses carry `trained: false`. Gated behind `--features experimental` (absent from default builds). |
 
 ## Research And Upgrade Notes
 

@@ -63,7 +63,7 @@ are load-bearing for the spearhead, and `daemon` is wired into core config.
 
 ## Staged plan
 
-**Stage 1 — `chimera` only** (contained; one PR, CI-verified):
+**Stage 1 — `chimera` only** (contained; one PR, CI-verified): DONE.
 
 | File | Change |
 |---|---|
@@ -78,10 +78,13 @@ are load-bearing for the spearhead, and `daemon` is wired into core config.
 | `README.md` / `CONTRIBUTING.md` | flip "moving behind" → "build with `--features experimental`" for ChimeraLang. |
 
 **Stage 2 — predictive-reasoning cluster** (`state_predictor` + `trajectory_sampler`
-+ `alignment_loop` + `predictive_tools`): gate the four `mod`s, the three MCP
-tool-dispatch arms + tool-list entries in `mcp_stdio.rs`, the
-`predict_states_blocking` helper, and the tool-list test `assert!`s. Make the
-README "20 tools" count dynamic or feature-aware.
++ `alignment_loop` + `predictive_tools`): DONE. Gated the four `mod`s in
+`lib.rs`, the `align_states` field + constructor init on `McpContext`, the
+`tools.extend(predictive_tool_definitions())` call, the `predict_states_blocking`
+helper, and the three MCP dispatch arms (`axiom_predict_states`,
+`axiom_sample_trajectories`, `axiom_align_generation`) in `mcp_stdio.rs`. The
+`tools_list_exposes_tools_with_schemas` test is feature-aware: 17 tools without
+the feature, 20 with. Default builds expose no predictive tool names.
 
 **Stage 3 — DWE swarm / fleet + VFS hypervisor**: the big one. Requires making
 the `dwe` / `cluster` / `swarm*` / `vfs` fields on `server/prelude_state.rs`'s
