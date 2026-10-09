@@ -245,7 +245,10 @@ mod tests {
         // 2026-08-31 23:59:59 UTC vs 2026-09-01 00:00:00 UTC
         let before = PriceTable::for_model_at("claude-sonnet-5", 1_788_220_799);
         let after = PriceTable::for_model_at("claude-sonnet-5", 1_788_220_800);
-        assert!(!before.1 && !after.1, "sonnet-5 is a known model either side");
+        assert!(
+            !before.1 && !after.1,
+            "sonnet-5 is a known model either side"
+        );
         assert!((before.0.input_per_mtok - 2.00).abs() < 1e-9);
         assert!((after.0.input_per_mtok - 3.00).abs() < 1e-9);
         assert!((after.0.output_per_mtok - 15.00).abs() < 1e-9);
@@ -341,7 +344,12 @@ mod tests {
             + 2000.0 / 1e6 * 3.75
             + 500_000.0 / 1e6 * 0.30
             + 1500.0 / 1e6 * 15.00;
-        assert!((tc.usd - expected).abs() < 1e-9, "{} vs {}", tc.usd, expected);
+        assert!(
+            (tc.usd - expected).abs() < 1e-9,
+            "{} vs {}",
+            tc.usd,
+            expected
+        );
     }
 
     #[test]
@@ -370,8 +378,7 @@ mod tests {
         // resolved table rather than hardcoding a rate that would break in CI
         // after the price change.
         let (prices, _) = PriceTable::for_model("claude-super-6-hypothetical");
-        let expected =
-            1000.0 / 1e6 * prices.input_per_mtok + 100.0 / 1e6 * prices.output_per_mtok;
+        let expected = 1000.0 / 1e6 * prices.input_per_mtok + 100.0 / 1e6 * prices.output_per_mtok;
         assert!((tc.usd - expected).abs() < 1e-9);
     }
 
@@ -389,7 +396,10 @@ mod tests {
         assert!(!est4);
         assert!((sonnet4.input_per_mtok - 3.00).abs() < 1e-9);
 
-        assert_ne!(sonnet5, sonnet4, "distinct model families must not share a price table");
+        assert_ne!(
+            sonnet5, sonnet4,
+            "distinct model families must not share a price table"
+        );
     }
 
     #[test]
@@ -397,7 +407,10 @@ mod tests {
         // A hypothetical future version that isn't sonnet-5 or sonnet-4-x
         // must not silently inherit either table's pricing.
         let (_, estimated) = PriceTable::for_model("claude-sonnet-7");
-        assert!(estimated, "an unrecognized sonnet version must be flagged estimated");
+        assert!(
+            estimated,
+            "an unrecognized sonnet version must be flagged estimated"
+        );
     }
 
     #[test]
@@ -422,6 +435,9 @@ mod tests {
         let uncached = tc.uncached_equivalent_usd(&prices);
         let expected = (1000.0 + 2000.0 + 77_000.0) / 1e6 * 3.00 + 500.0 / 1e6 * 15.00;
         assert!((uncached - expected).abs() < 1e-9);
-        assert!(uncached > tc.usd, "uncached equivalent must exceed the actual (cached) cost");
+        assert!(
+            uncached > tc.usd,
+            "uncached equivalent must exceed the actual (cached) cost"
+        );
     }
 }

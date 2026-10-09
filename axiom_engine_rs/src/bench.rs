@@ -224,9 +224,7 @@ pub fn run_bench(
         let original_tokens = pipeline.token_count(&source);
         let digest = if opts.ranked {
             // PageRank-ranked skeletonization: symbols ordered by importance.
-            let lang = path.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             crate::skeleton::skeletonize_ranked(&source, lang, opts.budget)
         } else {
             build_digest(&source, "bench", original_tokens, 0.0, "bench", 3)
@@ -294,9 +292,18 @@ mod tests {
 
     #[test]
     fn symbol_extraction_handles_keywords_and_boundaries() {
-        assert_eq!(symbol_from_signature("pub fn run(a: u8) {").as_deref(), Some("run"));
-        assert_eq!(symbol_from_signature("    def go(self):").as_deref(), Some("go"));
-        assert_eq!(symbol_from_signature("class Beta {").as_deref(), Some("Beta"));
+        assert_eq!(
+            symbol_from_signature("pub fn run(a: u8) {").as_deref(),
+            Some("run")
+        );
+        assert_eq!(
+            symbol_from_signature("    def go(self):").as_deref(),
+            Some("go")
+        );
+        assert_eq!(
+            symbol_from_signature("class Beta {").as_deref(),
+            Some("Beta")
+        );
         // `transform` contains the substring "fn " mid-word — must NOT match it.
         assert_eq!(symbol_from_signature("let transform = 1;"), None);
         assert_eq!(symbol_from_signature("// just a comment"), None);
@@ -326,7 +333,10 @@ mod tests {
 pub fn real_fn(x: i32) -> i32 { … }
 struct RealStruct { … }";
         let symbols = symbols_in_digest(digest);
-        assert_eq!(symbols, vec!["real_fn".to_string(), "RealStruct".to_string()]);
+        assert_eq!(
+            symbols,
+            vec!["real_fn".to_string(), "RealStruct".to_string()]
+        );
     }
 
     #[test]

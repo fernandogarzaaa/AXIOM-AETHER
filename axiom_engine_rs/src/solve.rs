@@ -145,8 +145,15 @@ pub fn solve(
             cands
         };
         for src in &candidates {
-            if attempt_source_repair(command, args, opts, round, &sup.diagnostics, src, &mut report)?
-            {
+            if attempt_source_repair(
+                command,
+                args,
+                opts,
+                round,
+                &sup.diagnostics,
+                src,
+                &mut report,
+            )? {
                 return Ok(report);
             }
         }
@@ -422,7 +429,9 @@ where
         }
         // Rejected: roll back byte-for-byte, feed this attempt's trace forward.
         if let Err(e) = std::fs::write(source_path, &original) {
-            eprintln!("[axiom-solve] WARNING: failed to restore original after rejected patch: {e}");
+            eprintln!(
+                "[axiom-solve] WARNING: failed to restore original after rejected patch: {e}"
+            );
         }
         if !trace.trim().is_empty() {
             failure = trace;
@@ -652,9 +661,33 @@ mod tests {
         let path = tmp("noop.txt");
         std::fs::write(&path, "SAME").unwrap();
         let (cmd, args) = grep_fixed(&path);
-        assert!(!apply_verified_patch_iterative(&cmd, &args, None, &path, 1, "", |_f, o| Some(o.to_string())));
-        assert!(!apply_verified_patch_iterative(&cmd, &args, None, &path, 1, "", |_f, _o| Some("   ".into())));
-        assert!(!apply_verified_patch_iterative(&cmd, &args, None, &path, 1, "", |_f, _o| None));
+        assert!(!apply_verified_patch_iterative(
+            &cmd,
+            &args,
+            None,
+            &path,
+            1,
+            "",
+            |_f, o| Some(o.to_string())
+        ));
+        assert!(!apply_verified_patch_iterative(
+            &cmd,
+            &args,
+            None,
+            &path,
+            1,
+            "",
+            |_f, _o| Some("   ".into())
+        ));
+        assert!(!apply_verified_patch_iterative(
+            &cmd,
+            &args,
+            None,
+            &path,
+            1,
+            "",
+            |_f, _o| None
+        ));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "SAME");
         let _ = std::fs::remove_file(&path);
     }
@@ -672,37 +705,61 @@ mod tests {
         let cmd = posix_shell();
         let args = vec![
             "-c".to_string(),
-            format!("grep -q FIXED '{}' || {{ echo NEED_FIXED >&2; exit 1; }}", path.display()),
+            format!(
+                "grep -q FIXED '{}' || {{ echo NEED_FIXED >&2; exit 1; }}",
+                path.display()
+            ),
         ];
         let mut calls = 0usize;
         let mut saw_feedback = false;
-        let kept = apply_verified_patch_iterative(&cmd, &args, None, &path, 3, "", |failure, _o| {
-            calls += 1;
-            if failure.trim().is_empty() {
-                Some("STILL WRONG".into()) // attempt 1: will be rejected
-            } else {
-                saw_feedback = true; // attempt 2 saw the prior verifier trace
-                Some("FIXED".into())
-            }
-        });
-        assert!(kept, "iterative repair should succeed once it proposes FIXED");
-        assert!(calls >= 2, "should have retried at least once (calls={calls})");
-        assert!(saw_feedback, "later attempts must receive the failure trace");
+        let kept =
+            apply_verified_patch_iterative(&cmd, &args, None, &path, 3, "", |failure, _o| {
+                calls += 1;
+                if failure.trim().is_empty() {
+                    Some("STILL WRONG".into()) // attempt 1: will be rejected
+                } else {
+                    saw_feedback = true; // attempt 2 saw the prior verifier trace
+                    Some("FIXED".into())
+                }
+            });
+        assert!(
+            kept,
+            "iterative repair should succeed once it proposes FIXED"
+        );
+        assert!(
+            calls >= 2,
+            "should have retried at least once (calls={calls})"
+        );
+        assert!(
+            saw_feedback,
+            "later attempts must receive the failure trace"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "FIXED");
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn run_verify_reflects_exit_code() {
-        assert!(run_verify(&posix_shell(), &["-c".into(), "exit 0".into()], None));
-        assert!(!run_verify(&posix_shell(), &["-c".into(), "exit 1".into()], None));
+        assert!(run_verify(
+            &posix_shell(),
+            &["-c".into(), "exit 0".into()],
+            None
+        ));
+        assert!(!run_verify(
+            &posix_shell(),
+            &["-c".into(), "exit 1".into()],
+            None
+        ));
     }
 
     #[test]
     fn run_verify_capture_returns_stdout_stderr_and_status() {
         let (ok, trace) = run_verify_capture(
             &posix_shell(),
-            &["-c".into(), "echo out_marker; echo err_marker >&2; exit 3".into()],
+            &[
+                "-c".into(),
+                "echo out_marker; echo err_marker >&2; exit 3".into(),
+            ],
             None,
         );
         assert!(!ok, "exit 3 → not success");
@@ -713,10 +770,16 @@ mod tests {
     #[test]
     fn strip_code_fences_unwraps_only_paired_fences() {
         assert_eq!(strip_code_fences("fn main() {}"), "fn main() {}");
-        assert_eq!(strip_code_fences("```rust\nfn main() {}\n```"), "fn main() {}");
+        assert_eq!(
+            strip_code_fences("```rust\nfn main() {}\n```"),
+            "fn main() {}"
+        );
         assert_eq!(strip_code_fences("```\nabc\ndef\n```"), "abc\ndef");
         // A lone opening fence (no closing) must NOT be stripped — that would
         // corrupt content that legitimately begins with ```.
-        assert_eq!(strip_code_fences("```rust\nfn x() {}"), "```rust\nfn x() {}");
+        assert_eq!(
+            strip_code_fences("```rust\nfn x() {}"),
+            "```rust\nfn x() {}"
+        );
     }
 }

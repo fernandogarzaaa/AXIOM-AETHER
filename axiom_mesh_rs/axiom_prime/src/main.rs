@@ -90,10 +90,19 @@ fn build_mesh(goal: &Array1<f32>) -> KineticNeuralMesh {
     let claude_affinity: Vec<f32> = goal.iter().map(|g| g * 2.5).collect();
     let gemini_affinity: Vec<f32> = goal.iter().map(|g| g * 3.0).collect();
 
-    let workers = [("codex", codex_affinity), ("claude", claude_affinity), ("gemini", gemini_affinity)];
+    let workers = [
+        ("codex", codex_affinity),
+        ("claude", claude_affinity),
+        ("gemini", gemini_affinity),
+    ];
     for (i, (name, affinity)) in workers.into_iter().enumerate() {
-        mesh.add_node(WorkerNode::new(i, name, NodeKind::Llm(name.to_string()), affinity))
-            .expect("affinity dim matches mesh dim");
+        mesh.add_node(WorkerNode::new(
+            i,
+            name,
+            NodeKind::Llm(name.to_string()),
+            affinity,
+        ))
+        .expect("affinity dim matches mesh dim");
     }
     mesh
 }
@@ -104,7 +113,11 @@ fn build_mesh(goal: &Array1<f32>) -> KineticNeuralMesh {
 fn worker_binary_path() -> PathBuf {
     let mut path = std::env::current_exe().expect("resolve current executable path");
     path.pop();
-    path.push(if cfg!(windows) { "aether_worker.exe" } else { "aether_worker" });
+    path.push(if cfg!(windows) {
+        "aether_worker.exe"
+    } else {
+        "aether_worker"
+    });
     if !path.exists() {
         println!("axiom_prime: building aether_worker (first run)...");
         // Must match whatever profile *this* binary was built under, since
@@ -147,8 +160,12 @@ async fn run_worker(
     tx: mpsc::Sender<(NodeId, DispatchOutcome)>,
 ) {
     let outcome = match transport.dispatch(params).await {
-        Ok(result) => DispatchOutcome::Success { output: result.output },
-        Err(e) => DispatchOutcome::Failure { reason: e.to_string() },
+        Ok(result) => DispatchOutcome::Success {
+            output: result.output,
+        },
+        Err(e) => DispatchOutcome::Failure {
+            reason: e.to_string(),
+        },
     };
     let _ = tx.send((node, outcome)).await;
 }
@@ -161,8 +178,11 @@ async fn main() {
     // the fused encoding of "tests green, diff applied, exit code 0".
     let goal_vec = Array1::from_vec(vec![1.0, -0.5, 0.8, 0.0, 0.3, -0.2, 0.6, 0.1]);
     let mut mesh = build_mesh(&goal_vec);
-    let sidecars: Vec<MiniAetherSidecar> =
-        mesh.nodes().iter().map(|n| MiniAetherSidecar::standard(n.name.clone())).collect();
+    let sidecars: Vec<MiniAetherSidecar> = mesh
+        .nodes()
+        .iter()
+        .map(|n| MiniAetherSidecar::standard(n.name.clone()))
+        .collect();
 
     let worker_bin = worker_binary_path();
     let transports: Vec<Arc<dyn WorkerTransport>> = mesh
@@ -172,7 +192,9 @@ async fn main() {
             if n.name == "gemini" {
                 // Simulates a backend outage: every dispatch fails, so the
                 // demo exercises NodeHealth quarantine end to end.
-                Arc::new(MockTransport { fail_with: Some("simulated backend outage".into()) })
+                Arc::new(MockTransport {
+                    fail_with: Some("simulated backend outage".into()),
+                })
             } else {
                 Arc::new(
                     StdioTransport::spawn_with_timeout(&worker_bin, &[], WORKER_TIMEOUT)
@@ -183,7 +205,9 @@ async fn main() {
         .collect();
 
     let controller = IdcController::new(StateVector(goal_vec), EPSILON);
-    let mut env = Environment { current: StateVector::zeros(DIM) };
+    let mut env = Environment {
+        current: StateVector::zeros(DIM),
+    };
     let mut health = NodeHealth::new(QUARANTINE_THRESHOLD);
 
     let mut machine = PrimeFsm::new();
@@ -201,7 +225,9 @@ async fn main() {
         let Some(command) = queue.pop() else {
             // No pending commands: we're awaiting workers. Their
             // completions are the only thing that can advance the FSM.
-            let Some((node, outcome)) = rx.recv().await else { break };
+            let Some((node, outcome)) = rx.recv().await else {
+                break;
+            };
             mesh.mark_idle(node);
             match outcome {
                 DispatchOutcome::Success { output } => {
@@ -237,9 +263,9 @@ async fn main() {
                 tick += 1;
                 let residual = controller.residual(&env.current);
                 println!("[tick {tick}] residual norm = {:.4}", residual.norm());
-                queue.extend(
-                    machine.step(PrimeEvent::Sensed { converged: residual.converged(EPSILON) }),
-                );
+                queue.extend(machine.step(PrimeEvent::Sensed {
+                    converged: residual.converged(EPSILON),
+                }));
             }
             PrimeCommand::RouteResidual => {
                 let residual = controller.residual(&env.current);
@@ -249,7 +275,9 @@ async fn main() {
                 let adhesion = match mesh.forward(&payload_embedding, Some(&residual), &mut rng) {
                     Ok(a) => a,
                     Err(e) => {
-                        queue.extend(machine.step(PrimeEvent::Fault { reason: e.to_string() }));
+                        queue.extend(machine.step(PrimeEvent::Fault {
+                            reason: e.to_string(),
+                        }));
                         continue;
                     }
                 };
@@ -259,7 +287,9 @@ async fn main() {
                     .filter_map(|id| mesh.node(*id).map(|n| n.name.as_str()))
                     .collect();
                 println!("    [mesh] payload snapped to {names:?}");
-                queue.extend(machine.step(PrimeEvent::Routed { nodes: adhesion.active }));
+                queue.extend(machine.step(PrimeEvent::Routed {
+                    nodes: adhesion.active,
+                }));
             }
             PrimeCommand::Dispatch { nodes } => {
                 let residual = controller.residual(&env.current);
@@ -278,7 +308,12 @@ async fn main() {
                         residual_norm: residual.norm(),
                     };
                     mesh.mark_active(id);
-                    tokio::spawn(run_worker(id, Arc::clone(&transports[id.0]), params, tx.clone()));
+                    tokio::spawn(run_worker(
+                        id,
+                        Arc::clone(&transports[id.0]),
+                        params,
+                        tx.clone(),
+                    ));
                 }
             }
             PrimeCommand::AnnounceConverged => {

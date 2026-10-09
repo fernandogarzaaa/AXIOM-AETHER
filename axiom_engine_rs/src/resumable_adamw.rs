@@ -77,14 +77,8 @@ impl ResumableAdamW {
     pub fn save_state<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let mut map: HashMap<String, Tensor> = HashMap::new();
         for v in &self.vars {
-            map.insert(
-                format!("{}.m", v.name),
-                v.first_moment.as_tensor().clone(),
-            );
-            map.insert(
-                format!("{}.v", v.name),
-                v.second_moment.as_tensor().clone(),
-            );
+            map.insert(format!("{}.m", v.name), v.first_moment.as_tensor().clone());
+            map.insert(format!("{}.v", v.name), v.second_moment.as_tensor().clone());
         }
         // step_t as a scalar u32 tensor.
         let device = Device::Cpu;
@@ -188,16 +182,10 @@ impl Optimizer for ResumableAdamW {
 
 impl ResumableAdamW {
     /// Convenience: build from a `VarMap`'s named variables.
-    pub fn from_varmap(
-        varmap: &candle_nn::VarMap,
-        params: ParamsAdamW,
-    ) -> Result<Self> {
+    pub fn from_varmap(varmap: &candle_nn::VarMap, params: ParamsAdamW) -> Result<Self> {
         let data = varmap.data();
         let guard = data.lock().unwrap();
-        let named: Vec<(String, Var)> = guard
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let named: Vec<(String, Var)> = guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         drop(guard);
         Self::new_named(named, params)
     }
@@ -223,10 +211,7 @@ mod tests {
         // Create Vars directly.
         let v1 = Var::zeros((4, 4), DType::F32, &device)?;
         let v2 = Var::zeros((8,), DType::F32, &device)?;
-        let named = vec![
-            ("w1".to_string(), v1),
-            ("w2".to_string(), v2),
-        ];
+        let named = vec![("w1".to_string(), v1), ("w2".to_string(), v2)];
 
         let params = ParamsAdamW {
             lr: 0.01,
@@ -263,10 +248,7 @@ mod tests {
         // Fresh optimizer then load.
         let v1b = Var::zeros((4, 4), DType::F32, &device)?;
         let v2b = Var::zeros((8,), DType::F32, &device)?;
-        let named2 = vec![
-            ("w1".to_string(), v1b),
-            ("w2".to_string(), v2b),
-        ];
+        let named2 = vec![("w1".to_string(), v1b), ("w2".to_string(), v2b)];
         let params2 = ParamsAdamW {
             lr: 0.01,
             ..Default::default()
@@ -302,8 +284,7 @@ mod tests {
     fn test_load_missing_file_errors() {
         let device = Device::Cpu;
         let varmap = candle_nn::VarMap::new();
-        let mut opt =
-            ResumableAdamW::from_varmap(&varmap, ParamsAdamW::default()).unwrap();
+        let mut opt = ResumableAdamW::from_varmap(&varmap, ParamsAdamW::default()).unwrap();
         let r = opt.load_state("/tmp/definitely_not_here_12345.optim", &device);
         assert!(r.is_err(), "missing file should error");
     }

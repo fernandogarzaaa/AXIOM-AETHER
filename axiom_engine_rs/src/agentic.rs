@@ -384,7 +384,11 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&b).unwrap(), "B1");
             // dropped without commit -> rollback
         }
-        assert_eq!(std::fs::read_to_string(&a).unwrap(), "A0", "existing file restored");
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "A0",
+            "existing file restored"
+        );
         assert!(!b.exists(), "newly created file removed on rollback");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -393,7 +397,10 @@ mod tests {
     fn edit_set_fingerprint_is_order_independent() {
         let f1 = EditSet::new().with("a", "x").with("b", "y").fingerprint();
         let f2 = EditSet::new().with("b", "y").with("a", "x").fingerprint();
-        assert_eq!(f1, f2, "same files+bytes hash identically regardless of order");
+        assert_eq!(
+            f1, f2,
+            "same files+bytes hash identically regardless of order"
+        );
         let f3 = EditSet::new().with("a", "x").with("b", "z").fingerprint();
         assert_ne!(f1, f3, "different bytes hash differently");
     }
@@ -402,9 +409,15 @@ mod tests {
     fn edit_set_fingerprint_collapses_duplicate_paths_last_write_wins() {
         // Transaction::apply is last-write-wins for a repeated path, so the
         // fingerprint must match the single-edit form with the same final bytes.
-        let dup = EditSet::new().with("a", "first").with("a", "final").fingerprint();
+        let dup = EditSet::new()
+            .with("a", "first")
+            .with("a", "final")
+            .fingerprint();
         let single = EditSet::new().with("a", "final").fingerprint();
-        assert_eq!(dup, single, "redundant earlier write must not change identity");
+        assert_eq!(
+            dup, single,
+            "redundant earlier write must not change identity"
+        );
     }
 
     #[test]
@@ -471,8 +484,19 @@ mod tests {
         };
         let mut mem = AttemptMemory::new();
         let t = target.clone();
-        let verify = move || std::fs::read_to_string(&t).map(|s| s == "GOOD").unwrap_or(false);
-        let outcome = agentic_loop("make it GOOD", 5, &mut mem, &mut proposer, verify, String::new);
+        let verify = move || {
+            std::fs::read_to_string(&t)
+                .map(|s| s == "GOOD")
+                .unwrap_or(false)
+        };
+        let outcome = agentic_loop(
+            "make it GOOD",
+            5,
+            &mut mem,
+            &mut proposer,
+            verify,
+            String::new,
+        );
 
         assert!(outcome.solved);
         assert_eq!(outcome.attempts, 2);
@@ -493,7 +517,14 @@ mod tests {
             idx: 0,
         };
         let mut mem = AttemptMemory::new();
-        let outcome = agentic_loop("impossible", 3, &mut mem, &mut proposer, || false, String::new);
+        let outcome = agentic_loop(
+            "impossible",
+            3,
+            &mut mem,
+            &mut proposer,
+            || false,
+            String::new,
+        );
 
         assert!(!outcome.solved);
         assert_eq!(outcome.rejected, 1);
@@ -518,18 +549,24 @@ mod tests {
 
         let mut proposer = ScriptedProposer {
             scripted: vec![
-                EditSet::new().with(target.clone(), "TRAIN"),        // passes train only
-                EditSet::new().with(target.clone(), "TRAIN HOLD"),   // passes both
+                EditSet::new().with(target.clone(), "TRAIN"), // passes train only
+                EditSet::new().with(target.clone(), "TRAIN HOLD"), // passes both
             ],
             idx: 0,
         };
         let mut mem = AttemptMemory::new();
         let t1 = target.clone();
-        let verify_train =
-            move || std::fs::read_to_string(&t1).map(|s| s.contains("TRAIN")).unwrap_or(false);
+        let verify_train = move || {
+            std::fs::read_to_string(&t1)
+                .map(|s| s.contains("TRAIN"))
+                .unwrap_or(false)
+        };
         let t2 = target.clone();
-        let verify_holdout =
-            move || std::fs::read_to_string(&t2).map(|s| s.contains("HOLD")).unwrap_or(false);
+        let verify_holdout = move || {
+            std::fs::read_to_string(&t2)
+                .map(|s| s.contains("HOLD"))
+                .unwrap_or(false)
+        };
 
         let outcome = agentic_loop_with_holdout(
             "fix it",
@@ -597,7 +634,10 @@ mod tests {
         let mut mem = AttemptMemory::new();
         let outcome = agentic_loop("goal", 3, &mut mem, &mut proposer, || false, String::new);
         assert!(!outcome.solved);
-        assert_eq!(outcome.rejected, 1, "identical proposal only counted/applied once");
+        assert_eq!(
+            outcome.rejected, 1,
+            "identical proposal only counted/applied once"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

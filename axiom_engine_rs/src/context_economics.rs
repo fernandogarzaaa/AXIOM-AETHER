@@ -215,7 +215,10 @@ mod tests {
         assert_eq!(r.tokens_saved_est(), 0);
         assert_eq!(r.reduction_ratio_est(), 0.0);
         assert!(r.evidence_preserved);
-        assert!(r.estimated, "token figures must always be labeled estimates");
+        assert!(
+            r.estimated,
+            "token figures must always be labeled estimates"
+        );
     }
 
     #[test]

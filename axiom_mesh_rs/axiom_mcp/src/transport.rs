@@ -108,12 +108,17 @@ impl StdioTransport {
                 continue;
             }
             // Non-protocol noise on stdout is skipped, not fatal.
-            let Ok(resp) = serde_json::from_str::<RpcResponse>(&line) else { continue };
+            let Ok(resp) = serde_json::from_str::<RpcResponse>(&line) else {
+                continue;
+            };
             if resp.id != id {
                 continue; // stale response from a previous, timed-out call
             }
             if let Some(err) = resp.error {
-                return Err(TransportError::Worker { code: err.code, message: err.message });
+                return Err(TransportError::Worker {
+                    code: err.code,
+                    message: err.message,
+                });
             }
             let result = resp.result.ok_or(TransportError::Closed)?;
             return Ok(serde_json::from_value(result)?);
@@ -148,7 +153,10 @@ impl WorkerTransport for MockTransport {
     fn dispatch(&self, params: DispatchParams) -> DispatchFuture<'_> {
         Box::pin(async move {
             if let Some(msg) = &self.fail_with {
-                return Err(TransportError::Worker { code: -1, message: msg.clone() });
+                return Err(TransportError::Worker {
+                    code: -1,
+                    message: msg.clone(),
+                });
             }
             Ok(DispatchResult {
                 ok: true,
@@ -184,9 +192,15 @@ mod tests {
 
     #[tokio::test]
     async fn mock_transport_fails_when_told() {
-        let t = MockTransport { fail_with: Some("down".into()) };
+        let t = MockTransport {
+            fail_with: Some("down".into()),
+        };
         let err = t
-            .dispatch(DispatchParams { worker: "x".into(), payload: "".into(), residual_norm: 0.0 })
+            .dispatch(DispatchParams {
+                worker: "x".into(),
+                payload: "".into(),
+                residual_norm: 0.0,
+            })
             .await
             .unwrap_err();
         assert!(matches!(err, TransportError::Worker { .. }));
@@ -200,7 +214,11 @@ mod tests {
         let t = StdioTransport::spawn_with_timeout("sleep", &["5"], Duration::from_millis(200))
             .expect("spawn sleep");
         let err = t
-            .dispatch(DispatchParams { worker: "wedged".into(), payload: "x".into(), residual_norm: 0.0 })
+            .dispatch(DispatchParams {
+                worker: "wedged".into(),
+                payload: "x".into(),
+                residual_norm: 0.0,
+            })
             .await
             .unwrap_err();
         assert!(matches!(err, TransportError::Timeout(_)), "got: {err:?}");

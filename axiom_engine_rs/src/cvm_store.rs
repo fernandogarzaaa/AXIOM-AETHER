@@ -146,7 +146,12 @@ impl CvmStore {
     /// `PageId`. If the session's total stored bytes would exceed the
     /// 64 MiB cap, the oldest rows are dropped first (and the eviction
     /// logged) to make room.
-    pub fn put(&self, session_id: &str, kind: &str, original_text: &str) -> std::io::Result<PageId> {
+    pub fn put(
+        &self,
+        session_id: &str,
+        kind: &str,
+        original_text: &str,
+    ) -> std::io::Result<PageId> {
         self.ensure_loaded(session_id);
         let page_id = Self::page_id_for(original_text);
         let row = CvmPage {
@@ -252,8 +257,7 @@ pub fn build_stub(
     let snippet = snippet.replace(['\n', '\r'], " ");
     // JSON-encode the session id so quotes, backslashes, and brackets in a
     // hostile value round-trip instead of breaking the stub grammar.
-    let session_attr =
-        serde_json::to_string(session_id).expect("session IDs are serializable");
+    let session_attr = serde_json::to_string(session_id).expect("session IDs are serializable");
     format!("[AXIOM-PAGE {page_id} session={session_attr} {orig_tokens}tok {kind}] {snippet}...")
 }
 

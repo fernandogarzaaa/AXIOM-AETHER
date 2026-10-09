@@ -352,7 +352,10 @@ mod tests {
                 "mid",
                 "personal",
                 "mid",
-                vec![std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2],
+                vec![
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                ],
             ),
         ];
         let ranked = top_k(&[1.0, 0.0], &recs, 2);

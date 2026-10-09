@@ -83,7 +83,10 @@ pub fn set_newest_cache_ttl(messages: &mut [Value], ttl: &str) -> bool {
             continue;
         };
         for block in content.iter_mut().rev() {
-            if let Some(cc) = block.get_mut("cache_control").and_then(Value::as_object_mut) {
+            if let Some(cc) = block
+                .get_mut("cache_control")
+                .and_then(Value::as_object_mut)
+            {
                 cc.insert("ttl".to_string(), Value::String(ttl.to_string()));
                 return true;
             }
@@ -214,15 +217,16 @@ pub fn rebase_transcript(messages: &[Value], store: &CvmStore, session_id: &str)
             if i == newest_idx {
                 return msg.clone(); // never touch the newest turn
             }
-            rewrite_heavy_blocks(msg, &mut |text| match store
-                .put(session_id, "tool_result", text)
-            {
-                Ok(page_id) => Some(stub_replacement(&page_id, session_id, text)),
-                Err(e) => {
-                    eprintln!("[axiom-pss] rebase store.put failed: {e}");
-                    None
-                }
-            })
+            rewrite_heavy_blocks(
+                msg,
+                &mut |text| match store.put(session_id, "tool_result", text) {
+                    Ok(page_id) => Some(stub_replacement(&page_id, session_id, text)),
+                    Err(e) => {
+                        eprintln!("[axiom-pss] rebase store.put failed: {e}");
+                        None
+                    }
+                },
+            )
         })
         .collect()
 }
@@ -304,9 +308,14 @@ mod tests {
         ];
         assert!(set_newest_cache_ttl(&mut messages, "1h"));
         // newest breakpoint gets the ttl...
-        assert_eq!(messages[1]["content"][1]["cache_control"]["ttl"], json!("1h"));
+        assert_eq!(
+            messages[1]["content"][1]["cache_control"]["ttl"],
+            json!("1h")
+        );
         // ...and the older breakpoint is left untouched.
-        assert!(messages[0]["content"][0]["cache_control"].get("ttl").is_none());
+        assert!(messages[0]["content"][0]["cache_control"]
+            .get("ttl")
+            .is_none());
     }
 
     #[test]
@@ -320,9 +329,15 @@ mod tests {
             json!({"role":"user","content":"a"}),
             json!({"role":"assistant","content":"b"}),
         ];
-        assert!(!is_genuine_break(len1, &hash1, &turn2), "append-only growth is not a break");
+        assert!(
+            !is_genuine_break(len1, &hash1, &turn2),
+            "append-only growth is not a break"
+        );
         // And an identical prefix is not a break either.
-        assert!(!is_genuine_break(len1, &hash1, &turn1), "unchanged prefix is not a break");
+        assert!(
+            !is_genuine_break(len1, &hash1, &turn1),
+            "unchanged prefix is not a break"
+        );
     }
 
     #[test]
@@ -334,13 +349,19 @@ mod tests {
         let (len, hash) = frozen_fingerprint(&prev);
         // Compaction: the prefix shrank.
         let shrunk = vec![json!({"role":"user","content":"summary of a+b"})];
-        assert!(is_genuine_break(len, &hash, &shrunk), "a shrunken prefix is a break");
+        assert!(
+            is_genuine_break(len, &hash, &shrunk),
+            "a shrunken prefix is a break"
+        );
         // Restructure: same length, different leading content.
         let mutated = vec![
             json!({"role":"user","content":"a CHANGED"}),
             json!({"role":"assistant","content":"b"}),
         ];
-        assert!(is_genuine_break(len, &hash, &mutated), "a mutated prefix is a break");
+        assert!(
+            is_genuine_break(len, &hash, &mutated),
+            "a mutated prefix is a break"
+        );
     }
 
     #[test]
@@ -385,9 +406,19 @@ mod tests {
             json!({"role":"user","content":"newest turn stays whole"}),
         ];
         let out = rebase_transcript(&messages, &store, "s1");
-        assert!(out[0].to_string().contains("AXIOM-PAGE"), "old heavy digested");
-        assert!(!out[0].to_string().contains(&"x ".repeat(9000)), "raw text removed");
-        assert_eq!(out[1]["content"], json!("newest turn stays whole"), "newest untouched");
+        assert!(
+            out[0].to_string().contains("AXIOM-PAGE"),
+            "old heavy digested"
+        );
+        assert!(
+            !out[0].to_string().contains(&"x ".repeat(9000)),
+            "raw text removed"
+        );
+        assert_eq!(
+            out[1]["content"],
+            json!("newest turn stays whole"),
+            "newest untouched"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -452,7 +483,10 @@ mod tests {
         // now-old messages; protect_last=false since these aren't the newest
         // turn of the later request.
         let replayed = reapply_stubs(&original, &store, "s1", false);
-        assert_eq!(replayed, rebased, "reapply must match the original rebase exactly");
+        assert_eq!(
+            replayed, rebased,
+            "reapply must match the original rebase exactly"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -502,9 +536,17 @@ mod tests {
                 {"type":"tool_result","tool_use_id":"a","content": big.clone()}]}),
             json!({"role":"assistant","content":"ack"}),
         ];
-        let once = reapply_stubs(&rebase_transcript(&original, &store, "s1"), &store, "s1", false);
+        let once = reapply_stubs(
+            &rebase_transcript(&original, &store, "s1"),
+            &store,
+            "s1",
+            false,
+        );
         let twice = reapply_stubs(&once, &store, "s1", false);
-        assert_eq!(once, twice, "reapplying to an already-stubbed transcript is a no-op");
+        assert_eq!(
+            once, twice,
+            "reapplying to an already-stubbed transcript is a no-op"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -554,7 +596,10 @@ mod tests {
         ];
         let first = rebase_transcript(&messages, &store, "s1");
         let second = rebase_transcript(&messages, &store, "s1");
-        assert_eq!(first, second, "re-paging identical content is deterministic");
+        assert_eq!(
+            first, second,
+            "re-paging identical content is deterministic"
+        );
         let page_id = CvmStore::page_id_for(&big);
         assert_eq!(store.get("s1", &page_id), Some(big));
         // Assert the underlying JSONL file directly: `first == second` and
@@ -566,7 +611,10 @@ mod tests {
             .lines()
             .filter(|l| !l.trim().is_empty())
             .count();
-        assert_eq!(row_count, 1, "identical content paged twice must add exactly one row");
+        assert_eq!(
+            row_count, 1,
+            "identical content paged twice must add exactly one row"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

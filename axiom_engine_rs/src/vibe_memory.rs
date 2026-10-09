@@ -155,9 +155,7 @@ impl MasterVibe {
     /// the first commit. The caller uses these in place of identity-initialised
     /// W̃ matrices when opt-in priming is enabled.
     pub fn prime_states(&self) -> Option<Vec<Tensor>> {
-        self.master
-            .as_ref()
-            .map(|m| m.to_vec())
+        self.master.as_ref().map(|m| m.to_vec())
     }
 
     /// EMA-merge one session's adapted W̃ states into the master.
@@ -379,10 +377,17 @@ mod tests {
 
         let healthy_session = eye_states(1, 2, &dev);
         let err = vibe.commit_session(&healthy_session);
-        assert!(err.is_err(), "merging a healthy session into a poisoned master must be rejected");
+        assert!(
+            err.is_err(),
+            "merging a healthy session into a poisoned master must be rejected"
+        );
         // The master must remain untouched by the rejected commit.
         let still_poisoned = vibe.prime_states().unwrap();
-        let flat = still_poisoned[0].flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let flat = still_poisoned[0]
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert!(flat[0].is_infinite());
     }
 

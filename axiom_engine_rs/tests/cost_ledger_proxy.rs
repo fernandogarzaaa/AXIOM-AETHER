@@ -142,8 +142,7 @@ async fn non_streaming_messages_turn_updates_awareness_cost_summary() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (aw_status, awareness) =
-        get_json(&app, &format!("/v1/awareness/{session_id}")).await;
+    let (aw_status, awareness) = get_json(&app, &format!("/v1/awareness/{session_id}")).await;
     assert_eq!(aw_status, StatusCode::OK);
 
     let cost = &awareness["cost"];
@@ -151,10 +150,8 @@ async fn non_streaming_messages_turn_updates_awareness_cost_summary() {
     assert_eq!(cost["cache_write_tokens"], 2000);
     assert_eq!(cost["uncached_input_tokens"], 1000);
     assert_eq!(cost["output_tokens"], 500);
-    let expected_usd = 1000.0 / 1e6 * 3.00
-        + 2000.0 / 1e6 * 3.75
-        + 77_000.0 / 1e6 * 0.30
-        + 500.0 / 1e6 * 15.00;
+    let expected_usd =
+        1000.0 / 1e6 * 3.00 + 2000.0 / 1e6 * 3.75 + 77_000.0 / 1e6 * 0.30 + 500.0 / 1e6 * 15.00;
     let usd = cost["usd_total"].as_f64().unwrap();
     assert!((usd - expected_usd).abs() < 1e-6, "{usd} vs {expected_usd}");
     let uncached_equiv = cost["usd_uncached_equivalent"].as_f64().unwrap();
@@ -231,8 +228,7 @@ async fn streaming_messages_turn_scans_sse_usage_without_altering_the_stream() {
     assert!(text.contains("event: message_delta"));
     assert!(text.contains("\"text\":\"hi\""));
 
-    let (aw_status, awareness) =
-        get_json(&app, &format!("/v1/awareness/{session_id}")).await;
+    let (aw_status, awareness) = get_json(&app, &format!("/v1/awareness/{session_id}")).await;
     assert_eq!(aw_status, StatusCode::OK);
     let cost = &awareness["cost"];
     assert_eq!(cost["cache_read_tokens"], 77_000);
@@ -289,10 +285,8 @@ async fn streaming_prices_with_upstream_resolved_model_not_the_request_model() {
     let usd = awareness["cost"]["usd_total"].as_f64().unwrap();
     // Legacy Sonnet 4.x rate ($3/$3.75/$0.30/$15), matching message_start's
     // declared model -- NOT the request's "claude-sonnet-5" ($2/.../$10).
-    let expected_legacy = 1000.0 / 1e6 * 3.00
-        + 2000.0 / 1e6 * 3.75
-        + 77_000.0 / 1e6 * 0.30
-        + 500.0 / 1e6 * 15.00;
+    let expected_legacy =
+        1000.0 / 1e6 * 3.00 + 2000.0 / 1e6 * 3.75 + 77_000.0 / 1e6 * 0.30 + 500.0 / 1e6 * 15.00;
     assert!(
         (usd - expected_legacy).abs() < 1e-6,
         "expected upstream-resolved (legacy Sonnet 4.6) pricing {expected_legacy}, got {usd}"

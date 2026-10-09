@@ -44,8 +44,11 @@ fn transform_preserves_every_unselected_value_exactly() {
         {"role":"user", "content":"new question"}
     ]});
     let plan = plan_compression(&body).unwrap();
-    let fingerprints: Vec<String> =
-        plan.runs.iter().map(|_| "<axiom_context_fingerprint />".to_string()).collect();
+    let fingerprints: Vec<String> = plan
+        .runs
+        .iter()
+        .map(|_| "<axiom_context_fingerprint />".to_string())
+        .collect();
     let output = apply_plan(&body, &plan, &fingerprints).unwrap();
     assert_eq!(output["model"], body["model"]);
     assert_eq!(output["previous_response_id"], body["previous_response_id"]);

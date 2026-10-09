@@ -24,7 +24,10 @@ impl NodeHealth {
     /// `threshold` — consecutive failures (with no intervening success)
     /// before `record_failure` reports quarantine.
     pub fn new(threshold: u32) -> Self {
-        Self { consecutive_failures: HashMap::new(), threshold }
+        Self {
+            consecutive_failures: HashMap::new(),
+            threshold,
+        }
     }
 
     /// Record a successful dispatch: clears the node's failure streak.
@@ -51,7 +54,10 @@ mod tests {
         let mut health = NodeHealth::new(3);
         assert!(!health.record_failure(NodeId(0)));
         assert!(!health.record_failure(NodeId(0)));
-        assert!(health.record_failure(NodeId(0)), "third consecutive failure must quarantine");
+        assert!(
+            health.record_failure(NodeId(0)),
+            "third consecutive failure must quarantine"
+        );
     }
 
     #[test]
@@ -59,13 +65,19 @@ mod tests {
         let mut health = NodeHealth::new(2);
         assert!(!health.record_failure(NodeId(0)));
         health.record_success(NodeId(0));
-        assert!(!health.record_failure(NodeId(0)), "streak must have reset after success");
+        assert!(
+            !health.record_failure(NodeId(0)),
+            "streak must have reset after success"
+        );
     }
 
     #[test]
     fn nodes_are_tracked_independently() {
         let mut health = NodeHealth::new(1);
         assert!(health.record_failure(NodeId(0)));
-        assert!(health.record_failure(NodeId(1)), "node 1's own first failure must quarantine too");
+        assert!(
+            health.record_failure(NodeId(1)),
+            "node 1's own first failure must quarantine too"
+        );
     }
 }

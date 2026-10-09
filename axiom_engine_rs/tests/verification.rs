@@ -29,8 +29,7 @@ use candle_core::Device;
 const CONVERGED_CHECKPOINT: &str = "./checkpoints/axiom_converged.bin";
 
 /// The unique semantic needle. Must not appear in the training corpus.
-const NEEDLE: &str =
-    "const AXIOM_SECRET_VALIDATION_TOKEN: &str = \"TTT_ALIVE_AND_CONVERGING\";";
+const NEEDLE: &str = "const AXIOM_SECRET_VALIDATION_TOKEN: &str = \"TTT_ALIVE_AND_CONVERGING\";";
 
 /// Random-init projections collapse the recall vector toward zero; a trained
 /// model lifts it well clear of that floor. `COLLAPSE_CEILING` is the upper
@@ -105,9 +104,14 @@ fn load_or_train_pipeline(config: &AxiomConfig, device: &Device) -> (InferencePi
             /* seed          */ 42,
         )
         .expect("meta-trainer must build from repo files");
-        assert!(trainer.dataset_len() > 0, "meta-train dataset must be non-empty");
+        assert!(
+            trainer.dataset_len() > 0,
+            "meta-train dataset must be non-empty"
+        );
         let final_loss = trainer
-            .run(/* epochs */ 1, /* steps_per_epoch */ 60, /* lr */ 1e-3)
+            .run(
+                /* epochs */ 1, /* steps_per_epoch */ 60, /* lr */ 1e-3,
+            )
             .expect("meta-training run must succeed");
         println!("[passkey] meta-train final loss = {final_loss:.4}");
     }
@@ -187,12 +191,18 @@ fn passkey_recall_breaks_past_zero_after_convergence() {
         "[telemetry] post-adapt W̃ norms  : {:?}",
         fingerprint.layer_frobenius_norms
     );
-    println!("[telemetry] pre-adapt recall_norm  = {:.6}", pre.recall_norm);
+    println!(
+        "[telemetry] pre-adapt recall_norm  = {:.6}",
+        pre.recall_norm
+    );
     println!(
         "[telemetry] post-adapt recall_norm = {:.6}  (healthy {HEALTHY_LO}..{HEALTHY_HI})",
         fingerprint.recall_norm
     );
-    println!("[telemetry] recall_l1              = {:.6}", fingerprint.recall_l1);
+    println!(
+        "[telemetry] recall_l1              = {:.6}",
+        fingerprint.recall_l1
+    );
 
     // The recall vector must be alive and finite...
     assert!(

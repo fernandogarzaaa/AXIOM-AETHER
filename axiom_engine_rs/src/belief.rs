@@ -50,7 +50,10 @@ impl Default for BetaBelief {
 impl BetaBelief {
     /// The uniform prior `Beta(1,1)` — maximum uncertainty, mean 0.5.
     pub fn uniform() -> Self {
-        Self { alpha: 1.0, beta: 1.0 }
+        Self {
+            alpha: 1.0,
+            beta: 1.0,
+        }
     }
 
     /// Build from a scalar confidence in [0,1] with a pseudocount `strength`
@@ -230,9 +233,15 @@ mod tests {
         for _ in 0..10 {
             many.reinforce();
         }
-        assert!(few.mean() > 0.6 && !few.is_established(), "1 success is not established");
+        assert!(
+            few.mean() > 0.6 && !few.is_established(),
+            "1 success is not established"
+        );
         assert!(many.is_established(), "many successes → established");
-        assert!(many.variance() < few.variance(), "more evidence → less uncertainty");
+        assert!(
+            many.variance() < few.variance(),
+            "more evidence → less uncertainty"
+        );
     }
 
     #[test]
@@ -243,15 +252,27 @@ mod tests {
         }
         assert!(b.is_established());
         let stale = b.decayed(1.0);
-        assert!((stale.mean() - 0.5).abs() < 1e-5, "full decay → uniform mean");
-        assert!(!stale.is_established(), "fully decayed belief is no longer trusted");
+        assert!(
+            (stale.mean() - 0.5).abs() < 1e-5,
+            "full decay → uniform mean"
+        );
+        assert!(
+            !stale.is_established(),
+            "fully decayed belief is no longer trusted"
+        );
         assert!(stale.variance() > b.variance(), "decay raises uncertainty");
     }
 
     #[test]
     fn ds_combination_compounds_agreement() {
-        let a = BetaBelief { alpha: 4.0, beta: 1.0 };
-        let b = BetaBelief { alpha: 5.0, beta: 1.0 };
+        let a = BetaBelief {
+            alpha: 4.0,
+            beta: 1.0,
+        };
+        let b = BetaBelief {
+            alpha: 5.0,
+            beta: 1.0,
+        };
         let c = a.combine_ds(&b).unwrap();
         assert!(c.evidence() > a.evidence(), "agreeing evidence compounds");
         assert!(c.mean() > 0.8);
@@ -259,30 +280,54 @@ mod tests {
 
     #[test]
     fn ds_combination_flags_conflict() {
-        let yes = BetaBelief { alpha: 9.0, beta: 1.0 }; // strongly yes
-        let no = BetaBelief { alpha: 1.0, beta: 9.0 }; // strongly no
+        let yes = BetaBelief {
+            alpha: 9.0,
+            beta: 1.0,
+        }; // strongly yes
+        let no = BetaBelief {
+            alpha: 1.0,
+            beta: 9.0,
+        }; // strongly no
         let err = yes.combine_ds(&no).unwrap_err();
         assert!(err.conflict_mass > DS_CONFLICT_THRESHOLD);
     }
 
     #[test]
     fn reliability_discount_reduces_peer_influence() {
-        let local = BetaBelief { alpha: 5.0, beta: 1.0 }; // confident yes
-        let peer = BetaBelief { alpha: 1.0, beta: 9.0 }; // confident no
-        // Full trust: the peer pulls the mean down hard.
+        let local = BetaBelief {
+            alpha: 5.0,
+            beta: 1.0,
+        }; // confident yes
+        let peer = BetaBelief {
+            alpha: 1.0,
+            beta: 9.0,
+        }; // confident no
+           // Full trust: the peer pulls the mean down hard.
         let full = local.combine_ds_reliable(&peer, 1.0);
         // Zero trust: the peer is collapsed to the uniform prior → no influence.
         let none = local.combine_ds_reliable(&peer, 0.0).unwrap();
-        assert!((none.mean() - local.mean()).abs() < 1e-6, "reliability 0 ⇒ peer ignored");
+        assert!(
+            (none.mean() - local.mean()).abs() < 1e-6,
+            "reliability 0 ⇒ peer ignored"
+        );
         if let Ok(full) = full {
-            assert!(full.mean() < none.mean(), "trusted disagreeing peer lowers the mean");
+            assert!(
+                full.mean() < none.mean(),
+                "trusted disagreeing peer lowers the mean"
+            );
         }
     }
 
     #[test]
     fn conflict_aware_falls_back_to_murphy_without_erroring() {
-        let yes = BetaBelief { alpha: 9.0, beta: 1.0 };
-        let no = BetaBelief { alpha: 1.0, beta: 9.0 };
+        let yes = BetaBelief {
+            alpha: 9.0,
+            beta: 1.0,
+        };
+        let no = BetaBelief {
+            alpha: 1.0,
+            beta: 9.0,
+        };
         // Raw combine_ds errors on this conflict...
         assert!(yes.combine_ds(&no).is_err());
         // ...but the conflict-aware merge returns a finite Murphy average + flag.
@@ -291,14 +336,36 @@ mod tests {
         assert!(fused.mean().is_finite() && fused.alpha > 0.0 && fused.beta > 0.0);
         // Murphy average of symmetric yes/no sits near 0.5 — supported by neither
         // extreme, but not the paradoxical Dempster result.
-        assert!((fused.mean() - 0.5).abs() < 0.2, "murphy fusion is a sane midpoint");
+        assert!(
+            (fused.mean() - 0.5).abs() < 0.2,
+            "murphy fusion is a sane midpoint"
+        );
     }
 
     #[test]
     fn plausibility_rejects_byzantine_values() {
-        assert!(BetaBelief { alpha: 5.0, beta: 2.0 }.is_plausible(1000.0));
-        assert!(!BetaBelief { alpha: f32::NAN, beta: 1.0 }.is_plausible(1000.0));
-        assert!(!BetaBelief { alpha: -1.0, beta: 1.0 }.is_plausible(1000.0));
-        assert!(!BetaBelief { alpha: 1e9, beta: 1.0 }.is_plausible(1000.0), "fabricated certainty rejected");
+        assert!(BetaBelief {
+            alpha: 5.0,
+            beta: 2.0
+        }
+        .is_plausible(1000.0));
+        assert!(!BetaBelief {
+            alpha: f32::NAN,
+            beta: 1.0
+        }
+        .is_plausible(1000.0));
+        assert!(!BetaBelief {
+            alpha: -1.0,
+            beta: 1.0
+        }
+        .is_plausible(1000.0));
+        assert!(
+            !BetaBelief {
+                alpha: 1e9,
+                beta: 1.0
+            }
+            .is_plausible(1000.0),
+            "fabricated certainty rejected"
+        );
     }
 }

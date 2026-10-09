@@ -37,8 +37,7 @@ fn assert_history(task: &AgentTask, outcomes: &[ProposeOutcome]) {
 
 #[test]
 fn starts_with_empty_history_and_normalizes_zero_budget() {
-    let task = AgentTask::start("id".into(), "goal".into(), "exit 0".into(), vec![], 0)
-        .unwrap();
+    let task = AgentTask::start("id".into(), "goal".into(), "exit 0".into(), vec![], 0).unwrap();
     assert_eq!(task.task_id, "id");
     assert_eq!(task.goal, "goal");
     assert_eq!(task.verify_cmd, "exit 0");
@@ -191,9 +190,10 @@ fn abort_restores_initial_snapshot_after_multiple_successes() {
     fs::write(&path, original).unwrap();
     let mut task = task(&[path.clone(), created.clone()], "exit 0");
     assert!(task.propose(vec![edit(&path, "v1")]).passed);
-    assert!(task
-        .propose(vec![edit(&path, "v2"), edit(&created, "new")])
-        .passed);
+    assert!(
+        task.propose(vec![edit(&path, "v2"), edit(&created, "new")])
+            .passed
+    );
 
     task.finish(false).unwrap();
     assert_eq!(fs::read(&path).unwrap(), original);
@@ -244,11 +244,18 @@ fn attempt_budget_prevents_additional_file_changes() {
         )
         .unwrap();
         for attempt in 0..budget.max(1) {
-            assert!(!task.propose(vec![edit(&path, &format!("bad-{attempt}"))]).passed);
+            assert!(
+                !task
+                    .propose(vec![edit(&path, &format!("bad-{attempt}"))])
+                    .passed
+            );
         }
         task.verify_cmd = "exit 0".into();
         let over_budget = task.propose(vec![edit(&path, "must not apply")]);
-        assert!(!over_budget.passed, "exhausted budget {budget} must reject edits");
+        assert!(
+            !over_budget.passed,
+            "exhausted budget {budget} must reject edits"
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "initial");
     }
 }
@@ -262,10 +269,17 @@ fn registry_keeps_tasks_independent_and_removal_returns_the_task() {
     second.task_id = "other".into();
     registry.insert(first);
     registry.insert(second);
-    assert!(shared.with_task("missing", |_| panic!("must not run")).is_none());
+    assert!(shared
+        .with_task("missing", |_| panic!("must not run"))
+        .is_none());
     assert!(shared.remove("missing").is_none());
-    shared.with_task("test-task", |t| t.propose(vec![])).unwrap();
-    assert_eq!(registry.with_task("test-task", |t| t.history().len()), Some(1));
+    shared
+        .with_task("test-task", |t| t.propose(vec![]))
+        .unwrap();
+    assert_eq!(
+        registry.with_task("test-task", |t| t.history().len()),
+        Some(1)
+    );
     assert_eq!(registry.with_task("other", |t| t.history().len()), Some(0));
     let removed = shared.remove("test-task").unwrap();
     assert_eq!(removed.task_id, "test-task");

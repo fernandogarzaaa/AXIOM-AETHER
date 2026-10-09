@@ -195,11 +195,16 @@ async fn empty_mutable_tail_never_gains_a_phantom_carrier_turn() {
     let captured = capture.requests.lock().unwrap();
     let sent_messages = captured[0]["messages"].as_array().unwrap();
     assert_eq!(
-        sent_messages.len(), 2,
+        sent_messages.len(),
+        2,
         "no phantom carrier turn: exactly the original 2 messages, got {sent_messages:?}"
     );
     assert_eq!(sent_messages[0]["role"], json!("user"));
-    assert_eq!(sent_messages[1]["role"], json!("system"), "system message must end the array");
+    assert_eq!(
+        sent_messages[1]["role"],
+        json!("system"),
+        "system message must end the array"
+    );
 }
 
 #[tokio::test]

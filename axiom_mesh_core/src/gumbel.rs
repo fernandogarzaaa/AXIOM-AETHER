@@ -64,7 +64,12 @@ pub struct GumbelSample {
 /// noise dominate (explorative). `soft` is derived from this same
 /// perturbed vector, so it stays consistent with `winner` rather than
 /// describing a different draw.
-pub fn gumbel_softmax(logits: &Array1<f32>, tau: f32, hard: bool, rng: &mut impl Rng) -> GumbelSample {
+pub fn gumbel_softmax(
+    logits: &Array1<f32>,
+    tau: f32,
+    hard: bool,
+    rng: &mut impl Rng,
+) -> GumbelSample {
     assert!(tau > 0.0, "gumbel_softmax: tau must be positive, got {tau}");
     assert!(!logits.is_empty(), "gumbel_softmax: empty logits");
 
@@ -87,7 +92,11 @@ pub fn gumbel_softmax(logits: &Array1<f32>, tau: f32, hard: bool, rng: &mut impl
         soft.clone()
     };
 
-    GumbelSample { soft, adhesion, winner }
+    GumbelSample {
+        soft,
+        adhesion,
+        winner,
+    }
 }
 
 #[cfg(test)]
@@ -141,11 +150,17 @@ mod tests {
         // winner reliably; high tau should be close to a coin flip.
         let logits = array![1.0, 0.0];
         let mut rng = StdRng::seed_from_u64(11);
-        let low_tau_wins = (0..300).filter(|_| gumbel_softmax(&logits, 0.05, true, &mut rng).winner == 0).count();
-        let high_tau_wins =
-            (0..300).filter(|_| gumbel_softmax(&logits, 20.0, true, &mut rng).winner == 0).count();
+        let low_tau_wins = (0..300)
+            .filter(|_| gumbel_softmax(&logits, 0.05, true, &mut rng).winner == 0)
+            .count();
+        let high_tau_wins = (0..300)
+            .filter(|_| gumbel_softmax(&logits, 20.0, true, &mut rng).winner == 0)
+            .count();
 
-        assert!(low_tau_wins >= 295, "low tau should track the true winner nearly always, got {low_tau_wins}/300");
+        assert!(
+            low_tau_wins >= 295,
+            "low tau should track the true winner nearly always, got {low_tau_wins}/300"
+        );
         assert!(
             (100..200).contains(&high_tau_wins),
             "high tau should wash out the gap toward a coin flip, got {high_tau_wins}/300"

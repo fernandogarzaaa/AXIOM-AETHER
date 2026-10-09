@@ -205,9 +205,10 @@ pub async fn send_ping(
     let body = build_ping_body(last_request, max_tokens_override);
     match forwarder.forward_messages_json(&body, &auth).await {
         Ok(resp) => estimate_and_wrap(&resp, &model, max_tokens_override),
-        Err(ForwarderError::Upstream { status: 400, body: err_body })
-            if max_tokens_override == 0 && err_body.to_lowercase().contains("max_tokens") =>
-        {
+        Err(ForwarderError::Upstream {
+            status: 400,
+            body: err_body,
+        }) if max_tokens_override == 0 && err_body.to_lowercase().contains("max_tokens") => {
             let retry_body = build_ping_body(last_request, 1);
             match forwarder.forward_messages_json(&retry_body, &auth).await {
                 Ok(resp) => estimate_and_wrap(&resp, &model, 1),
@@ -232,10 +233,7 @@ fn outcome_from_error(e: ForwarderError, max_tokens_used: u64) -> PingResult {
 }
 
 fn estimate_and_wrap(resp: &Value, model: &str, max_tokens_used: u64) -> PingResult {
-    let response_model = resp
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or(model);
+    let response_model = resp.get("model").and_then(Value::as_str).unwrap_or(model);
     let estimated_usd_saved = resp
         .get("usage")
         .and_then(|usage| crate::cost_ledger::turn_cost(response_model, usage))
@@ -392,8 +390,7 @@ impl KeepaliveManager {
                         _ => None,
                     }
                 };
-                let Some((belief, pings_sent, max_tokens, headers, last_request)) = snapshot
-                else {
+                let Some((belief, pings_sent, max_tokens, headers, last_request)) = snapshot else {
                     return;
                 };
                 let remaining = planned.saturating_sub(pings_sent);
@@ -469,7 +466,11 @@ mod tests {
         let routed = json!({"model": "claude-haiku-4-5", "max_tokens": 16});
         let held = restore_original_model(&routed, Some("claude-opus-4-8"));
         assert_eq!(held["model"], json!("claude-opus-4-8"));
-        assert_eq!(routed["model"], json!("claude-haiku-4-5"), "input untouched");
+        assert_eq!(
+            routed["model"],
+            json!("claude-haiku-4-5"),
+            "input untouched"
+        );
 
         let unrouted = json!({"model": "claude-sonnet-5"});
         assert_eq!(restore_original_model(&unrouted, None), unrouted);
@@ -508,7 +509,7 @@ mod tests {
     #[test]
     fn should_ping_uniform_prior_favors_pinging_when_few_remain() {
         let belief = BetaBelief::uniform(); // mean 0.5
-        // 0.5 * 1.25 = 0.625 > 0.1 * 1 = 0.1
+                                            // 0.5 * 1.25 = 0.625 > 0.1 * 1 = 0.1
         assert!(should_ping(&belief, 1));
         // 0.5 * 1.25 = 0.625 < 0.1 * 10 = 1.0
         assert!(!should_ping(&belief, 10));
@@ -620,7 +621,12 @@ mod tests {
             preceding.ends_with("#[derive(Clone)]"),
             "HeldHeaders's only derive must be #[derive(Clone)] (no Debug -- would leak secrets)"
         );
-        for needle in ["derive(Serialize", "use serde::Serialize", "impl Serialize for", "Serializable for"] {
+        for needle in [
+            "derive(Serialize",
+            "use serde::Serialize",
+            "impl Serialize for",
+            "Serializable for",
+        ] {
             assert!(
                 !source.contains(needle),
                 "keepalive.rs's production code must never import, derive, or implement \
@@ -653,7 +659,8 @@ mod tests {
         // genuinely absent (this crate's test binaries run in parallel and
         // no other test in this file touches this var).
         if std::env::var("AXIOM_KEEPALIVE").is_err() {
-            let manager = KeepaliveManager::from_env(crate::session_awareness::AwarenessStore::default());
+            let manager =
+                KeepaliveManager::from_env(crate::session_awareness::AwarenessStore::default());
             assert!(!manager.is_enabled());
         }
     }

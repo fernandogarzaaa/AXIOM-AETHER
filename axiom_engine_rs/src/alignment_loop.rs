@@ -42,7 +42,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::belief::BetaBelief;
-use crate::state_predictor::{SemanticStateMap, SemanticMilestone};
+use crate::state_predictor::{SemanticMilestone, SemanticStateMap};
 
 /// Default drift threshold: if the drift score exceeds this, a correction is applied.
 pub const DEFAULT_DRIFT_THRESHOLD: f32 = 0.5;
@@ -99,11 +99,7 @@ pub struct AlignmentLoop {
 
 impl AlignmentLoop {
     /// Create a new alignment loop with the given configuration.
-    pub fn new(
-        drift_threshold: f32,
-        correction_lr: f32,
-        max_corrections: usize,
-    ) -> Self {
+    pub fn new(drift_threshold: f32, correction_lr: f32, max_corrections: usize) -> Self {
         Self {
             drift_threshold,
             correction_lr,
@@ -144,9 +140,9 @@ impl AlignmentLoop {
         generation_state: &[f32],
     ) -> AlignmentCheck {
         // Get the current milestone (or the last one if we've passed them all).
-        let milestone_idx = state.current_milestone.min(
-            state.state_map.milestones.len().saturating_sub(1),
-        );
+        let milestone_idx = state
+            .current_milestone
+            .min(state.state_map.milestones.len().saturating_sub(1));
 
         let milestone = match state.state_map.milestones.get(milestone_idx) {
             Some(m) => m,
@@ -166,8 +162,8 @@ impl AlignmentLoop {
         let drift_score = cosine_distance(generation_state, &milestone.predicted_state);
 
         // Determine if a correction is needed.
-        let needs_correction = drift_score > state.drift_threshold
-            && state.corrections_applied < self.max_corrections;
+        let needs_correction =
+            drift_score > state.drift_threshold && state.corrections_applied < self.max_corrections;
 
         let correction_strength = if needs_correction {
             // Scale correction by drift magnitude (more drift = stronger correction).
@@ -267,7 +263,11 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 
 /// Render an alignment check as a human-readable string.
 pub fn render_alignment_check(check: &AlignmentCheck) -> String {
-    let status = if check.corrected { "CORRECTED" } else { "ALIGNED" };
+    let status = if check.corrected {
+        "CORRECTED"
+    } else {
+        "ALIGNED"
+    };
     format!(
         "AlignmentCheck [{}] {} drift={:.3} correction={:.4} confidence={:.2}",
         check.milestone_label,
@@ -329,8 +329,14 @@ mod tests {
         let check = loop_.check_alignment(&mut state, &gen_state);
 
         assert!(!check.corrected, "aligned state should not need correction");
-        assert!(check.drift_score < 0.01, "identical states should have ~0 drift");
-        assert_eq!(state.current_milestone, 1, "should advance to next milestone");
+        assert!(
+            check.drift_score < 0.01,
+            "identical states should have ~0 drift"
+        );
+        assert_eq!(
+            state.current_milestone, 1,
+            "should advance to next milestone"
+        );
     }
 
     #[test]
@@ -344,7 +350,10 @@ mod tests {
         let check = loop_.check_alignment(&mut state, &gen_state);
 
         assert!(check.corrected, "drifted state should trigger correction");
-        assert!(check.drift_score > 0.5, "orthogonal states should have high drift");
+        assert!(
+            check.drift_score > 0.5,
+            "orthogonal states should have high drift"
+        );
         assert_eq!(state.corrections_applied, 1);
     }
 
@@ -359,7 +368,10 @@ mod tests {
         for _ in 0..10 {
             loop_.check_alignment(&mut state, &gen_state);
         }
-        assert!(state.corrections_applied <= 2, "should not exceed max corrections");
+        assert!(
+            state.corrections_applied <= 2,
+            "should not exceed max corrections"
+        );
     }
 
     #[test]
@@ -375,7 +387,10 @@ mod tests {
         let gen2 = vec![0.0, 1.0, 0.0, 0.5, 0.0, 0.2, 0.0, 0.1];
         loop_.check_alignment(&mut state, &gen2);
 
-        assert!(state.completed, "should complete after aligning with all milestones");
+        assert!(
+            state.completed,
+            "should complete after aligning with all milestones"
+        );
     }
 
     #[test]
@@ -393,8 +408,14 @@ mod tests {
         let correction = loop_.compute_correction(&gen_state, &milestone, 0.1);
 
         // Correction should point toward the milestone state.
-        assert!(correction[0] > 0.0, "correction should steer toward milestone");
-        assert!((correction[0] - 0.1).abs() < 1e-6, "correction magnitude should be lr * delta");
+        assert!(
+            correction[0] > 0.0,
+            "correction should steer toward milestone"
+        );
+        assert!(
+            (correction[0] - 0.1).abs() < 1e-6,
+            "correction magnitude should be lr * delta"
+        );
     }
 
     #[test]

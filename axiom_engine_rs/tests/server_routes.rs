@@ -184,9 +184,15 @@ async fn verify_grounding_gated_expansion_spends_tokens_only_where_needed() {
     assert_eq!(v["mode"], "grounding_gated_expansion");
     let before = v["grounded_fraction_before"].as_f64().unwrap();
     let after = v["grounded_fraction_after"].as_f64().unwrap();
-    assert!(after > before, "expansion must improve grounding ({before} -> {after})");
     assert!(
-        v["expanded_symbols"].as_array().unwrap().contains(&serde_json::json!("checksum")),
+        after > before,
+        "expansion must improve grounding ({before} -> {after})"
+    );
+    assert!(
+        v["expanded_symbols"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("checksum")),
         "only the referenced symbol should be expanded: {:?}",
         v["expanded_symbols"]
     );
