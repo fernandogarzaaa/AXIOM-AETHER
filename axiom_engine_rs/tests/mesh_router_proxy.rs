@@ -29,17 +29,32 @@ async fn tags_handler() -> impl IntoResponse {
     }))
 }
 
-async fn chat_handler(State(mock): State<MockOllama>, Json(body): Json<Value>) -> axum::response::Response {
-    let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+async fn chat_handler(
+    State(mock): State<MockOllama>,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     mock.dispatched.lock().unwrap().push(model.clone());
     if mock.fail_models.contains(&model) {
-        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "mock model unavailable").into_response();
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "mock model unavailable",
+        )
+            .into_response();
     }
-    Json(json!({"message": {"role": "assistant", "content": format!("ok from {model}")}})).into_response()
+    Json(json!({"message": {"role": "assistant", "content": format!("ok from {model}")}}))
+        .into_response()
 }
 
 async fn start_mock(fail_models: Vec<String>) -> (String, MockOllama) {
-    let mock = MockOllama { dispatched: Arc::new(Mutex::new(Vec::new())), fail_models: Arc::new(fail_models) };
+    let mock = MockOllama {
+        dispatched: Arc::new(Mutex::new(Vec::new())),
+        fail_models: Arc::new(fail_models),
+    };
     let app = Router::new()
         .route("/api/tags", get(tags_handler))
         .route("/api/chat", post(chat_handler))
@@ -66,10 +81,15 @@ async fn naive_and_mesh_routing_both_pick_top_priority_when_healthy() {
     let (base_url, mock) = start_mock(vec![]).await;
     let router = SwarmRouter::new(config(base_url, true));
 
-    let result = router.route_chat_payload(&json!({"messages": [{"role": "user", "content": "hi"}]})).await;
+    let result = router
+        .route_chat_payload(&json!({"messages": [{"role": "user", "content": "hi"}]}))
+        .await;
     assert!(result.is_ok(), "expected success, got {result:?}");
     assert_eq!(result.unwrap().model, "phi4:3.8b");
-    assert_eq!(*mock.dispatched.lock().unwrap(), vec!["phi4:3.8b".to_string()]);
+    assert_eq!(
+        *mock.dispatched.lock().unwrap(),
+        vec!["phi4:3.8b".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -81,7 +101,9 @@ async fn mesh_routing_learns_around_a_failing_top_priority_model() {
     let router = SwarmRouter::new(config(base_url, true));
 
     for _ in 0..20 {
-        let _ = router.route_chat_payload(&json!({"messages": [{"role": "user", "content": "hi"}]})).await;
+        let _ = router
+            .route_chat_payload(&json!({"messages": [{"role": "user", "content": "hi"}]}))
+            .await;
     }
 
     let dispatched = mock.dispatched.lock().unwrap();
@@ -109,7 +131,9 @@ async fn naive_routing_keeps_retrying_the_failing_top_priority_model_forever() {
     let router = SwarmRouter::new(config(base_url, false));
 
     for _ in 0..10 {
-        let result = router.route_chat_payload(&json!({"messages": [{"role": "user", "content": "hi"}]})).await;
+        let result = router
+            .route_chat_payload(&json!({"messages": [{"role": "user", "content": "hi"}]}))
+            .await;
         assert!(matches!(result, Err(SwarmRouteError::Upstream(_))));
     }
     let dispatched = mock.dispatched.lock().unwrap();
@@ -123,7 +147,12 @@ async fn mesh_routing_off_by_default_matches_naive_selection() {
     // when AXIOM_MESH_ROUTING is unset.
     let router = SwarmRouter::new(config(base_url, false));
 
-    let result = router.route_chat_payload(&json!({"messages": [{"role": "user", "content": "hi"}]})).await;
+    let result = router
+        .route_chat_payload(&json!({"messages": [{"role": "user", "content": "hi"}]}))
+        .await;
     assert_eq!(result.unwrap().model, "phi4:3.8b");
-    assert_eq!(*mock.dispatched.lock().unwrap(), vec!["phi4:3.8b".to_string()]);
+    assert_eq!(
+        *mock.dispatched.lock().unwrap(),
+        vec!["phi4:3.8b".to_string()]
+    );
 }

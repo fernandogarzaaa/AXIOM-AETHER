@@ -142,7 +142,11 @@ fn main() {
         let msg: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(stdout, "{}", err(&Value::Null, -32700, format!("parse error: {e}")));
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    err(&Value::Null, -32700, format!("parse error: {e}"))
+                );
                 let _ = stdout.flush();
                 continue;
             }
@@ -258,7 +262,11 @@ fn handle_finish(registry: &TaskRegistry, id: &Value, params: Value) -> String {
             registry.remove(&p.task_id);
             ok(id, json!({"committed": p.commit}))
         }
-        Some(Err(e)) => err(id, -32002, format!("finish failed, task retained for retry: {e}")),
+        Some(Err(e)) => err(
+            id,
+            -32002,
+            format!("finish failed, task retained for retry: {e}"),
+        ),
         None => err(id, -32001, format!("unknown task_id: {}", p.task_id)),
     }
 }

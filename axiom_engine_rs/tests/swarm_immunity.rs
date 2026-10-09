@@ -6,8 +6,8 @@ use axiom_engine::config::AxiomConfig;
 use axiom_engine::heal_memory::{fingerprint, HealMemory};
 use axiom_engine::inference::InferencePipeline;
 use axiom_engine::self_heal::{run_supervised, Heal, SupervisorOptions};
-use axiom_engine::solve::posix_shell;
 use axiom_engine::server::{create_router, AppState};
+use axiom_engine::solve::posix_shell;
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use candle_core::Device;
@@ -92,7 +92,10 @@ async fn immunity_endpoints_export_and_merge() {
     assert_eq!(resp.status(), StatusCode::OK);
     let exported = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let exported = String::from_utf8(exported.to_vec()).unwrap();
-    assert!(exported.contains(&fp), "export must contain node A's program");
+    assert!(
+        exported.contains(&fp),
+        "export must contain node A's program"
+    );
 
     // Merge into fresh node B.
     let mem_b = unique_tmp("node_b").with_extension("json");

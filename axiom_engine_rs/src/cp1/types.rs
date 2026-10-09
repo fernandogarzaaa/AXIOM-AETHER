@@ -463,7 +463,11 @@ mod tests {
             50,
             vec![
                 segment(SegmentRole::Goal, "ship it", None),
-                segment(SegmentRole::Memory, "the build always fails on Tuesdays", None),
+                segment(
+                    SegmentRole::Memory,
+                    "the build always fails on Tuesdays",
+                    None,
+                ),
             ],
             Provenance::now(Component::Axiom, "axiom:context/compress"),
         );
@@ -482,15 +486,29 @@ mod tests {
             50,
             vec![
                 segment(SegmentRole::Goal, "ship it", None),
-                segment(SegmentRole::Memory, "builds fail on missing deps", Some("66666666-6666-4666-8666-666666666666")),
-                segment(SegmentRole::Belief, "tests catch regressions", Some("55555555-5555-4555-8555-555555555555")),
+                segment(
+                    SegmentRole::Memory,
+                    "builds fail on missing deps",
+                    Some("66666666-6666-4666-8666-666666666666"),
+                ),
+                segment(
+                    SegmentRole::Belief,
+                    "tests catch regressions",
+                    Some("55555555-5555-4555-8555-555555555555"),
+                ),
             ],
             Provenance::now(Component::Axiom, "axiom:context/compress"),
         );
         assert!(context.grounded);
         assert!(context.grounding_failures.is_empty());
-        assert_eq!(context.memory_ids, vec!["66666666-6666-4666-8666-666666666666"]);
-        assert_eq!(context.belief_ids, vec!["55555555-5555-4555-8555-555555555555"]);
+        assert_eq!(
+            context.memory_ids,
+            vec!["66666666-6666-4666-8666-666666666666"]
+        );
+        assert_eq!(
+            context.belief_ids,
+            vec!["55555555-5555-4555-8555-555555555555"]
+        );
     }
 
     #[test]
@@ -533,7 +551,10 @@ mod tests {
             ],
             Provenance::now(Component::Axiom, "axiom:context/compress"),
         );
-        assert_eq!(context.memory_ids, vec![memory.to_string(), other.to_string()]);
+        assert_eq!(
+            context.memory_ids,
+            vec![memory.to_string(), other.to_string()]
+        );
     }
 
     #[test]

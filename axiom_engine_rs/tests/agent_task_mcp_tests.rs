@@ -66,7 +66,10 @@ impl Server {
         let response: Value = serde_json::from_str(&line).expect("one JSON response per line");
         assert_eq!(response["jsonrpc"], "2.0");
         assert!(response.get("id").is_some());
-        assert_ne!(response.get("result").is_some(), response.get("error").is_some());
+        assert_ne!(
+            response.get("result").is_some(),
+            response.get("error").is_some()
+        );
         response
     }
 
@@ -123,7 +126,13 @@ impl Drop for Server {
 fn assert_error(response: &Value, code: i64, message: &str) {
     assert!(response.get("result").is_none(), "{response}");
     assert_eq!(response["error"]["code"], code, "{response}");
-    assert!(response["error"]["message"].as_str().unwrap().contains(message), "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(message),
+        "{response}"
+    );
 }
 
 #[test]
@@ -153,23 +162,41 @@ fn invalid_params_are_rejected_for_every_tool() {
         ("task_start", json!({"verify_cmd": "exit 0"})),
         ("task_start", json!({"goal": "goal"})),
         ("task_start", json!({"goal": 12, "verify_cmd": "exit 0"})),
-        ("task_start", json!({"goal": "g", "verify_cmd": "exit 0", "files": "a"})),
-        ("task_start", json!({"goal": "g", "verify_cmd": "exit 0", "max_attempts": -1})),
+        (
+            "task_start",
+            json!({"goal": "g", "verify_cmd": "exit 0", "files": "a"}),
+        ),
+        (
+            "task_start",
+            json!({"goal": "g", "verify_cmd": "exit 0", "max_attempts": -1}),
+        ),
         ("task_propose", json!({"edits": []})),
         ("task_propose", json!({"task_id": "missing"})),
-        ("task_propose", json!({"task_id": "missing", "edits": [{"path": "a"}]})),
-        ("task_propose", json!({"task_id": "missing", "edits": [{"path": 1, "content": "x"}]})),
+        (
+            "task_propose",
+            json!({"task_id": "missing", "edits": [{"path": "a"}]}),
+        ),
+        (
+            "task_propose",
+            json!({"task_id": "missing", "edits": [{"path": 1, "content": "x"}]}),
+        ),
         ("task_history", json!({})),
         ("task_history", json!({"task_id": 1})),
         ("task_finish", json!({})),
-        ("task_finish", json!({"task_id": "missing", "commit": "false"})),
+        (
+            "task_finish",
+            json!({"task_id": "missing", "commit": "false"}),
+        ),
     ];
     for (index, (method, params)) in cases.into_iter().enumerate() {
         let response = server.request(json!(index), method, params);
         assert_error(&response, -32602, "invalid params");
     }
     // Optional start parameters really are optional, even after invalid calls.
-    let started = server.result("task_start", json!({"goal": "goal", "verify_cmd": "exit 0"}));
+    let started = server.result(
+        "task_start",
+        json!({"goal": "goal", "verify_cmd": "exit 0"}),
+    );
     assert!(started["task_id"].is_string());
 }
 
@@ -205,7 +232,10 @@ fn successful_lifecycle_preserves_contents_and_defaults_to_commit() {
     let path = server.workspace.path().join("file.txt");
     fs::write(&path, "original").unwrap();
     let task_id = server.start("exit 0", &["file.txt"]);
-    assert_eq!(server.result("task_history", json!({"task_id": task_id}))["attempts"], json!([]));
+    assert_eq!(
+        server.result("task_history", json!({"task_id": task_id}))["attempts"],
+        json!([])
+    );
 
     let content = "updated\n\"quoted\" \\ \u{03bb}\n";
     let proposed = server.result(
@@ -273,7 +303,10 @@ fn rejected_and_empty_proposals_are_results_and_history_is_ordered() {
     assert_eq!(duplicate["passed"], false);
     assert_eq!(duplicate["attempt"], 2);
     assert_eq!(duplicate["fingerprint"], first["fingerprint"]);
-    assert!(duplicate["output"].as_str().unwrap().contains("already rejected"));
+    assert!(duplicate["output"]
+        .as_str()
+        .unwrap()
+        .contains("already rejected"));
     let empty = server.result("task_propose", json!({"task_id": task_id, "edits": []}));
     assert_eq!(empty["passed"], false);
     assert_eq!(empty["attempt"], 3);

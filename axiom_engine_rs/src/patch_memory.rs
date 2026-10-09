@@ -142,7 +142,10 @@ impl PatchMemory {
     /// add it. Candidates are kept ranked by `verified_count` (desc).
     pub fn record_verified(&mut self, fingerprint: &str, rel_path: &str, content: &str) {
         let sha = sha256_hex(content.as_bytes());
-        let list = self.by_fingerprint.entry(fingerprint.to_string()).or_default();
+        let list = self
+            .by_fingerprint
+            .entry(fingerprint.to_string())
+            .or_default();
         if let Some(existing) = list.iter_mut().find(|c| c.sha256 == sha) {
             existing.verified_count = existing.verified_count.saturating_add(1);
         } else {
@@ -210,11 +213,15 @@ impl PatchMemory {
         // verified_count) rather than raw verified_count order. This only changes
         // *which candidate the verifier tries first* — the verify gate below is
         // unchanged, so re-verify-before-trust is fully preserved.
-        let matching: Vec<&PatchCandidate> =
-            candidates.iter().filter(|c| c.rel_path == rel_path).collect();
+        let matching: Vec<&PatchCandidate> = candidates
+            .iter()
+            .filter(|c| c.rel_path == rel_path)
+            .collect();
         let adapter_cands: Vec<crate::test_time_adapter::Candidate> = matching
             .iter()
-            .map(|c| crate::test_time_adapter::Candidate::new(c.content.clone(), c.verified_count as f32))
+            .map(|c| {
+                crate::test_time_adapter::Candidate::new(c.content.clone(), c.verified_count as f32)
+            })
             .collect();
         let order = crate::test_time_adapter::rerank_by_self_consistency(&adapter_cands);
 
@@ -232,7 +239,9 @@ impl PatchMemory {
             }
             // Rejected locally → roll back byte-for-byte; never trust unverified.
             if std::fs::write(source_path, &original).is_err() {
-                eprintln!("[axiom-patch] WARNING: failed to restore original after rejected candidate");
+                eprintln!(
+                    "[axiom-patch] WARNING: failed to restore original after rejected candidate"
+                );
             }
         }
         None
@@ -250,7 +259,9 @@ impl PatchMemory {
             list.iter().filter(|c| c.rel_path == rel_path).collect();
         let adapter_cands: Vec<crate::test_time_adapter::Candidate> = matching
             .iter()
-            .map(|c| crate::test_time_adapter::Candidate::new(c.content.clone(), c.verified_count as f32))
+            .map(|c| {
+                crate::test_time_adapter::Candidate::new(c.content.clone(), c.verified_count as f32)
+            })
             .collect();
         crate::test_time_adapter::rerank_by_self_consistency(&adapter_cands)
             .into_iter()
@@ -298,8 +309,8 @@ impl PatchMemory {
         policy: FleetTrustPolicy,
     ) -> Result<PatchMergeReport, ProvenanceError> {
         let payload = verify_export(export, fleet_key)?;
-        let peer: PatchMemory = serde_json::from_str(payload)
-            .map_err(|_| ProvenanceError::BadSchema)?;
+        let peer: PatchMemory =
+            serde_json::from_str(payload).map_err(|_| ProvenanceError::BadSchema)?;
         let mut report = PatchMergeReport {
             new_candidates: 0,
             reinforced: 0,
@@ -322,7 +333,9 @@ impl PatchMemory {
                 if let Some(existing) = local.iter_mut().find(|c| c.sha256 == pc.sha256) {
                     // Bound the trust a single peer can inject: one export should
                     // count as at most a few independent confirmations.
-                    let bump = pc.verified_count.min(policy.max_verified_bump_per_candidate);
+                    let bump = pc
+                        .verified_count
+                        .min(policy.max_verified_bump_per_candidate);
                     existing.verified_count = existing.verified_count.saturating_add(bump);
                     report.reinforced += 1;
                 } else {
@@ -333,8 +346,9 @@ impl PatchMemory {
                     }
                     // Also clamp the incoming count of a brand-new candidate so a
                     // peer cannot seed a fresh patch at the top of the ranking.
-                    pc.verified_count =
-                        pc.verified_count.min(policy.max_verified_bump_per_candidate);
+                    pc.verified_count = pc
+                        .verified_count
+                        .min(policy.max_verified_bump_per_candidate);
                     local.push(pc);
                     new_this_fp += 1;
                     report.new_candidates += 1;
@@ -415,14 +429,16 @@ mod tests {
         let mut m = PatchMemory::new();
         m.record_verified("fp", "f.txt", "WRONG"); // won't verify
         m.record_verified("fp", "f.txt", "FIXED"); // will verify
-        // Make FIXED outrank WRONG so order is deterministic-ish, but try() must
-        // still skip WRONG (fails verify) and keep FIXED.
+                                                   // Make FIXED outrank WRONG so order is deterministic-ish, but try() must
+                                                   // still skip WRONG (fails verify) and keep FIXED.
         m.record_verified("fp", "f.txt", "FIXED");
 
         // verify() = the file currently contains FIXED.
         let p = path.clone();
         let applied = m.try_candidates("fp", "f.txt", &path, || {
-            std::fs::read_to_string(&p).map(|s| s.contains("FIXED")).unwrap_or(false)
+            std::fs::read_to_string(&p)
+                .map(|s| s.contains("FIXED"))
+                .unwrap_or(false)
         });
         assert!(applied.is_some(), "the locally-verifying patch is applied");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "FIXED");
@@ -431,7 +447,8 @@ mod tests {
 
     #[test]
     fn try_candidates_leaves_source_untouched_when_none_verify() {
-        let path = std::env::temp_dir().join(format!("axiom_patchmem_none_{}.txt", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("axiom_patchmem_none_{}.txt", std::process::id()));
         std::fs::write(&path, "ORIGINAL").unwrap();
         let mut m = PatchMemory::new();
         m.record_verified("fp", "f.txt", "ALSO_WRONG");
@@ -452,14 +469,18 @@ mod tests {
         // even when they share a fingerprint and verify() would pass. Without the
         // rel_path guard a broad suite (one fingerprint, many files) could let an
         // `a.rs` fix corrupt `b.rs`.
-        let path = std::env::temp_dir().join(format!("axiom_patchmem_xfile_{}.txt", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("axiom_patchmem_xfile_{}.txt", std::process::id()));
         std::fs::write(&path, "ORIGINAL_B").unwrap();
         let mut m = PatchMemory::new();
         m.record_verified("fp", "src/a.rs", "FIX_FOR_A"); // recorded for a.rs only
 
         // Caller targets b.rs (rel_path "src/b.rs"); verify() would accept anything.
         let applied = m.try_candidates("fp", "src/b.rs", &path, || true);
-        assert!(applied.is_none(), "a patch recorded for a.rs is not applied to b.rs");
+        assert!(
+            applied.is_none(),
+            "a patch recorded for a.rs is not applied to b.rs"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "ORIGINAL_B",
@@ -518,7 +539,10 @@ mod tests {
         let rep = local
             .merge_signed_guarded(&export, Some(key), FleetTrustPolicy::robust())
             .unwrap();
-        assert_eq!(rep.new_candidates, 8, "flood capped to 8 new per fingerprint");
+        assert_eq!(
+            rep.new_candidates, 8,
+            "flood capped to 8 new per fingerprint"
+        );
         assert_eq!(rep.byzantine_rejected, 12);
         assert_eq!(local.candidates("fp").len(), 8);
         assert!(
@@ -547,7 +571,9 @@ mod tests {
             ..FleetTrustPolicy::robust()
         };
         let mut local = PatchMemory::new();
-        let rep = local.merge_signed_guarded(&export, Some(key), policy).unwrap();
+        let rep = local
+            .merge_signed_guarded(&export, Some(key), policy)
+            .unwrap();
         assert_eq!(rep.new_candidates, 0);
         assert_eq!(rep.byzantine_rejected, 1);
         assert!(local.candidates("fp").is_empty());
@@ -574,6 +600,10 @@ mod tests {
         let rep = local.merge_signed(&export, Some(key)).unwrap();
         assert_eq!(rep.reinforced, 1);
         assert_eq!(rep.byzantine_rejected, 0);
-        assert_eq!(local.candidates("fp")[0].verified_count, 51, "1 + 50 unbounded");
+        assert_eq!(
+            local.candidates("fp")[0].verified_count,
+            51,
+            "1 + 50 unbounded"
+        );
     }
 }

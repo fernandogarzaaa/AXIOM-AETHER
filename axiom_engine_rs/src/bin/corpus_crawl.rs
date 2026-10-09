@@ -16,7 +16,10 @@ use std::path::PathBuf;
 use axiom_engine::corpus::{collect_files, Deduper};
 
 fn env_u64(k: &str, d: u64) -> u64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -51,7 +54,11 @@ fn main() -> std::io::Result<()> {
     }
     eprintln!(
         "[crawl] roots: {}",
-        roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     let mut dedup = Deduper::new();

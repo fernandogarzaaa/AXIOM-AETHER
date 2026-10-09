@@ -83,7 +83,10 @@ fn prime_on_empty_dir_writes_identity_vibe() {
 
     assert_eq!(report.files_absorbed, 0);
     assert_eq!(report.tokens_absorbed, 0);
-    assert!(vibe_path.exists(), "an identity master vibe is still written");
+    assert!(
+        vibe_path.exists(),
+        "an identity master vibe is still written"
+    );
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_file(&vibe_path);

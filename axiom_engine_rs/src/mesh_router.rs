@@ -75,11 +75,16 @@ impl MeshModelSelector {
             // was a real, measured problem at a bigger step size.
             let bias = (candidates.len() - i) as f32 * 0.3;
             let node =
-                WorkerNode::new(i, name.clone(), NodeKind::Llm(name.clone()), vec![1.0; DIM]).with_bias(bias);
+                WorkerNode::new(i, name.clone(), NodeKind::Llm(name.clone()), vec![1.0; DIM])
+                    .with_bias(bias);
             let id = mesh.add_node(node).expect("constant dim always matches");
             nodes.push((name.clone(), id));
         }
-        Self { mesh: Mutex::new(mesh), rng: Mutex::new(StdRng::from_entropy()), nodes }
+        Self {
+            mesh: Mutex::new(mesh),
+            rng: Mutex::new(StdRng::from_entropy()),
+            nodes,
+        }
     }
 
     /// Pick a model from `available`, restricted to the subset the mesh
@@ -100,9 +105,14 @@ impl MeshModelSelector {
         let payload = Array1::<f32>::ones(DIM);
         let mesh = self.mesh.lock().unwrap();
         let mut rng = self.rng.lock().unwrap();
-        let adhesion = mesh.forward_restricted(&payload, None, &eligible, &mut *rng).ok()?;
+        let adhesion = mesh
+            .forward_restricted(&payload, None, &eligible, &mut *rng)
+            .ok()?;
         let winner = adhesion.active.first()?;
-        self.nodes.iter().find(|(_, id)| id == winner).map(|(name, _)| name.clone())
+        self.nodes
+            .iter()
+            .find(|(_, id)| id == winner)
+            .map(|(name, _)| name.clone())
     }
 
     /// Feed back whether `model`'s call succeeded and how long it took.
@@ -124,8 +134,14 @@ impl MeshModelSelector {
     /// depends on absolute wall-clock units or can dwarf a real failure
     /// signal.
     pub fn record_outcome(&self, model: &str, success: bool, latency_ms: u64) {
-        let Some((_, id)) = self.nodes.iter().find(|(name, _)| name == model) else { return };
-        let reward = if success { 200.0 / (latency_ms.max(1) as f32 + 200.0) } else { -1.0 };
+        let Some((_, id)) = self.nodes.iter().find(|(name, _)| name == model) else {
+            return;
+        };
+        let reward = if success {
+            200.0 / (latency_ms.max(1) as f32 + 200.0)
+        } else {
+            -1.0
+        };
         self.mesh.lock().unwrap().record_outcome(*id, reward);
     }
 }
@@ -140,7 +156,8 @@ mod tests {
 
     #[test]
     fn selects_the_top_priority_candidate_with_no_learned_signal() {
-        let selector = MeshModelSelector::new(&names(&["phi4:3.8b", "deepseek-r1:8b", "llama3.3:8b"]));
+        let selector =
+            MeshModelSelector::new(&names(&["phi4:3.8b", "deepseek-r1:8b", "llama3.3:8b"]));
         // All three available, tau low enough (0.3) with a clear bias gap
         // (2.0 per rank) that the top-priority candidate should win
         // essentially every draw — sweep seeds to confirm it's not luck.
@@ -152,7 +169,10 @@ mod tests {
                 top_wins += 1;
             }
         }
-        assert!(top_wins >= 48, "expected the top-priority candidate to dominate, got {top_wins}/50");
+        assert!(
+            top_wins >= 48,
+            "expected the top-priority candidate to dominate, got {top_wins}/50"
+        );
     }
 
     #[test]
@@ -180,7 +200,9 @@ mod tests {
         }
         let mut deepseek_wins = 0;
         for _ in 0..50 {
-            if selector.select(&names(&["phi4:3.8b", "deepseek-r1:8b"])) == Some("deepseek-r1:8b".to_string()) {
+            if selector.select(&names(&["phi4:3.8b", "deepseek-r1:8b"]))
+                == Some("deepseek-r1:8b".to_string())
+            {
                 deepseek_wins += 1;
             }
         }
@@ -194,6 +216,9 @@ mod tests {
     fn record_outcome_for_unknown_model_is_a_no_op() {
         let selector = MeshModelSelector::new(&names(&["phi4:3.8b"]));
         selector.record_outcome("not-a-configured-model", true, 10); // must not panic
-        assert_eq!(selector.select(&names(&["phi4:3.8b"])), Some("phi4:3.8b".to_string()));
+        assert_eq!(
+            selector.select(&names(&["phi4:3.8b"])),
+            Some("phi4:3.8b".to_string())
+        );
     }
 }

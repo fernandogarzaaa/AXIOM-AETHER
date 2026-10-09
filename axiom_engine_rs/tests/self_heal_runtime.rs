@@ -99,12 +99,7 @@ fn heals_missing_directory_and_completes() {
     let target = base.join("out").join("result.txt");
     let script = format!("echo healed-run-output > {}", sh_path(&target));
 
-    let report = supervise(
-        tiny_pipeline(),
-        posix_shell(),
-        vec!["-c".into(), script],
-        3,
-    );
+    let report = supervise(tiny_pipeline(), posix_shell(), vec!["-c".into(), script], 3);
 
     assert!(report.success, "run must succeed after the heal");
     assert_eq!(report.attempts, 2, "fail once, heal, succeed on restart");
@@ -113,7 +108,10 @@ fn heals_missing_directory_and_completes() {
         vec![Heal::CreatedDirectory(base.join("out"))],
         "the missing directory must be the applied heal"
     );
-    assert!(report.tokens_absorbed > 0, "the failure trace must be absorbed");
+    assert!(
+        report.tokens_absorbed > 0,
+        "the failure trace must be absorbed"
+    );
     assert_eq!(report.tension.len(), 1, "one failure → one tension sample");
     assert!(
         report.tension[0].ce_before.is_finite() && report.tension[0].ce_after.is_finite(),
@@ -137,7 +135,11 @@ fn stops_without_applicable_heal_and_propagates_exit_code() {
     );
     assert!(!report.success);
     assert_eq!(report.attempts, 1, "no heal → no blind restart");
-    assert_eq!(report.exit_code, Some(7), "child exit code must be preserved");
+    assert_eq!(
+        report.exit_code,
+        Some(7),
+        "child exit code must be preserved"
+    );
     assert!(report.heals.is_empty());
 }
 
@@ -148,16 +150,14 @@ fn never_fabricates_missing_file_content() {
     let base = unique_tmp("nofab");
     let target = base.join("cfg").join("settings.json");
 
-    let report = supervise(
-        tiny_pipeline(),
-        "cat".into(),
-        vec![sh_path(&target)],
-        3,
-    );
+    let report = supervise(tiny_pipeline(), "cat".into(), vec![sh_path(&target)], 3);
 
     assert!(!report.success, "cat of a missing file cannot be healed");
     assert_eq!(report.attempts, 2, "heal dir, retry, then stop");
-    assert!(!target.exists(), "the supervisor must never create file content");
+    assert!(
+        !target.exists(),
+        "the supervisor must never create file content"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -189,7 +189,10 @@ fn transient_fault_retries_then_succeeds() {
 
     assert!(report.success, "must recover after the transient retry");
     assert_eq!(report.attempts, 2);
-    assert_eq!(report.heals, vec![Heal::TransientRetry("connection refused")]);
+    assert_eq!(
+        report.heals,
+        vec![Heal::TransientRetry("connection refused")]
+    );
 
     let _ = std::fs::remove_file(&marker);
 }
@@ -289,7 +292,10 @@ fn immunity_is_per_command_fingerprint() {
         Some(memory.clone()),
     );
     assert!(other.success);
-    assert!(other.heals.is_empty(), "no inherited immunity across commands");
+    assert!(
+        other.heals.is_empty(),
+        "no inherited immunity across commands"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_file(&memory);
@@ -361,7 +367,10 @@ fn immunity_is_location_invariant_across_working_directories() {
     std::fs::create_dir_all(&dir_b).unwrap();
     let memory = unique_tmp("loc_mem").with_extension("json");
     // cwd-relative output path — identical command string → identical fingerprint.
-    let args = vec!["-c".to_string(), "echo built > build/out/app.bin".to_string()];
+    let args = vec![
+        "-c".to_string(),
+        "echo built > build/out/app.bin".to_string(),
+    ];
 
     let mk = |anchor: PathBuf| SupervisorOptions {
         max_restarts: 3,
@@ -371,16 +380,27 @@ fn immunity_is_location_invariant_across_working_directories() {
     };
 
     // Run 1 in dir A: fails on missing build/out, heals it, succeeds, learns.
-    let a = supervise_opts(tiny_pipeline(), posix_shell(), args.clone(), mk(dir_a.clone()));
+    let a = supervise_opts(
+        tiny_pipeline(),
+        posix_shell(),
+        args.clone(),
+        mk(dir_a.clone()),
+    );
     assert!(a.success);
-    assert_eq!(a.heals, vec![CreatedDirectory(dir_a.join("build").join("out"))]);
+    assert_eq!(
+        a.heals,
+        vec![CreatedDirectory(dir_a.join("build").join("out"))]
+    );
 
     // Run 2 in dir B: never ran here, yet immunity pre-creates build/out under B
     // and the program succeeds on the first attempt.
     assert!(!dir_b.join("build").join("out").exists());
     let b = supervise_opts(tiny_pipeline(), posix_shell(), args, mk(dir_b.clone()));
     assert!(b.success);
-    assert_eq!(b.attempts, 1, "portable immunity → first-try success in a new location");
+    assert_eq!(
+        b.attempts, 1,
+        "portable immunity → first-try success in a new location"
+    );
     assert_eq!(b.heals, vec![Immunized(dir_b.join("build").join("out"))]);
     assert!(dir_b.join("build").join("out").join("app.bin").exists());
 
@@ -401,7 +421,10 @@ fn predicts_failure_from_missing_prerequisites_before_running() {
     // Teach Axiom that this command needs ./build/out (relative).
     let mut mem = HealMemory::load(&memory);
     mem.remember_dirs(
-        &fingerprint(&posix_shell(), &["-c".into(), "echo x > build/out/r".into()]),
+        &fingerprint(
+            &posix_shell(),
+            &["-c".into(), "echo x > build/out/r".into()],
+        ),
         "sh -c echo x > build/out/r",
         &[PathBuf::from("build/out")],
     );
@@ -418,7 +441,10 @@ fn predicts_failure_from_missing_prerequisites_before_running() {
     // Prerequisite missing under the anchor → failure predicted before running.
     let p = predict_failure(&cmd, &args, &opts(anchor.clone()));
     assert!(p.likely, "missing prerequisite must predict failure");
-    assert_eq!(p.missing_prerequisites, vec![anchor.join("build").join("out")]);
+    assert_eq!(
+        p.missing_prerequisites,
+        vec![anchor.join("build").join("out")]
+    );
 
     // Create it → prediction flips to no-failure (prerequisites satisfied).
     std::fs::create_dir_all(anchor.join("build").join("out")).unwrap();
@@ -450,18 +476,16 @@ fn heals_missing_execute_bit_on_a_script() {
 
     // Supervise the script directly: spawn fails with PermissionDenied → chmod
     // +x heal → retry → success.
-    let report = supervise(
-        tiny_pipeline(),
-        script.display().to_string(),
-        vec![],
-        3,
-    );
+    let report = supervise(tiny_pipeline(), script.display().to_string(), vec![], 3);
     assert!(report.success, "must run after the execute-bit heal");
     assert_eq!(report.heals, vec![MadeExecutable(script.clone())]);
     let mode = std::fs::metadata(&script).unwrap().permissions().mode();
     assert!(mode & 0o111 != 0, "execute bit must be set");
     // Contents are never touched by the heal.
-    assert_eq!(std::fs::read_to_string(&script).unwrap(), "#!/bin/sh\necho ran\n");
+    assert_eq!(
+        std::fs::read_to_string(&script).unwrap(),
+        "#!/bin/sh\necho ran\n"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -488,7 +512,10 @@ fn diagnoses_and_remembers_missing_env_var() {
     // Can't fabricate the value → run fails, but a diagnostic is surfaced…
     assert!(!report.success);
     assert!(
-        report.diagnostics.iter().any(|d| d.contains("AXIOM_FAKE_TOKEN_XYZ")),
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.contains("AXIOM_FAKE_TOKEN_XYZ")),
         "missing env var must be diagnosed: {:?}",
         report.diagnostics
     );
@@ -535,7 +562,10 @@ fn novel_healed_failure_is_written_to_recall_memory() {
         rec.body.contains(&sh_path(&base.join("out"))),
         "memory body must name the directory heal"
     );
-    assert!(!rec.embedding.is_empty(), "memory must be embedded for recall");
+    assert!(
+        !rec.embedding.is_empty(),
+        "memory must be embedded for recall"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::remove_dir_all(&mem_root);
@@ -585,14 +615,22 @@ fn structural_immunity_generalizes_across_unrelated_commands() {
     // heal -- C gets it pre-created before its very first attempt.
     let c_args = vec!["-c".to_string(), "echo c > dist/c.out".to_string()];
     let fp_c = fingerprint(&posix_shell(), &c_args);
-    assert!(HealMemory::load(&memory).record(&fp_c).is_none(), "C must be genuinely unseen");
+    assert!(
+        HealMemory::load(&memory).record(&fp_c).is_none(),
+        "C must be genuinely unseen"
+    );
 
     let c = supervise_opts(tiny_pipeline(), posix_shell(), c_args, opts);
     assert!(c.success);
-    assert_eq!(c.attempts, 1, "structural immunity must prevent C's first failure entirely");
+    assert_eq!(
+        c.attempts, 1,
+        "structural immunity must prevent C's first failure entirely"
+    );
     assert_eq!(c.heals, vec![StructurallyImmunized(anchor.join("dist"), 2)]);
     assert_eq!(
-        std::fs::read_to_string(anchor.join("dist").join("c.out")).unwrap().trim(),
+        std::fs::read_to_string(anchor.join("dist").join("c.out"))
+            .unwrap()
+            .trim(),
         "c"
     );
 
@@ -600,8 +638,14 @@ fn structural_immunity_generalizes_across_unrelated_commands() {
     // not just a one-off borrowed from A and B.
     let mem = HealMemory::load(&memory);
     let record = mem.record(&fp_c).expect("C must now have its own record");
-    assert!(record.dirs.contains(&PathBuf::from("dist")), "C must own the dir heal directly now");
-    assert_eq!(record.immunizations, 1, "the successful structural run must reinforce C's own belief");
+    assert!(
+        record.dirs.contains(&PathBuf::from("dist")),
+        "C must own the dir heal directly now"
+    );
+    assert_eq!(
+        record.immunizations, 1,
+        "the successful structural run must reinforce C's own belief"
+    );
 
     let _ = std::fs::remove_dir_all(&anchor);
     let _ = std::fs::remove_file(&memory);

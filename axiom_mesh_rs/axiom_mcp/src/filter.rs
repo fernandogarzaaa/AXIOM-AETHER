@@ -47,8 +47,10 @@ impl TokenScrubber {
     /// Scrub a payload. Control characters (except `\n` and `\t`) are always
     /// removed; rules then apply per line.
     pub fn scrub(&self, input: &str) -> String {
-        let cleaned: String =
-            input.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
+        let cleaned: String = input
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+            .collect();
 
         let mut out = Vec::new();
         'line: for line in cleaned.lines() {
@@ -81,19 +83,24 @@ fn redact_assignment(line: &str, key: &str) -> String {
     while let Some(pos) = lower[search_from..].find(&key) {
         let key_end = search_from + pos + key.len();
         let rest = &line[key_end..];
-        let sep_len = rest.find(['=', ':']).filter(|&i| {
-            rest[..i].chars().all(|c| c.is_whitespace())
-        });
+        let sep_len = rest
+            .find(['=', ':'])
+            .filter(|&i| rest[..i].chars().all(|c| c.is_whitespace()));
         if let Some(i) = sep_len {
             let value_start = key_end + i + 1;
             // Value runs to the next whitespace or end of line.
             let value = line[value_start..].trim_start();
             let value_offset = line[value_start..].len() - value.len();
-            let value_end =
-                value.find(char::is_whitespace).map(|e| value_start + value_offset + e).unwrap_or(line.len());
+            let value_end = value
+                .find(char::is_whitespace)
+                .map(|e| value_start + value_offset + e)
+                .unwrap_or(line.len());
             if value_start + value_offset < value_end {
-                result =
-                    format!("{}[REDACTED]{}", &line[..value_start + value_offset], &line[value_end..]);
+                result = format!(
+                    "{}[REDACTED]{}",
+                    &line[..value_start + value_offset],
+                    &line[value_end..]
+                );
                 return result; // one redaction per rule per line is enough
             }
         }

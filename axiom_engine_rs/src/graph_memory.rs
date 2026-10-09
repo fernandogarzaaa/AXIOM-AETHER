@@ -100,7 +100,9 @@ impl EdgeStore {
             }
         }
         live.into_iter()
-            .filter(|e| !e.tombstone && !tombstoned.contains(&(e.from.clone(), e.to.clone(), e.kind)))
+            .filter(|e| {
+                !e.tombstone && !tombstoned.contains(&(e.from.clone(), e.to.clone(), e.kind))
+            })
             .collect()
     }
 
@@ -164,7 +166,10 @@ impl Adjacency {
                 .or_default()
                 .push((e.kind, e.from.clone(), e.weight));
         }
-        Self { out_edges, in_edges }
+        Self {
+            out_edges,
+            in_edges,
+        }
     }
 
     /// Every neighbor reachable from `id` in either direction, as
@@ -214,7 +219,11 @@ impl Default for SpreadParams {
 /// cycles (including self-loops) cannot cause the traversal to loop forever
 /// -- termination is additionally guaranteed structurally, since the outer
 /// loop runs at most `max_hops` times.
-pub fn spread(adj: &Adjacency, seeds: &[(String, f32)], params: &SpreadParams) -> Vec<(String, f32)> {
+pub fn spread(
+    adj: &Adjacency,
+    seeds: &[(String, f32)],
+    params: &SpreadParams,
+) -> Vec<(String, f32)> {
     let mut activation: HashMap<String, f32> = HashMap::new();
     let mut visited: HashSet<String> = HashSet::new();
 
@@ -451,7 +460,12 @@ mod tests {
     fn spread_respects_max_visited() {
         let mut edges = Vec::new();
         for i in 0..1000 {
-            edges.push(edge("center", &format!("leaf{i}"), EdgeKind::CoOccurred, 1.0));
+            edges.push(edge(
+                "center",
+                &format!("leaf{i}"),
+                EdgeKind::CoOccurred,
+                1.0,
+            ));
         }
         let adj = Adjacency::build(&edges);
         let params = SpreadParams {
@@ -466,7 +480,12 @@ mod tests {
     fn spread_is_deterministic() {
         let mut edges = Vec::new();
         for i in 0..50 {
-            edges.push(edge("center", &format!("leaf{i}"), EdgeKind::CoOccurred, 1.0));
+            edges.push(edge(
+                "center",
+                &format!("leaf{i}"),
+                EdgeKind::CoOccurred,
+                1.0,
+            ));
         }
         let adj = Adjacency::build(&edges);
         let params = SpreadParams {

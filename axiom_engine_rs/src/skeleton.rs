@@ -650,7 +650,11 @@ fn capture_constant_block(lines: &[&str], start: usize) -> String {
     }
     for line in &lines[start + 1..] {
         // A new zero-indentation line outside any brackets ends the value.
-        if depth <= 0 && !line.starts_with(' ') && !line.starts_with('\t') && !line.trim().is_empty() {
+        if depth <= 0
+            && !line.starts_with(' ')
+            && !line.starts_with('\t')
+            && !line.trim().is_empty()
+        {
             break;
         }
         for c in line.chars() {
@@ -758,8 +762,12 @@ fn rust_decl_name(node: Node, source: &str) -> Option<String> {
     for i in 0..node.named_child_count() {
         let c = node.named_child(i as u32)?;
         match c.kind() {
-            "declaration_list" | "block" | "field_declaration_list"
-            | "ordered_field_declaration_list" | "enum_variant_list" | "token_tree" => break,
+            "declaration_list"
+            | "block"
+            | "field_declaration_list"
+            | "ordered_field_declaration_list"
+            | "enum_variant_list"
+            | "token_tree" => break,
             "identifier" | "type_identifier" => {
                 if let Some(t) = node_text(c, source) {
                     let t = t.trim();
@@ -958,18 +966,13 @@ fn extract_symbols_generic(heavy: &str) -> (Vec<String>, Vec<RankedSymbol>) {
 /// score descending. At least one line is emitted whenever there is content.
 ///
 /// This is additive: `build_digest` and `expand_symbol` are untouched.
-pub fn skeletonize_ranked(
-    text: &str,
-    language: &str,
-    token_budget: Option<usize>,
-) -> String {
-    let (imports, mut symbols) = if language.eq_ignore_ascii_case("rust")
-        || language.eq_ignore_ascii_case("rs")
-    {
-        extract_symbols_rust(text)
-    } else {
-        extract_symbols_generic(text)
-    };
+pub fn skeletonize_ranked(text: &str, language: &str, token_budget: Option<usize>) -> String {
+    let (imports, mut symbols) =
+        if language.eq_ignore_ascii_case("rust") || language.eq_ignore_ascii_case("rs") {
+            extract_symbols_rust(text)
+        } else {
+            extract_symbols_generic(text)
+        };
 
     if !symbols.is_empty() {
         let adj = build_reference_graph(&symbols);
@@ -977,11 +980,7 @@ pub fn skeletonize_ranked(
         for (sym, sc) in symbols.iter_mut().zip(scores.iter()) {
             sym.score = *sc;
         }
-        symbols.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(Ordering::Equal)
-        });
+        symbols.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
     }
 
     // No code structure found: fall back to a prose excerpt like build_digest.
@@ -1301,9 +1300,7 @@ fn block_end(lines: &[&str], start: usize) -> Option<usize> {
     } else {
         None
     }
-
 }
-
 
 /// Filter one function/method body: keep the signature header, interesting
 /// lines (plus their blocks), and the closing brace; collapse boring runs
@@ -1562,9 +1559,7 @@ mod tests {
         let out = skeletonize_ranked(txt, "python", Some(8));
         // At least the names must appear as stubs, even if signatures don't fit.
         let has_stub = out.contains("(… body elided …)");
-        let all_names_visible = ["alpha", "beta", "gamma"]
-            .iter()
-            .all(|n| out.contains(n));
+        let all_names_visible = ["alpha", "beta", "gamma"].iter().all(|n| out.contains(n));
         assert!(
             has_stub || all_names_visible,
             "budget-elided symbols must keep names: {out}"
@@ -1855,7 +1850,8 @@ impl Point {
 
     #[test]
     fn token_budget_keeps_top_symbols() {
-        let src = "fn aaa() {\n    bbb();\n}\nfn bbb() {\n    ccc();\n}\nfn ccc() -> i32 {\n    42\n}\n";
+        let src =
+            "fn aaa() {\n    bbb();\n}\nfn bbb() {\n    ccc();\n}\nfn ccc() -> i32 {\n    42\n}\n";
         let out = skeletonize_ranked(src, "rust", Some(10));
         assert!(out.contains("fn ccc()"), "{out}");
         assert!(!out.contains("fn aaa()"), "{out}");
@@ -1864,7 +1860,8 @@ impl Point {
 
     #[test]
     fn token_budget_none_keeps_everything() {
-        let src = "fn aaa() {\n    bbb();\n}\nfn bbb() {\n    ccc();\n}\nfn ccc() -> i32 {\n    42\n}\n";
+        let src =
+            "fn aaa() {\n    bbb();\n}\nfn bbb() {\n    ccc();\n}\nfn ccc() -> i32 {\n    42\n}\n";
         let out = skeletonize_ranked(src, "rust", None);
         assert!(out.contains("fn aaa()"));
         assert!(out.contains("fn bbb()"));
@@ -1895,10 +1892,7 @@ impl Point {
             extract_decl_name("pub fn add(a: i32) -> i32 {"),
             Some("add".to_string())
         );
-        assert_eq!(
-            extract_decl_name("class Foo:"),
-            Some("Foo".to_string())
-        );
+        assert_eq!(extract_decl_name("class Foo:"), Some("Foo".to_string()));
         assert_eq!(
             extract_decl_name("    async handle(req, res) {"),
             Some("handle".to_string())
@@ -1907,10 +1901,7 @@ impl Point {
             extract_decl_name("const MAX: usize = 5;"),
             Some("MAX".to_string())
         );
-        assert_eq!(
-            extract_decl_name("impl Point {"),
-            Some("Point".to_string())
-        );
+        assert_eq!(extract_decl_name("impl Point {"), Some("Point".to_string()));
         // `fn` after a colon is a type, not the name.
         assert_eq!(
             extract_decl_name("const f: fn() = g;"),

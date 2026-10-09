@@ -24,8 +24,11 @@ pub fn serialize<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, bincode::e
 ///
 /// Accepts borrowed types like `&str` (via `Deserialize<'a>`), matching the
 /// bincode 1.3 API. The returned value borrows from `bytes`.
-pub fn deserialize<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, bincode::error::DecodeError> {
-    bincode::serde::borrow_decode_from_slice(bytes, bincode::config::legacy()).map(|(value, _)| value)
+pub fn deserialize<'a, T: Deserialize<'a>>(
+    bytes: &'a [u8],
+) -> Result<T, bincode::error::DecodeError> {
+    bincode::serde::borrow_decode_from_slice(bytes, bincode::config::legacy())
+        .map(|(value, _)| value)
 }
 
 #[cfg(test)]

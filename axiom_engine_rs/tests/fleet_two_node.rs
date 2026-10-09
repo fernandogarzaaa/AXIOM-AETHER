@@ -1,8 +1,8 @@
 use axiom_engine::config::AxiomConfig;
-use axiom_engine::dwe::{DweBus, DweFragment, DweLayerDelta, start_dwe_listener};
+use axiom_engine::dwe::{start_dwe_listener, DweBus, DweFragment, DweLayerDelta};
 use axiom_engine::inference::InferencePipeline;
-use axiom_engine::server::{AppState, create_router, start_dwe_apply_loop};
-use axum::body::{Body, to_bytes};
+use axiom_engine::server::{create_router, start_dwe_apply_loop, AppState};
+use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use candle_core::Device;
 use serde_json::json;

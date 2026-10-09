@@ -190,7 +190,8 @@ impl OnlineGuards {
     }
     /// Set the pre-update gradient-norm veto threshold (`0.0` disables).
     pub fn set_max_grad_norm(&self, v: f32) {
-        self.max_grad_norm.store(v.max(0.0).to_bits(), Ordering::Relaxed);
+        self.max_grad_norm
+            .store(v.max(0.0).to_bits(), Ordering::Relaxed);
     }
     /// Enable/disable post-update NaN/Inf rollback.
     pub fn set_nan_rollback(&self, v: bool) {
@@ -222,7 +223,10 @@ impl OnlineGuards {
     /// True when every guard is at its disabled default — lets `forward_native`
     /// skip the guard block (and its device syncs) entirely on the hot path.
     fn all_disabled(&self) -> bool {
-        self.drift() == 0.0 && self.min_error() == 0.0 && self.anchor() == 0.0 && self.max_grad_norm_val() == 0.0
+        self.drift() == 0.0
+            && self.min_error() == 0.0
+            && self.anchor() == 0.0
+            && self.max_grad_norm_val() == 0.0
     }
 }
 
@@ -269,13 +273,15 @@ impl NativeTTTBlock {
         // Default init gives values near 0 ⇒ factor ≈ 1.0 ⇒ starts close to the
         // unmodulated path. The optimizer tunes it during meta-training.
         // Backward compat: old checkpoints lack lr_scale; init to 0.
-        let lr_scale = vs.pp("lr_scale").get((), "lr_scale").unwrap_or_else(|_| {
-            Tensor::zeros((), candle_core::DType::F32, &device).unwrap()
-        });
+        let lr_scale = vs
+            .pp("lr_scale")
+            .get((), "lr_scale")
+            .unwrap_or_else(|_| Tensor::zeros((), candle_core::DType::F32, &device).unwrap());
         // Fast-weight bias. Backward compat: old checkpoints lack fast_bias; init to 0.
-        let fast_bias = vs.pp("fast_bias").get(d, "fast_bias").unwrap_or_else(|_| {
-            Tensor::zeros(d, candle_core::DType::F32, &device).unwrap()
-        });
+        let fast_bias = vs
+            .pp("fast_bias")
+            .get(d, "fast_bias")
+            .unwrap_or_else(|_| Tensor::zeros(d, candle_core::DType::F32, &device).unwrap());
         // Per-token learnable LR offset. Zeros init ⇒ token_scale starts as
         // pure 1/(t+1). Backward compat: old checkpoints lack this key;
         // init to t/(t+1) so token_scale = 1/(t+1) + t/(t+1) = 1.0,
@@ -295,20 +301,21 @@ impl NativeTTTBlock {
         let w_lr = vs
             .pp("w_lr")
             .get((d, 1), "weight")
-            .unwrap_or_else(|_| {
-                Tensor::zeros((d, 1), candle_core::DType::F32, &device).unwrap()
-            });
-        let b_lr = vs.pp("w_lr").get((), "bias").unwrap_or_else(|_| {
-            Tensor::zeros((), candle_core::DType::F32, &device).unwrap()
-        });
+            .unwrap_or_else(|_| Tensor::zeros((d, 1), candle_core::DType::F32, &device).unwrap());
+        let b_lr = vs
+            .pp("w_lr")
+            .get((), "bias")
+            .unwrap_or_else(|_| Tensor::zeros((), candle_core::DType::F32, &device).unwrap());
         // Titans surprise-gating params (Task 3). Init alpha=1.0, beta=0.0.
         // Backward compat: old checkpoints lack these keys.
-        let surprise_alpha = vs.pp("surprise").get((), "alpha").unwrap_or_else(|_| {
-            Tensor::new(1.0f32, &device).unwrap()
-        });
-        let surprise_beta = vs.pp("surprise").get((), "beta").unwrap_or_else(|_| {
-            Tensor::new(0.0f32, &device).unwrap()
-        });
+        let surprise_alpha = vs
+            .pp("surprise")
+            .get((), "alpha")
+            .unwrap_or_else(|_| Tensor::new(1.0f32, &device).unwrap());
+        let surprise_beta = vs
+            .pp("surprise")
+            .get((), "beta")
+            .unwrap_or_else(|_| Tensor::new(0.0f32, &device).unwrap());
         Ok(Self {
             w_q,
             w_k,
@@ -490,11 +497,7 @@ impl NativeTTTBlock {
         // (where sigma = sqrt(var(pred) + eps)). We scale the error by 1/sigma.
         let d_model_f = pred.dims()[0] as f64;
         let pred_mean = (pred.sum_all()? / d_model_f)?;
-        let pred_var = (pred
-            .broadcast_sub(&pred_mean)?
-            .sqr()?
-            .sum_all()?
-            / d_model_f)?;
+        let pred_var = (pred.broadcast_sub(&pred_mean)?.sqr()?.sum_all()? / d_model_f)?;
         let inv_sigma = (pred_var + 1e-5)?.sqrt()?.recip()?;
         let error_corrected = error.broadcast_mul(&inv_sigma)?;
         // Gated-DeltaNet forget gate α ∈ (0, 1] read live from the shared atomic.
@@ -509,7 +512,7 @@ impl NativeTTTBlock {
             let logit = w_alpha.forward(x)?.affine(1.0, GATE_INIT_LOGIT)?; // [1, 1]
             let s = candle_nn::ops::sigmoid(&logit)?; // [1, 1] ∈ (0, 1)
             let alpha_t = s.affine(1.0 - GATE_FLOOR, GATE_FLOOR)?; // [1, 1]
-            // Use error_corrected for the LayerNorm Jacobian correction.
+                                                                   // Use error_corrected for the LayerNorm Jacobian correction.
             let pred_outer = error_corrected.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
             let v_outer = target.unsqueeze(1)?.matmul(&k_eff)?; // [d, d]
             let memory = session_state.sub(&pred_outer.broadcast_mul(&lr)?)?;
@@ -582,8 +585,7 @@ impl NativeTTTBlock {
                 let fro = updated_state.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
                 if fro > drift {
                     let d = updated_state.dim(0)?;
-                    updated_state =
-                        Tensor::eye(d, updated_state.dtype(), updated_state.device())?;
+                    updated_state = Tensor::eye(d, updated_state.dtype(), updated_state.device())?;
                 }
             }
             if self.guards.nan_rollback_on() {
@@ -712,9 +714,15 @@ mod tests {
         let before: Vec<f32> = state.flatten_all().unwrap().to_vec1().unwrap();
         let out = block.forward_native(&x, &mut state, false, 0).unwrap();
         let ov: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
-        assert!(ov.iter().all(|v| v.is_finite()), "learned-gate output must be finite");
+        assert!(
+            ov.iter().all(|v| v.is_finite()),
+            "learned-gate output must be finite"
+        );
         let after: Vec<f32> = state.flatten_all().unwrap().to_vec1().unwrap();
-        assert_ne!(before, after, "learned gate must still update the fast weights");
+        assert_ne!(
+            before, after,
+            "learned gate must still update the fast weights"
+        );
     }
 
     #[test]
@@ -785,7 +793,10 @@ mod tests {
 
         let ungated = run(1.0);
         let gated = run(0.9);
-        assert!(ungated.is_finite() && gated.is_finite(), "states must stay finite");
+        assert!(
+            ungated.is_finite() && gated.is_finite(),
+            "states must stay finite"
+        );
         assert!(
             gated < ungated,
             "forget gate must shrink retained memory (gated {gated} !< ungated {ungated})"
@@ -865,7 +876,11 @@ mod tests {
             }
             state.flatten_all().unwrap().to_vec1::<f32>().unwrap()
         };
-        assert_eq!(run(), run(), "default-guard path must be a deterministic no-op");
+        assert_eq!(
+            run(),
+            run(),
+            "default-guard path must be a deterministic no-op"
+        );
     }
 
     #[test]
@@ -881,9 +896,19 @@ mod tests {
         for _ in 0..32 {
             let _ = block.forward_native(&x, &mut state, false, 0).unwrap();
         }
-        let moved = state.sub(&init).unwrap().sqr().unwrap().sum_all().unwrap()
-            .to_scalar::<f32>().unwrap();
-        assert!(moved < 1e-9, "all updates should have been skipped (moved {moved})");
+        let moved = state
+            .sub(&init)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            moved < 1e-9,
+            "all updates should have been skipped (moved {moved})"
+        );
     }
 
     #[test]
@@ -902,8 +927,15 @@ mod tests {
                 let _ = block.forward_native(&x, &mut state, false, 0).unwrap();
             }
             let eye = Tensor::eye(d, DType::F32, &device_cpu()).unwrap();
-            state.sub(&eye).unwrap().sqr().unwrap().sum_all().unwrap()
-                .to_scalar::<f32>().unwrap()
+            state
+                .sub(&eye)
+                .unwrap()
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
         };
         let unanchored = run(0.0);
         let anchored = run(0.9);
@@ -1015,9 +1047,7 @@ mod tests {
                         .unwrap()
                         .sqrt()
                 })
-                .unwrap_or_else(|| {
-                    panic!("{name} must receive a gradient with training=true")
-                });
+                .unwrap_or_else(|| panic!("{name} must receive a gradient with training=true"));
             assert!(
                 norm > 1e-6,
                 "{name} gradient norm {norm} must be non-zero with training=true"

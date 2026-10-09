@@ -6,7 +6,7 @@
 
 use crate::cognition::PillarResult;
 use crate::corpus::default_corpus_dir;
-use axiom_engine::session_recorder::{ExchangeRecord, read_session};
+use axiom_engine::session_recorder::{read_session, ExchangeRecord};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

@@ -23,11 +23,24 @@ use crate::residual::{Residual, StateVector};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SensorReading {
     /// Terminal output from a command the system ran.
-    Terminal { command: String, stdout: String, stderr: String, exit_code: i32 },
+    Terminal {
+        command: String,
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    },
     /// A file changed on disk.
-    FileDiff { path: String, lines_added: usize, lines_removed: usize },
+    FileDiff {
+        path: String,
+        lines_added: usize,
+        lines_removed: usize,
+    },
     /// A test run finished.
-    TestLog { passed: usize, failed: usize, failures: Vec<String> },
+    TestLog {
+        passed: usize,
+        failed: usize,
+        failures: Vec<String>,
+    },
 }
 
 /// A concrete action command — never conversational text.
@@ -74,18 +87,39 @@ pub fn fuse(readings: &[SensorReading], dim: usize) -> StateVector {
     let mut state = Array1::zeros(dim);
     for r in readings {
         match r {
-            SensorReading::Terminal { command, stderr, exit_code, .. } => {
+            SensorReading::Terminal {
+                command,
+                stderr,
+                exit_code,
+                ..
+            } => {
                 hash_feature(&mut state, &format!("term:{command}"), 1.0);
-                hash_feature(&mut state, "term:exit_ok", if *exit_code == 0 { 1.0 } else { -1.0 });
+                hash_feature(
+                    &mut state,
+                    "term:exit_ok",
+                    if *exit_code == 0 { 1.0 } else { -1.0 },
+                );
                 if !stderr.is_empty() {
                     hash_feature(&mut state, "term:stderr", -1.0);
                 }
             }
-            SensorReading::FileDiff { path, lines_added, lines_removed } => {
+            SensorReading::FileDiff {
+                path,
+                lines_added,
+                lines_removed,
+            } => {
                 hash_feature(&mut state, &format!("diff:{path}"), 1.0);
-                hash_feature(&mut state, "diff:churn", (*lines_added + *lines_removed) as f32 / 100.0);
+                hash_feature(
+                    &mut state,
+                    "diff:churn",
+                    (*lines_added + *lines_removed) as f32 / 100.0,
+                );
             }
-            SensorReading::TestLog { passed, failed, failures } => {
+            SensorReading::TestLog {
+                passed,
+                failed,
+                failures,
+            } => {
                 let total = (passed + failed).max(1) as f32;
                 hash_feature(&mut state, "tests:pass_rate", *passed as f32 / total);
                 hash_feature(&mut state, "tests:failing", *failed as f32);
@@ -124,8 +158,14 @@ impl StateSmoother {
     /// # Panics
     /// Panics if `alpha` isn't in `(0.0, 1.0]`.
     pub fn new(alpha: f32) -> Self {
-        assert!(alpha > 0.0 && alpha <= 1.0, "StateSmoother: alpha must be in (0.0, 1.0], got {alpha}");
-        Self { alpha, estimate: None }
+        assert!(
+            alpha > 0.0 && alpha <= 1.0,
+            "StateSmoother: alpha must be in (0.0, 1.0], got {alpha}"
+        );
+        Self {
+            alpha,
+            estimate: None,
+        }
     }
 
     /// A smoother that performs no smoothing — every `update` returns the
@@ -179,15 +219,23 @@ impl IdcController {
     pub fn actuate(&self, residual: &Residual, verify_command: Option<&str>) -> CorrectionVector {
         let norm = residual.norm();
         if residual.converged(self.epsilon) {
-            return CorrectionVector { residual_norm: norm, actions: vec![Actuation::Halt] };
+            return CorrectionVector {
+                residual_norm: norm,
+                actions: vec![Actuation::Halt],
+            };
         }
         let mut actions = vec![Actuation::Dispatch {
             intent: format!("reduce residual (norm {norm:.4}) toward goal state"),
         }];
         if let Some(cmd) = verify_command {
-            actions.push(Actuation::RunCommand { command: cmd.to_string() });
+            actions.push(Actuation::RunCommand {
+                command: cmd.to_string(),
+            });
         }
-        CorrectionVector { residual_norm: norm, actions }
+        CorrectionVector {
+            residual_norm: norm,
+            actions,
+        }
     }
 }
 
@@ -196,7 +244,11 @@ mod tests {
     use super::*;
 
     fn passing_tests() -> SensorReading {
-        SensorReading::TestLog { passed: 10, failed: 0, failures: vec![] }
+        SensorReading::TestLog {
+            passed: 10,
+            failed: 0,
+            failures: vec![],
+        }
     }
 
     #[test]
@@ -217,7 +269,11 @@ mod tests {
     fn failing_tests_move_state_away_from_goal() {
         let goal = fuse(&[passing_tests()], 32);
         let bad = fuse(
-            &[SensorReading::TestLog { passed: 5, failed: 5, failures: vec!["t::a".into()] }],
+            &[SensorReading::TestLog {
+                passed: 5,
+                failed: 5,
+                failures: vec!["t::a".into()],
+            }],
             32,
         );
         let ctl = IdcController::new(goal, 1e-3);
@@ -240,7 +296,12 @@ mod tests {
         let cv = ctl.actuate(&gap, Some("cargo test"));
         assert!(cv.residual_norm > 0.0);
         assert!(matches!(cv.actions[0], Actuation::Dispatch { .. }));
-        assert_eq!(cv.actions[1], Actuation::RunCommand { command: "cargo test".into() });
+        assert_eq!(
+            cv.actions[1],
+            Actuation::RunCommand {
+                command: "cargo test".into()
+            }
+        );
     }
 
     #[test]
@@ -259,7 +320,10 @@ mod tests {
         let second = StateVector(Array1::from_vec(vec![4.0]));
 
         // First call seeds the estimate verbatim.
-        assert_eq!(smoother.update(first), StateVector(Array1::from_vec(vec![0.0])));
+        assert_eq!(
+            smoother.update(first),
+            StateVector(Array1::from_vec(vec![0.0]))
+        );
         // Second: 0.75*0.0 + 0.25*4.0 = 1.0.
         let out = smoother.update(second);
         assert!((out.0[0] - 1.0).abs() < 1e-6, "got {}", out.0[0]);
@@ -269,11 +333,15 @@ mod tests {
     fn smoother_reduces_variance_of_an_oscillating_signal() {
         // A signal alternating far above/below its true mean (0.0) — the
         // kind of tick-to-tick chatter a flaky sensor produces.
-        let raw: Vec<f32> = (0..40).map(|i| if i % 2 == 0 { 10.0 } else { -10.0 }).collect();
+        let raw: Vec<f32> = (0..40)
+            .map(|i| if i % 2 == 0 { 10.0 } else { -10.0 })
+            .collect();
 
         let mut smoother = StateSmoother::new(0.1);
-        let smoothed: Vec<f32> =
-            raw.iter().map(|&x| smoother.update(StateVector(Array1::from_vec(vec![x]))).0[0]).collect();
+        let smoothed: Vec<f32> = raw
+            .iter()
+            .map(|&x| smoother.update(StateVector(Array1::from_vec(vec![x]))).0[0])
+            .collect();
 
         let variance = |xs: &[f32]| {
             let mean = xs.iter().sum::<f32>() / xs.len() as f32;

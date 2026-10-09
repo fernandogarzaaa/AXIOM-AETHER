@@ -88,10 +88,17 @@ impl std::fmt::Display for Heal {
         match self {
             Heal::CreatedDirectory(p) => write!(f, "created directory {}", p.display()),
             Heal::TransientRetry(phrase) => {
-                write!(f, "transient fault (\"{phrase}\") — backing off and retrying")
+                write!(
+                    f,
+                    "transient fault (\"{phrase}\") — backing off and retrying"
+                )
             }
             Heal::Immunized(p) => {
-                write!(f, "immunity: pre-created remembered directory {}", p.display())
+                write!(
+                    f,
+                    "immunity: pre-created remembered directory {}",
+                    p.display()
+                )
             }
             Heal::StructurallyImmunized(p, n) => {
                 write!(
@@ -266,8 +273,7 @@ pub fn extract_missing_paths(trace: &str) -> Vec<PathBuf> {
             }
             let absolute = t.starts_with('/') || t.starts_with("./");
             let relative_path = t.contains('/')
-                && t
-                    .chars()
+                && t.chars()
                     .next()
                     .is_some_and(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_');
             if absolute || relative_path {
@@ -320,7 +326,9 @@ pub fn extract_permission_denied_paths(trace: &str) -> Vec<PathBuf> {
             continue;
         }
         for raw in line.split(|c: char| c.is_whitespace() || c == ':') {
-            let t = raw.trim().trim_matches(|c| c == '\'' || c == '"' || c == ',' || c == ';');
+            let t = raw
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"' || c == ',' || c == ';');
             if t.len() <= 1 || t.contains("://") || seen.contains(t) {
                 continue;
             }
@@ -515,7 +523,11 @@ pub struct FailurePrediction {
 /// Predict, before running, whether `command args...` is likely to fail in the
 /// current environment — purely from learned immunity (no execution, no model).
 /// This is the anticipatory counterpart to the reactive supervisor.
-pub fn predict_failure(command: &str, args: &[String], opts: &SupervisorOptions) -> FailurePrediction {
+pub fn predict_failure(
+    command: &str,
+    args: &[String],
+    opts: &SupervisorOptions,
+) -> FailurePrediction {
     let anchor = opts
         .anchor
         .clone()
@@ -543,7 +555,8 @@ pub fn predict_failure(command: &str, args: &[String], opts: &SupervisorOptions)
     // any per-program missing dirs already found above; `missing_structural_
     // prerequisites` already excludes dirs this program knows about itself,
     // so the two lists cannot overlap.
-    let (structural_missing, structural_confidence) = mem.missing_structural_prerequisites(&fp, &anchor);
+    let (structural_missing, structural_confidence) =
+        mem.missing_structural_prerequisites(&fp, &anchor);
     if !structural_missing.is_empty() {
         confidence = if missing.is_empty() {
             structural_confidence
@@ -911,7 +924,9 @@ fn finalize_memory(
             .filter_map(|h| match h {
                 Heal::CreatedDirectory(p)
                 | Heal::Immunized(p)
-                | Heal::StructurallyImmunized(p, _) => Some(crate::heal_memory::relativize_dir(p, anchor)),
+                | Heal::StructurallyImmunized(p, _) => {
+                    Some(crate::heal_memory::relativize_dir(p, anchor))
+                }
                 _ => None,
             })
             .collect();
@@ -1078,11 +1093,15 @@ mod tests {
 
     #[test]
     fn extracts_diagnostics_for_disk_full_and_missing_command() {
-        assert!(extract_diagnostics("cp: error writing '/out': No space left on device")
-            .iter()
-            .any(|d| d.contains("disk full")));
+        assert!(
+            extract_diagnostics("cp: error writing '/out': No space left on device")
+                .iter()
+                .any(|d| d.contains("disk full"))
+        );
         let d = extract_diagnostics("bash: line 1: ghostscript: command not found");
-        assert!(d.iter().any(|s| s.contains("ghostscript") && s.contains("missing executable")));
+        assert!(d
+            .iter()
+            .any(|s| s.contains("ghostscript") && s.contains("missing executable")));
         // Clean trace → no diagnostics.
         assert!(extract_diagnostics("all good here").is_empty());
     }
@@ -1119,7 +1138,10 @@ mod tests {
         let heal = heal_missing_path(&file_path, Path::new("/unused")).expect("heal must apply");
         assert_eq!(heal, Heal::CreatedDirectory(base.join("deep")));
         assert!(base.join("deep").exists());
-        assert!(!file_path.exists(), "heal must never create the file itself");
+        assert!(
+            !file_path.exists(),
+            "heal must never create the file itself"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1141,12 +1163,16 @@ mod tests {
     }
 
     fn nanos_tag() -> u128 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     }
 
     #[test]
     fn predict_failure_generalizes_a_structural_heal_to_an_unseen_program() {
-        let mem_path = std::env::temp_dir().join(format!("axiom_predict_structural_{}.json", nanos_tag()));
+        let mem_path =
+            std::env::temp_dir().join(format!("axiom_predict_structural_{}.json", nanos_tag()));
         let anchor = std::env::temp_dir().join(format!("axiom_predict_anchor_{}", nanos_tag()));
         std::fs::create_dir_all(&anchor).unwrap();
 
@@ -1175,7 +1201,10 @@ mod tests {
         };
         assert!(!anchor.join("dist").exists());
         let prediction = predict_failure("gradle", &["build".to_string()], &opts);
-        assert!(prediction.likely, "an unseen program must still inherit a structural prediction");
+        assert!(
+            prediction.likely,
+            "an unseen program must still inherit a structural prediction"
+        );
         assert_eq!(prediction.missing_prerequisites, vec![anchor.join("dist")]);
 
         let _ = std::fs::remove_dir_all(&anchor);

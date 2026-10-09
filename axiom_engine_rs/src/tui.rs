@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -148,7 +150,9 @@ impl App {
     /// available; clears `background_job` once the sender side is dropped
     /// (the job finished).
     fn drain_background_job(&mut self) {
-        let Some(rx) = self.background_job.as_ref() else { return };
+        let Some(rx) = self.background_job.as_ref() else {
+            return;
+        };
         let mut lines = Vec::new();
         let mut disconnected = false;
         loop {
@@ -222,7 +226,9 @@ impl App {
     fn features_value(&self, field: FeaturesField) -> String {
         match field {
             FeaturesField::TttCompress => bool_label(self.cfg.features.ttt_compress),
-            FeaturesField::TttThreshold => self.cfg.features.ttt_compress_threshold_tokens.to_string(),
+            FeaturesField::TttThreshold => {
+                self.cfg.features.ttt_compress_threshold_tokens.to_string()
+            }
             FeaturesField::SwarmLocal => bool_label(self.cfg.features.swarm_local),
             FeaturesField::MeshRouting => bool_label(self.cfg.features.mesh_routing),
             FeaturesField::OllamaUrl => self.cfg.features.ollama_url.clone(),
@@ -243,7 +249,10 @@ impl App {
 
     fn is_bool_field(&self) -> bool {
         match self.tab {
-            1 => matches!(SETTINGS_FIELDS[self.settings_idx], SettingsField::AutoFetchModel),
+            1 => matches!(
+                SETTINGS_FIELDS[self.settings_idx],
+                SettingsField::AutoFetchModel
+            ),
             2 => matches!(
                 FEATURES_FIELDS[self.features_idx],
                 FeaturesField::TttCompress | FeaturesField::SwarmLocal | FeaturesField::MeshRouting
@@ -285,13 +294,19 @@ impl App {
         }
         self.editing = Some(Editing {
             tab: self.tab,
-            index: if self.tab == 1 { self.settings_idx } else { self.features_idx },
+            index: if self.tab == 1 {
+                self.settings_idx
+            } else {
+                self.features_idx
+            },
             buffer: String::new(),
         });
     }
 
     fn commit_edit(&mut self) {
-        let Some(edit) = self.editing.take() else { return };
+        let Some(edit) = self.editing.take() else {
+            return;
+        };
         if edit.buffer.trim().is_empty() {
             self.status_line = "edit cancelled (nothing typed)".to_string();
             return;
@@ -338,7 +353,9 @@ impl App {
                     if cfg.models.auto_fetch {
                         let _ = match config::ensure_base_model(&paths, &cfg) {
                             Ok(Some(p)) => tx.send(format!("base model ready at {}", p.display())),
-                            Ok(None) => tx.send("base model fetch skipped (auto_fetch off)".to_string()),
+                            Ok(None) => {
+                                tx.send("base model fetch skipped (auto_fetch off)".to_string())
+                            }
                             Err(e) => tx.send(format!("base model fetch skipped: {e}")),
                         };
                     }
@@ -358,7 +375,10 @@ impl App {
             }
             ActionItem::DaemonStart => match daemon::start() {
                 Ok(s) => {
-                    self.log(format!("daemon started: pid={:?} endpoint={}", s.pid, s.endpoint));
+                    self.log(format!(
+                        "daemon started: pid={:?} endpoint={}",
+                        s.pid, s.endpoint
+                    ));
                     self.daemon = s;
                 }
                 Err(e) => self.log(format!("daemon start failed: {e}")),
@@ -390,11 +410,17 @@ fn bool_label(v: bool) -> String {
     }
 }
 
-fn apply_settings_edit(cfg: &mut UserConfig, field: SettingsField, raw: &str) -> Result<(), String> {
+fn apply_settings_edit(
+    cfg: &mut UserConfig,
+    field: SettingsField,
+    raw: &str,
+) -> Result<(), String> {
     let raw = raw.trim();
     match field {
         SettingsField::Host => cfg.runtime.host = raw.to_string(),
-        SettingsField::Port => cfg.runtime.port = raw.parse().map_err(|_| "expected a port number")?,
+        SettingsField::Port => {
+            cfg.runtime.port = raw.parse().map_err(|_| "expected a port number")?
+        }
         SettingsField::Device => cfg.runtime.device = raw.to_string(),
         SettingsField::VramBudgetMb => {
             cfg.runtime.vram_budget_mb = raw.parse().map_err(|_| "expected a whole number (MB)")?
@@ -408,16 +434,25 @@ fn apply_settings_edit(cfg: &mut UserConfig, field: SettingsField, raw: &str) ->
     Ok(())
 }
 
-fn apply_features_edit(cfg: &mut UserConfig, field: FeaturesField, raw: &str) -> Result<(), String> {
+fn apply_features_edit(
+    cfg: &mut UserConfig,
+    field: FeaturesField,
+    raw: &str,
+) -> Result<(), String> {
     let raw = raw.trim();
     match field {
         FeaturesField::TttThreshold => {
-            cfg.features.ttt_compress_threshold_tokens =
-                raw.parse().map_err(|_| "expected a whole number (tokens)")?
+            cfg.features.ttt_compress_threshold_tokens = raw
+                .parse()
+                .map_err(|_| "expected a whole number (tokens)")?
         }
         FeaturesField::OllamaUrl => cfg.features.ollama_url = raw.to_string(),
         FeaturesField::OllamaModels => {
-            cfg.features.ollama_models = raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            cfg.features.ollama_models = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         FeaturesField::TttCompress | FeaturesField::SwarmLocal | FeaturesField::MeshRouting => {}
     }
@@ -437,7 +472,9 @@ pub fn run() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let app = App::new(paths, cfg);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop(&mut terminal, app)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        event_loop(&mut terminal, app)
+    }));
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -449,7 +486,10 @@ pub fn run() -> io::Result<()> {
     }
 }
 
-fn event_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
+fn event_loop<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    mut app: App,
+) -> io::Result<()> {
     let tick = Duration::from_millis(250);
     let mut last_tick = Instant::now();
     loop {
@@ -541,14 +581,22 @@ fn wrap_index(current: usize, delta: i32, len: usize) -> usize {
 fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
         .split(f.area());
 
     let titles: Vec<Line> = TABS.iter().map(|t| Line::from(*t)).collect();
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL).title(" axiom "))
         .select(app.tab)
-        .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
     f.render_widget(tabs, chunks[0]);
 
     match app.tab {
@@ -571,7 +619,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Line::from(format!("logs:    {}", app.paths.logs_dir.display())),
         Line::from(format!(
             "daemon:  {} {}",
-            if app.daemon.running { "running" } else { "stopped" },
+            if app.daemon.running {
+                "running"
+            } else {
+                "stopped"
+            },
             app.daemon
                 .pid
                 .map(|p| format!("(pid {p})"))
@@ -593,7 +645,15 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = SETTINGS_FIELDS
         .iter()
         .enumerate()
-        .map(|(i, field)| field_row(f_selected(app.tab, i, app.settings_idx), App::settings_label(*field), &app.settings_value(*field), app, i))
+        .map(|(i, field)| {
+            field_row(
+                f_selected(app.tab, i, app.settings_idx),
+                App::settings_label(*field),
+                &app.settings_value(*field),
+                app,
+                i,
+            )
+        })
         .collect();
     let list = List::new(items).block(
         Block::default()
@@ -607,7 +667,15 @@ fn draw_features(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = FEATURES_FIELDS
         .iter()
         .enumerate()
-        .map(|(i, field)| field_row(f_selected(app.tab, i, app.features_idx), App::features_label(*field), &app.features_value(*field), app, i))
+        .map(|(i, field)| {
+            field_row(
+                f_selected(app.tab, i, app.features_idx),
+                App::features_label(*field),
+                &app.features_value(*field),
+                app,
+                i,
+            )
+        })
         .collect();
     let list = List::new(items).block(
         Block::default()
@@ -621,7 +689,13 @@ fn f_selected(_tab: usize, i: usize, selected: usize) -> bool {
     i == selected
 }
 
-fn field_row(selected: bool, label: &str, value: &str, app: &App, index: usize) -> ListItem<'static> {
+fn field_row(
+    selected: bool,
+    label: &str,
+    value: &str,
+    app: &App,
+    index: usize,
+) -> ListItem<'static> {
     let editing_here = app
         .editing
         .as_ref()
@@ -663,10 +737,21 @@ fn draw_actions(f: &mut Frame, app: &App, area: Rect) {
             ListItem::new(action_label(*action)).style(style)
         })
         .collect();
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" actions — Enter to run "));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" actions — Enter to run "),
+    );
     f.render_widget(list, chunks[0]);
 
-    let output_lines: Vec<Line> = app.output.iter().rev().take(200).rev().map(|l| Line::from(l.clone())).collect();
+    let output_lines: Vec<Line> = app
+        .output
+        .iter()
+        .rev()
+        .take(200)
+        .rev()
+        .map(|l| Line::from(l.clone()))
+        .collect();
     let output = Paragraph::new(output_lines)
         .block(Block::default().borders(Borders::ALL).title(" output "))
         .wrap(Wrap { trim: false });

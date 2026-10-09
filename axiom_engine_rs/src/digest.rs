@@ -150,9 +150,10 @@ pub fn expand_tool_available(outbound: &Value) -> bool {
         .and_then(Value::as_array)
         .map(|tools| {
             tools.iter().any(|t| {
-                t.get("name").and_then(Value::as_str).map(|n| {
-                    n == "axiom_expand" || n.ends_with("__axiom_expand")
-                }).unwrap_or(false)
+                t.get("name")
+                    .and_then(Value::as_str)
+                    .map(|n| n == "axiom_expand" || n.ends_with("__axiom_expand"))
+                    .unwrap_or(false)
             })
         })
         .unwrap_or(false)
@@ -272,7 +273,10 @@ fn append_fault_to(path: &std::path::Path, session: &str, page_id: &str, turns_s
         Ok(mut f) => {
             let _ = writeln!(f, "{line}");
         }
-        Err(e) => eprintln!("[axiom-cvm] failed to append fault row to {}: {e}", path.display()),
+        Err(e) => eprintln!(
+            "[axiom-cvm] failed to append fault row to {}: {e}",
+            path.display()
+        ),
     }
 }
 

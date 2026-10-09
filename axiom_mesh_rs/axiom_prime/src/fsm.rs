@@ -74,7 +74,9 @@ impl Default for PrimeFsm {
 
 impl PrimeFsm {
     pub fn new() -> Self {
-        Self { state: PrimeState::Idle }
+        Self {
+            state: PrimeState::Idle,
+        }
     }
 
     pub fn state(&self) -> &PrimeState {
@@ -82,7 +84,10 @@ impl PrimeFsm {
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self.state, PrimeState::Converged | PrimeState::Halted { .. })
+        matches!(
+            self.state,
+            PrimeState::Converged | PrimeState::Halted { .. }
+        )
     }
 
     /// Pure transition: consume an event, emit commands. Unexpected events
@@ -94,7 +99,9 @@ impl PrimeFsm {
 
         match (&self.state, event) {
             (_, E::Fault { reason }) => {
-                self.state = S::Halted { reason: reason.clone() };
+                self.state = S::Halted {
+                    reason: reason.clone(),
+                };
                 vec![PrimeCommand::AnnounceHalt { reason }]
             }
             (S::Idle, E::GoalLoaded) => {
@@ -111,7 +118,9 @@ impl PrimeFsm {
                 }
             }
             (S::Routing, E::Routed { nodes }) => {
-                self.state = S::AwaitingWorkers { pending: nodes.len() };
+                self.state = S::AwaitingWorkers {
+                    pending: nodes.len(),
+                };
                 vec![PrimeCommand::Dispatch { nodes }]
             }
             (S::AwaitingWorkers { pending }, E::WorkerDone) => {
@@ -142,12 +151,17 @@ mod tests {
     #[test]
     fn full_control_loop_reaches_convergence() {
         let mut fsm = PrimeFsm::new();
-        assert_eq!(fsm.step(PrimeEvent::GoalLoaded), vec![PrimeCommand::FuseSensors]);
+        assert_eq!(
+            fsm.step(PrimeEvent::GoalLoaded),
+            vec![PrimeCommand::FuseSensors]
+        );
         assert_eq!(fsm.step(sensed(false)), vec![PrimeCommand::RouteResidual]);
 
         let nodes = vec![NodeId(0), NodeId(2)];
         assert_eq!(
-            fsm.step(PrimeEvent::Routed { nodes: nodes.clone() }),
+            fsm.step(PrimeEvent::Routed {
+                nodes: nodes.clone()
+            }),
             vec![PrimeCommand::Dispatch { nodes }]
         );
         // First worker done: still waiting, no commands.
@@ -158,7 +172,10 @@ mod tests {
             vec![PrimeCommand::FuseSensors]
         );
         // Residual now within epsilon.
-        assert_eq!(fsm.step(sensed(true)), vec![PrimeCommand::AnnounceConverged]);
+        assert_eq!(
+            fsm.step(sensed(true)),
+            vec![PrimeCommand::AnnounceConverged]
+        );
         assert!(fsm.is_terminal());
     }
 
@@ -166,8 +183,15 @@ mod tests {
     fn fault_halts_from_any_state() {
         let mut fsm = PrimeFsm::new();
         fsm.step(PrimeEvent::GoalLoaded);
-        let cmds = fsm.step(PrimeEvent::Fault { reason: "mesh empty".into() });
-        assert_eq!(cmds, vec![PrimeCommand::AnnounceHalt { reason: "mesh empty".into() }]);
+        let cmds = fsm.step(PrimeEvent::Fault {
+            reason: "mesh empty".into(),
+        });
+        assert_eq!(
+            cmds,
+            vec![PrimeCommand::AnnounceHalt {
+                reason: "mesh empty".into()
+            }]
+        );
         assert!(fsm.is_terminal());
     }
 
@@ -198,8 +222,9 @@ mod tests {
             prop_oneof![
                 Just(PrimeEvent::GoalLoaded),
                 any::<bool>().prop_map(|converged| PrimeEvent::Sensed { converged }),
-                prop::collection::vec(0usize..4, 0..3)
-                    .prop_map(|ids| PrimeEvent::Routed { nodes: ids.into_iter().map(NodeId).collect() }),
+                prop::collection::vec(0usize..4, 0..3).prop_map(|ids| PrimeEvent::Routed {
+                    nodes: ids.into_iter().map(NodeId).collect()
+                }),
                 Just(PrimeEvent::WorkerDone),
                 "[a-z]{0,8}".prop_map(|reason| PrimeEvent::Fault { reason }),
             ]

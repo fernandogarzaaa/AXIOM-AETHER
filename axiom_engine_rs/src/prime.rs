@@ -94,7 +94,11 @@ pub(crate) fn collect_source_files(target: &Path, max_files: usize) -> Vec<PathB
         if !ext_ok {
             continue;
         }
-        if entry.metadata().map(|m| m.len() > MAX_FILE_BYTES).unwrap_or(true) {
+        if entry
+            .metadata()
+            .map(|m| m.len() > MAX_FILE_BYTES)
+            .unwrap_or(true)
+        {
             continue;
         }
         files.push(path.to_path_buf());
@@ -158,8 +162,13 @@ pub fn run_prime(
         tokens_absorbed += tokens.len();
     }
 
-    let mut vibe =
-        MasterVibe::load_or_init(vibe_path, n_layers, d_model, pipeline.device(), DEFAULT_VIBE_DECAY);
+    let mut vibe = MasterVibe::load_or_init(
+        vibe_path,
+        n_layers,
+        d_model,
+        pipeline.device(),
+        DEFAULT_VIBE_DECAY,
+    );
     vibe.commit_and_save(&states)?;
 
     let elapsed = started.elapsed();
@@ -167,7 +176,10 @@ pub fn run_prime(
         "[prime] absorbed {files_absorbed} file(s) / {tokens_absorbed} tokens into {n_layers}×[{d_model}×{d_model}] W̃ in {:.1}s",
         elapsed.as_secs_f32()
     );
-    println!("[prime] committed to master vibe: {}", vibe.path().display());
+    println!(
+        "[prime] committed to master vibe: {}",
+        vibe.path().display()
+    );
     println!("[prime] new sessions can start from it with AXIOM_VIBE_PRIME=1");
 
     Ok(PrimeReport {

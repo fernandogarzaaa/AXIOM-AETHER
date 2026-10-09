@@ -67,6 +67,31 @@ jobs:
             exit 1
           fi
 
+  # cargo fmt is the formatting gate. It runs on every Rust workspace in the
+  # repo and fails the build if any file is not rustfmt-clean, so formatting
+  # drift is caught at PR time instead of accumulating.
+  fmt:
+    name: Formatting (cargo fmt)
+    needs: protocol
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: |
+          for crate in axiom_engine_rs axiom_mesh_rs axiom_mesh_core; do
+            echo "Checking $crate"
+            (cd "$crate" && cargo fmt --check)
+          done
+
   test:
     name: Build & test (Rust)
     # The protocol gate is cheap and its failure invalidates everything below.

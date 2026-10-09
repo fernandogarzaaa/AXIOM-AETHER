@@ -47,7 +47,9 @@ impl Residual {
             goal.dim(),
             current.dim()
         );
-        Self { vector: &goal.0 - &current.0 }
+        Self {
+            vector: &goal.0 - &current.0,
+        }
     }
 
     /// Magnitude of the remaining gap.

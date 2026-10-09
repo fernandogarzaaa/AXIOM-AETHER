@@ -50,10 +50,10 @@ impl Candidate {
 /// simply renamed like any identifier, which is harmless for the equivalence
 /// test as long as it is applied consistently.)
 const PRESERVED_KEYWORDS: &[&str] = &[
-    "fn", "let", "mut", "if", "else", "for", "while", "loop", "match", "return",
-    "struct", "enum", "impl", "trait", "pub", "use", "mod", "const", "static",
-    "self", "Self", "true", "false", "in", "as", "ref", "move", "where", "type",
-    "def", "class", "import", "from", "return", "elif", "None", "True", "False",
+    "fn", "let", "mut", "if", "else", "for", "while", "loop", "match", "return", "struct", "enum",
+    "impl", "trait", "pub", "use", "mod", "const", "static", "self", "Self", "true", "false", "in",
+    "as", "ref", "move", "where", "type", "def", "class", "import", "from", "return", "elif",
+    "None", "True", "False",
 ];
 
 /// Compute the augmentation-invariant canonical form of a source string:
@@ -131,7 +131,10 @@ pub fn rerank_by_self_consistency(candidates: &[Candidate]) -> Vec<usize> {
     }
     // Cluster by canonical form; each cluster's vote is the summed prior mass.
     let mut cluster_vote: HashMap<String, f32> = HashMap::new();
-    let canon: Vec<String> = candidates.iter().map(|c| canonical_form(&c.content)).collect();
+    let canon: Vec<String> = candidates
+        .iter()
+        .map(|c| canonical_form(&c.content))
+        .collect();
     for (idx, key) in canon.iter().enumerate() {
         *cluster_vote.entry(key.clone()).or_insert(0.0) += candidates[idx].prior.max(0.0);
     }

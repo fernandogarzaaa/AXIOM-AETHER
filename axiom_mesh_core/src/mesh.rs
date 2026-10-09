@@ -197,7 +197,10 @@ impl KineticNeuralMesh {
     /// expected at runtime).
     pub fn add_node(&mut self, node: WorkerNode) -> Result<NodeId, MeshError> {
         if node.affinity.len() != self.config.dim {
-            return Err(MeshError::NodeDimMismatch { node: node.affinity.len(), mesh: self.config.dim });
+            return Err(MeshError::NodeDimMismatch {
+                node: node.affinity.len(),
+                mesh: self.config.dim,
+            });
         }
         self.nodes.push(node);
         self.rebuild();
@@ -228,7 +231,9 @@ impl KineticNeuralMesh {
         let mut affinity = Array2::zeros((n, self.config.dim));
         let mut bias = Array1::zeros(n);
         for (i, node) in self.nodes.iter().enumerate() {
-            affinity.row_mut(i).assign(&Array1::from_vec(node.affinity.clone()));
+            affinity
+                .row_mut(i)
+                .assign(&Array1::from_vec(node.affinity.clone()));
             bias[i] = node.bias;
         }
         self.affinity = affinity;
@@ -274,7 +279,8 @@ impl KineticNeuralMesh {
                 }
                 if self.config.bandit_exploration != 0.0 {
                     let n_i = self.visits[i].max(1) as f32;
-                    logits[i] += self.config.bandit_exploration * (total_visits.ln().max(0.0) / n_i).sqrt();
+                    logits[i] +=
+                        self.config.bandit_exploration * (total_visits.ln().max(0.0) / n_i).sqrt();
                 }
             }
         }
@@ -308,7 +314,10 @@ impl KineticNeuralMesh {
             return Err(MeshError::Empty);
         }
         if payload.len() != self.config.dim {
-            return Err(MeshError::DimMismatch { payload: payload.len(), mesh: self.config.dim });
+            return Err(MeshError::DimMismatch {
+                payload: payload.len(),
+                mesh: self.config.dim,
+            });
         }
 
         let field = self.field(payload, residual);
@@ -316,7 +325,11 @@ impl KineticNeuralMesh {
         let tau = self.effective_tau(residual);
 
         let (weights, active) = self.route_topk(&field, fan_out, tau, rng);
-        Ok(Adhesion { weights, active, field })
+        Ok(Adhesion {
+            weights,
+            active,
+            field,
+        })
     }
 
     /// Top-k discrete routing shared by `forward` and `forward_restricted`:
@@ -337,7 +350,11 @@ impl KineticNeuralMesh {
         for _ in 0..fan_out {
             let sample = gumbel_softmax(&masked, tau, self.config.hard, rng);
             let w = sample.winner;
-            weights[w] = if self.config.hard { 1.0 } else { sample.adhesion[w] };
+            weights[w] = if self.config.hard {
+                1.0
+            } else {
+                sample.adhesion[w]
+            };
             active.push(self.nodes[w].id);
             masked[w] = f32::NEG_INFINITY;
         }
@@ -378,7 +395,10 @@ impl KineticNeuralMesh {
             return Err(MeshError::Empty);
         }
         if payload.len() != self.config.dim {
-            return Err(MeshError::DimMismatch { payload: payload.len(), mesh: self.config.dim });
+            return Err(MeshError::DimMismatch {
+                payload: payload.len(),
+                mesh: self.config.dim,
+            });
         }
 
         let eligible_idx: std::collections::HashSet<usize> = eligible
@@ -400,7 +420,11 @@ impl KineticNeuralMesh {
         let tau = self.effective_tau(residual);
 
         let (weights, active) = self.route_topk(&field, fan_out, tau, rng);
-        Ok(Adhesion { weights, active, field })
+        Ok(Adhesion {
+            weights,
+            active,
+            field,
+        })
     }
 
     /// Expert-choice batch dispatch: instead of each payload picking its
@@ -438,7 +462,10 @@ impl KineticNeuralMesh {
         }
         for p in payloads {
             if p.len() != self.config.dim {
-                return Err(MeshError::DimMismatch { payload: p.len(), mesh: self.config.dim });
+                return Err(MeshError::DimMismatch {
+                    payload: p.len(),
+                    mesh: self.config.dim,
+                });
             }
         }
         let capacity = capacity.max(1);
@@ -472,9 +499,14 @@ impl KineticNeuralMesh {
             .filter(|(_, ps)| !ps.is_empty())
             .map(|(n_idx, ps)| (self.nodes[n_idx].id, ps))
             .collect();
-        let dropped = (0..payloads.len()).filter(|&p| !payload_claimed[p]).collect();
+        let dropped = (0..payloads.len())
+            .filter(|&p| !payload_claimed[p])
+            .collect();
 
-        Ok(BatchAdhesion { assignments, dropped })
+        Ok(BatchAdhesion {
+            assignments,
+            dropped,
+        })
     }
 
     /// Mean row of the affinity matrix — a cheap mesh "center of mass",
@@ -502,7 +534,11 @@ mod tests {
     }
 
     fn mesh3() -> KineticNeuralMesh {
-        let mut mesh = KineticNeuralMesh::new(MeshConfig { dim: 3, tau: 0.1, ..Default::default() });
+        let mut mesh = KineticNeuralMesh::new(MeshConfig {
+            dim: 3,
+            tau: 0.1,
+            ..Default::default()
+        });
         mesh.add_node(axis_node(0, "codex", 3, 0)).unwrap();
         mesh.add_node(axis_node(1, "claude", 3, 1)).unwrap();
         mesh.add_node(axis_node(2, "gemini", 3, 2)).unwrap();
@@ -514,7 +550,9 @@ mod tests {
         let mesh = mesh3();
         let mut rng = StdRng::seed_from_u64(3);
         // Payload lives entirely on axis 1 → must snap to "claude".
-        let adhesion = mesh.forward(&array![0.0, 1.0, 0.0], None, &mut rng).unwrap();
+        let adhesion = mesh
+            .forward(&array![0.0, 1.0, 0.0], None, &mut rng)
+            .unwrap();
         assert_eq!(adhesion.active, vec![NodeId(1)]);
         assert_eq!(adhesion.weights, array![0.0, 1.0, 0.0]);
     }
@@ -524,7 +562,9 @@ mod tests {
         let mut mesh = mesh3();
         mesh.config.fan_out = 2;
         let mut rng = StdRng::seed_from_u64(3);
-        let adhesion = mesh.forward(&array![1.0, 1.0, 0.0], None, &mut rng).unwrap();
+        let adhesion = mesh
+            .forward(&array![1.0, 1.0, 0.0], None, &mut rng)
+            .unwrap();
         assert_eq!(adhesion.active.len(), 2);
         assert_eq!(adhesion.weights.iter().filter(|&&w| w == 1.0).count(), 2);
         // Axis-2 node has no pull; it must stay dark.
@@ -539,7 +579,9 @@ mod tests {
         let goal = StateVector(array![0.0, 0.0, 10.0]);
         let current = StateVector::zeros(3);
         let residual = Residual::between(&goal, &current);
-        let adhesion = mesh.forward(&array![0.1, 0.1, 0.1], Some(&residual), &mut rng).unwrap();
+        let adhesion = mesh
+            .forward(&array![0.1, 0.1, 0.1], Some(&residual), &mut rng)
+            .unwrap();
         assert_eq!(adhesion.active, vec![NodeId(2)]);
     }
 
@@ -550,7 +592,9 @@ mod tests {
         assert_eq!(mesh.nodes().len(), 2);
         let mut rng = StdRng::seed_from_u64(3);
         // Axis-1 payload now falls to whichever remaining node wins.
-        let adhesion = mesh.forward(&array![0.0, 1.0, 0.0], None, &mut rng).unwrap();
+        let adhesion = mesh
+            .forward(&array![0.0, 1.0, 0.0], None, &mut rng)
+            .unwrap();
         assert_eq!(adhesion.active.len(), 1);
         assert_ne!(adhesion.active[0], NodeId(1));
     }
@@ -567,22 +611,36 @@ mod tests {
 
     #[test]
     fn empty_mesh_is_an_error() {
-        let mesh = KineticNeuralMesh::new(MeshConfig { dim: 2, ..Default::default() });
+        let mesh = KineticNeuralMesh::new(MeshConfig {
+            dim: 2,
+            ..Default::default()
+        });
         let mut rng = StdRng::seed_from_u64(0);
-        assert!(matches!(mesh.forward(&array![1.0, 0.0], None, &mut rng), Err(MeshError::Empty)));
+        assert!(matches!(
+            mesh.forward(&array![1.0, 0.0], None, &mut rng),
+            Err(MeshError::Empty)
+        ));
     }
 
     #[test]
     fn forward_restricted_never_picks_an_ineligible_node() {
         let mesh = mesh3(); // codex=axis0, claude=axis1, gemini=axis2
-        // Payload favors claude, but claude is excluded from this call —
-        // sweep several seeds since this is a stochastic draw.
+                            // Payload favors claude, but claude is excluded from this call —
+                            // sweep several seeds since this is a stochastic draw.
         for seed in 0..30 {
             let mut rng = StdRng::seed_from_u64(seed);
             let adhesion = mesh
-                .forward_restricted(&array![0.0, 1.0, 0.0], None, &[NodeId(0), NodeId(2)], &mut rng)
+                .forward_restricted(
+                    &array![0.0, 1.0, 0.0],
+                    None,
+                    &[NodeId(0), NodeId(2)],
+                    &mut rng,
+                )
                 .unwrap();
-            assert!(!adhesion.active.contains(&NodeId(1)), "claude must never be chosen when excluded");
+            assert!(
+                !adhesion.active.contains(&NodeId(1)),
+                "claude must never be chosen when excluded"
+            );
         }
     }
 
@@ -607,12 +665,18 @@ mod tests {
         }
         let mut rng = StdRng::seed_from_u64(1);
         // Exclude node 0 for one call...
-        let adhesion = mesh.forward_restricted(&array![1.0, 0.0], None, &[NodeId(1)], &mut rng).unwrap();
+        let adhesion = mesh
+            .forward_restricted(&array![1.0, 0.0], None, &[NodeId(1)], &mut rng)
+            .unwrap();
         assert_eq!(adhesion.active, vec![NodeId(1)]);
         // ...then route unrestricted again: node 0's learned edge must
         // still be there, not reset by having been excluded.
         let adhesion = mesh.forward(&array![1.0, 0.0], None, &mut rng).unwrap();
-        assert_eq!(adhesion.active, vec![NodeId(0)], "node 0's learned quality must have survived exclusion");
+        assert_eq!(
+            adhesion.active,
+            vec![NodeId(0)],
+            "node 0's learned quality must have survived exclusion"
+        );
     }
 
     #[test]
@@ -632,8 +696,15 @@ mod tests {
         mesh.config.tau_min = 0.05;
         mesh.config.tau_max = 2.0;
 
-        let far = Residual::between(&StateVector(array![0.0, 0.0, 100.0]), &StateVector::zeros(3));
-        assert_eq!(mesh.effective_tau(Some(&far)), 2.0, "large residual must clamp to tau_max");
+        let far = Residual::between(
+            &StateVector(array![0.0, 0.0, 100.0]),
+            &StateVector::zeros(3),
+        );
+        assert_eq!(
+            mesh.effective_tau(Some(&far)),
+            2.0,
+            "large residual must clamp to tau_max"
+        );
 
         let near = Residual::between(&StateVector(array![0.0, 0.0, 0.1]), &StateVector::zeros(3));
         assert!(
@@ -651,15 +722,31 @@ mod tests {
             capacity_penalty: 100.0, // large enough to dominate the tie
             ..Default::default()
         });
-        mesh.add_node(WorkerNode::new(0, "a", NodeKind::Llm("a".into()), vec![1.0, 0.0])).unwrap();
-        mesh.add_node(WorkerNode::new(1, "b", NodeKind::Llm("b".into()), vec![1.0, 0.0])).unwrap();
+        mesh.add_node(WorkerNode::new(
+            0,
+            "a",
+            NodeKind::Llm("a".into()),
+            vec![1.0, 0.0],
+        ))
+        .unwrap();
+        mesh.add_node(WorkerNode::new(
+            1,
+            "b",
+            NodeKind::Llm("b".into()),
+            vec![1.0, 0.0],
+        ))
+        .unwrap();
 
         mesh.mark_active(NodeId(0));
         mesh.mark_active(NodeId(0));
 
         let mut rng = StdRng::seed_from_u64(1);
         let adhesion = mesh.forward(&array![1.0, 0.0], None, &mut rng).unwrap();
-        assert_eq!(adhesion.active, vec![NodeId(1)], "busy node 0 must lose the tie to idle node 1");
+        assert_eq!(
+            adhesion.active,
+            vec![NodeId(1)],
+            "busy node 0 must lose the tie to idle node 1"
+        );
 
         mesh.mark_idle(NodeId(0));
         mesh.mark_idle(NodeId(0));
@@ -687,8 +774,20 @@ mod tests {
             bandit_exploration,
             ..Default::default()
         });
-        mesh.add_node(WorkerNode::new(0, "a", NodeKind::Llm("a".into()), vec![1.0, 0.0])).unwrap();
-        mesh.add_node(WorkerNode::new(1, "b", NodeKind::Llm("b".into()), vec![1.0, 0.0])).unwrap();
+        mesh.add_node(WorkerNode::new(
+            0,
+            "a",
+            NodeKind::Llm("a".into()),
+            vec![1.0, 0.0],
+        ))
+        .unwrap();
+        mesh.add_node(WorkerNode::new(
+            1,
+            "b",
+            NodeKind::Llm("b".into()),
+            vec![1.0, 0.0],
+        ))
+        .unwrap();
         mesh
     }
 
@@ -731,7 +830,11 @@ mod tests {
 
         let mut rng = StdRng::seed_from_u64(1);
         let adhesion = mesh.forward(&array![1.0, 0.0], None, &mut rng).unwrap();
-        assert_eq!(adhesion.active, vec![NodeId(0)], "higher observed reward must win the tie");
+        assert_eq!(
+            adhesion.active,
+            vec![NodeId(0)],
+            "higher observed reward must win the tie"
+        );
     }
 
     #[test]
@@ -754,27 +857,56 @@ mod tests {
     #[test]
     fn batch_dispatch_assigns_each_payload_to_its_clear_best_node() {
         let mesh = mesh3(); // axis-aligned nodes: codex=axis0, claude=axis1, gemini=axis2
-        let payloads = vec![array![1.0, 0.0, 0.0], array![0.0, 1.0, 0.0], array![0.0, 0.0, 1.0]];
+        let payloads = vec![
+            array![1.0, 0.0, 0.0],
+            array![0.0, 1.0, 0.0],
+            array![0.0, 0.0, 1.0],
+        ];
         let result = mesh.forward_batch(&payloads, 5, None).unwrap();
         assert!(result.dropped.is_empty());
         let mut by_node: Vec<_> = result.assignments;
         by_node.sort_by_key(|(id, _)| id.0);
-        assert_eq!(by_node, vec![(NodeId(0), vec![0]), (NodeId(1), vec![1]), (NodeId(2), vec![2])]);
+        assert_eq!(
+            by_node,
+            vec![
+                (NodeId(0), vec![0]),
+                (NodeId(1), vec![1]),
+                (NodeId(2), vec![2])
+            ]
+        );
     }
 
     #[test]
     fn batch_dispatch_respects_capacity_and_drops_overflow() {
         // Two nodes tied toward the same direction; three payloads all
         // pulling that way, capacity 1 each — only 2 of 3 can be served.
-        let mut mesh = KineticNeuralMesh::new(MeshConfig { dim: 2, ..Default::default() });
-        mesh.add_node(WorkerNode::new(0, "a", NodeKind::Llm("a".into()), vec![1.0, 0.0])).unwrap();
-        mesh.add_node(WorkerNode::new(1, "b", NodeKind::Llm("b".into()), vec![1.0, 0.0])).unwrap();
+        let mut mesh = KineticNeuralMesh::new(MeshConfig {
+            dim: 2,
+            ..Default::default()
+        });
+        mesh.add_node(WorkerNode::new(
+            0,
+            "a",
+            NodeKind::Llm("a".into()),
+            vec![1.0, 0.0],
+        ))
+        .unwrap();
+        mesh.add_node(WorkerNode::new(
+            1,
+            "b",
+            NodeKind::Llm("b".into()),
+            vec![1.0, 0.0],
+        ))
+        .unwrap();
 
         let payloads = vec![array![1.0, 0.0], array![1.0, 0.0], array![1.0, 0.0]];
         let result = mesh.forward_batch(&payloads, 1, None).unwrap();
 
         let assigned_total: usize = result.assignments.iter().map(|(_, ps)| ps.len()).sum();
-        assert_eq!(assigned_total, 2, "capacity 1 x 2 nodes must serve exactly 2 of 3 payloads");
+        assert_eq!(
+            assigned_total, 2,
+            "capacity 1 x 2 nodes must serve exactly 2 of 3 payloads"
+        );
         assert_eq!(result.dropped.len(), 1);
         for (_, ps) in &result.assignments {
             assert_eq!(ps.len(), 1, "no node may exceed its capacity");
@@ -784,7 +916,11 @@ mod tests {
     #[test]
     fn batch_dispatch_is_deterministic() {
         let mesh = mesh3();
-        let payloads = vec![array![0.5, 0.5, 0.0], array![0.0, 0.5, 0.5], array![0.5, 0.0, 0.5]];
+        let payloads = vec![
+            array![0.5, 0.5, 0.0],
+            array![0.0, 0.5, 0.5],
+            array![0.5, 0.0, 0.5],
+        ];
         let a = mesh.forward_batch(&payloads, 1, None).unwrap();
         let b = mesh.forward_batch(&payloads, 1, None).unwrap();
         let sorted = |r: &BatchAdhesion| {
@@ -807,8 +943,14 @@ mod tests {
 
     #[test]
     fn batch_dispatch_on_empty_mesh_is_an_error() {
-        let mesh = KineticNeuralMesh::new(MeshConfig { dim: 2, ..Default::default() });
-        assert!(matches!(mesh.forward_batch(&[array![1.0, 0.0]], 1, None), Err(MeshError::Empty)));
+        let mesh = KineticNeuralMesh::new(MeshConfig {
+            dim: 2,
+            ..Default::default()
+        });
+        assert!(matches!(
+            mesh.forward_batch(&[array![1.0, 0.0]], 1, None),
+            Err(MeshError::Empty)
+        ));
     }
 
     #[test]

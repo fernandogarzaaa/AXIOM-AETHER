@@ -168,7 +168,10 @@ async fn digest_replaces_heavy_tool_result_with_stub_and_original_is_expandable(
         !sent_str.contains("generated_function_1199"),
         "the original heavy text must not reach upstream verbatim"
     );
-    assert!(sent_str.contains("AXIOM-PAGE"), "a stub line must be present");
+    assert!(
+        sent_str.contains("AXIOM-PAGE"),
+        "a stub line must be present"
+    );
     assert!(
         sent_str.contains("AXIOM-PAGE-END"),
         "the expand trailer must be present"

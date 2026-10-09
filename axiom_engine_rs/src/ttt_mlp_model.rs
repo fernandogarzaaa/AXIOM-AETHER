@@ -87,11 +87,7 @@ impl AxiomMlpLM {
     }
 
     /// Autoregressive forward returning normed hidden states `[1, T, d_model]`.
-    pub fn forward_hidden(
-        &self,
-        input_ids: &Tensor,
-        states: &mut [MlpState],
-    ) -> Result<Tensor> {
+    pub fn forward_hidden(&self, input_ids: &Tensor, states: &mut [MlpState]) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
         let embeddings = self.embeddings.forward(input_ids)?;
         let mut token_outputs: Vec<Tensor> = Vec::with_capacity(seq_len);
@@ -150,9 +146,7 @@ pub fn mlp_vs_linear_reconstruction(
     // A *deterministic*, bounded token activation, fed repeatedly so each block
     // adapts its fast-weights to one fixed (key, value) association. Deterministic
     // (not randn) so the measurement is reproducible across machines/CI.
-    let pattern: Vec<f32> = (0..d_model)
-        .map(|i| ((i % 7) as f32) * 0.1 - 0.3)
-        .collect();
+    let pattern: Vec<f32> = (0..d_model).map(|i| ((i % 7) as f32) * 0.1 - 0.3).collect();
     let x = Tensor::from_vec(pattern, (1usize, d_model), &device)?;
 
     // Linear block.
@@ -245,8 +239,19 @@ mod tests {
         let before = states[0].w1.clone();
         let ids = Tensor::new(&[[1u32, 2, 3]], &device).unwrap();
         let _ = model.forward_lm(&ids, &mut states).unwrap();
-        let moved = states[0].w1.sub(&before).unwrap().sqr().unwrap().sum_all().unwrap()
-            .to_scalar::<f32>().unwrap();
-        assert!(moved > 0.0, "MLP layer state must adapt during the forward pass");
+        let moved = states[0]
+            .w1
+            .sub(&before)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            moved > 0.0,
+            "MLP layer state must adapt during the forward pass"
+        );
     }
 }

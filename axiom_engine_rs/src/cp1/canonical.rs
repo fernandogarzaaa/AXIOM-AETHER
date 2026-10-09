@@ -182,7 +182,10 @@ mod tests {
     #[test]
     fn object_keys_are_sorted_at_every_depth() {
         let value = json!({ "z": 1, "a": { "y": 2, "b": 3 } });
-        assert_eq!(to_canonical(&value).unwrap(), r#"{"a":{"b":3,"y":2},"z":1}"#);
+        assert_eq!(
+            to_canonical(&value).unwrap(),
+            r#"{"a":{"b":3,"y":2},"z":1}"#
+        );
     }
 
     #[test]

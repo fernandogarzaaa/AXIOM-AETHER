@@ -173,7 +173,12 @@ impl AgentTask {
         }
 
         if edit_set.is_empty() {
-            return self.record(attempt_no, String::new(), false, "empty edit-set rejected".into());
+            return self.record(
+                attempt_no,
+                String::new(),
+                false,
+                "empty edit-set rejected".into(),
+            );
         }
 
         let fingerprint = edit_set.fingerprint();
@@ -232,15 +237,13 @@ impl AgentTask {
                     Some(bytes) => {
                         std::fs::write(path, bytes)?;
                     }
-                    None => {
-                        match std::fs::remove_file(path) {
-                            Ok(()) => {},
-                            Err(e)
-                                if e.kind() == std::io::ErrorKind::NotFound
-                                    || e.kind() == std::io::ErrorKind::IsADirectory => {},
-                            Err(e) => return Err(e),
-                        }
-                    }
+                    None => match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::NotFound
+                                || e.kind() == std::io::ErrorKind::IsADirectory => {}
+                        Err(e) => return Err(e),
+                    },
                 }
             }
         }
@@ -335,7 +338,10 @@ impl TaskRegistry {
     ///
     /// Recovers the lock if a previous panic poisoned the mutex.
     pub fn insert(&self, task: AgentTask) {
-        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).insert(task.task_id.clone(), task);
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task.task_id.clone(), task);
     }
 
     /// Call `f` with the matching task while holding the registry lock.
@@ -356,7 +362,10 @@ impl TaskRegistry {
     ///
     /// Recovers the lock if a previous panic poisoned the mutex.
     pub fn remove(&self, task_id: &str) -> Option<AgentTask> {
-        self.tasks.lock().unwrap_or_else(|e| e.into_inner()).remove(task_id)
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(task_id)
     }
 }
 

@@ -113,7 +113,11 @@ impl SwarmRouter {
         let mesh_selector = config
             .mesh_routing
             .then(|| Arc::new(MeshModelSelector::new(&config.model_candidates)));
-        Self { config, client, mesh_selector }
+        Self {
+            config,
+            client,
+            mesh_selector,
+        }
     }
 
     pub fn config(&self) -> &SwarmRouterConfig {
@@ -151,7 +155,11 @@ impl SwarmRouter {
         Ok(SwarmChatResult { model, content })
     }
 
-    async fn dispatch_to_model(&self, model: &str, payload: &Value) -> Result<String, SwarmRouteError> {
+    async fn dispatch_to_model(
+        &self,
+        model: &str,
+        payload: &Value,
+    ) -> Result<String, SwarmRouteError> {
         let messages = translate_messages(payload);
         let request = json!({
             "model": model,
@@ -183,7 +191,11 @@ impl SwarmRouter {
         }
         let decoded: OllamaChatResponse =
             serde_json::from_str(&body).map_err(|e| SwarmRouteError::Decode(e.to_string()))?;
-        Ok(decoded.message.map(|m| m.content).or(decoded.response).unwrap_or_default())
+        Ok(decoded
+            .message
+            .map(|m| m.content)
+            .or(decoded.response)
+            .unwrap_or_default())
     }
 
     async fn available_models(&self) -> Result<Vec<String>, SwarmRouteError> {

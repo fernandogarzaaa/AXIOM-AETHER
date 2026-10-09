@@ -182,7 +182,10 @@ async fn recording_persists_scrubbed_exchange_when_enabled() {
     std::env::set_var("AXIOM_SESSIONS_DIR", &rec_dir);
 
     async fn upstream(Json(_body): Json<Value>) -> (StatusCode, Json<Value>) {
-        (StatusCode::OK, Json(json!({"id":"resp_rec","object":"response"})))
+        (
+            StatusCode::OK,
+            Json(json!({"id":"resp_rec","object":"response"})),
+        )
     }
     let upstream_app = Router::new().route("/v1/responses", post(upstream));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

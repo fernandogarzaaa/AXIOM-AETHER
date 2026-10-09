@@ -56,32 +56,53 @@ fn declared(cap: Capability) -> TurnSignals {
 
 #[test]
 fn case_e_opus_with_large_context_is_optimized() {
-    let d = select_model("claude-haiku-4-5", &declared(Capability::Reasoning), CAPABILITY);
+    let d = select_model(
+        "claude-haiku-4-5",
+        &declared(Capability::Reasoning),
+        CAPABILITY,
+    );
     assert_eq!(d.selected_model, "claude-opus-4-8");
 
     let report = optimize(LARGE_CONTEXT_TOKENS);
-    assert!(!report.is_noop(), "Opus must still receive context optimization");
+    assert!(
+        !report.is_noop(),
+        "Opus must still receive context optimization"
+    );
     assert!(report.tokens_saved_est() > 0);
     assert!(report.evidence_preserved);
 }
 
 #[test]
 fn case_f_sonnet_with_large_context_is_optimized() {
-    let d = select_model("claude-haiku-4-5", &declared(Capability::General), CAPABILITY);
+    let d = select_model(
+        "claude-haiku-4-5",
+        &declared(Capability::General),
+        CAPABILITY,
+    );
     assert_eq!(d.selected_model, "claude-sonnet-5");
 
     let report = optimize(LARGE_CONTEXT_TOKENS);
-    assert!(!report.is_noop(), "Sonnet must still receive context optimization");
+    assert!(
+        !report.is_noop(),
+        "Sonnet must still receive context optimization"
+    );
     assert!(report.tokens_saved_est() > 0);
 }
 
 #[test]
 fn case_g_haiku_with_large_context_is_optimized() {
-    let d = select_model("claude-opus-4-8", &declared(Capability::Mechanical), CAPABILITY);
+    let d = select_model(
+        "claude-opus-4-8",
+        &declared(Capability::Mechanical),
+        CAPABILITY,
+    );
     assert_eq!(d.selected_model, "claude-haiku-4-5");
 
     let report = optimize(LARGE_CONTEXT_TOKENS);
-    assert!(!report.is_noop(), "Haiku must still receive context optimization");
+    assert!(
+        !report.is_noop(),
+        "Haiku must still receive context optimization"
+    );
     assert!(report.tokens_saved_est() > 0);
 }
 
@@ -135,7 +156,12 @@ fn case_h_context_size_does_not_change_model_selection() {
     ] {
         let baseline = select_model("claude-sonnet-5", &declared(cap), CAPABILITY);
         let mut seen_reports = Vec::new();
-        for tokens in [0usize, NOOP_THRESHOLD_TOKENS, LARGE_CONTEXT_TOKENS, 5_000_000] {
+        for tokens in [
+            0usize,
+            NOOP_THRESHOLD_TOKENS,
+            LARGE_CONTEXT_TOKENS,
+            5_000_000,
+        ] {
             seen_reports.push(optimize(tokens));
             let after = select_model("claude-sonnet-5", &declared(cap), CAPABILITY);
             assert_eq!(
@@ -166,7 +192,10 @@ fn case_h_high_risk_reasoning_survives_an_enormous_context() {
         AUTO,
     );
     let report = optimize(5_000_000);
-    assert!(report.tokens_saved_est() > 0, "the context was still reduced");
+    assert!(
+        report.tokens_saved_est() > 0,
+        "the context was still reduced"
+    );
     assert_eq!(
         d.selected_model, "claude-opus-4-8",
         "a huge context must never cheapen a high-risk turn"

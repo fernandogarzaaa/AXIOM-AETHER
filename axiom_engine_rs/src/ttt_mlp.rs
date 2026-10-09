@@ -52,12 +52,20 @@ impl MlpState {
     /// learning, since `dW₂ = e ⊗ φ(0) = 0`).
     pub fn init(d_model: usize, hidden: usize, device: &Device) -> Result<Self> {
         if d_model == 0 || hidden == 0 {
-            candle_core::bail!("MlpState dimensions must be non-zero (d_model={d_model}, hidden={hidden})");
+            candle_core::bail!(
+                "MlpState dimensions must be non-zero (d_model={d_model}, hidden={hidden})"
+            );
         }
         let n = d_model.max(hidden);
         let eye = Tensor::eye(n, DType::F32, device)?;
-        let w1 = eye.narrow(0, 0, hidden)?.narrow(1, 0, d_model)?.contiguous()?;
-        let w2 = eye.narrow(0, 0, d_model)?.narrow(1, 0, hidden)?.contiguous()?;
+        let w1 = eye
+            .narrow(0, 0, hidden)?
+            .narrow(1, 0, d_model)?
+            .contiguous()?;
+        let w2 = eye
+            .narrow(0, 0, d_model)?
+            .narrow(1, 0, hidden)?
+            .contiguous()?;
         Ok(Self { w1, w2 })
     }
 }
@@ -95,7 +103,11 @@ impl NativeTTTMlpBlock {
             w_q: candle_nn::linear_no_bias(d, d, vs.pp("w_q"))?,
             w_k: candle_nn::linear_no_bias(d, d, vs.pp("w_k"))?,
             w_v: candle_nn::linear_no_bias(d, d, vs.pp("w_v"))?,
-            layer_norm: candle_nn::layer_norm_no_bias(d, config.norm_eps as f64, vs.pp("layer_norm"))?,
+            layer_norm: candle_nn::layer_norm_no_bias(
+                d,
+                config.norm_eps as f64,
+                vs.pp("layer_norm"),
+            )?,
             hidden,
             d_model: d,
             inner_lr,
@@ -132,7 +144,12 @@ impl NativeTTTMlpBlock {
     /// * `state` – the `[h,d]` / `[d,h]` MLP fast-weights, updated in place.
     ///
     /// Returns `[1, d_model]` after the update and embedded layer norm.
-    pub fn forward_native(&self, x: &Tensor, state: &mut MlpState, training: bool) -> Result<Tensor> {
+    pub fn forward_native(
+        &self,
+        x: &Tensor,
+        state: &mut MlpState,
+        training: bool,
+    ) -> Result<Tensor> {
         let q = self.w_q.forward(x)?; // [1,d]
         let k = self.w_k.forward(x)?; // [1,d]
         let v = self.w_v.forward(x)?; // [1,d]
@@ -158,7 +175,7 @@ impl NativeTTTMlpBlock {
         // dz = da ⊙ (1 − a²)   (tanh′).
         let one_minus_a2 = a.sqr()?.affine(-1.0, 1.0)?; // 1 − a²
         let dz = da.mul(&one_minus_a2)?; // [h]
-        // dW1 = dz ⊗ k  ([h,1]·[1,d] = [h,d]).
+                                         // dW1 = dz ⊗ k  ([h,1]·[1,d] = [h,d]).
         let dw1 = dz.unsqueeze(1)?.matmul(&k_vec.unsqueeze(0)?)?;
 
         // One gradient-descent step on both layers. During meta-training
@@ -237,10 +254,26 @@ mod tests {
         let w2_before = st.w2.clone();
         let x = Tensor::randn(0f32, 1f32, (1usize, d), &device).unwrap();
         let _ = block.forward_native(&x, &mut st, false).unwrap();
-        let d1 = st.w1.sub(&w1_before).unwrap().sqr().unwrap().sum_all().unwrap()
-            .to_scalar::<f32>().unwrap();
-        let d2 = st.w2.sub(&w2_before).unwrap().sqr().unwrap().sum_all().unwrap()
-            .to_scalar::<f32>().unwrap();
+        let d1 = st
+            .w1
+            .sub(&w1_before)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let d2 = st
+            .w2
+            .sub(&w2_before)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
         assert!(d1 > 0.0, "W1 must update");
         assert!(d2 > 0.0, "W2 must update");
     }
@@ -271,10 +304,27 @@ mod tests {
         let recon_err = |block: &NativeTTTMlpBlock, st: &MlpState| -> f32 {
             let k = block.w_k.forward(&x).unwrap().squeeze(0).unwrap();
             let v = block.w_v.forward(&x).unwrap().squeeze(0).unwrap();
-            let z = st.w1.matmul(&k.unsqueeze(1).unwrap()).unwrap().squeeze(D::Minus1).unwrap();
+            let z = st
+                .w1
+                .matmul(&k.unsqueeze(1).unwrap())
+                .unwrap()
+                .squeeze(D::Minus1)
+                .unwrap();
             let a = z.tanh().unwrap();
-            let pred = st.w2.matmul(&a.unsqueeze(1).unwrap()).unwrap().squeeze(D::Minus1).unwrap();
-            pred.sub(&v).unwrap().sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap()
+            let pred = st
+                .w2
+                .matmul(&a.unsqueeze(1).unwrap())
+                .unwrap()
+                .squeeze(D::Minus1)
+                .unwrap();
+            pred.sub(&v)
+                .unwrap()
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
         };
 
         let before = recon_err(&block, &st);

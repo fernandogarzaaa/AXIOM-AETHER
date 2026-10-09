@@ -36,7 +36,13 @@ pub struct WorkerNode {
 
 impl WorkerNode {
     pub fn new(id: usize, name: impl Into<String>, kind: NodeKind, affinity: Vec<f32>) -> Self {
-        Self { id: NodeId(id), name: name.into(), kind, affinity, bias: 0.0 }
+        Self {
+            id: NodeId(id),
+            name: name.into(),
+            kind,
+            affinity,
+            bias: 0.0,
+        }
     }
 
     pub fn with_bias(mut self, bias: f32) -> Self {

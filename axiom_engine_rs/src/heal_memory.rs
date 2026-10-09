@@ -210,7 +210,15 @@ pub struct HealMemory {
 
 /// Shell wrappers whose raw `-c` snippets are too generic to advise on.
 const SHELL_WRAPPERS: [&str; 9] = [
-    "sh", "bash", "zsh", "dash", "fish", "cmd", "cmd.exe", "powershell", "pwsh",
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "fish",
+    "cmd",
+    "cmd.exe",
+    "powershell",
+    "pwsh",
 ];
 
 /// A lowercase, matchable signature for a command line — the program name plus
@@ -546,7 +554,10 @@ impl HealMemory {
         let mut by_dir: HashMap<&Path, Vec<&str>> = HashMap::new();
         for record in self.data.programs.values() {
             for d in &record.dirs {
-                by_dir.entry(d.as_path()).or_default().push(record.command.as_str());
+                by_dir
+                    .entry(d.as_path())
+                    .or_default()
+                    .push(record.command.as_str());
             }
         }
         let mut out: Vec<(PathBuf, Vec<&str>)> = by_dir
@@ -863,7 +874,10 @@ mod tests {
         let mem2 = HealMemory::load(&mem_path);
         let applied = mem2.immunize(&fp);
         assert_eq!(applied, vec![dir.clone()]);
-        assert!(dir.exists(), "immunization must re-create the remembered dir");
+        assert!(
+            dir.exists(),
+            "immunization must re-create the remembered dir"
+        );
         // Second immunization is a no-op (already present).
         assert!(mem2.immunize(&fp).is_empty());
 
@@ -890,7 +904,11 @@ mod tests {
         ours.observe_failure(&fp_shared, "shared", 4.0); // count=1, mean=4.0
 
         let mut theirs = HealMemory::load(tmp("merge_theirs"));
-        theirs.remember_dirs(&fp_shared, "shared", &[PathBuf::from("/a"), PathBuf::from("/b")]);
+        theirs.remember_dirs(
+            &fp_shared,
+            "shared",
+            &[PathBuf::from("/a"), PathBuf::from("/b")],
+        );
         // Three failures at 6.0 → their history outweighs ours 3:1.
         for _ in 0..3 {
             theirs.observe_failure(&fp_shared, "shared", 6.0);
@@ -905,7 +923,10 @@ mod tests {
         let shared = ours.record(&fp_shared).unwrap();
         assert_eq!(shared.dirs, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
         assert_eq!(shared.ce_count, 4);
-        assert!((shared.ce_mean - 5.5).abs() < 1e-5, "count-weighted: (4+18)/4");
+        assert!(
+            (shared.ce_mean - 5.5).abs() < 1e-5,
+            "count-weighted: (4+18)/4"
+        );
         assert!(ours.record(&fp_peer_only).is_some());
     }
 
@@ -935,7 +956,10 @@ mod tests {
         let mut theirs = HealMemory::load(tmp("merge_conf_b"));
         theirs.remember_dirs(&fp, "prog", &[PathBuf::from("/a")]);
         if let Some(r) = theirs.data.programs.get_mut(&fp) {
-            r.belief = Some(crate::belief::BetaBelief { alpha: 1.0, beta: 11.0 });
+            r.belief = Some(crate::belief::BetaBelief {
+                alpha: 1.0,
+                beta: 11.0,
+            });
         }
 
         let report = ours.merge_json(&theirs.to_json()).unwrap();
@@ -950,7 +974,11 @@ mod tests {
         );
         // But the discounted average must not capitulate to the peer's
         // strongly-negative view either — it stays above the peer's mean.
-        let peer_mean = crate::belief::BetaBelief { alpha: 1.0, beta: 11.0 }.mean();
+        let peer_mean = crate::belief::BetaBelief {
+            alpha: 1.0,
+            beta: 11.0,
+        }
+        .mean();
         assert!(
             fused_mean > peer_mean,
             "fusion must not adopt the peer outright: fused {fused_mean} vs peer {peer_mean}"
@@ -967,7 +995,10 @@ mod tests {
         let mut theirs = HealMemory::load(tmp("merge_byz_b"));
         theirs.remember_dirs(&fp, "prog", &[PathBuf::from("/evil")]);
         if let Some(r) = theirs.data.programs.get_mut(&fp) {
-            r.belief = Some(crate::belief::BetaBelief { alpha: 1.0e9, beta: 1.0 });
+            r.belief = Some(crate::belief::BetaBelief {
+                alpha: 1.0e9,
+                beta: 1.0,
+            });
         }
 
         let report = ours.merge_json(&theirs.to_json()).unwrap();
@@ -991,7 +1022,10 @@ mod tests {
 
         let filtered = mem.report_text(Some("cargo"));
         assert!(filtered.contains("cargo build"));
-        assert!(!filtered.contains("python app.py"), "filter must exclude non-matches");
+        assert!(
+            !filtered.contains("python app.py"),
+            "filter must exclude non-matches"
+        );
 
         let miss = mem.report_text(Some("rustc"));
         assert!(miss.contains("no acquired immunity matching"));
@@ -1028,7 +1062,8 @@ mod tests {
 
         let adv = mem.advisories_for_text("why does cargo run fail?");
         assert!(
-            adv.iter().any(|a| a.contains("DATABASE_URL") && a.contains("environment variable")),
+            adv.iter()
+                .any(|a| a.contains("DATABASE_URL") && a.contains("environment variable")),
             "env requirement must surface as an advisory: {adv:?}"
         );
         assert!(mem.report_text(None).contains("requires env vars"));
@@ -1037,12 +1072,17 @@ mod tests {
     #[test]
     fn report_text_empty_memory_is_friendly() {
         let mem = HealMemory::load(tmp("empty_report"));
-        assert!(mem.report_text(None).contains("has not learned any program failures"));
+        assert!(mem
+            .report_text(None)
+            .contains("has not learned any program failures"));
     }
 
     #[test]
     fn command_signature_skips_shells_and_keeps_real_tools() {
-        assert_eq!(command_signature("cargo build --release").as_deref(), Some("cargo build"));
+        assert_eq!(
+            command_signature("cargo build --release").as_deref(),
+            Some("cargo build")
+        );
         assert_eq!(command_signature("pytest").as_deref(), Some("pytest"));
         assert_eq!(command_signature("npm test").as_deref(), Some("npm test"));
         // shell wrappers and their snippets are too generic to advise on
@@ -1066,7 +1106,9 @@ mod tests {
         // pytest is referenced but has no learned heal → no advisory.
         assert!(mem.advisories_for_text("my pytest run is slow").is_empty());
         // cargo not mentioned → no advisory.
-        assert!(mem.advisories_for_text("unrelated question about npm").is_empty());
+        assert!(mem
+            .advisories_for_text("unrelated question about npm")
+            .is_empty());
     }
 
     #[test]
@@ -1091,15 +1133,24 @@ mod tests {
         assert!(prev >= 0.6, "after 3 reuses confidence should be 'proven'+");
         let rec = mem.record(&fp).unwrap();
         let fresh = rec.belief_now(now + 3);
-        assert!(fresh.is_established(), "after 3 reuses the belief is established");
+        assert!(
+            fresh.is_established(),
+            "after 3 reuses the belief is established"
+        );
 
         // Waning: long after the last reuse the belief regresses toward the
         // uniform prior — staleness becomes *uncertainty* (higher variance,
         // mean drifting back toward 0.5), not a confidence driven to zero.
         let later = now + 3 + 4 * (CONFIDENCE_HALFLIFE_DAYS as u64) * 86_400;
         let stale = rec.belief_now(later);
-        assert!(!stale.is_established(), "a waned belief is no longer established");
-        assert!(stale.variance() > fresh.variance(), "waning raises uncertainty");
+        assert!(
+            !stale.is_established(),
+            "a waned belief is no longer established"
+        );
+        assert!(
+            stale.variance() > fresh.variance(),
+            "waning raises uncertainty"
+        );
         assert!(stale.mean() < fresh.mean(), "mean regresses toward 0.5");
     }
 
@@ -1141,7 +1192,10 @@ mod tests {
         // A single program's own heal is not structural, no matter how many
         // times it's reinforced.
         mem.remember_dirs(&fp_a, "make", &[PathBuf::from("dist")]);
-        assert!(mem.structural_dirs().is_empty(), "one program alone must not generalize");
+        assert!(
+            mem.structural_dirs().is_empty(),
+            "one program alone must not generalize"
+        );
 
         // A second, unrelated program independently needing the same path is
         // corroboration: this is now a structural heal.
@@ -1154,15 +1208,23 @@ mod tests {
 
     #[test]
     fn immunize_structural_applies_to_a_program_never_seen_before() {
-        let dir = std::env::temp_dir().join(tmp("structural_dir").file_stem().unwrap().to_os_string());
+        let dir =
+            std::env::temp_dir().join(tmp("structural_dir").file_stem().unwrap().to_os_string());
         let mut mem = HealMemory::load(tmp("structural_apply"));
         mem.remember_dirs(&fingerprint("make", &[]), "make", &[dir.clone()]);
-        mem.remember_dirs(&fingerprint("npm", &["run".into()]), "npm run", &[dir.clone()]);
+        mem.remember_dirs(
+            &fingerprint("npm", &["run".into()]),
+            "npm run",
+            &[dir.clone()],
+        );
 
         // A third program, with zero history of its own, still gets the
         // structurally-corroborated directory pre-created.
         let unknown_fp = fingerprint("gradle", &["build".into()]);
-        assert!(mem.record(&unknown_fp).is_none(), "must genuinely be unknown to this program");
+        assert!(
+            mem.record(&unknown_fp).is_none(),
+            "must genuinely be unknown to this program"
+        );
         assert!(!dir.exists());
         let applied = mem.immunize_structural(&unknown_fp, &std::env::current_dir().unwrap());
         assert_eq!(applied, vec![(dir.clone(), 2)]);
@@ -1182,13 +1244,21 @@ mod tests {
         // must not re-report it as a *structural* heal for `a` (that would
         // double-count the same directory as two different kinds of evidence).
         let applied = mem.immunize_structural(&fingerprint("a", &[]), &std::env::temp_dir());
-        assert!(applied.is_empty(), "a program's own dir must not double up as structural: {applied:?}");
+        assert!(
+            applied.is_empty(),
+            "a program's own dir must not double up as structural: {applied:?}"
+        );
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join(&shared));
     }
 
     #[test]
     fn missing_structural_prerequisites_predicts_for_an_unknown_program() {
-        let anchor = std::env::temp_dir().join(tmp("structural_predict_anchor").file_stem().unwrap().to_os_string());
+        let anchor = std::env::temp_dir().join(
+            tmp("structural_predict_anchor")
+                .file_stem()
+                .unwrap()
+                .to_os_string(),
+        );
         std::fs::create_dir_all(&anchor).unwrap();
         let mut mem = HealMemory::load(tmp("structural_predict"));
         mem.remember_dirs(&fingerprint("a", &[]), "a", &[PathBuf::from("needed")]);
@@ -1197,7 +1267,10 @@ mod tests {
         let unknown_fp = fingerprint("c", &[]);
         let (missing, confidence) = mem.missing_structural_prerequisites(&unknown_fp, &anchor);
         assert_eq!(missing, vec![anchor.join("needed")]);
-        assert!(confidence >= 0.0, "confidence must be a valid, non-negative estimate");
+        assert!(
+            confidence >= 0.0,
+            "confidence must be a valid, non-negative estimate"
+        );
 
         let _ = std::fs::remove_dir_all(&anchor);
     }
@@ -1206,7 +1279,11 @@ mod tests {
     fn report_text_shows_structural_heals_only_on_the_unfiltered_view() {
         let mut mem = HealMemory::load(tmp("structural_report"));
         mem.remember_dirs(&fingerprint("make", &[]), "make", &[PathBuf::from("dist")]);
-        mem.remember_dirs(&fingerprint("npm", &["run".into()]), "npm run", &[PathBuf::from("dist")]);
+        mem.remember_dirs(
+            &fingerprint("npm", &["run".into()]),
+            "npm run",
+            &[PathBuf::from("dist")],
+        );
 
         let all = mem.report_text(None);
         assert!(all.contains("Structural (environment-wide) heals"));

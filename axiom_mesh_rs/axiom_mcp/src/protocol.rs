@@ -59,7 +59,10 @@ impl RpcResponse {
             jsonrpc: "2.0".into(),
             id,
             result: None,
-            error: Some(RpcError { code, message: message.into() }),
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+            }),
         }
     }
 }
@@ -91,8 +94,11 @@ mod tests {
 
     #[test]
     fn request_round_trips_through_json() {
-        let params =
-            DispatchParams { worker: "claude".into(), payload: "state: x".into(), residual_norm: 0.5 };
+        let params = DispatchParams {
+            worker: "claude".into(),
+            payload: "state: x".into(),
+            residual_norm: 0.5,
+        };
         let req = RpcRequest::dispatch(7, &params);
         let line = serde_json::to_string(&req).unwrap();
         let back: RpcRequest = serde_json::from_str(&line).unwrap();

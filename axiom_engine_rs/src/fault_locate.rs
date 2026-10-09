@@ -121,7 +121,10 @@ pub fn default_verify(language: Language) -> (String, Vec<String>) {
         // subcommand `axiom chimera check` is the command-line equivalent.
         Language::Chimera => ("axiom", &["chimera", "check"]),
     };
-    (prog.to_string(), args.iter().map(|s| s.to_string()).collect())
+    (
+        prog.to_string(),
+        args.iter().map(|s| s.to_string()).collect(),
+    )
 }
 
 fn has_source_ext(path: &str) -> bool {
@@ -380,7 +383,14 @@ ValueError: boom";
         let paths: Vec<_> = sites.iter().map(|s| s.path.clone()).collect();
         assert!(paths.contains(&PathBuf::from("/app/pkg/runner.py")));
         assert!(paths.contains(&PathBuf::from("/app/pkg/core.py")));
-        assert_eq!(sites.iter().find(|s| s.path == PathBuf::from("/app/pkg/core.py")).unwrap().line, 88);
+        assert_eq!(
+            sites
+                .iter()
+                .find(|s| s.path == PathBuf::from("/app/pkg/core.py"))
+                .unwrap()
+                .line,
+            88
+        );
     }
 
     #[test]
@@ -392,7 +402,10 @@ ValueError: boom";
         assert_eq!(locate_sites(js)[0].line, 23);
         assert_eq!(locate_sites(ts)[0].path, PathBuf::from("src/server.ts"));
         assert_eq!(locate_sites(ts)[0].line, 120);
-        assert_eq!(locate_sites(go)[0].path, PathBuf::from("./internal/db/conn.go"));
+        assert_eq!(
+            locate_sites(go)[0].path,
+            PathBuf::from("./internal/db/conn.go")
+        );
         assert_eq!(locate_sites(go)[0].line, 31);
     }
 
@@ -456,7 +469,10 @@ src/real.rs:9:2: error";
             dep = dep.display()
         );
         let found = best_source(&trace, &project);
-        assert_eq!(found, Some(project.join("src/app.rs").canonicalize().unwrap()));
+        assert_eq!(
+            found,
+            Some(project.join("src/app.rs").canonicalize().unwrap())
+        );
 
         // An absolute out-of-root frame on its own localizes nothing.
         let only_dep = format!("{}:10:5: boom", dep.display());
@@ -547,7 +563,11 @@ src/widget.rs:50:9: error
 src/unrelated.rs:3:1: error";
         // Matches by file name; the same line dedups; ranked by frequency.
         let hints = line_hints_for(trace, Path::new("/abs/proj/src/widget.rs"));
-        assert_eq!(hints, vec![42, 50], "line 42 (2 hits) ranks before line 50 (1)");
+        assert_eq!(
+            hints,
+            vec![42, 50],
+            "line 42 (2 hits) ranks before line 50 (1)"
+        );
         // A file the trace never mentions yields no hint.
         assert!(line_hints_for(trace, Path::new("src/ghost.rs")).is_empty());
     }
