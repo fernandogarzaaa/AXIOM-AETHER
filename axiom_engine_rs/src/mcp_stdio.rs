@@ -557,12 +557,23 @@ fn tools_list() -> Value {
     // alignment checking). Merged in separately from `predictive_tools.rs` so
     // that module owns its own schemas; see handle_tools_call for dispatch.
     // Experimental: these tools are wired but untrained; see docs/EXPERIMENTAL.md.
-    #[cfg(feature = "experimental")]
+    // Gated behind --features experimental via add_experimental_tools below.
+    add_experimental_tools(&mut catalogue);
+    catalogue
+}
+
+/// Append the predictive-reasoning tools to the catalogue. Only compiled with
+/// `--features experimental`; a no-op otherwise so default builds expose 17
+/// tools instead of 20.
+#[cfg(feature = "experimental")]
+fn add_experimental_tools(catalogue: &mut Value) {
     if let Some(tools) = catalogue["tools"].as_array_mut() {
         tools.extend(crate::predictive_tools::predictive_tool_definitions());
     }
-    catalogue
 }
+
+#[cfg(not(feature = "experimental"))]
+fn add_experimental_tools(_catalogue: &mut Value) {}
 
 /// Route `tools/call` to the named tool, returning a JSON-RPC response whose
 /// result is an MCP tool-result payload (`{ content: [...], isError: bool }`).
