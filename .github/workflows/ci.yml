@@ -67,11 +67,58 @@ jobs:
             exit 1
           fi
 
+  # Phase 2 safety invariant: LOSSY_CONTEXT implies RECOVERY_CAPABILITY_PRESENT.
+  # This job fails if any gate test is deleted or any gate call is removed
+  # from the request paths. The invariant tests live in
+  # axiom_engine_rs/tests/lossy_invariant.rs, a file feature work does not
+  # touch. See docs/safety/lossy-invariant.md.
+  lossy-invariant-guard:
+    name: Lossy-context invariant guard
+    needs: protocol
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Verify invariant test file exists with all gate tests
+        run: |
+          FILE="axiom_engine_rs/tests/lossy_invariant.rs"
+          test -f "$FILE" || { echo "MISSING: $FILE"; exit 1; }
+          for t in \
+            invariant_digest_skipped_without_expand_tool \
+            invariant_rebase_skipped_without_expand_tool \
+            invariant_tool_deferral_skipped_on_bespoke_toolset \
+            invariant_local_ack_labels_synthetic_answer \
+            invariant_routing_downgrade_is_recorded \
+            invariant_responses_apply_plan_fails_closed_on_length_mismatch; do
+            grep -q "fn $t" "$FILE" || { echo "MISSING gate test: $t"; exit 1; }
+          done
+          echo "All 6 invariant gate tests present."
+
+      - name: Verify gate calls survive in request paths
+        run: |
+          # The expand gate must be checked before digesting and before rebase.
+          grep -q "expand_tool_available" axiom_engine_rs/src/digest.rs \
+            || { echo "MISSING: expand_tool_available in digest.rs"; exit 1; }
+          grep -q "crate::digest::expand_tool_available" axiom_engine_rs/src/server/routes_messages.rs \
+            || { echo "MISSING: expand gate call in routes_messages.rs"; exit 1; }
+          # Tool deferral must fail closed on zero working-set overlap.
+          grep -q "has_working_set_overlap" axiom_engine_rs/src/server/routes_messages.rs \
+            || { echo "MISSING: deferral fail-closed check in routes_messages.rs"; exit 1; }
+          # Local-trivial must remain fail-closed (is_trivial gate).
+          grep -q "crate::local_trivial::is_trivial" axiom_engine_rs/src/server/routes_messages.rs \
+            || { echo "MISSING: local-trivial gate in routes_messages.rs"; exit 1; }
+          # Model routing must keep its 4xx fallback.
+          grep -q "model_rewritten_from" axiom_engine_rs/src/server/routes_messages.rs \
+            || { echo "MISSING: routing fallback tracking in routes_messages.rs"; exit 1; }
+          echo "All gate calls present in request paths."
+
   test:
     name: Build & test (Rust)
     # The protocol gate is cheap and its failure invalidates everything below.
-    needs: protocol
-    runs-on: ubuntu-22.04
+    needs: protocol    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5

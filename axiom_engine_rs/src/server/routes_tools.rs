@@ -316,6 +316,16 @@ async fn get_awareness(State(state): State<AppState>, Path(id): Path<String>) ->
                     "cache_hit_rate": cost.cache_hit_rate(),
                     "estimated": cost.estimated,
                 },
+                // Phase 2 invariant: model downgrades and local answers must
+                // be visible in the session receipt.
+                "local_answers": {
+                    "turns_answered_locally": cost.local_answered_turns,
+                },
+                "model_routing": {
+                    "turns_downgraded": cost.routed_turns,
+                    "route_fallbacks": cost.route_fallbacks,
+                    "quota_units_saved": cost.routed_quota_saved_units,
+                },
                 "global_counters": {
                     "requests": requests,
                     "messages_compressed": msgs,
