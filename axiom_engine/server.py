@@ -50,7 +50,13 @@ _response_cache: Optional[ResponseCache] = None
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global _pipeline, _claude_backend, _response_cache
-    cfg = AxiomConfig()
+    # ``from_env`` honours AXIOM_PY_PRESET / AXIOM_PY_* so the server can boot
+    # on ordinary hardware; tests may swap AxiomConfig for a plain factory.
+    cfg = getattr(AxiomConfig, "from_env", AxiomConfig)()
+    logger.info(
+        "[+] Model config: d_model=%d n_layers=%d heads=%d vocab=%d",
+        cfg.d_model, cfg.n_layers, cfg.num_heads, cfg.vocab_size,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("[+] Loading Axiom-TTT pipeline on %s", device)
     _pipeline = InferencePipeline(cfg, device=device)
@@ -659,7 +665,21 @@ def serve() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--reload", action="store_true")
+    parser.add_argument(
+        "--preset",
+        choices=["tiny", "small", "default"],
+        default=None,
+        help=(
+            "Model size preset (sets AXIOM_PY_PRESET). The default config is a "
+            "~7B-parameter model that needs tens of GB of RAM; use 'tiny' to "
+            "try the API on a laptop."
+        ),
+    )
     args = parser.parse_args()
+    if args.preset:
+        import os
+
+        os.environ["AXIOM_PY_PRESET"] = args.preset
 
     uvicorn.run(
         "axiom_engine.server:app",
