@@ -118,7 +118,8 @@ jobs:
   test:
     name: Build & test (Rust)
     # The protocol gate is cheap and its failure invalidates everything below.
-    needs: protocol    runs-on: ubuntu-22.04
+    needs: protocol
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5
