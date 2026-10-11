@@ -318,19 +318,36 @@ fn record_savings(state: &AppState, session_id: &str, bytes_in: u64, bytes_out: 
 }
 
 /// Drop a session's ledger entry, printing its receipt when non-trivial.
+/// Phase 2 invariant: model downgrades and local answers show in the receipt.
 fn emit_savings_receipt(state: &AppState, session_id: &str) {
     let entry = state
         .savings
         .lock()
         .ok()
         .and_then(|mut ledger| ledger.remove(session_id));
-    if let Some((bytes_in, bytes_out)) = entry {
+    let (bytes_in, bytes_out) = entry.unwrap_or((0, 0));
+    // Pull the lossy-path counters so downgrades and local answers are
+    // visible even when no bytes were saved.
+    let (local_turns, routed_turns) = state
+        .awareness
+        .get(session_id)
+        .map(|a| {
+            let s = a.cost_summary();
+            (s.local_answered_turns, s.routed_turns)
+        })
+        .unwrap_or((0, 0));
+    if bytes_in > 0 || local_turns > 0 || routed_turns > 0 {
+        let mut parts = Vec::new();
         if bytes_in > 0 {
-            eprintln!(
-                "[receipt] session {session_id}: {}",
-                savings_receipt(bytes_in, bytes_out)
-            );
+            parts.push(savings_receipt(bytes_in, bytes_out));
         }
+        if local_turns > 0 {
+            parts.push(format!("{local_turns} turn(s) answered locally"));
+        }
+        if routed_turns > 0 {
+            parts.push(format!("{routed_turns} turn(s) model-downgraded"));
+        }
+        eprintln!("[receipt] session {session_id}: {}", parts.join(", "));
     }
 }
 
