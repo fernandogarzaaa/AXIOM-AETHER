@@ -66,6 +66,16 @@ maturin build --release --bindings bin --out dist && \
 
 ## Notes & caveats
 
+- Tag == published artifact. The registry release for a version must be built
+  from that version's tag commit, so `git checkout vX.Y.Z` reproduces exactly
+  what `cargo install axiom_engine@X.Y.Z` compiles. Provenance break (2026-10):
+  crates.io `axiom_engine` 0.4.2 was published from a post-`v0.4.2`-tag `main`
+  commit (it contains PR #176 surprise-triage and PR #190 vendored
+  `mesh_core`, neither of which is in the `v0.4.2` tag; the tag's
+  `config.rs` also points at a different checkpoint URL). Do not repeat this:
+  if a publish must run from a non-tagged commit, bump the version first so
+  the registry artifact always matches its tag.
+
 - crates.io enforces a package-size limit; `Cargo.toml`'s `exclude` keeps
   checkpoints/models/`target` out (dry-run packages ~1.3 MiB).
 - `cargo install axiom_engine` compiles candle on the user's machine (slower,
