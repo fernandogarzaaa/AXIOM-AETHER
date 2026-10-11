@@ -336,12 +336,14 @@ GET    /v1/sessions/{id}/checkpoint
 PUT    /v1/sessions/{id}/checkpoint
 DELETE /v1/sessions/{id}
 GET    /v1/awareness/{id}                   # per-session dollar-true cost telemetry (CVM cost stack)
-GET    /v1/budget
+GET    /v1/prefix-diet/report/{session_id}  # last request's dedup stats (CVM S4; AXIOM_PREFIX_DEDUP=1 only)
+POST   /v1/budget
 GET    /v1/ttt/sessions
 DELETE /v1/ttt/sessions
 POST   /v1/ttt/feedback
 GET    /v1/immunity
 GET    /v1/patches
+POST   /v1/patches/merge                    # verified-patch gossip (32 MB body limit)
 GET    /v1/config
 POST   /v1/config
 
