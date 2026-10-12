@@ -18,7 +18,7 @@ var).
 | 2 | Checkpoint downloads had no integrity verification | **P1** | **FIXED** this pass |
 | 3 | `sandbox.rs` naming implies a security boundary it doesn't provide | P2 | Documented, not renamed |
 | 4 | No execution isolation anywhere (self_heal, solve, poly_jit, sandbox all run real subprocesses) | P1 (architectural), not new in this pass | Documented |
-| 5 | Data-plane bind defaults to `0.0.0.0` with auth opt-in | P1, already flagged and partly mitigated (2026-07-24 audit) | Documented, reinforced |
+| 5 | Data-plane bind defaults to `0.0.0.0` with auth opt-in | P1, already flagged and partly mitigated (2026-07-24 audit) | **FIXED** 2026-10 (loopback default, fail closed off-loopback without a key) |
 | 6 | Patch-memory trust model | — | **Strength**, not a finding |
 | 7 | No formal capability model | P2 | Documented, scoped recommendation below |
 
@@ -215,6 +215,14 @@ severity of being unauthenticated is not uniform across routes.
 existing `AXIOM_API_KEY` mechanism is sound for what it protects; the gap
 was capability-blindness, not authentication-blindness, and that's now
 closed for the one route where it mattered most.
+
+**Update (2026-10 audit pass): fixed in code.** The native binary now
+defaults `AXIOM_HOST` to `127.0.0.1`, and `run_server` refuses a
+non-loopback bind unless `AXIOM_API_KEY` is set or the operator opts out
+with `AXIOM_ALLOW_OPEN=1` (`server::check_bind_policy`, unit-tested in
+`server/run.rs`). The Docker image, compose file, and Helm chart set
+`AXIOM_ALLOW_OPEN=1` for the in-container `0.0.0.0` bind so existing
+container deployments keep working; compose still publishes on loopback.
 
 ---
 

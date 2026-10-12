@@ -76,7 +76,12 @@ USER axiom
 EXPOSE 8080
 
 # Environment defaults (overridable at runtime)
+# The server refuses a non-loopback bind without AXIOM_API_KEY. Inside a
+# container 0.0.0.0 is required to receive traffic from the Docker bridge and
+# `docker run -p` is the real exposure boundary, so the image opts out with
+# AXIOM_ALLOW_OPEN=1. Set AXIOM_API_KEY before publishing the port publicly.
 ENV AXIOM_HOST=0.0.0.0 \
+    AXIOM_ALLOW_OPEN=1 \
     AXIOM_PORT=8080 \
     AXIOM_DEVICE=cpu \
     RUST_LOG=info \

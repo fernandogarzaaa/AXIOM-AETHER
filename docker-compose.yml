@@ -39,6 +39,9 @@ services:
       # 0.0.0.0 is correct INSIDE the container (it must accept traffic from the
       # Docker bridge); host-side exposure is controlled by `ports` above.
       - AXIOM_HOST=0.0.0.0
+      # Required for the in-container 0.0.0.0 bind when AXIOM_API_KEY is unset
+      # (the server otherwise refuses non-loopback binds without a key).
+      - AXIOM_ALLOW_OPEN=1
       - AXIOM_PORT=8080
       # Data-plane auth. Unset = open; the server warns loudly at boot.
       - AXIOM_API_KEY=${AXIOM_API_KEY:-}
