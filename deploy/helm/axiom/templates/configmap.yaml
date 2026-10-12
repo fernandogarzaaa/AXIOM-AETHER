@@ -6,6 +6,9 @@ metadata:
     {{- include "axiom.labels" . | nindent 4 }}
 data:
   AXIOM_HOST: "0.0.0.0"
+  # In-pod 0.0.0.0 bind; the Service/Ingress is the exposure boundary. Set
+  # AXIOM_API_KEY (via config.extraEnv or a Secret) before exposing publicly.
+  AXIOM_ALLOW_OPEN: "1"
   AXIOM_PORT: "8080"
   AXIOM_DEVICE: {{ .Values.config.device | quote }}
   RUST_LOG: {{ .Values.config.rustLog | quote }}

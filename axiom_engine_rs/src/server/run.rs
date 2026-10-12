@@ -6,6 +6,16 @@ pub async fn run_server(
     checkpoint_path: &str,
     device: Device,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Fail closed before any heavy init: refuse to expose the unauthenticated
+    // data plane (which forwards with the operator's upstream API key) on a
+    // non-loopback address unless AXIOM_API_KEY is set or the operator opts
+    // out explicitly with AXIOM_ALLOW_OPEN=1.
+    let api_key_configured = std::env::var("AXIOM_API_KEY")
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    let allow_open = env_flag_enabled(std::env::var("AXIOM_ALLOW_OPEN").ok().as_deref());
+    check_bind_policy(host, api_key_configured, allow_open)?;
+
     println!("[*] Initializing system sanity check prior to binding network sockets...");
 
     // BPE tokenizer wiring: when AXIOM_TOKENIZER points at a tokenizer.json the
@@ -244,11 +254,13 @@ pub async fn run_server(
         .filter(|k| !k.is_empty());
     if api_key.is_some() {
         println!("[+] Data plane requires X-Axiom-Key header (AXIOM_API_KEY set)");
-    } else if host != "127.0.0.1" && host != "localhost" {
+    } else if !bind_host_is_loopback(host) {
+        // Only reachable with AXIOM_ALLOW_OPEN=1 (check_bind_policy above).
         eprintln!(
-            "[axiom] WARNING: data-plane endpoints are UNAUTHENTICATED and bound to {host}. \
-             Anyone who can reach this host can drive Axiom. Set AXIOM_API_KEY before \
-             exposing it beyond a trusted local network."
+            "[axiom] WARNING: data-plane endpoints are UNAUTHENTICATED and bound to {host} \
+             (AXIOM_ALLOW_OPEN=1). Anyone who can reach this host can drive Axiom and spend \
+             the configured upstream API key. Set AXIOM_API_KEY before exposing it beyond a \
+             trusted network."
         );
     }
     // Optional process-execution capability: POST /v1/hypervisor/jit_run runs
@@ -399,3 +411,125 @@ async fn wait_for_shutdown_signal() {
 }
 
 // ---------------------------------------------------------------------------
+
+/// True when `host` names a loopback interface (`localhost`, `127.0.0.0/8`,
+/// `::1`, optionally in `[::1]` bracket form). Anything else, including
+/// `0.0.0.0`, `::`, LAN addresses and other hostnames, counts as exposed.
+fn bind_host_is_loopback(host: &str) -> bool {
+    let h = host.trim();
+    let h = h
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(h);
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    h.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Parse a boolean opt-in env value (`1`, `true`, `yes`, `on`; case-insensitive).
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Bind-safety policy for the HTTP server.
+///
+/// Loopback binds are always allowed. A non-loopback bind is allowed only when
+/// `AXIOM_API_KEY` is configured (data-plane routes then require
+/// `X-Axiom-Key`) or the operator sets `AXIOM_ALLOW_OPEN=1` explicitly (e.g.
+/// inside a container whose port publishing is the real boundary).
+fn check_bind_policy(
+    host: &str,
+    api_key_configured: bool,
+    allow_open: bool,
+) -> std::result::Result<(), String> {
+    if bind_host_is_loopback(host) || api_key_configured || allow_open {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to bind the unauthenticated data plane to non-loopback address '{host}': \
+         anyone who can reach it could use the configured upstream API key. Set AXIOM_API_KEY \
+         (clients then send X-Axiom-Key), bind to 127.0.0.1, or set AXIOM_ALLOW_OPEN=1 to \
+         accept the risk explicitly."
+    ))
+}
+
+#[cfg(test)]
+mod bind_policy_tests {
+    use super::{bind_host_is_loopback, check_bind_policy, env_flag_enabled};
+
+    #[test]
+    fn loopback_hosts_are_recognised() {
+        for host in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "localhost",
+            "LOCALHOST",
+            "::1",
+            "[::1]",
+            " 127.0.0.1 ",
+        ] {
+            assert!(bind_host_is_loopback(host), "{host} should be loopback");
+        }
+    }
+
+    #[test]
+    fn exposed_hosts_are_not_loopback() {
+        for host in [
+            "0.0.0.0",
+            "::",
+            "[::]",
+            "192.168.1.10",
+            "10.0.0.5",
+            "example.com",
+            "",
+            "localhost.evil.com",
+            "128.0.0.1",
+        ] {
+            assert!(
+                !bind_host_is_loopback(host),
+                "{host} should not be loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_bind_is_allowed_without_key() {
+        assert!(check_bind_policy("127.0.0.1", false, false).is_ok());
+        assert!(check_bind_policy("localhost", false, false).is_ok());
+        assert!(check_bind_policy("::1", false, false).is_ok());
+    }
+
+    #[test]
+    fn public_bind_without_key_is_refused() {
+        let err = check_bind_policy("0.0.0.0", false, false).unwrap_err();
+        assert!(err.contains("0.0.0.0"));
+        assert!(err.contains("AXIOM_API_KEY"));
+        assert!(err.contains("AXIOM_ALLOW_OPEN"));
+        assert!(check_bind_policy("192.168.1.10", false, false).is_err());
+        assert!(check_bind_policy("::", false, false).is_err());
+    }
+
+    #[test]
+    fn public_bind_is_allowed_with_key_or_explicit_opt_out() {
+        assert!(check_bind_policy("0.0.0.0", true, false).is_ok());
+        assert!(check_bind_policy("0.0.0.0", false, true).is_ok());
+        assert!(check_bind_policy("0.0.0.0", true, true).is_ok());
+    }
+
+    #[test]
+    fn allow_open_flag_parsing() {
+        for v in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(env_flag_enabled(Some(v)), "{v} should enable");
+        }
+        for v in ["0", "false", "no", "off", "", "2", "enabled"] {
+            assert!(!env_flag_enabled(Some(v)), "{v} should not enable");
+        }
+        assert!(!env_flag_enabled(None));
+    }
+}

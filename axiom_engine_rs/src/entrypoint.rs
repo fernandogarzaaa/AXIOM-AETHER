@@ -172,7 +172,10 @@ fn parse_cli() -> Result<CliArgs> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(256);
-    let mut host = env::var("AXIOM_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    // Loopback by default: the data plane forwards with the operator's upstream
+    // key, so a non-loopback bind requires AXIOM_API_KEY (or the explicit
+    // AXIOM_ALLOW_OPEN=1 escape hatch); see server::check_bind_policy.
+    let mut host = env::var("AXIOM_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let mut port = env::var("AXIOM_PORT")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())

@@ -375,8 +375,18 @@ right default for a `127.0.0.1` bind. **Before exposing it beyond a trusted
 local network** (Docker `-p`, Helm Service, a tunnel), set `AXIOM_API_KEY` —
 every route except `/healthz`, `/readyz`, `/metrics`, and `/mcp` then requires
 `X-Axiom-Key: <key>`. Guard the remote `/mcp` transport separately with
-`AXIOM_MCP_TOKEN` (`Authorization: Bearer <token>`). When the server binds off
-loopback without `AXIOM_API_KEY`, it logs a warning at startup.
+`AXIOM_MCP_TOKEN` (`Authorization: Bearer <token>`).
+
+The native binary binds `127.0.0.1` by default (`AXIOM_HOST` / `--host`). It
+**refuses to start** on a non-loopback address (`0.0.0.0`, `::`, a LAN IP, a
+hostname) unless `AXIOM_API_KEY` is set, because the proxy forwards with your
+upstream key (e.g. `ANTHROPIC_API_KEY`) and anyone who could reach the port
+could spend it. To bind openly anyway (for example inside a container where
+port publishing is the real boundary), set `AXIOM_ALLOW_OPEN=1`; the server
+then starts with a loud warning. The Docker image, `docker-compose.yml`, and
+the Helm chart set `AXIOM_ALLOW_OPEN=1` because they must bind `0.0.0.0`
+inside the container; `docker-compose.yml` publishes the port on loopback
+only. Set `AXIOM_API_KEY` before publishing the port beyond localhost.
 
 `X-Axiom-Key` and `Authorization: Bearer` are **bearer secrets** — the server
 only checks their value. Any deployment that carries them over the network must
@@ -550,6 +560,8 @@ Useful environment variables:
 |---|---|
 | `AXIOM_DEVICE` | `cpu`, `cuda`, `metal`, or `auto`. |
 | `AXIOM_API_KEY` | Optional data-plane auth. When set, every route except `/healthz`, `/readyz`, `/metrics`, and `/mcp` requires the header `X-Axiom-Key: <key>`. A dedicated header is used so it never collides with the client `Authorization`/`x-api-key` the `/v1/messages` proxy relays upstream. Unset ⇒ open (local-first default). Set this before binding off `127.0.0.1`, and serve it over HTTPS/TLS — it is a bearer secret. |
+| `AXIOM_HOST` | Bind address for `--mode server` (default `127.0.0.1`). A non-loopback bind requires `AXIOM_API_KEY` or `AXIOM_ALLOW_OPEN=1`. |
+| `AXIOM_ALLOW_OPEN` | Set to `1`/`true`/`yes`/`on` to allow a non-loopback bind **without** `AXIOM_API_KEY` (startup warning). Set by the Docker image and Helm chart for the in-container bind. |
 | `AXIOM_MCP_TOKEN` | Optional bearer token guarding `/mcp` (`Authorization: Bearer <token>`). Independent of `AXIOM_API_KEY`. |
 | `AXIOM_ENABLE_JIT_EXEC` | Off by default. Set to `1`/`true`/`on` to enable `POST /v1/hypervisor/jit_run`, which executes a caller-supplied command and can overwrite `source_path` on disk. A `process.execute` capability, distinct from `AXIOM_API_KEY` (which only decides *who* may call it). See [Process execution capability](#process-execution-capability). |
 | `AXIOM_PRODUCTION_BPE` | Enable the trained BPE checkpoint path. |
