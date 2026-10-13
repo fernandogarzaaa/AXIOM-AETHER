@@ -73,7 +73,10 @@ jobs:
           MESH_VERSION=$(grep '^version' axiom_mesh_core/Cargo.toml | head -1 | cut -d'"' -f2)
           echo "Waiting for axiom_mesh_core $MESH_VERSION on crates.io..."
           for i in $(seq 1 30); do
-            if curl -sf "https://crates.io/api/v1/crates/axiom_mesh_core/$MESH_VERSION" > /dev/null; then
+            # crates.io rejects API requests without a descriptive User-Agent (HTTP 403),
+            # which made this wait loop time out even after the crate was live.
+            if curl -sf -A "AXIOM-AETHER-publish (https://github.com/${{ github.repository }})" \
+                "https://crates.io/api/v1/crates/axiom_mesh_core/$MESH_VERSION" > /dev/null; then
               echo "axiom_mesh_core $MESH_VERSION available"
               exit 0
             fi
