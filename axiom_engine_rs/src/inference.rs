@@ -77,7 +77,7 @@ impl InferencePipeline {
         let meta = ModelMeta::load(checkpoint);
         let learned_gate = meta.as_ref().map(|m| m.learned_gate).unwrap_or(false);
 
-        let mut varmap = VarMap::new();
+        let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
         let model = AxiomTTTLM::new_with_options(vb, config.clone(), learned_gate)?;
 
@@ -95,7 +95,29 @@ impl InferencePipeline {
             ))
         })?;
         if checkpoint_loaded {
-            varmap.load(checkpoint)?;
+            // Tolerant checkpoint load: override model vars with file values
+            // where the file has them, keep the documented init fallbacks
+            // (zeros, lr schedule, surprise gate, …) for tensors the checkpoint
+            // predates. Older checkpoints (pre-fast_bias, pre-w_lr, …) load
+            // instead of hard-failing on `cannot find tensor`.
+            let file_bytes =
+                std::fs::read(checkpoint).map_err(|e| {
+                    candle_core::Error::Msg(format!(
+                        "cannot read checkpoint {checkpoint}: {e}"
+                    ))
+                })?;
+            let file_tensors =
+                candle_core::safetensors::load_buffer(&file_bytes, &device)?;
+            let mut tensor_data = varmap.data().lock().unwrap();
+            for (name, var) in tensor_data.iter_mut() {
+                if let Some(value) = file_tensors.get(name) {
+                    if let Err(err) = var.set(value) {
+                        return Err(candle_core::Error::Msg(format!(
+                            "error setting {name} using data from {checkpoint:?}: {err}"
+                        )));
+                    }
+                }
+            }
             // Diagnostics go to stderr: stdout is reserved as a pure protocol
             // channel for `--mode mcp` (JSON-RPC stdio). The HTTP server prints
             // its own banner separately.
