@@ -41,8 +41,10 @@ use crate::memory_store::{now_secs, MemoryKind, MemoryRecord, MemoryStore};
 use crate::session_awareness::AwarenessStore;
 use crate::vibe_memory::MasterVibe;
 
-/// MCP protocol revision we advertise in the `initialize` handshake.
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// MCP protocol revision we advertise (2026-07-28). The `initialize`
+/// handshake is retained for dual-era backwards compatibility but is no
+/// longer required; clients should use `server/discover`.
+const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const SERVER_NAME: &str = "axiom-ttt";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -263,6 +265,20 @@ async fn handle_message(line: &str, ctx: &McpContext) -> Option<Value> {
     let is_notification = id.is_none();
 
     match method {
+        // MCP 2.0 (2026-07-28): stateless discovery. Returns supported
+        // protocol versions, server capabilities, and server identity.
+        // Per-request client metadata arrives in params._meta; no
+        // initialize handshake or session state is required.
+        "server/discover" => Some(success_response(
+            id.unwrap_or(Value::Null),
+            json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "supportedVersions": [MCP_PROTOCOL_VERSION, "2024-11-05"],
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+            }),
+        )),
+        // Dual-era: pre-2.0 clients may still send initialize.
         "initialize" => Some(success_response(
             id.unwrap_or(Value::Null),
             json!({
@@ -2168,6 +2184,22 @@ mod tests {
         });
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["protocolVersion"], MCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn discover_advertises_versions_and_identity() {
+        // MCP 2.0 (2026-07-28): server/discover returns versions,
+        // capabilities, and server identity for stateless clients.
+        let result = json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "supportedVersions": [MCP_PROTOCOL_VERSION, "2024-11-05"],
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+        });
+        assert_eq!(result["protocolVersion"], "2026-07-28");
+        assert!(result["supportedVersions"].as_array().unwrap().len() >= 1);
+        assert!(result["capabilities"]["tools"].is_object());
+        assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
     }
 
     #[test]
