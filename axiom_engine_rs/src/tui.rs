@@ -449,7 +449,10 @@ pub fn run() -> io::Result<()> {
     }
 }
 
-fn event_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
+fn event_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()>
+where
+    io::Error: From<B::Error>,
+{
     let tick = Duration::from_millis(250);
     let mut last_tick = Instant::now();
     loop {
