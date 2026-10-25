@@ -109,6 +109,7 @@ impl InferencePipeline {
             let file_tensors =
                 candle_core::safetensors::load_buffer(&file_bytes, &device)?;
             let mut tensor_data = varmap.data().lock().unwrap();
+            let mut skipped: Vec<String> = Vec::new();
             for (name, var) in tensor_data.iter_mut() {
                 if let Some(value) = file_tensors.get(name) {
                     if let Err(err) = var.set(value) {
@@ -116,7 +117,18 @@ impl InferencePipeline {
                             "error setting {name} using data from {checkpoint:?}: {err}"
                         )));
                     }
+                } else {
+                    skipped.push(name.clone());
                 }
+            }
+            if !skipped.is_empty() {
+                eprintln!(
+                    "[!] Warning: checkpoint {checkpoint} predates {} tensor(s); \
+                     running with init fallbacks for: {}. \
+                     This is a partial load, not the full checkpoint.",
+                    skipped.len(),
+                    skipped.join(", ")
+                );
             }
             // Diagnostics go to stderr: stdout is reserved as a pure protocol
             // channel for `--mode mcp` (JSON-RPC stdio). The HTTP server prints
