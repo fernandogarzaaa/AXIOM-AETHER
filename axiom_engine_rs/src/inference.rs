@@ -74,7 +74,10 @@ impl InferencePipeline {
         // adds `w_alpha` weights, so the architecture must match the checkpoint
         // to load. Missing/old sidecar → learned_gate=false → parameter-identical
         // to the original model, so existing checkpoints load unchanged.
-        let meta = ModelMeta::load(checkpoint);
+        // A sidecar from a *newer* engine is refused outright: falling back to
+        // defaults would build a model whose shape silently disagrees with the
+        // weights on disk.
+        let meta = ModelMeta::load_checked(checkpoint).map_err(candle_core::Error::Msg)?;
         let learned_gate = meta.as_ref().map(|m| m.learned_gate).unwrap_or(false);
 
         let mut varmap = VarMap::new();
@@ -237,7 +240,9 @@ impl InferencePipeline {
         }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
-        let mut generated = Vec::with_capacity(max_new_tokens);
+        // Never pre-size from a caller-supplied count: the server clamps
+        // `max_tokens`, but library callers may not.
+        let mut generated = Vec::with_capacity(max_new_tokens.min(4096));
 
         for _ in 0..max_new_tokens {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
@@ -433,7 +438,9 @@ impl InferencePipeline {
         }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
-        let mut generated = Vec::with_capacity(max_new_tokens);
+        // Never pre-size from a caller-supplied count: the server clamps
+        // `max_tokens`, but library callers may not.
+        let mut generated = Vec::with_capacity(max_new_tokens.min(4096));
 
         for _ in 0..max_new_tokens {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;

@@ -195,13 +195,14 @@ pub fn start_dwe_apply_loop(
             };
             let mut applied_any = false;
             for layer in &fragment.layers {
-                let total: usize = layer.shape.iter().product();
-                if total != layer.values.len() {
+                let total = checked_shape_product(&layer.shape);
+                if total != Some(layer.values.len()) {
                     let error = format!("layer {} shape/value mismatch", layer.layer_index);
                     eprintln!("[dwe] {error}");
                     record_rejected_fragment(&telemetry, &fragment.session_id, &error);
                     continue;
                 }
+                let total = layer.values.len();
                 let delta = Tensor::from_vec(layer.values.clone(), (total,), &apply_state.device)
                     .and_then(|t| t.reshape(layer.shape.as_slice()));
                 match delta {

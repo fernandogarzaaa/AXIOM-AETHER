@@ -15,11 +15,11 @@ transport -- no HTTP, no tunnel, no network exposure.
 The Cline MCP settings file is at:
 %APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json
 
-It should contain the Axiom stdio server registration with all 16 tools,
+It should contain the Axiom stdio server registration with all 17 tools,
 environment variables for BPE model, memory, vibe priming, and alwaysAllow
 for all tools to reduce friction.
 
-## Available Tools (16 total)
+## Available Tools (17 total)
 
 ### Context and Compression
 - axiom_compress_path: Absorb a directory through TTT, return a context fingerprint

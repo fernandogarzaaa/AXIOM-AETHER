@@ -277,3 +277,37 @@ regression test) to every future route that executes, writes outside a
 scoped store, or reaches the network on the caller's behalf — without
 building a generic policy engine until there are enough instances of the
 pattern to generalize from honestly.
+
+---
+
+# Addendum — 2026-10-29 request-path audit
+
+Scope: every request-reachable path in `axiom_engine_rs/src/server/*.rs`,
+`mcp_stdio.rs`, the two forwarders, `vfs.rs`, `cvm_store.rs` and
+`session_recorder.rs`, read for panics on untrusted input, filesystem reach,
+auth parity, unbounded memory, blocking calls on async workers, lock misuse
+and SSRF. Everything marked **FIXED** landed in the same change set with a
+regression test in `src/server/tests.rs`, `src/vfs.rs` or
+`src/context_compressor.rs`.
+
+| # | Finding | Severity | Status |
+|---|---|---|---|
+| A1 | `max_tokens` from the request sized a `Vec::with_capacity`; `10^12` aborts the process (`handle_alloc_error`, not a catchable panic) | **P0** | **FIXED** — clamped to `AXIOM_MAX_GENERATION_TOKENS` (16384) in `run_generation`; pre-allocation capped in `inference.rs` |
+| A2 | `POST /v1/cluster/merge` read any readable file (error echoed the path) and `create_dir_all` + wrote any writable path, guarded only by the data-plane key | **P0** | **FIXED** — inputs/output confined to `AXIOM_MERGE_ROOT` (default cwd + `~/.axiom`), `..` refused, output's nearest existing ancestor canonicalized |
+| A3 | Proxy TTT sessions (`X-Axiom-Session-Id`, `/v1/ttt/feedback`) and `/v1/sessions` were unbounded; each holds `n_layers × d_model²` floats | **P1** | **FIXED** — `AXIOM_MAX_TTT_SESSIONS` (512, LRU eviction) and `AXIOM_MAX_SESSIONS` (1024, `409`) |
+| A4 | `/v1/hypervisor/mount` accepts any root (so `/`), `/read` had no size cap and accepted device nodes | **P1** | **FIXED** — regular files only, `AXIOM_VFS_MAX_READ_BYTES` (16 MiB); optional `AXIOM_VFS_ALLOWED_ROOTS` allowlist (unset keeps the local-first default; set it on any network-reachable host) |
+| A5 | `/mcp` sat outside `require_api_key`; with `AXIOM_API_KEY` set but no `AXIOM_MCP_TOKEN`, the MCP tools (`axiom_compress_path` reads local files; memory and task board write) were open | **P1** | **FIXED** — without an MCP token `/mcp` requires the API key (`X-Axiom-Key` or `Authorization: Bearer`) |
+| A6 | Synchronous generation (`/v1/completions`, `/v1/chat/completions`, local `/v1/messages`, `/v1/adapt`) ran on async workers; a blocking HTTP backend panics in debug builds and stalls a worker in release | P2 | **FIXED** — moved to `spawn_blocking` |
+| A7 | UTF-8 slicing at a byte offset in `axiom_compress_path` (`max_bytes` cut) and MCP `fetch` id decoding; shape-product overflow on checkpoint upload and DWE apply | P2 (contained: `spawn_blocking` / debug-only) | **FIXED** — char-boundary back-off, `checked_mul` |
+| A8 | Secret comparisons used `==` | P3 | **FIXED** — constant-time compare |
+| A9 | `cvm_store.rs` index is keyed by session id with no eviction; `put` rewrites the whole session file synchronously from the digest hook | P2 | **Open** — bounded per session (64 MB) but not across sessions; needs an LRU over sessions and append-only writes. Tracked in ROADMAP.md |
+| A10 | `HealMemory::load` reads a JSON file on every `/v1/messages` and `/v1/immunity`; `vfs` metadata calls use `std::fs` in async handlers | P3 | **Open** — cheap today; cache the heal memory or move to `tokio::fs` when it shows up in a profile |
+
+Checked and found sound: every `/v1/*` route (including the WebSocket
+`GET /v1/responses`) is behind `require_api_key`; the forwarders relay only an
+allowlist of client headers and never echo upstream keys; no request-body URL
+is fetched (no SSRF); body limits are axum's 2 MB default (32 MB on
+`/v1/patches/merge`); no `std` lock guard is held across an `.await`; the
+session recorder and CVM store sanitise file stems; `frozen_prefix_len`,
+`merge_delta`, `bearer_value` and the system-reminder splitters are
+bounds-checked.

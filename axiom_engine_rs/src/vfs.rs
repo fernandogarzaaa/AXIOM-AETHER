@@ -95,6 +95,14 @@ impl NeuralVfs {
         if !canonical.is_dir() {
             return Err("vfs mount root must be a directory".into());
         }
+        if let Some(allowed) = vfs_allowed_roots() {
+            if !allowed.iter().any(|a| canonical.starts_with(a)) {
+                return Err(format!(
+                    "vfs mount root '{}' is outside AXIOM_VFS_ALLOWED_ROOTS",
+                    canonical.display()
+                ));
+            }
+        }
         *self
             .root
             .write()
@@ -163,6 +171,27 @@ impl NeuralVfs {
         sessions: Arc<TttSessionStore>,
     ) -> Result<VfsReadReport, String> {
         let resolved = self.resolve(path.as_ref())?;
+        // Only regular files, and only up to the read cap: the whole file is
+        // read into memory and then tokenized, so a device node (`/dev/zero`)
+        // or a multi-GB file would otherwise exhaust the server.
+        let meta = tokio::fs::metadata(&resolved)
+            .await
+            .map_err(|e| format!("vfs read failed: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!(
+                "vfs read refused: '{}' is not a regular file",
+                resolved.display()
+            ));
+        }
+        let max_bytes = vfs_max_read_bytes();
+        if meta.len() > max_bytes {
+            return Err(format!(
+                "vfs read refused: '{}' is {} bytes, above the {} byte cap (AXIOM_VFS_MAX_READ_BYTES)",
+                resolved.display(),
+                meta.len(),
+                max_bytes
+            ));
+        }
         let text = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|e| format!("vfs read failed: {e}"))?;
@@ -226,6 +255,37 @@ impl NeuralVfs {
     }
 }
 
+/// Default cap on a single `/v1/hypervisor/read` (16 MiB).
+pub const DEFAULT_VFS_MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+
+/// `AXIOM_VFS_MAX_READ_BYTES` or the default cap.
+fn vfs_max_read_bytes() -> u64 {
+    std::env::var("AXIOM_VFS_MAX_READ_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_VFS_MAX_READ_BYTES)
+}
+
+/// `AXIOM_VFS_ALLOWED_ROOTS` (directories separated by `;`), canonicalized.
+/// `None` when unset: any directory may be mounted, the local-first default
+/// (the data plane is loopback-only or API-key guarded). Set it on any server
+/// reachable by more than its operator so a caller cannot mount `/`.
+fn vfs_allowed_roots() -> Option<Vec<PathBuf>> {
+    let raw = std::env::var("AXIOM_VFS_ALLOWED_ROOTS").ok()?;
+    let roots: Vec<PathBuf> = raw
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| Path::new(s).canonicalize().ok())
+        .collect();
+    if roots.is_empty() && raw.trim().is_empty() {
+        None
+    } else {
+        Some(roots)
+    }
+}
+
 pub fn structural_digest_for_vfs(path: &Path, text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(path.to_string_lossy().as_bytes());
@@ -258,6 +318,35 @@ mod tests {
         );
         assert!(digest.contains("fn run"));
         assert!(!digest.contains("secret + 1"));
+    }
+
+    #[test]
+    fn mount_honours_allowed_roots() {
+        let allowed = std::env::temp_dir().join(format!("axiom-vfs-allowed-{}", Uuid::new_v4()));
+        let other = std::env::temp_dir().join(format!("axiom-vfs-other-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(allowed.join("sub")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::env::set_var("AXIOM_VFS_ALLOWED_ROOTS", &allowed);
+        let vfs = NeuralVfs::new();
+        assert!(vfs.mount(allowed.join("sub")).is_ok());
+        let err = vfs.mount(&other).unwrap_err();
+        assert!(err.contains("AXIOM_VFS_ALLOWED_ROOTS"), "{err}");
+        std::env::remove_var("AXIOM_VFS_ALLOWED_ROOTS");
+        // Unset again → any directory mounts (the local-first default).
+        assert!(vfs.mount(&other).is_ok());
+        let _ = std::fs::remove_dir_all(allowed);
+        let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn read_cap_defaults_and_parses_env() {
+        assert_eq!(DEFAULT_VFS_MAX_READ_BYTES, 16 * 1024 * 1024);
+        std::env::set_var("AXIOM_VFS_MAX_READ_BYTES", "123");
+        assert_eq!(vfs_max_read_bytes(), 123);
+        std::env::set_var("AXIOM_VFS_MAX_READ_BYTES", "0");
+        assert_eq!(vfs_max_read_bytes(), DEFAULT_VFS_MAX_READ_BYTES);
+        std::env::remove_var("AXIOM_VFS_MAX_READ_BYTES");
+        assert_eq!(vfs_max_read_bytes(), DEFAULT_VFS_MAX_READ_BYTES);
     }
 
     #[test]

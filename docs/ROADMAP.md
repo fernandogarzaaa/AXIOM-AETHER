@@ -36,11 +36,12 @@ evidence in this repo supports as important.
   before starting: this is a multi-week feature with real platform
   portability tradeoffs (Linux-only primitives vs. the Windows-first
   deployment story `scripts/*.ps1` implies), not a one-PR change.
-- [ ] **Checkpoint compatibility versioning**: `ModelMeta` has three
-  independent boolean architecture flags (`stabilize`, `last_token_only`,
-  `learned_gate`) but no `min_engine_version` or monotonic schema version.
-  Low risk today (3 flags); add before a 4th is needed. See
-  ARCHITECTURE-AUDIT.md §3.3.
+- [x] **DONE (2026-10-29)** — **Checkpoint compatibility versioning**:
+  `ModelMeta` now carries `schema_version` (current `1`; unversioned sidecars
+  load as `0`) and `engine_version` provenance. `save` stamps both;
+  `load_checked` refuses a sidecar from a newer schema, and the production
+  load path (`InferencePipeline::with_checkpoint_and_options`) fails loudly
+  instead of building the wrong model shape. See ARCHITECTURE-AUDIT.md §3.3.
 - [ ] **`graph_memory.rs` integration**: the edge store + spreading
   activation merged this pass (ARCHITECTURE-AUDIT.md §3.4) is tested in
   isolation but not wired into `memory_recall.rs`. Needs a real design
@@ -78,6 +79,11 @@ evidence in this repo supports as important.
   `AXIOM_CHECKPOINT_SHA256` has a maintainer-verified source to be pinned
   from, closing the residual gap noted in SECURITY-AUDIT.md §2.
 
+- [ ] **CVM store cross-session bound** (SECURITY-AUDIT.md addendum A9):
+  `cvm_store.rs` bounds each session at 64 MB but never evicts sessions, and
+  `put` rewrites the whole session file. Add an LRU over sessions, a total
+  byte cap, and append-only writes on the digest hook.
+
 ## P3 — Performance improvements
 
 - [ ] No new P3 performance findings beyond the P1 concurrency fix already
@@ -95,11 +101,10 @@ evidence in this repo supports as important.
 - [x] **DONE** — this document, plus ARCHITECTURE-AUDIT.md,
   SECURITY-AUDIT.md, COMPETITIVE-ANALYSIS.md, AXIOMBENCH.md, and a README
   terminology/security update.
-- [ ] **`axiombench`'s `RESULTS.md` overwrite bug** (found this pass, see
-  AXIOMBENCH.md §2): running the binary without the cost pillar silently
-  drops hand-maintained prose and the cost row from `RESULTS.md`. Fix:
-  either preserve non-generated sections on write, or move the
-  generated table into its own file the hand-written prose doesn't share.
+- [x] **DONE (2026-10-29)** — **`axiombench`'s `RESULTS.md` overwrite bug**
+  (see AXIOMBENCH.md §2): the writer now replaces only a marker-delimited
+  table block, carries over rows for pillars that did not run, and preserves
+  all hand-maintained prose.
 - [ ] **Stale branch/PR cleanup** — this pass determined disposition for
   every open branch/PR (ARCHITECTURE-AUDIT.md §8, table) but did not delete
   or force-close any of them, as that's a visible, semi-destructive action
@@ -111,14 +116,11 @@ evidence in this repo supports as important.
   `docs/audit-2026-06` (all confirmed superseded/stale, evidence in the
   table). `claude/docs-audit-fixes` (95 lines of un-reviewed doc diff
   remaining) is worth a quick look before deciding, not blind deletion.
-- [ ] **`cargo fmt` is not a CI gate**, and the repo is not currently
-  `cargo fmt --check`-clean even in files untouched by this pass (confirmed:
-  large diffs in `bin/axiombench/*.rs`, `bin/build_pairs.rs`, and others).
-  Not fixed in this pass (would be a large, unrelated diff). Recommend
-  either adding `cargo fmt --check` to CI and doing one dedicated
-  formatting-only PR to establish the baseline, or explicitly documenting
-  that this repo doesn't enforce rustfmt and removing any implication
-  otherwise.
+- [x] **DONE (2026-10-29)** — **`cargo fmt` is now a CI gate**: the three
+  Rust crate graphs were formatted in one dedicated formatting-only commit
+  and `ci.yml` runs `cargo fmt --check` on each of them. Clippy is also
+  gated at deny-warnings across all targets (bins and tests), not just the
+  library.
 - [ ] **Terminology table** (ARCHITECTURE-AUDIT.md §6) should be folded into
   the top-level README's architecture section for new-contributor
   discoverability — done partially in this pass's README diff (the security

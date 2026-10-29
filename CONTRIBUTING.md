@@ -33,7 +33,8 @@ git clone https://github.com/fernandogarzaaa/AXIOM-AETHER
 cd AXIOM-AETHER/axiom_engine_rs
 
 cargo build --release --locked --bin axiom      # the shipped binary
-cargo clippy --lib --locked -- -D warnings      # library lints, warning-free
+cargo fmt --check                                                   # rustfmt baseline (CI gate)
+cargo clippy --locked --all-targets --features tools -- -D warnings  # lib + bins + tests, warning-free (CI gate)
 cargo test  --release --locked                  # full suite (lib unit tests + tests/)
 ```
 
@@ -148,7 +149,7 @@ ones, grouped by pillar:
 | File | Role |
 |---|---|
 | `server.rs`, `server/*.rs` | `axum` OpenAI- + Anthropic-compatible HTTP API, TTT session management. |
-| `mcp_stdio.rs` | Native MCP server (stdio + HTTP), 20 tools. |
+| `mcp_stdio.rs` | Native MCP server (stdio + HTTP), 17 tools (20 with `--features experimental`). |
 | `lsp.rs` | Language Server Protocol daemon. |
 | `metrics.rs` | Prometheus exposition. |
 | `cp1.rs` | CP/1 normative protocol source (see `protocol/cp1/`). |
@@ -233,7 +234,7 @@ should note any expected movement in those numbers.
 ## Pull request guidelines
 
 1. **One concern per PR.**
-2. `cargo fmt`, `cargo clippy --lib --locked -- -D warnings`, and
+2. `cargo fmt --check`, `cargo clippy --locked --all-targets --features tools -- -D warnings`, and
    `cargo test --release --locked` pass locally before opening.
 3. **Update this file** when you add a module or move a surface between
    core and experimental.

@@ -1,5 +1,6 @@
 # AxiomBench Results
 
+<!-- axiombench:table:begin -->
 Generated (unix): 1783089448
 
 | Pillar | Headline | n | Read as |
@@ -8,8 +9,15 @@ Generated (unix): 1783089448
 | trust | 100% supported coverage; neural contradiction catch-rate 10% -> 100% (threshold 0.750) | 240 calibration claims | calibrated result |
 | fleet | node B pre-immunized in 0.17 ms; signed DWE applied in 0.10 ms (pass) | 2 nodes | pass/fail, not a benchmark |
 | cost | 75.1% byte reduction | **3 replayed records from 3 sessions** | indicative only |
+<!-- axiombench:table:end -->
 
 ## How to read these
+
+The table above sits between `axiombench:table` marker comments: running the
+`axiombench` binary rewrites only that block. Rows for pillars that did not run
+(for example `cost` without `--live`) are carried over from the previous table,
+and everything below the markers is hand-maintained and never touched by the
+generator.
 
 **Three of the four pillars run on a tiny sample** — cognition (n=3), fleet
 (n=2), and cost (n=3) — and the `n` column exists so a percentage cannot be

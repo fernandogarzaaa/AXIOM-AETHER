@@ -308,10 +308,11 @@ pub fn apply_fragment(
         if layer.layer_index >= states.len() {
             candle_core::bail!("dwe layer {} out of range", layer.layer_index);
         }
-        let total: usize = layer.shape.iter().product();
-        if total != layer.values.len() {
+        let total = layer.shape.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d));
+        if total != Some(layer.values.len()) {
             candle_core::bail!("dwe layer shape/value mismatch");
         }
+        let total = layer.values.len();
         let delta = Tensor::from_vec(layer.values.clone(), (total,), device)?
             .reshape(layer.shape.as_slice())?;
         states[layer.layer_index] = states[layer.layer_index].add(&delta)?;

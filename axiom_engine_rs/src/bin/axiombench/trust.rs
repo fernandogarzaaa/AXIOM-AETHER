@@ -139,6 +139,8 @@ pub fn run_trust() -> PillarResult {
             neural_contradiction_catch_rate * 100.0,
             threshold
         ),
+        n: format!("{} calibration claims", all_rows.len()),
+        read_as: "calibrated result".into(),
         detail: json!({
             "threshold": threshold,
             "coverage": coverage,

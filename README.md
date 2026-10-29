@@ -326,6 +326,7 @@ POST   /v1/completions
 POST   /v1/chat/completions
 POST   /v1/messages
 POST   /v1/responses                        # Responses-input compression — on by default
+GET    /v1/responses                        # WebSocket relay to the Responses upstream (Codex transport)
 GET/POST /mcp                               # MCP server over HTTP — needs AXIOM_MCP_HTTP=1
 POST   /v1/adapt
 POST   /v1/expand
@@ -339,7 +340,8 @@ GET    /v1/awareness/{id}                   # per-session dollar-true cost telem
 GET    /v1/prefix-diet/report/{session_id}  # last request's dedup stats (CVM S4; AXIOM_PREFIX_DEDUP=1 only)
 POST   /v1/budget
 GET    /v1/ttt/sessions
-DELETE /v1/ttt/sessions
+DELETE /v1/ttt/sessions                     # drop every TTT session
+DELETE /v1/ttt/sessions/{id}                # drop one TTT session
 POST   /v1/ttt/feedback
 GET    /v1/immunity
 GET    /v1/patches
@@ -347,35 +349,45 @@ POST   /v1/patches/merge                    # verified-patch gossip (32 MB body 
 GET    /v1/config
 POST   /v1/config
 
-# Experimental — moving behind `--features experimental` (see § Experimental):
+# Experimental (see § Experimental). Registered in every build unless noted:
 POST   /v1/immunity/merge                   # DWE swarm — fleet immunity gossip
 POST   /v1/cluster/sync                     # DWE swarm
-POST   /v1/cluster/merge                    # DWE swarm
+POST   /v1/cluster/merge                    # DWE swarm — paths confined to AXIOM_MERGE_ROOT (default: cwd + ~/.axiom)
 GET    /v1/fleet/status                     # DWE swarm
 GET    /v1/swarm/matrix_state               # DWE swarm
-POST   /v1/chimera/run                      # ChimeraLang DSL
-POST   /v1/hypervisor/mount                 # VFS hypervisor
-POST   /v1/hypervisor/read                  # VFS hypervisor
+POST   /v1/chimera/run                      # ChimeraLang DSL — only with `--features experimental`
+POST   /v1/hypervisor/mount                 # VFS hypervisor — root restricted by AXIOM_VFS_ALLOWED_ROOTS when set
+POST   /v1/hypervisor/read                  # VFS hypervisor — regular files up to AXIOM_VFS_MAX_READ_BYTES (16 MiB)
 POST   /v1/hypervisor/jit_run               # VFS hypervisor — also needs AXIOM_ENABLE_JIT_EXEC=1
 GET    /v1/hypervisor/jit_status            # VFS hypervisor
-GET    /v1/hypervisor/list                  # VFS hypervisor
-GET    /v1/hypervisor/stat                  # VFS hypervisor
+POST   /v1/hypervisor/list                  # VFS hypervisor
+POST   /v1/hypervisor/stat                  # VFS hypervisor
 GET    /v1/hypervisor/quantum_coherent_state # VFS hypervisor
 ```
 
-This list is generated from the actual `.route(...)` registrations across
-`axiom_engine_rs/src/server/*.rs` — if you add or remove a route, update it
-here too; it had drifted out of sync with the code before (missing 9 real
-routes, several backing "on by default" features like `/v1/responses`).
+This list is maintained by hand against the `.route(...)` registrations in
+`axiom_engine_rs/src/server/routes_verify.rs` — if you add or remove a route,
+update it here too; it had drifted out of sync with the code before (missing
+routes, wrong HTTP methods on `/v1/hypervisor/list` and `/stat`).
+
+`max_tokens` on `/v1/completions`, `/v1/chat/completions` and the local
+`/v1/messages` path is clamped to `AXIOM_MAX_GENERATION_TOKENS` (default
+16384). `POST /v1/sessions` returns `409` once `AXIOM_MAX_SESSIONS` (default
+1024) sessions are live; proxy TTT sessions keyed by `X-Axiom-Session-Id` are
+capped at `AXIOM_MAX_TTT_SESSIONS` (default 512) with least-recently-used
+eviction.
 
 ### Authentication
 
 Axiom is local-first: with no auth configured the server is open, which is the
 right default for a `127.0.0.1` bind. **Before exposing it beyond a trusted
 local network** (Docker `-p`, Helm Service, a tunnel), set `AXIOM_API_KEY` —
-every route except `/healthz`, `/readyz`, `/metrics`, and `/mcp` then requires
-`X-Axiom-Key: <key>`. Guard the remote `/mcp` transport separately with
-`AXIOM_MCP_TOKEN` (`Authorization: Bearer <token>`).
+every route except `/healthz`, `/readyz`, and `/metrics` then requires
+`X-Axiom-Key: <key>`. The remote `/mcp` transport can be guarded separately
+with `AXIOM_MCP_TOKEN` (`Authorization: Bearer <token>`); when no MCP token is
+configured, `/mcp` accepts the `AXIOM_API_KEY` instead (as `X-Axiom-Key` or
+`Authorization: Bearer`), so it is never more open than the data plane it
+reaches.
 
 The native binary binds `127.0.0.1` by default (`AXIOM_HOST` / `--host`). It
 **refuses to start** on a non-loopback address (`0.0.0.0`, `::`, a LAN IP, a
@@ -520,19 +532,21 @@ The runtime supports both legacy `--mode` operation and newer subcommands:
 axiom --mode generate|train|server|mcp|lsp|meta-train|doctor
 axiom init [--no-fetch] [--no-train]
 axiom prime {dir}
-axiom bench [--verbose] [--strict] {dir}
+axiom bench [--verbose] [--strict] [--ranked [--budget N]] {dir}
+axiom skeleton [--format readable|json] [--max-doc-lines N] [--diagnostic] {path}
 axiom run [--dry-run] [--max-restarts N] -- {cmd}
-axiom solve [--source PATH] [--max-rounds N] -- {cmd}
+axiom solve [--source PATH] [--max-rounds N] [--max-restarts N] [-- {cmd}]
 axiom task --goal "<desc>" [--file PATH]... [--max-attempts N] -- {cmd}
 axiom eval-agentic
+axiom verify-suggest [FILES]... [--diff PATH] [--explain] [--root DIR]
 axiom immunity [query] [--prune]
 axiom swarm connect {peer}
 axiom swarm immunity {host:port}
 axiom fleet status [--offline] [--base-url URL]
 axiom fleet join {peer}
-axiom chimera check|run {file}
-axiom chimera prove {file} [--out PATH]
-axiom chimera verify {cert}
+axiom chimera check|run {file}            # --features experimental only
+axiom chimera prove {file} [--out PATH]    # --features experimental only
+axiom chimera verify {cert}                # --features experimental only
 axiom daemon start|stop|status
 axiom mount {dir}
 axiom tui
@@ -550,9 +564,14 @@ axiom tui
   repair.
 - `axiom eval-agentic` measures the autonomous loop against built-in seeded
   fixtures — deterministic, no LLM required.
+- `axiom skeleton` prints the readable structural digest (what the proxy
+  forwards instead of the full file) for one path; `--diagnostic` adds the
+  weak-spot heuristics. `axiom verify-suggest` proposes verifier commands for
+  the task loop from the files or diff you point it at.
 - `axiom chimera` runs the in-tree ChimeraLang DSL (`belief`/`inquire`/
   `resolve`/`guard`/`evolve` programs) on the same belief/provenance substrate
-  as the engine itself.
+  as the engine itself. It is compiled only with `--features experimental`
+  (see [Experimental](#experimental)).
 
 Useful environment variables:
 
@@ -562,7 +581,11 @@ Useful environment variables:
 | `AXIOM_API_KEY` | Optional data-plane auth. When set, every route except `/healthz`, `/readyz`, `/metrics`, and `/mcp` requires the header `X-Axiom-Key: <key>`. A dedicated header is used so it never collides with the client `Authorization`/`x-api-key` the `/v1/messages` proxy relays upstream. Unset ⇒ open (local-first default). Set this before binding off `127.0.0.1`, and serve it over HTTPS/TLS — it is a bearer secret. |
 | `AXIOM_HOST` | Bind address for `--mode server` (default `127.0.0.1`). A non-loopback bind requires `AXIOM_API_KEY` or `AXIOM_ALLOW_OPEN=1`. |
 | `AXIOM_ALLOW_OPEN` | Set to `1`/`true`/`yes`/`on` to allow a non-loopback bind **without** `AXIOM_API_KEY` (startup warning). Set by the Docker image and Helm chart for the in-container bind. |
-| `AXIOM_MCP_TOKEN` | Optional bearer token guarding `/mcp` (`Authorization: Bearer <token>`). Independent of `AXIOM_API_KEY`. |
+| `AXIOM_MCP_TOKEN` | Optional bearer token guarding `/mcp` (`Authorization: Bearer <token>`). When unset and `AXIOM_API_KEY` is set, `/mcp` requires the API key instead. |
+| `AXIOM_MAX_GENERATION_TOKENS` | Ceiling applied to request `max_tokens` for local generation (default 16384). |
+| `AXIOM_MAX_SESSIONS` / `AXIOM_MAX_TTT_SESSIONS` | Caps on `/v1/sessions` W̃ sessions (default 1024, `409` past it) and on proxy TTT sessions (default 512, LRU-evicted). |
+| `AXIOM_MERGE_ROOT` | `;`-separated directories `POST /v1/cluster/merge` may read from and write to (default: current directory and `~/.axiom`). |
+| `AXIOM_VFS_ALLOWED_ROOTS` / `AXIOM_VFS_MAX_READ_BYTES` | Restrict `/v1/hypervisor/mount` to these `;`-separated directories (unset ⇒ any), and cap a single `/v1/hypervisor/read` (default 16 MiB). |
 | `AXIOM_ENABLE_JIT_EXEC` | Off by default. Set to `1`/`true`/`on` to enable `POST /v1/hypervisor/jit_run`, which executes a caller-supplied command and can overwrite `source_path` on disk. A `process.execute` capability, distinct from `AXIOM_API_KEY` (which only decides *who* may call it). See [Process execution capability](#process-execution-capability). |
 | `AXIOM_PRODUCTION_BPE` | Enable the trained BPE checkpoint path. |
 | `AXIOM_TOKENIZER` | Path to `axiom_bpe.json`. |
@@ -579,6 +602,9 @@ Useful environment variables:
 | `AXIOM_ROUTER_CONSENSUS` | Set to `1` to enable consensus mode: the router asks two providers and fuses answers via `BetaBelief`. |
 | `AXIOM_CONFORMAL_THRESHOLD` | Pre-calibrated support threshold τ for the conformal factuality gate; replaces the shipped default of 0.75 (`SHIPPED_CONFORMAL_THRESHOLD` in `hallucination.rs`; 0.60 is a separate internal tier constant, `SUPPORT_HIGH`, not the default cutoff). |
 | `AXIOM_CONFORMAL_DELTA` | Coverage tolerance δ (default 0.10 → 90% coverage); pair with `AXIOM_CONFORMAL_THRESHOLD` or calibrate via `calibrate_conformal_threshold`. |
+
+The complete list of every `AXIOM_*` variable the binary reads, including the
+tuning knobs omitted here, is in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).
 
 ## Agent Task Loop (axiom-agent-task)
 
@@ -684,10 +710,13 @@ Full guide: [`docs/DEPLOY_K8S.md`](docs/DEPLOY_K8S.md).
 ## Experimental
 
 Wired and reachable, but **not covered by the [Proof Loop](#proof-loop), not
-benchmarked, and not part of the supported surface.** These are moving behind a
-`cargo` feature named `experimental` (default off) so stock builds — `cargo
-install`, the pip wheel, Docker, releases — ship only the proven surface.
-File-by-file plan: [`docs/EXPERIMENTAL.md`](docs/EXPERIMENTAL.md).
+benchmarked, and not part of the supported surface.** ChimeraLang and the
+predictive-reasoning MCP tools are already compiled only with the `cargo`
+feature `experimental` (default off), so stock builds — `cargo install`, the
+pip wheel, Docker, releases — omit them; the VFS hypervisor and DWE swarm
+routes are still registered in every build and are gated by configuration
+(`AXIOM_ENABLE_JIT_EXEC`, `AXIOM_FLEET_KEY`, `AXIOM_VFS_ALLOWED_ROOTS`)
+instead. File-by-file status: [`docs/EXPERIMENTAL.md`](docs/EXPERIMENTAL.md).
 
 | Subsystem | Surface | Status |
 |---|---|---|
@@ -725,29 +754,44 @@ against its own claims. The current set:
 
 ```text
 axiom_engine_rs/src/
+  main.rs                  3-line shim → entrypoint::run()
+  entrypoint.rs            --mode dispatch and every subcommand's driver
+  cli.rs                   clap subcommands
+  bin/axiom.rs             the `axiom` command (same entrypoint)
+  bin/agent_task_mcp.rs    the `axiom-agent-task` MCP server (agent task loop)
+  bin/axiombench/          proof-layer benchmark (--features tools)
+  server.rs                include!() shim over server/
+  server/                  axum HTTP API: prelude_state (AppState), routes_*.rs, run.rs
   adaptive.rs              adaptive compression thresholding
+  agentic.rs, agent_task.rs  goal-directed task loop and verifier gate
   anthropic_forwarder.rs   Anthropic Messages passthrough/forwarding
   belief.rs                Beta belief and conflict-aware peer confidence
-  cli.rs                   clap subcommands
-  context_compressor.rs    context partitioning and digest construction
+  cache_safety.rs, cvm_store.rs, digest.rs, cost_ledger.rs  CVM cost stack
+  prefix_diet.rs, tool_defer.rs, cache_stack.rs, keepalive.rs  prolonged-session stack
+  context_compressor.rs    context partitioning, TTT session store, digest construction
+  responses_compressor.rs  /v1/responses transcript compression
+  epistemic_drift.rs       epistemic validation of claims
   graph_memory.rs          directed edge graph over memory records + bounded spreading activation
   hallucination.rs         evidence-relative grounding checks
   heal_memory.rs           learned self-healing memory
   inference.rs             tokenizer plus inference pipeline
-  main.rs                  binary entrypoint and mode dispatch
-  mcp_stdio.rs             native MCP stdio server
+  mcp_stdio.rs             native MCP server (stdio + /mcp dispatch)
+  predictive_tools.rs      experimental predictive-reasoning MCP tools
   memory_store.rs          long-term memory store
   model.rs                 model layers
-  model_meta.rs            checkpoint sidecar metadata
+  model_meta.rs            checkpoint sidecar metadata (schema-versioned)
   openai_forwarder.rs      OpenAI-compatible forwarding
   poly_jit.rs              source repair loop support
   provenance.rs            signed export verification
   search_ingest.rs         live search ingestion into TTT
   search_scrape.rs         Rust web scraping helper
   self_heal.rs             supervised command runner
-  server.rs                HTTP API
   skeleton.rs              readable structural compression digest
   solve.rs                 verifier-driven solve loop
+  verify_suggest.rs        verifier suggestions + weak-spot heuristics
+  daemon.rs, vfs.rs        background daemon and user-mode neural VFS
+  tui.rs                   ratatui settings/status UI
+  chimera.rs               ChimeraLang DSL (--features experimental)
   ttt_block.rs             fast-weight update rule
   weight_merge.rs          checkpoint and peer merge logic
 ```

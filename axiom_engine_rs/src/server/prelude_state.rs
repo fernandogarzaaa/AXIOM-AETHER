@@ -1624,19 +1624,27 @@ fn tensor_to_layer_checkpoint(t: &Tensor) -> candle_core::Result<LayerCheckpoint
     Ok(LayerCheckpoint { shape, data })
 }
 
+/// Product of a tensor shape, `None` on overflow.
+pub(crate) fn checked_shape_product(shape: &[usize]) -> Option<usize> {
+    shape.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))
+}
+
 fn layer_checkpoint_to_tensor(
     lc: &LayerCheckpoint,
     device: &Device,
 ) -> candle_core::Result<Tensor> {
-    let total: usize = lc.shape.iter().product();
-    if total != lc.data.len() {
+    // Checked: a client-supplied shape like [2^40, 2^40] overflows the
+    // product (a panic in debug builds, a wrapped value in release).
+    let total = checked_shape_product(&lc.shape);
+    if total != Some(lc.data.len()) {
         candle_core::bail!(
             "checkpoint shape {:?} implies {} elements but data has {}",
             lc.shape,
-            total,
+            total.map_or_else(|| "an overflowing number of".to_string(), |t| t.to_string()),
             lc.data.len()
         );
     }
+    let total = lc.data.len();
     Tensor::from_vec(lc.data.clone(), (total,), device)?.reshape(lc.shape.as_slice())
 }
 

@@ -48,3 +48,9 @@ Repository = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
 
 [tool.setuptools.packages.find]
 include = ["axiom_engine*"]
+
+[tool.pytest.ini_options]
+# pytest-asyncio: pin the fixture loop scope explicitly so the suite does not
+# emit a PytestDeprecationWarning and behaves the same when the default flips.
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

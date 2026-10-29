@@ -77,9 +77,13 @@ fn resolve_production_model(legacy: AxiomConfig, default_ckpt: &str) -> (AxiomCo
             // Prefer dims from the checkpoint sidecar so any baked size loads;
             // fall back to the original 256/4 when no sidecar is present.
             let (d_model, n_layers, lr_inner, norm_eps) =
-                match crate::model_meta::ModelMeta::load(&ckpt) {
-                    Some(m) => (m.d_model, m.n_layers, m.lr_inner, m.norm_eps),
-                    None => (256, 4, 1e-3, 1e-6),
+                match crate::model_meta::ModelMeta::load_checked(&ckpt) {
+                    Ok(Some(m)) => (m.d_model, m.n_layers, m.lr_inner, m.norm_eps),
+                    Ok(None) => (256, 4, 1e-3, 1e-6),
+                    Err(e) => {
+                        eprintln!("[axiom] {e} — staying on legacy model");
+                        return (legacy, default_ckpt.to_string());
+                    }
                 };
             eprintln!(
                 "[axiom] PRODUCTION MODEL = BPE (vocab {vocab}, d_model {d_model}, n_layers {n_layers}); checkpoint {ckpt}"

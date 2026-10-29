@@ -24,7 +24,8 @@ binary wheel. Keep the names distinct to avoid confusion.
 ## How the binary set is controlled
 
 The crate defines two user-facing bins (`axiom`, `axiom_engine`) from the same
-entrypoint, and gates its ~10 dev/training/eval bins behind the **`tools`**
+entrypoint plus the `axiom-agent-task` MCP server, and gates its 11
+dev/training/eval bins (`axiombench`, trainers, crawlers, evals) behind the **`tools`**
 feature (`Cargo.toml`). A default build — `cargo install`, the pip wheel, Docker,
 and release — therefore ships only `axiom` (+ the `axiom_engine` alias), not the
 training toolchain. Build the dev tools with `cargo build --features tools`.

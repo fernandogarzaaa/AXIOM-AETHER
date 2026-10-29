@@ -6,7 +6,16 @@ async fn create_completion(
     let max_tokens = req.max_tokens.unwrap_or(32);
     let model = req.model.as_deref().unwrap_or(&state.model_id).to_string();
 
-    let text = run_generation(&state, &req.prompt, max_tokens, req.session_id.as_deref())?;
+    // Generation is synchronous (model decode loop, or a blocking HTTP call
+    // to a remote backend); keep it off the async worker threads.
+    let text = {
+        let gen_state = state.clone();
+        spawn_blocking(move || {
+            run_generation(&gen_state, &req.prompt, max_tokens, req.session_id.as_deref())
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("generation task join failed: {e}")))??
+    };
     state.trigger_lru_vram_budget();
 
     Ok(Json(CompletionResponse {
@@ -64,13 +73,16 @@ async fn create_chat_completion(
         }
     };
 
-    if req.stream.unwrap_or(false) {
-        let sse = chat_completion_sse(state.clone(), req);
-        state.trigger_lru_vram_budget();
-        sse.into_response()
+    // Both paths generate synchronously (see `run_generation`), so run them
+    // on the blocking pool rather than stalling an async worker.
+    let gen_state = state.clone();
+    let response = if req.stream.unwrap_or(false) {
+        spawn_blocking(move || chat_completion_sse(gen_state, req).into_response()).await
     } else {
-        let json = chat_completion_json(state.clone(), req);
-        state.trigger_lru_vram_budget();
-        json.into_response()
-    }
+        spawn_blocking(move || chat_completion_json(gen_state, req).into_response()).await
+    };
+    state.trigger_lru_vram_budget();
+    response.unwrap_or_else(|e| {
+        ApiError::Internal(format!("generation task join failed: {e}")).into_response()
+    })
 }

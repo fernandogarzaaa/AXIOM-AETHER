@@ -23,6 +23,15 @@ async fn create_session(
             .sessions
             .write()
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
+        // Sessions are only ever freed by an explicit DELETE; without a cap a
+        // client can allocate W_tilde tensors until the process dies.
+        let cap = max_legacy_sessions();
+        if sessions.len() >= cap {
+            return Err(ApiError::Conflict(format!(
+                "session limit reached ({cap} live sessions; DELETE /v1/sessions/{{id}} to free one, \
+                 or raise AXIOM_MAX_SESSIONS)"
+            )));
+        }
         sessions.insert(session_id.clone(), SessionData::new_active(states, now));
     }
     metrics::register_session(&session_id);
@@ -93,14 +102,21 @@ async fn adapt(
         resolve_or_create_session(&state, req.session_id.as_deref())?;
 
     let started_at = Instant::now();
+    // The inner TTT loop is pure CPU/GPU work; run it on the blocking pool so
+    // a long corpus does not stall every other request on this worker.
     let updated_states = {
-        let pipeline = state
-            .pipeline
-            .read()
-            .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
-        pipeline
-            .adapt_on_corpus_with_steps(&req.corpus, initial_states, steps_per_token)
-            .map_err(|e| ApiError::Internal(format!("adapt failed: {e}")))?
+        let pipeline = state.pipeline.clone();
+        let corpus = req.corpus;
+        spawn_blocking(move || {
+            let pipeline = pipeline
+                .read()
+                .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
+            pipeline
+                .adapt_on_corpus_with_steps(&corpus, initial_states, steps_per_token)
+                .map_err(|e| ApiError::Internal(format!("adapt failed: {e}")))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("adapt task join failed: {e}")))??
     };
     metrics::add_prefilled_tokens(corpus_tokens);
     metrics::observe_prefill_latency(started_at.elapsed().as_secs_f64());
@@ -269,12 +285,18 @@ async fn cluster_merge(
     Json(req): Json<ClusterMergeRequest>,
 ) -> Result<Json<MergeSummary>, ApiError> {
     let alpha = req.alpha.unwrap_or(0.5);
+    // The request names files on this server's disk. Confine every path to
+    // the merge roots so a data-plane caller cannot read arbitrary files
+    // (error messages echo the path) or overwrite arbitrary ones.
+    let roots = merge_allowed_roots();
     let inputs = req
         .inputs
-        .into_iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let output = PathBuf::from(req.output);
+        .iter()
+        .map(|p| confine_merge_path(FsPath::new(p), &roots, true))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError::BadRequest)?;
+    let output = confine_merge_path(FsPath::new(&req.output), &roots, false)
+        .map_err(ApiError::BadRequest)?;
     // Fleet merges default to DARE-TIES (sign-elected, sparsified) so agreeing
     // peers compound and conflicting deltas don't cancel; "alpha_blend" selects
     // the uniform task-vector interpolation instead.
@@ -297,6 +319,95 @@ async fn cluster_merge(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Directories `POST /v1/cluster/merge` may read inputs from and write its
+/// output into. `AXIOM_MERGE_ROOT` (one or more directories separated by `;`)
+/// sets them explicitly; otherwise the current working directory and
+/// `~/.axiom` are allowed, which covers the compression-cache files the route
+/// exists to merge. Roots that do not exist are skipped.
+fn merge_allowed_roots() -> Vec<PathBuf> {
+    let configured = std::env::var("AXIOM_MERGE_ROOT").ok();
+    let candidates: Vec<PathBuf> = match configured.as_deref().map(str::trim) {
+        Some(v) if !v.is_empty() => v
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+        _ => {
+            let mut v = Vec::new();
+            if let Ok(cwd) = std::env::current_dir() {
+                v.push(cwd);
+            }
+            if let Some(home) = dirs::home_dir() {
+                v.push(home.join(".axiom"));
+            }
+            v
+        }
+    };
+    candidates
+        .into_iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect()
+}
+
+/// Resolve `path` and check it lies under one of `roots`.
+///
+/// For `must_exist` (inputs) the whole path is canonicalized. For an output
+/// that may not exist yet, the nearest existing ancestor is canonicalized and
+/// checked instead, and `..` components are rejected outright so the un-
+/// canonicalized tail cannot climb back out. Returns the resolved path.
+fn confine_merge_path(path: &FsPath, roots: &[PathBuf], must_exist: bool) -> Result<PathBuf, String> {
+    use std::path::Component;
+    if path.as_os_str().is_empty() {
+        return Err("path must not be empty".into());
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!("path '{}' must not contain '..'", path.display()));
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot resolve current directory: {e}"))?
+            .join(path)
+    };
+    let resolved = if must_exist {
+        absolute
+            .canonicalize()
+            .map_err(|e| format!("input '{}' is not readable: {e}", path.display()))?
+    } else {
+        // Walk up to the nearest existing ancestor, canonicalize it, then
+        // re-attach the (already '..'-free) remainder.
+        let mut existing = absolute.clone();
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        while !existing.exists() {
+            let Some(name) = existing.file_name() else {
+                return Err(format!("output '{}' has no existing ancestor", path.display()));
+            };
+            tail.push(name.to_os_string());
+            existing = existing
+                .parent()
+                .map(FsPath::to_path_buf)
+                .ok_or_else(|| format!("output '{}' has no existing ancestor", path.display()))?;
+        }
+        let mut resolved = existing
+            .canonicalize()
+            .map_err(|e| format!("output '{}' is not resolvable: {e}", path.display()))?;
+        for name in tail.iter().rev() {
+            resolved.push(name);
+        }
+        resolved
+    };
+    if roots.iter().any(|root| resolved.starts_with(root)) {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "path '{}' is outside the merge roots (set AXIOM_MERGE_ROOT to allow other directories)",
+            path.display()
+        ))
+    }
+}
 
 /// Concatenate chat messages into a single prompt string.
 fn messages_to_prompt(messages: &[ChatMessage]) -> String {
@@ -337,6 +448,32 @@ fn partition_messages_for_state(
     }))
 }
 
+/// Default for `AXIOM_MAX_SESSIONS`: cap on `/v1/sessions` W_tilde sessions.
+const MAX_LEGACY_SESSIONS: usize = 1024;
+
+fn max_legacy_sessions() -> usize {
+    std::env::var("AXIOM_MAX_SESSIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MAX_LEGACY_SESSIONS)
+}
+
+/// Hard ceiling on `max_tokens` for any generation served by this process
+/// (`/v1/completions`, `/v1/chat/completions`, local `/v1/messages`). Override
+/// with `AXIOM_MAX_GENERATION_TOKENS`. The request value is clamped, not
+/// rejected, so OpenAI-style clients that send a large default keep working.
+const MAX_GENERATION_TOKENS: usize = 16_384;
+
+fn clamp_max_tokens(requested: usize) -> usize {
+    let ceiling = std::env::var("AXIOM_MAX_GENERATION_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MAX_GENERATION_TOKENS);
+    requested.min(ceiling)
+}
+
 /// Run generation, optionally using and updating a named session.
 ///
 /// When a Claude backend is installed on [`AppState`], generation is
@@ -349,6 +486,10 @@ fn run_generation(
     max_tokens: usize,
     session_id: Option<&str>,
 ) -> Result<String, ApiError> {
+    // `max_tokens` is attacker-controlled: an enormous value used to size a
+    // pre-allocation (or spin the decode loop) for as long as the client
+    // likes. Clamp it to the server ceiling before any backend sees it.
+    let max_tokens = clamp_max_tokens(max_tokens);
     // Router mode (AXIOM_BACKEND=router): GPT + Claude + local together, with
     // failover. Generation is delegated to external providers, so session TTT
     // state does not apply here.

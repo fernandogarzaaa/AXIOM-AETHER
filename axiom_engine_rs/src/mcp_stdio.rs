@@ -1502,7 +1502,13 @@ fn compress_path_blocking(path: &str, ctx: &McpContext) -> Result<String, String
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
                 let remaining = ctx.max_bytes.saturating_sub(total_bytes);
                 let slice = if text.len() > remaining {
-                    &text[..remaining]
+                    // Back off to a char boundary: slicing a multi-byte
+                    // character in half would panic.
+                    let mut cut = remaining;
+                    while cut > 0 && !text.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    &text[..cut]
                 } else {
                     &text[..]
                 };
@@ -1777,7 +1783,9 @@ fn pct_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 3 <= bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            // `get` (not `[..]`) so a multi-byte char right after '%' cannot
+            // make the slice land off a char boundary and panic.
+            if let Some(b) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok()) {
                 out.push(b);
                 i += 3;
                 continue;

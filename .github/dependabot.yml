@@ -1,0 +1,44 @@
+# Dependabot: keep the three Rust crate graphs, the Python reference package,
+# the Docker base images, and the GitHub Actions pins current. The Oct 2026
+# audit (#223) fixed five alerts by hand that automated bumps would have
+# surfaced as PRs; this makes that routine instead of a one-off.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /axiom_engine_rs
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: cargo
+    directory: /axiom_mesh_core
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: cargo
+    directory: /axiom_mesh_rs
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
