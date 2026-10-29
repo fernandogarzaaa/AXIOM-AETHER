@@ -770,6 +770,7 @@ against its own claims. The current set:
 | [`docs/COMPETITIVE-ANALYSIS.md`](docs/COMPETITIVE-ANALYSIS.md) | How AXIOM compares to Letta/Mem0/Zep, LLMLingua, and LiteLLM/Portkey — what's genuinely differentiated vs. unmeasured |
 | [`docs/AXIOMBENCH.md`](docs/AXIOMBENCH.md) | What's actually measured today vs. simulated vs. not built yet, and the spec for the task-success benchmark this project doesn't have |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Every finding, ranked P0–P4, with what's already fixed |
+| [`docs/LIVE-TEST-2026-10-29.md`](docs/LIVE-TEST-2026-10-29.md) | Deep live test of the release binary against the published Hugging Face checkpoints: loading, compression, proxy + CVM, hardening probes, MCP, first-run journey, with five findings |
 | [`docs/AUDIT_2026-07.md`](docs/AUDIT_2026-07.md), [`docs/ARCHITECTURE-UNIFIED.md`](docs/ARCHITECTURE-UNIFIED.md) | Prior audit passes — Docker/CI, and the AXIOM/EVE/ADAM cross-repository ownership map — still accurate for what they cover |
 
 ## Repository Map

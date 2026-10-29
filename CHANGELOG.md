@@ -57,6 +57,13 @@ releases are described on the GitHub Releases page.
   verify the download against it and refuse a mismatch
   (`AXIOM_REQUIRE_CHECKSUM=1` also refuses a release without a sidecar).
 - README `## Terminology` table.
+- `docs/LIVE-TEST-2026-10-29.md`: live test of the release binary against the
+  published Hub checkpoints (all three load; 86.3% bench savings; CVM digest
+  97.4% smaller with verbatim expand; every hardening probe behaves as
+  specified) and five findings, led by `axiom init` not wiring the checkpoint
+  it downloads.
+- `axiom bench` prints a caveat when the input is too small (under ~500
+  tokens) for the savings percentage to mean anything.
 - Checkpoint sidecars (`<ckpt>.meta.json`) carry `schema_version` and
   `engine_version`; a sidecar from a newer engine is refused instead of
   silently loading with default dimensions.
