@@ -32,6 +32,12 @@ releases are described on the GitHub Releases page.
 - API key and MCP token comparisons are constant-time.
 
 ### Fixed
+- `axiom init` now installs a usable production model: it fetches the
+  tokenizer and architecture sidecar next to the checkpoint it already
+  downloaded, and the proxy, MCP server, `bench` and `run` pick that model up
+  automatically when `AXIOM_PRODUCTION_BPE` is unset (`0` forces the legacy
+  model; `1` with `AXIOM_BPE_CKPT`/`AXIOM_TOKENIZER` is unchanged). Before,
+  the download went unused and a fresh install ran the legacy kernel.
 - `CvmStore::put` appends one line per page instead of rewriting the whole
   session file, and the digest hook's store write runs on the blocking pool.
 - Heal memory is no longer re-read and re-parsed from disk on every proxied

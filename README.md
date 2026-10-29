@@ -588,7 +588,7 @@ Useful environment variables:
 | `AXIOM_MERGE_ROOT` | `;`-separated directories `POST /v1/cluster/merge` may read from and write to (default: current directory and `~/.axiom`). |
 | `AXIOM_VFS_ALLOWED_ROOTS` / `AXIOM_VFS_MAX_READ_BYTES` | Restrict `/v1/hypervisor/mount` to these `;`-separated directories (unset ⇒ any), and cap a single `/v1/hypervisor/read` (default 16 MiB). |
 | `AXIOM_ENABLE_JIT_EXEC` | Off by default. Set to `1`/`true`/`on` to enable `POST /v1/hypervisor/jit_run`, which executes a caller-supplied command and can overwrite `source_path` on disk. A `process.execute` capability, distinct from `AXIOM_API_KEY` (which only decides *who* may call it). See [Process execution capability](#process-execution-capability). |
-| `AXIOM_PRODUCTION_BPE` | Enable the trained BPE checkpoint path. |
+| `AXIOM_PRODUCTION_BPE` | Unset = auto: the model `axiom init` installed under `~/.axiom/models/` is used when present. `1` forces the production path (`AXIOM_BPE_CKPT` / `AXIOM_TOKENIZER`), `0` forces the legacy model. |
 | `AXIOM_TOKENIZER` | Path to `axiom_bpe.json`. |
 | `AXIOM_BPE_CKPT` | Path to `axiom_production_bpe.bin`. |
 | `AXIOM_CHECKPOINT_SHA256` / `AXIOM_TOKENIZER_SHA256` | Optional pinned SHA-256 for the artifact fetched via `AXIOM_CHECKPOINT_URL` / `AXIOM_TOKENIZER_URL`. When set, a mismatch deletes the partial download and fails `axiom init` instead of installing an unverified checkpoint. When unset, the fetch still succeeds but the computed hash is printed so you can capture and pin it. |
@@ -770,6 +770,7 @@ against its own claims. The current set:
 | [`docs/COMPETITIVE-ANALYSIS.md`](docs/COMPETITIVE-ANALYSIS.md) | How AXIOM compares to Letta/Mem0/Zep, LLMLingua, and LiteLLM/Portkey — what's genuinely differentiated vs. unmeasured |
 | [`docs/AXIOMBENCH.md`](docs/AXIOMBENCH.md) | What's actually measured today vs. simulated vs. not built yet, and the spec for the task-success benchmark this project doesn't have |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Every finding, ranked P0–P4, with what's already fixed |
+| [`docs/MODEL-OPERATIONS.md`](docs/MODEL-OPERATIONS.md) | Runbook: whether and how to train the main model further, training and publishing the recall embedder, and fixing the published sidecars |
 | [`docs/LIVE-TEST-2026-10-29.md`](docs/LIVE-TEST-2026-10-29.md) | Deep live test of the release binary against the published Hugging Face checkpoints: loading, compression, proxy + CVM, hardening probes, MCP, first-run journey, with five findings |
 | [`docs/AUDIT_2026-07.md`](docs/AUDIT_2026-07.md), [`docs/ARCHITECTURE-UNIFIED.md`](docs/ARCHITECTURE-UNIFIED.md) | Prior audit passes — Docker/CI, and the AXIOM/EVE/ADAM cross-repository ownership map — still accurate for what they cover |
 

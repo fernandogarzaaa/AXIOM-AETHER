@@ -64,6 +64,20 @@ impl Point { pub fn norm(&self) -> f64 { (self.x * self.x + self.y * self.y).sqr
 RS
 "$BIN" bench "$SAMPLE/src" 2>&1 | grep -iE "token savings|signatures kept|round-trip|fidelity" | head -3 | sed 's/^/    /'
 "$BIN" bench "$SAMPLE/src" 2>&1 | grep -qiE "savings|round-trip" && ok "compression measured" || no "bench"
+# The model `axiom init` just downloaded must be the one bench runs on — not
+# the legacy kernel (2026-10-29 live test: init fetched it but nothing used it).
+# Offline (no download) the legacy banner is expected, so only assert when
+# init actually installed both halves.
+if [ -f "$HOME/.axiom/models/axiom_production_bpe.bin" ] && [ -f "$HOME/.axiom/models/axiom_bpe.json" ]; then
+    # Capture first: the banner is printed at startup, so `| grep -q` would
+    # close the pipe early and, under pipefail, report bench's SIGPIPE as a
+    # failure even though the banner matched.
+    BENCH_LOG="$("$BIN" bench "$SAMPLE/src" 2>&1)"
+    echo "$BENCH_LOG" | grep -q "PRODUCTION MODEL = BPE" \
+        && ok "bench ran on the production model init installed" || no "bench ignored the model init installed"
+else
+    echo "    (offline: init could not fetch the production model; legacy kernel in use)"
+fi
 
 st "4. axiom run — self-healing runtime (creates a missing dir)"
 "$BIN" run -- sh -c "echo built > $WORK/dist/app.bin" 2>&1 | grep -iE "heal|result|immun" | head -3 | sed 's/^/    /'

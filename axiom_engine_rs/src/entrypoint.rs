@@ -48,32 +48,56 @@ fn usage() -> &'static str {
 /// feature flag (`--features cuda` or `--features metal`).
 /// Objective 1.3: production model selection, SAFETY-GATED.
 ///
-/// The live proxy only switches from the legacy 256-hash model to the scaled
-/// BPE model when `AXIOM_PRODUCTION_BPE=1` AND the tokenizer artifact exists —
-/// so it can never accidentally serve an unbaked model. On activation it sets
-/// `AXIOM_TOKENIZER` (consumed by run_server / mcp_stdio) and returns the scaled
-/// config (vocab read from the tokenizer) plus the BPE checkpoint path.
+/// The proxy switches from the legacy 256-hash model to the scaled BPE model
+/// only when the tokenizer artifact exists, so it can never serve an unbaked
+/// model. Which model is considered is decided by
+/// [`config::select_production_model`]: `AXIOM_PRODUCTION_BPE=1` with
+/// `AXIOM_BPE_CKPT`/`AXIOM_TOKENIZER` (the historical explicit form),
+/// `AXIOM_PRODUCTION_BPE=0` to force legacy, or — with the flag unset — the
+/// model `axiom init` installed under `~/.axiom/models/`, so a fresh install
+/// runs the real checkpoint without exporting anything. On activation it sets
+/// `AXIOM_TOKENIZER` / `AXIOM_BPE_CKPT` (consumed by run_server / mcp_stdio)
+/// and returns the scaled config (vocab read from the tokenizer) plus the BPE
+/// checkpoint path.
 fn resolve_production_model(legacy: AxiomConfig, default_ckpt: &str) -> (AxiomConfig, String) {
-    let enabled = std::env::var("AXIOM_PRODUCTION_BPE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if !enabled {
-        return (legacy, default_ckpt.to_string());
-    }
-    let bpe = std::env::var("AXIOM_TOKENIZER")
-        .unwrap_or_else(|_| "checkpoints/axiom_bpe.json".to_string());
-    let ckpt = std::env::var("AXIOM_BPE_CKPT")
-        .unwrap_or_else(|_| "checkpoints/axiom_production_bpe.bin".to_string());
+    let flag = std::env::var("AXIOM_PRODUCTION_BPE").ok();
+    let env_ckpt = std::env::var("AXIOM_BPE_CKPT").ok();
+    let env_tok = std::env::var("AXIOM_TOKENIZER").ok();
+    // Only look at ~/.axiom when the decision can depend on it.
+    let installed = if env_ckpt.is_none() && env_tok.is_none() && flag.as_deref() != Some("0") {
+        config::installed_production_model()
+    } else {
+        None
+    };
+    let (ckpt, bpe, auto) = match config::select_production_model(
+        flag.as_deref(),
+        (env_ckpt.as_deref(), env_tok.as_deref()),
+        installed.as_ref(),
+    ) {
+        config::ProductionSelection::Legacy => return (legacy, default_ckpt.to_string()),
+        config::ProductionSelection::Production(c, t, auto) => (
+            c.to_string_lossy().into_owned(),
+            t.to_string_lossy().into_owned(),
+            auto,
+        ),
+    };
     if !std::path::Path::new(&bpe).exists() {
         eprintln!(
             "[axiom] AXIOM_PRODUCTION_BPE=1 but tokenizer '{bpe}' missing — staying on legacy model"
         );
         return (legacy, default_ckpt.to_string());
     }
+    if auto {
+        eprintln!(
+            "[axiom] using the production model installed by `axiom init` ({ckpt}); set \
+             AXIOM_PRODUCTION_BPE=0 to force the legacy model"
+        );
+    }
     match tokenizers::Tokenizer::from_file(&bpe) {
         Ok(tok) => {
             let vocab = tok.get_vocab_size(true);
             std::env::set_var("AXIOM_TOKENIZER", &bpe);
+            std::env::set_var("AXIOM_BPE_CKPT", &ckpt);
             // Prefer dims from the checkpoint sidecar so any baked size loads;
             // fall back to the original 256/4 when no sidecar is present.
             let (d_model, n_layers, lr_inner, norm_eps) =
@@ -693,12 +717,29 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 cfg.models.auto_fetch = false;
                 config::write_user_config(&paths, &cfg)
                     .map_err(|e| candle_core::Error::Msg(format!("config write failed: {e}")))?;
-            } else if let Err(err) = config::ensure_base_model(&paths, &cfg) {
-                eprintln!(
-                    "[axiom] model auto-fetch skipped: {err}. You can place {} manually in {}.",
-                    cfg.models.base_model_file,
-                    paths.models_dir.display()
-                );
+            } else {
+                match config::ensure_base_model(&paths, &cfg) {
+                    Err(err) => eprintln!(
+                        "[axiom] model auto-fetch skipped: {err}. You can place {} manually in {}.",
+                        cfg.models.base_model_file,
+                        paths.models_dir.display()
+                    ),
+                    Ok(_) => match paths.user_production_model(&cfg) {
+                        Some(m) => println!(
+                            "[axiom] production model ready: {} + {} — the proxy, MCP server, bench \
+                             and run use it automatically (AXIOM_PRODUCTION_BPE=0 forces the legacy model)",
+                            m.checkpoint.display(),
+                            m.tokenizer.display()
+                        ),
+                        None => println!(
+                            "[axiom] production model NOT wired: {} needs both {} and {} in {}",
+                            cfg.models.base_model_file,
+                            cfg.models.base_model_file,
+                            cfg.models.tokenizer_file,
+                            paths.models_dir.display()
+                        ),
+                    },
+                }
             }
             println!(
                 "[axiom] initialized {} at {}",
