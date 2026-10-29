@@ -331,14 +331,14 @@ mod tests {
     #[tokio::test]
     async fn pipeline_lock_allows_concurrent_readers() {
         let state = make_test_state().await;
-        let first = state.pipeline.read().unwrap();
-        let second = state
-            .pipeline
-            .try_read()
-            .expect("a second concurrent reader must not block behind the first");
-        assert_eq!(first.token_count("same pipeline"), second.token_count("same pipeline"));
-        drop(first);
-        drop(second);
+        {
+            let first = state.pipeline.read().unwrap();
+            let second = state
+                .pipeline
+                .try_read()
+                .expect("a second concurrent reader must not block behind the first");
+            assert_eq!(first.token_count("same pipeline"), second.token_count("same pipeline"));
+        }
         safe_drop(state.pipeline.clone()).await;
     }
 
@@ -473,12 +473,17 @@ mod tests {
         ));
 
         {
-            let pipeline = state.pipeline.read().unwrap();
-            let handle = state
-                .ttt_sessions
-                .get_or_create("persist-s1", &pipeline)
-                .unwrap();
+            // Take the async session lock first so the std pipeline read guard
+            // is never held across an `.await`.
+            let handle = {
+                let pipeline = state.pipeline.read().unwrap();
+                state
+                    .ttt_sessions
+                    .get_or_create("persist-s1", &pipeline)
+                    .unwrap()
+            };
             let mut states = handle.lock().await;
+            let pipeline = state.pipeline.read().unwrap();
             let tokens = pipeline.encode_text("fn persisted() { cache(); }");
             adapt_session_blocking(&pipeline, &mut states, &tokens).unwrap();
         }
@@ -1166,6 +1171,10 @@ mod tests {
         assert!(confine_merge_path(FsPath::new(""), &roots, false).is_err());
     }
 
+    // `#[tokio::test]` is a current-thread runtime and nothing else runs on it
+    // while the env guard is held, so holding the std mutex across the awaits
+    // below is intentional: it serialises env mutation against the sync tests.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cluster_merge_refuses_paths_outside_merge_roots() {
         let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -1273,6 +1282,10 @@ mod tests {
         safe_drop(pipeline_arc).await;
     }
 
+    // `#[tokio::test]` is a current-thread runtime and nothing else runs on it
+    // while the env guard is held, so holding the std mutex across the awaits
+    // below is intentional: it serialises env mutation against the sync tests.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn session_creation_is_capped() {
         let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());

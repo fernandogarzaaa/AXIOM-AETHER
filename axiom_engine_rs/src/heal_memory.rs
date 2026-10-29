@@ -862,11 +862,11 @@ mod tests {
     #[test]
     fn remember_save_load_immunize_roundtrip() {
         let mem_path = tmp("roundtrip");
-        let dir = std::env::temp_dir().join(tmp("dir").file_stem().unwrap().to_os_string());
+        let dir = std::env::temp_dir().join(tmp("dir").file_stem().unwrap());
         let fp = fingerprint("prog", &[]);
 
         let mut mem = HealMemory::load(&mem_path);
-        mem.remember_dirs(&fp, "prog", &[dir.clone()]);
+        mem.remember_dirs(&fp, "prog", std::slice::from_ref(&dir));
         mem.save().unwrap();
 
         // Fresh load in a "fresh environment" (dir does not exist yet).
@@ -1208,14 +1208,17 @@ mod tests {
 
     #[test]
     fn immunize_structural_applies_to_a_program_never_seen_before() {
-        let dir =
-            std::env::temp_dir().join(tmp("structural_dir").file_stem().unwrap().to_os_string());
+        let dir = std::env::temp_dir().join(tmp("structural_dir").file_stem().unwrap());
         let mut mem = HealMemory::load(tmp("structural_apply"));
-        mem.remember_dirs(&fingerprint("make", &[]), "make", &[dir.clone()]);
+        mem.remember_dirs(
+            &fingerprint("make", &[]),
+            "make",
+            std::slice::from_ref(&dir),
+        );
         mem.remember_dirs(
             &fingerprint("npm", &["run".into()]),
             "npm run",
-            &[dir.clone()],
+            std::slice::from_ref(&dir),
         );
 
         // A third program, with zero history of its own, still gets the
@@ -1237,8 +1240,8 @@ mod tests {
     fn immunize_structural_does_not_duplicate_a_programs_own_known_dir() {
         let mut mem = HealMemory::load(tmp("structural_no_dup"));
         let shared = PathBuf::from("shared_dir_xyz");
-        mem.remember_dirs(&fingerprint("a", &[]), "a", &[shared.clone()]);
-        mem.remember_dirs(&fingerprint("b", &[]), "b", &[shared.clone()]);
+        mem.remember_dirs(&fingerprint("a", &[]), "a", std::slice::from_ref(&shared));
+        mem.remember_dirs(&fingerprint("b", &[]), "b", std::slice::from_ref(&shared));
 
         // `a` already knows about `shared_dir_xyz` itself -- immunize_structural
         // must not re-report it as a *structural* heal for `a` (that would
@@ -1253,12 +1256,8 @@ mod tests {
 
     #[test]
     fn missing_structural_prerequisites_predicts_for_an_unknown_program() {
-        let anchor = std::env::temp_dir().join(
-            tmp("structural_predict_anchor")
-                .file_stem()
-                .unwrap()
-                .to_os_string(),
-        );
+        let anchor =
+            std::env::temp_dir().join(tmp("structural_predict_anchor").file_stem().unwrap());
         std::fs::create_dir_all(&anchor).unwrap();
         let mut mem = HealMemory::load(tmp("structural_predict"));
         mem.remember_dirs(&fingerprint("a", &[]), "a", &[PathBuf::from("needed")]);

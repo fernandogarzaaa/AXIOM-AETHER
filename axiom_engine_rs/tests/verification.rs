@@ -116,12 +116,9 @@ fn load_or_train_pipeline(config: &AxiomConfig, device: &Device) -> (InferencePi
         println!("[passkey] meta-train final loss = {final_loss:.4}");
     }
 
-    let pipeline = InferencePipeline::with_checkpoint(
-        config.clone(),
-        device.clone(),
-        CONVERGED_CHECKPOINT.to_string(),
-    )
-    .expect("pipeline must load the converged checkpoint");
+    let pipeline =
+        InferencePipeline::with_checkpoint(config.clone(), device.clone(), CONVERGED_CHECKPOINT)
+            .expect("pipeline must load the converged checkpoint");
     (pipeline, CONVERGED_CHECKPOINT.to_string())
 }
 

@@ -13,9 +13,13 @@ use candle_core::Device;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+/// One captured upstream request: the `X-Axiom-Session-Id` it carried (if
+/// any) and its JSON body.
+type CapturedRequest = (Option<String>, Value);
+
 #[derive(Clone, Default)]
 struct Capture {
-    requests: Arc<Mutex<Vec<(Option<String>, Value)>>>,
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
 }
 
 fn build_pipeline() -> InferencePipeline {

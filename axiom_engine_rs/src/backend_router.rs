@@ -473,8 +473,10 @@ mod tests {
 
     #[test]
     fn consensus_agreement_raises_confidence() {
-        let mut policy = RoutePolicy::default();
-        policy.consensus = true;
+        let policy = RoutePolicy {
+            consensus: true,
+            ..Default::default()
+        };
         let r = Router::new(policy)
             .with(Provider::OpenAi, Box::new(Fixed("the answer is 42")))
             .with(Provider::Anthropic, Box::new(Fixed("The answer is 42")));
@@ -490,8 +492,10 @@ mod tests {
 
     #[test]
     fn consensus_conflict_lowers_confidence() {
-        let mut policy = RoutePolicy::default();
-        policy.consensus = true;
+        let policy = RoutePolicy {
+            consensus: true,
+            ..Default::default()
+        };
         let r = Router::new(policy)
             .with(
                 Provider::OpenAi,
@@ -511,8 +515,10 @@ mod tests {
 
     #[test]
     fn consensus_falls_back_to_single_when_only_one_responds() {
-        let mut policy = RoutePolicy::default();
-        policy.consensus = true;
+        let policy = RoutePolicy {
+            consensus: true,
+            ..Default::default()
+        };
         let r = Router::new(policy).with(Provider::OpenAi, Box::new(Fixed("solo")));
         let a = r.generate(TaskKind::General, "q", 256).unwrap();
         assert_eq!(a.text, "solo");

@@ -294,5 +294,5 @@ fn run_harness() {
         );
     }
 
-    assert!(train_tokens.len() > 0);
+    assert!(!train_tokens.is_empty());
 }

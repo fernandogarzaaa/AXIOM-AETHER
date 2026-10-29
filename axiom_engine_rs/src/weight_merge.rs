@@ -574,7 +574,7 @@ mod tests {
             drop_prob: 0.5,
             seed: 1,
         };
-        assert!(merge_checkpoint_files_with(&[tmp.clone()], &tmp, bad).is_err());
+        assert!(merge_checkpoint_files_with(std::slice::from_ref(&tmp), &tmp, bad).is_err());
         let _ = std::fs::remove_file(&tmp);
     }
 }

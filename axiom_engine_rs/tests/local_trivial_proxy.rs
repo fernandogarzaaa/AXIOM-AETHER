@@ -37,6 +37,7 @@ impl EnvVarGuard {
         std::env::set_var(key, value);
         Self { key, prior }
     }
+    #[allow(dead_code)] // kept for symmetry with `set`; not every test needs it
     fn unset(key: &'static str) -> Self {
         let prior = std::env::var(key).ok();
         std::env::remove_var(key);

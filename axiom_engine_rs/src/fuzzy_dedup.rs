@@ -349,7 +349,7 @@ mod tests {
     use super::*;
 
     fn block(byte: char, len: usize) -> String {
-        let word: String = std::iter::repeat(byte).take(4).collect();
+        let word: String = std::iter::repeat_n(byte, 4).collect();
         let mut s = String::new();
         while s.len() < len {
             if !s.is_empty() {

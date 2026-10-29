@@ -70,7 +70,7 @@ fn main() {
         for (i, p) in mined.iter().enumerate().step_by(step).take(synth_n) {
             let prompt = format!(
                 "Read this code/text and write ONE short natural-language question a developer would ask whose answer is this snippet. Output ONLY the question.\n\n{}",
-                &p.positive.chars().take(1200).collect::<String>()
+                p.positive.chars().take(1200).collect::<String>()
             );
             let body = json!({
                 "model": "claude-haiku-4-5-20251001",

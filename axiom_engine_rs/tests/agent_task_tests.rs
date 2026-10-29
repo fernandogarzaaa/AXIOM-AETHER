@@ -105,7 +105,7 @@ fn failed_proposal_preserves_the_last_successful_proposal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file.txt");
     fs::write(&path, "initial").unwrap();
-    let mut task = task(&[path.clone()], "exit 0");
+    let mut task = task(std::slice::from_ref(&path), "exit 0");
     let accepted = task.propose(vec![edit(&path, "accepted")]);
     assert!(accepted.passed);
     task.verify_cmd = "exit 1".into();
@@ -149,7 +149,7 @@ fn equivalent_rejected_edits_are_deduplicated_even_when_reordered() {
 fn successful_proposals_are_not_added_to_rejection_memory() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file.txt");
-    let mut task = task(&[path.clone()], "exit 0");
+    let mut task = task(std::slice::from_ref(&path), "exit 0");
     let first = task.propose(vec![edit(&path, "accepted")]);
     let second = task.propose(vec![edit(&path, "accepted")]);
     assert!(first.passed && second.passed);
@@ -209,7 +209,7 @@ fn finish_is_idempotent_and_rejects_further_proposals() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
         fs::write(&path, "initial").unwrap();
-        let mut task = task(&[path.clone()], "exit 0");
+        let mut task = task(std::slice::from_ref(&path), "exit 0");
         let accepted = task.propose(vec![edit(&path, "accepted")]);
         assert!(accepted.passed);
         task.finish(commit).unwrap();
@@ -308,7 +308,7 @@ mod verifier {
         let path = dir.path().join("file with 'quotes'.txt");
         fs::write(&path, "old").unwrap();
         let command = format!("test \"$(cat {})\" = expected", shell_quote(&path));
-        let mut task = task(&[path.clone()], &command);
+        let mut task = task(std::slice::from_ref(&path), &command);
         assert!(!task.propose(vec![edit(&path, "incorrect")]).passed);
         assert_eq!(fs::read_to_string(&path).unwrap(), "old");
         assert!(task.propose(vec![edit(&path, "expected")]).passed);
@@ -329,7 +329,7 @@ mod verifier {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("file.txt");
-            let mut task = task(&[path.clone()], command);
+            let mut task = task(std::slice::from_ref(&path), command);
             let outcome = task.propose(vec![edit(&path, "new")]);
             assert_eq!(outcome.passed, passed, "{command}");
             assert_eq!(outcome.output, expected, "{command}");
@@ -344,7 +344,7 @@ mod verifier {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("file.txt");
             let command = format!("printf '%s' '{}'", "x".repeat(length));
-            let mut task = task(&[path.clone()], &command);
+            let mut task = task(std::slice::from_ref(&path), &command);
             let outcome = task.propose(vec![edit(&path, "new")]);
             assert!(outcome.passed);
             let mut expected = "x".repeat(length.min(8000));
@@ -362,7 +362,10 @@ mod verifier {
         let path = dir.path().join("file.txt");
         // The 8,000-byte limit falls in the middle of this three-byte character.
         let output = format!("{}\u{20ac}tail", "x".repeat(7999));
-        let mut task = task(&[path.clone()], &format!("printf '%s' '{output}'"));
+        let mut task = task(
+            std::slice::from_ref(&path),
+            &format!("printf '%s' '{output}'"),
+        );
         let outcome = task.propose(vec![edit(&path, "accepted")]);
         assert!(outcome.passed);
         let prefix = outcome.output.strip_suffix("\n...[truncated]").unwrap();

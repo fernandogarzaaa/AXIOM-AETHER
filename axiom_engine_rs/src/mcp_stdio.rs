@@ -2321,7 +2321,7 @@ mod tests {
             "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
         });
         assert_eq!(result["protocolVersion"], "2026-07-28");
-        assert!(result["supportedVersions"].as_array().unwrap().len() >= 1);
+        assert!(!result["supportedVersions"].as_array().unwrap().is_empty());
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
     }

@@ -834,7 +834,7 @@ mod tests {
 
     #[test]
     fn adapt_chunk_cap_stays_below_phase3_ceiling() {
-        assert!(MAX_ADAPT_CHUNK_TOKENS < 512);
+        const { assert!(MAX_ADAPT_CHUNK_TOKENS < 512) };
     }
 
     #[test]
