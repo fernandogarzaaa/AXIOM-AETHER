@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "axiom_engine"
 version = "0.5.0"
 edition = "2021"
@@ -156,7 +156,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1"
-tokenizers = "0.15"
+tokenizers = "0.22"
 scraper = "0.27"
 tree-sitter = "0.26.9"
 tree-sitter-rust = "0.24.2"
