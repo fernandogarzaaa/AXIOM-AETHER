@@ -103,14 +103,10 @@ impl InferencePipeline {
             // (zeros, lr schedule, surprise gate, …) for tensors the checkpoint
             // predates. Older checkpoints (pre-fast_bias, pre-w_lr, …) load
             // instead of hard-failing on `cannot find tensor`.
-            let file_bytes =
-                std::fs::read(checkpoint).map_err(|e| {
-                    candle_core::Error::Msg(format!(
-                        "cannot read checkpoint {checkpoint}: {e}"
-                    ))
-                })?;
-            let file_tensors =
-                candle_core::safetensors::load_buffer(&file_bytes, &device)?;
+            let file_bytes = std::fs::read(checkpoint).map_err(|e| {
+                candle_core::Error::Msg(format!("cannot read checkpoint {checkpoint}: {e}"))
+            })?;
+            let file_tensors = candle_core::safetensors::load_buffer(&file_bytes, &device)?;
             let mut tensor_data = varmap.data().lock().unwrap();
             let mut skipped: Vec<String> = Vec::new();
             for (name, var) in tensor_data.iter_mut() {
