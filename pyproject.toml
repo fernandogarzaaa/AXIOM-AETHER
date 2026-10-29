@@ -30,7 +30,7 @@ dependencies = [
 server = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
-    "pydantic>=2.0",
+    "pydantic>=2.14.1",
 ]
 dev = [
     "pytest>=8",
