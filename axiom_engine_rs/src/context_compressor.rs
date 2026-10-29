@@ -760,9 +760,15 @@ mod tests {
         store.insert_states("a".into(), Vec::new());
         store.insert_states("c".into(), Vec::new());
         assert_eq!(store.len(), 2);
-        let live: std::collections::BTreeSet<String> =
-            store.snapshot_handles().into_iter().map(|(k, _)| k).collect();
-        assert!(live.contains("a") && live.contains("c") && !live.contains("b"), "{live:?}");
+        let live: std::collections::BTreeSet<String> = store
+            .snapshot_handles()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            live.contains("a") && live.contains("c") && !live.contains("b"),
+            "{live:?}"
+        );
         // Replacing an existing id never evicts anything else.
         store.insert_states("c".into(), Vec::new());
         assert_eq!(store.len(), 2);

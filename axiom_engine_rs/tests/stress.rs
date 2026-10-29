@@ -111,8 +111,10 @@ async fn high_concurrency_multitenant_sessions_stay_isolated_and_clean() {
     let (mock_addr, captured) = start_mock_anthropic().await;
 
     let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
-    let forwarder =
-        AnthropicForwarder::new(Some("test-key".to_string()), Some(format!("http://{mock_addr}")));
+    let forwarder = AnthropicForwarder::new(
+        Some("test-key".to_string()),
+        Some(format!("http://{mock_addr}")),
+    );
     let cfg = CompressorConfig {
         enabled: true,
         heavy_message_threshold_tokens: 400,
@@ -178,7 +180,10 @@ async fn high_concurrency_multitenant_sessions_stay_isolated_and_clean() {
 
     let mut hashes = std::collections::HashSet::new();
     for body in &payloads {
-        assert!(body.get("session_id").is_none(), "session_id must be stripped");
+        assert!(
+            body.get("session_id").is_none(),
+            "session_id must be stripped"
+        );
         let combined: String = body["messages"]
             .as_array()
             .unwrap()

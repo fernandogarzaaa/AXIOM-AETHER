@@ -119,10 +119,16 @@ mod tests {
             json!({"name":"Monitor"}),
             json!({"name":"SendMessage"}),
         ];
-        assert!(!has_working_set_overlap(&bespoke, &keep), "no overlap -> skip deferral");
+        assert!(
+            !has_working_set_overlap(&bespoke, &keep),
+            "no overlap -> skip deferral"
+        );
         // The main-loop shape (builtins present) DOES overlap.
         let main_loop = vec![json!({"name":"Read"}), json!({"name":"ObscureTool"})];
-        assert!(has_working_set_overlap(&main_loop, &keep), "core overlap -> defer eligible");
+        assert!(
+            has_working_set_overlap(&main_loop, &keep),
+            "core overlap -> defer eligible"
+        );
     }
 
     #[test]
@@ -138,8 +144,16 @@ mod tests {
         ];
         let (out, count) = mark_deferred(&tools, &keep);
         assert_eq!(count, 1, "only the freshly-flagged tool counts");
-        assert_eq!(out[1]["defer_loading"], json!(true), "pre-deferred flag preserved");
-        assert_eq!(out[2]["defer_loading"], json!(true), "unused tool freshly deferred");
+        assert_eq!(
+            out[1]["defer_loading"],
+            json!(true),
+            "pre-deferred flag preserved"
+        );
+        assert_eq!(
+            out[2]["defer_loading"],
+            json!(true),
+            "unused tool freshly deferred"
+        );
     }
 
     #[test]
@@ -192,7 +206,10 @@ mod tests {
         let keep: HashSet<String> = ["A".to_string()].into_iter().collect();
         let a = mark_deferred(&tools, &keep).0;
         let b = mark_deferred(&tools, &keep).0;
-        assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap()
+        );
     }
 
     #[test]

@@ -108,8 +108,8 @@ impl TaskBoard {
 
     /// Open from the `AXIOM_TASK_DIR` env var (default `checkpoints/tasks/`).
     pub fn from_env() -> std::io::Result<Self> {
-        let dir = std::env::var("AXIOM_TASK_DIR")
-            .unwrap_or_else(|_| "checkpoints/tasks".to_string());
+        let dir =
+            std::env::var("AXIOM_TASK_DIR").unwrap_or_else(|_| "checkpoints/tasks".to_string());
         Self::open(dir)
     }
 
@@ -199,8 +199,8 @@ impl TaskBoard {
             .create(true)
             .append(true)
             .open(&path)?;
-        let line = serde_json::to_string(&entry)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let line =
+            serde_json::to_string(&entry).map_err(|e| std::io::Error::other(e.to_string()))?;
         writeln!(file, "{line}")?;
 
         Ok(entry)
@@ -227,7 +227,8 @@ impl TaskBoard {
             .min_by(|(ia, a), (ib, b)| {
                 // Higher priority wins (descending), then earlier posted_at
                 // (ascending), then lower index (ascending) to break ties.
-                b.priority.cmp(&a.priority)
+                b.priority
+                    .cmp(&a.priority)
                     .then(a.posted_at.cmp(&b.posted_at))
                     .then(ia.cmp(ib))
             });
@@ -280,11 +281,7 @@ impl TaskBoard {
     }
 
     /// List tasks in `channel`, optionally filtered by status string.
-    pub fn list_tasks(
-        &self,
-        channel: &str,
-        status_filter: Option<&str>,
-    ) -> Vec<TaskEntry> {
+    pub fn list_tasks(&self, channel: &str, status_filter: Option<&str>) -> Vec<TaskEntry> {
         self.load_channel(channel)
             .into_iter()
             .filter(|t| match status_filter {
@@ -304,11 +301,7 @@ impl TaskBoard {
             .filter_map(|e| {
                 let p = e.path();
                 if p.extension()?.to_str()? == "jsonl" {
-                    Some(
-                        p.file_stem()?
-                            .to_str()?
-                            .to_string(),
-                    )
+                    Some(p.file_stem()?.to_str()?.to_string())
                 } else {
                     None
                 }
@@ -339,9 +332,7 @@ mod tests {
     use super::*;
 
     fn tmp_board_std() -> (TaskBoard, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "axiom_task_test_{}", uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("axiom_task_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let board = TaskBoard::open(&dir).unwrap();
         (board, dir)
@@ -360,8 +351,12 @@ mod tests {
     #[test]
     fn claim_returns_oldest_pending() {
         let (board, _dir) = tmp_board_std();
-        board.post_task("chan", "first", None, None, 0, None).unwrap();
-        board.post_task("chan", "second", None, None, 0, None).unwrap();
+        board
+            .post_task("chan", "first", None, None, 0, None)
+            .unwrap();
+        board
+            .post_task("chan", "second", None, None, 0, None)
+            .unwrap();
         let claimed = board.claim_task("chan", Some("agent-1".into())).unwrap();
         assert!(claimed.is_some());
         let c = claimed.unwrap();
@@ -380,7 +375,9 @@ mod tests {
     #[test]
     fn task_result_marks_done() {
         let (board, _dir) = tmp_board_std();
-        let t = board.post_task("chan", "work", None, None, 0, None).unwrap();
+        let t = board
+            .post_task("chan", "work", None, None, 0, None)
+            .unwrap();
         board.claim_task("chan", None).unwrap();
         let ok = board.task_result(&t.task_id, "finished!", true).unwrap();
         assert!(ok);
@@ -392,8 +389,12 @@ mod tests {
     #[test]
     fn high_priority_claimed_first() {
         let (board, _dir) = tmp_board_std();
-        board.post_task("chan", "normal", None, None, 0, None).unwrap();
-        board.post_task("chan", "urgent", None, None, 1, Some("codex".into())).unwrap();
+        board
+            .post_task("chan", "normal", None, None, 0, None)
+            .unwrap();
+        board
+            .post_task("chan", "urgent", None, None, 1, Some("codex".into()))
+            .unwrap();
         let claimed = board.claim_task("chan", None).unwrap().unwrap();
         assert_eq!(claimed.description, "urgent");
     }

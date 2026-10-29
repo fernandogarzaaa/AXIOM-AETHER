@@ -148,7 +148,12 @@ pub fn merge_checkpoint_files_with(
                 input.display()
             ));
         }
-        sessions.extend(cache.entries.into_iter().map(|entry| entry.checkpoint.layers));
+        sessions.extend(
+            cache
+                .entries
+                .into_iter()
+                .map(|entry| entry.checkpoint.layers),
+        );
     }
     if sessions.is_empty() {
         return Err("input checkpoints contain no sessions".to_string());
@@ -178,8 +183,8 @@ pub fn merge_checkpoint_files_with(
         fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {} failed: {e}", parent.display()))?;
     }
-    let bytes =
-        crate::bincode_compat::serialize(&payload).map_err(|e| format!("encode merged cache failed: {e}"))?;
+    let bytes = crate::bincode_compat::serialize(&payload)
+        .map_err(|e| format!("encode merged cache failed: {e}"))?;
     fs::write(output, bytes).map_err(|e| format!("write {} failed: {e}", output.display()))?;
 
     Ok(MergeSummary {
@@ -519,7 +524,10 @@ mod tests {
             seed: 1,
         };
         let merged = merge_layer_stacks_with(&[a, b], method).unwrap();
-        assert!((merged[0].data[0] - 1.5).abs() < 1e-5, "agreeing deltas average");
+        assert!(
+            (merged[0].data[0] - 1.5).abs() < 1e-5,
+            "agreeing deltas average"
+        );
         assert!(
             (merged[0].data[1] - 0.5).abs() < 1e-5,
             "elected sign keeps the dominant delta, not the cancelled average"
@@ -532,7 +540,9 @@ mod tests {
         let mk = || {
             vec![vec![LayerWeights {
                 shape: vec![4, 4],
-                data: (0..16).map(|i| if i % 5 == 0 { 1.3 } else { 0.2 }).collect(),
+                data: (0..16)
+                    .map(|i| if i % 5 == 0 { 1.3 } else { 0.2 })
+                    .collect(),
             }]]
         };
         let method = MergeMethod::DareTies {

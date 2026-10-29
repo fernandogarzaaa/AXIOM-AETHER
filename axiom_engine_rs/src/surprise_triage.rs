@@ -185,8 +185,7 @@ impl SurpriseTriage {
         let out = match level {
             CompressionLevel::Verbatim => text.to_string(),
             CompressionLevel::Skeleton => {
-                let ranked =
-                    crate::skeleton::skeletonize_ranked(text, lang, Some(budget));
+                let ranked = crate::skeleton::skeletonize_ranked(text, lang, Some(budget));
                 if ranked.trim().is_empty() {
                     aggressive_truncate(text, budget)
                 } else {

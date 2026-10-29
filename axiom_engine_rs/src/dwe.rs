@@ -308,7 +308,10 @@ pub fn apply_fragment(
         if layer.layer_index >= states.len() {
             candle_core::bail!("dwe layer {} out of range", layer.layer_index);
         }
-        let total = layer.shape.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d));
+        let total = layer
+            .shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d));
         if total != Some(layer.values.len()) {
             candle_core::bail!("dwe layer shape/value mismatch");
         }

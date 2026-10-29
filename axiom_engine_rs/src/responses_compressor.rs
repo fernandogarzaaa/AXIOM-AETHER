@@ -26,7 +26,10 @@ pub struct ResponsesCompressionPlan {
 impl ResponsesCompressionPlan {
     /// All compressed item indices, flattened in ascending order (metrics/logging).
     pub fn item_indices(&self) -> Vec<usize> {
-        self.runs.iter().flat_map(|r| r.indices.iter().copied()).collect()
+        self.runs
+            .iter()
+            .flat_map(|r| r.indices.iter().copied())
+            .collect()
     }
 
     /// Concatenated context across every run — the total the threshold check
@@ -194,7 +197,11 @@ mod tests {
             assistant("A0"), user("U1"), assistant("A2"), user("latest")
         ]});
         let plan = plan_compression(&body).unwrap();
-        assert_eq!(plan.runs.len(), 2, "non-contiguous assistants are distinct runs");
+        assert_eq!(
+            plan.runs.len(),
+            2,
+            "non-contiguous assistants are distinct runs"
+        );
         assert_eq!(plan.runs[0].indices, vec![0]);
         assert_eq!(plan.runs[1].indices, vec![2]);
         assert_eq!(plan.item_indices(), vec![0, 2]);
@@ -217,7 +224,11 @@ mod tests {
         let out = apply_plan(&body, &plan, &["FP0".into(), "FP2".into()]).unwrap();
         let items = out.get("input").unwrap().as_array().unwrap();
 
-        assert_eq!(items.len(), 4, "two runs replaced 1-for-1, nothing collapsed away");
+        assert_eq!(
+            items.len(),
+            4,
+            "two runs replaced 1-for-1, nothing collapsed away"
+        );
         assert_eq!(items[1], user("U1"), "interleaved user stays at position 1");
         assert_eq!(items[3], user("latest"));
         assert_eq!(items[0]["role"], "assistant");
@@ -233,7 +244,11 @@ mod tests {
         let plan = plan_compression(&body).unwrap();
         let out = apply_plan(&body, &plan, &["FP".into()]).unwrap();
         let items = out.get("input").unwrap().as_array().unwrap();
-        assert_eq!(items.len(), 2, "the 2-message run collapses to one fingerprint");
+        assert_eq!(
+            items.len(),
+            2,
+            "the 2-message run collapses to one fingerprint"
+        );
         assert!(items[0]["content"].as_str().unwrap().contains("0:"));
         assert!(items[0]["content"].as_str().unwrap().contains("1:"));
         assert_eq!(items[1], user("latest"));

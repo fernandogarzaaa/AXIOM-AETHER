@@ -66,7 +66,10 @@ impl Server {
         let response: Value = serde_json::from_str(&line).expect("one JSON response per line");
         assert_eq!(response["jsonrpc"], "2.0");
         assert!(response.get("id").is_some());
-        assert_ne!(response.get("result").is_some(), response.get("error").is_some());
+        assert_ne!(
+            response.get("result").is_some(),
+            response.get("error").is_some()
+        );
         response
     }
 
@@ -123,7 +126,13 @@ impl Drop for Server {
 fn assert_error(response: &Value, code: i64, message: &str) {
     assert!(response.get("result").is_none(), "{response}");
     assert_eq!(response["error"]["code"], code, "{response}");
-    assert!(response["error"]["message"].as_str().unwrap().contains(message), "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(message),
+        "{response}"
+    );
 }
 
 #[test]
@@ -153,23 +162,41 @@ fn invalid_params_are_rejected_for_every_tool() {
         ("task_start", json!({"verify_cmd": "exit 0"})),
         ("task_start", json!({"goal": "goal"})),
         ("task_start", json!({"goal": 12, "verify_cmd": "exit 0"})),
-        ("task_start", json!({"goal": "g", "verify_cmd": "exit 0", "files": "a"})),
-        ("task_start", json!({"goal": "g", "verify_cmd": "exit 0", "max_attempts": -1})),
+        (
+            "task_start",
+            json!({"goal": "g", "verify_cmd": "exit 0", "files": "a"}),
+        ),
+        (
+            "task_start",
+            json!({"goal": "g", "verify_cmd": "exit 0", "max_attempts": -1}),
+        ),
         ("task_propose", json!({"edits": []})),
         ("task_propose", json!({"task_id": "missing"})),
-        ("task_propose", json!({"task_id": "missing", "edits": [{"path": "a"}]})),
-        ("task_propose", json!({"task_id": "missing", "edits": [{"path": 1, "content": "x"}]})),
+        (
+            "task_propose",
+            json!({"task_id": "missing", "edits": [{"path": "a"}]}),
+        ),
+        (
+            "task_propose",
+            json!({"task_id": "missing", "edits": [{"path": 1, "content": "x"}]}),
+        ),
         ("task_history", json!({})),
         ("task_history", json!({"task_id": 1})),
         ("task_finish", json!({})),
-        ("task_finish", json!({"task_id": "missing", "commit": "false"})),
+        (
+            "task_finish",
+            json!({"task_id": "missing", "commit": "false"}),
+        ),
     ];
     for (index, (method, params)) in cases.into_iter().enumerate() {
         let response = server.request(json!(index), method, params);
         assert_error(&response, -32602, "invalid params");
     }
     // Optional start parameters really are optional, even after invalid calls.
-    let started = server.result("task_start", json!({"goal": "goal", "verify_cmd": "exit 0"}));
+    let started = server.result(
+        "task_start",
+        json!({"goal": "goal", "verify_cmd": "exit 0"}),
+    );
     assert!(started["task_id"].is_string());
 }
 
@@ -205,7 +232,10 @@ fn successful_lifecycle_preserves_contents_and_defaults_to_commit() {
     let path = server.workspace.path().join("file.txt");
     fs::write(&path, "original").unwrap();
     let task_id = server.start("exit 0", &["file.txt"]);
-    assert_eq!(server.result("task_history", json!({"task_id": task_id}))["attempts"], json!([]));
+    assert_eq!(
+        server.result("task_history", json!({"task_id": task_id}))["attempts"],
+        json!([])
+    );
 
     let content = "updated\n\"quoted\" \\ \u{03bb}\n";
     let proposed = server.result(
@@ -273,7 +303,10 @@ fn rejected_and_empty_proposals_are_results_and_history_is_ordered() {
     assert_eq!(duplicate["passed"], false);
     assert_eq!(duplicate["attempt"], 2);
     assert_eq!(duplicate["fingerprint"], first["fingerprint"]);
-    assert!(duplicate["output"].as_str().unwrap().contains("already rejected"));
+    assert!(duplicate["output"]
+        .as_str()
+        .unwrap()
+        .contains("already rejected"));
     let empty = server.result("task_propose", json!({"task_id": task_id, "edits": []}));
     assert_eq!(empty["passed"], false);
     assert_eq!(empty["attempt"], 3);
@@ -327,7 +360,10 @@ fn mcp_call_error(server: &mut Server, id: i64, name: &str, arguments: Value) ->
     );
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(response["result"]["isError"], true, "{response}");
-    response["result"]["content"][0]["text"].as_str().unwrap().to_owned()
+    response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 fn mcp_initialize(server: &mut Server) {
@@ -344,7 +380,10 @@ fn mcp_initialize(server: &mut Server) {
     let result = &response["result"];
     assert_eq!(result["protocolVersion"], "2024-11-05", "{response}");
     assert!(result["capabilities"]["tools"].is_object(), "{response}");
-    assert_eq!(result["serverInfo"]["name"], "axiom-agent-task", "{response}");
+    assert_eq!(
+        result["serverInfo"]["name"], "axiom-agent-task",
+        "{response}"
+    );
     assert!(result["serverInfo"]["version"].is_string(), "{response}");
     // MCP lifecycle: client sends notifications/initialized, server stays alive.
     server.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
@@ -368,7 +407,10 @@ fn mcp_tools_list_exposes_four_task_tools_with_schemas() {
     assert!(response.get("error").is_none(), "{response}");
     let tools = response["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["task_start", "task_propose", "task_history", "task_finish"]);
+    assert_eq!(
+        names,
+        ["task_start", "task_propose", "task_history", "task_finish"]
+    );
     for tool in tools {
         assert!(tool["description"].is_string(), "{tool}");
         let schema = &tool["inputSchema"];
@@ -378,8 +420,14 @@ fn mcp_tools_list_exposes_four_task_tools_with_schemas() {
     }
     // Spot-check required fields.
     let start = &tools[0]["inputSchema"];
-    assert!(start["required"].as_array().unwrap().contains(&json!("goal")));
-    assert!(start["required"].as_array().unwrap().contains(&json!("verify_cmd")));
+    assert!(start["required"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("goal")));
+    assert!(start["required"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("verify_cmd")));
     server.finish_input();
 }
 
@@ -441,12 +489,7 @@ fn mcp_tool_level_failures_use_is_error_not_jsonrpc_error() {
     let mut server = Server::new();
     mcp_initialize(&mut server);
     // Unknown task_id is a tool-level failure, not a protocol error.
-    let msg = mcp_call_error(
-        &mut server,
-        1,
-        "task_history",
-        json!({"task_id": "absent"}),
-    );
+    let msg = mcp_call_error(&mut server, 1, "task_history", json!({"task_id": "absent"}));
     assert!(msg.contains("unknown task_id: absent"), "{msg}");
     // Invalid arguments are also tool-level failures.
     let msg = mcp_call_error(&mut server, 2, "task_start", json!({"goal": "g"}));

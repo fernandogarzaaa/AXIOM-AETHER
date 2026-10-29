@@ -153,7 +153,10 @@ fn merge_results_md(existing: Option<&str>, results: &[PillarResult], generated:
 fn write_results_md(root: &Path, results: &[PillarResult], generated: u64) -> std::io::Result<()> {
     let path = root.join("RESULTS.md");
     let existing = std::fs::read_to_string(&path).ok();
-    std::fs::write(&path, merge_results_md(existing.as_deref(), results, generated))
+    std::fs::write(
+        &path,
+        merge_results_md(existing.as_deref(), results, generated),
+    )
 }
 
 enum Command {
@@ -259,11 +262,20 @@ mod tests {
         assert!(out.contains("Hand-written caveats."), "{out}");
         assert!(out.contains("## How to read these"), "{out}");
         assert!(out.contains("Generated (unix): 42"), "{out}");
-        assert!(out.contains("| cognition | new | 3 | smoke check, not a rate |"), "{out}");
+        assert!(
+            out.contains("| cognition | new | 3 | smoke check, not a rate |"),
+            "{out}"
+        );
         assert!(!out.contains("| cognition | old |"), "{out}");
         // The cost row did not run this invocation and is carried over verbatim.
-        assert!(out.contains("| cost | 75.1% byte reduction | **3 records** | indicative only |"), "{out}");
-        assert!(out.contains("carried over from the previous table"), "{out}");
+        assert!(
+            out.contains("| cost | 75.1% byte reduction | **3 records** | indicative only |"),
+            "{out}"
+        );
+        assert!(
+            out.contains("carried over from the previous table"),
+            "{out}"
+        );
         assert_eq!(out.matches(TABLE_BEGIN).count(), 1);
         assert_eq!(out.matches(TABLE_END).count(), 1);
     }
@@ -272,13 +284,19 @@ mod tests {
     fn merge_inserts_markers_after_title_when_absent() {
         let existing = "# AxiomBench Results\n\nSome prose that must survive.\n";
         let out = merge_results_md(Some(existing), &[pillar("fleet", "pass")], 7);
-        assert!(out.starts_with("# AxiomBench Results\n\n<!-- axiombench:table:begin -->"), "{out}");
+        assert!(
+            out.starts_with("# AxiomBench Results\n\n<!-- axiombench:table:begin -->"),
+            "{out}"
+        );
         assert!(out.contains("Some prose that must survive."), "{out}");
         assert!(out.contains("| fleet | pass |"), "{out}");
         // Re-merging is idempotent on structure: still exactly one block.
         let again = merge_results_md(Some(&out), &[pillar("fleet", "pass again")], 8);
         assert_eq!(again.matches(TABLE_BEGIN).count(), 1);
-        assert!(again.contains("pass again") && !again.contains("| fleet | pass |"), "{again}");
+        assert!(
+            again.contains("pass again") && !again.contains("| fleet | pass |"),
+            "{again}"
+        );
     }
 
     #[test]

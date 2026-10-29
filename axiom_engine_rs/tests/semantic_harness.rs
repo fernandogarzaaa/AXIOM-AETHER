@@ -32,20 +32,36 @@ const CHUNK: usize = 512; // strict TTT/eval window cap (Phase 2.3)
 const TRAIN_WIN: usize = 256; // training backprop window (<= CHUNK)
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 fn env_f64(k: &str, d: f64) -> f64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn pick_device() -> Device {
     match Device::cuda_if_available(0) {
         Ok(d) => {
-            eprintln!("[harness] device = {}", if d.is_cuda() { "CUDA:0" } else { "CPU (cuda unavailable / not compiled)" });
+            eprintln!(
+                "[harness] device = {}",
+                if d.is_cuda() {
+                    "CUDA:0"
+                } else {
+                    "CPU (cuda unavailable / not compiled)"
+                }
+            );
             d
         }
         Err(e) => {
@@ -56,7 +72,9 @@ fn pick_device() -> Device {
 }
 
 fn encode(tok: &Tokenizer, text: &str) -> Vec<u32> {
-    tok.encode(text, false).map(|e| e.get_ids().to_vec()).unwrap_or_default()
+    tok.encode(text, false)
+        .map(|e| e.get_ids().to_vec())
+        .unwrap_or_default()
 }
 
 /// Cross-entropy over `ids`, scored in strict <=512-token chunks with the
@@ -66,18 +84,29 @@ fn chunked_ce(model: &AxiomTTTLM, dev: &Device, ids: &[u32], vocab: usize) -> f3
     let mut total = 0.0f32;
     let mut toks = 0usize;
     for chunk in ids.chunks(CHUNK) {
-        if chunk.len() < 2 { continue; }
+        if chunk.len() < 2 {
+            continue;
+        }
         let n = chunk.len();
         let input = Tensor::from_vec(chunk[..n - 1].to_vec(), (1, n - 1), dev).unwrap();
         let logits = model.forward_lm(&input, &mut states, false, 0).unwrap();
         let l2d = logits.squeeze(0).unwrap().reshape((n - 1, vocab)).unwrap();
         let tgt = Tensor::from_vec(chunk[1..].to_vec(), (n - 1,), dev).unwrap();
-        let loss = candle_nn::loss::cross_entropy(&l2d, &tgt).unwrap().to_scalar::<f32>().unwrap();
+        let loss = candle_nn::loss::cross_entropy(&l2d, &tgt)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
         total += loss * (n - 1) as f32;
         toks += n - 1;
-        for s in states.iter_mut() { *s = s.detach(); } // Phase 2.3: bounded graph
+        for s in states.iter_mut() {
+            *s = s.detach();
+        } // Phase 2.3: bounded graph
     }
-    if toks == 0 { 0.0 } else { total / toks as f32 }
+    if toks == 0 {
+        0.0
+    } else {
+        total / toks as f32
+    }
 }
 
 #[test]
@@ -113,7 +142,13 @@ fn run_harness() {
     let train_win = env_usize("AXIOM_TRAIN_WIN", TRAIN_WIN);
 
     let device = pick_device();
-    let config = AxiomConfig { d_model, n_layers, vocab_size: vocab, lr_inner: inner_lr, norm_eps: 1e-6 };
+    let config = AxiomConfig {
+        d_model,
+        n_layers,
+        vocab_size: vocab,
+        lr_inner: inner_lr,
+        norm_eps: 1e-6,
+    };
     eprintln!("[harness] config d_model={d_model} n_layers={n_layers} vocab={vocab} lr={lr} inner_lr={inner_lr} epochs={epochs}");
 
     let varmap = VarMap::new();
@@ -125,25 +160,47 @@ fn run_harness() {
     let src_dir = root.join("axiom_engine_rs/src");
     let mut train_files: Vec<PathBuf> = Vec::new();
     let mut held_files: Vec<PathBuf> = Vec::new();
-    let mut ents: Vec<PathBuf> = std::fs::read_dir(&src_dir).unwrap()
+    let mut ents: Vec<PathBuf> = std::fs::read_dir(&src_dir)
+        .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("rs"))
         .collect();
     ents.sort();
     for p in ents {
         let name = p.file_name().unwrap().to_str().unwrap().to_string();
-        if held_out.contains(&name.as_str()) { held_files.push(p); } else { train_files.push(p); }
+        if held_out.contains(&name.as_str()) {
+            held_files.push(p);
+        } else {
+            train_files.push(p);
+        }
     }
     let mut train_tokens: Vec<u32> = Vec::new();
     for p in &train_files {
-        train_tokens.extend(encode(&tok, &std::fs::read_to_string(p).unwrap_or_default()));
+        train_tokens.extend(encode(
+            &tok,
+            &std::fs::read_to_string(p).unwrap_or_default(),
+        ));
     }
-    eprintln!("[harness] train files={} tokens={}", train_files.len(), train_tokens.len());
+    eprintln!(
+        "[harness] train files={} tokens={}",
+        train_files.len(),
+        train_tokens.len()
+    );
     assert!(train_tokens.len() > train_win, "corpus too small");
 
     // ---- Train: AdamW over windows, bounded ----
-    let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW { lr, ..Default::default() }).unwrap();
-    let windows: Vec<&[u32]> = train_tokens.chunks(train_win).filter(|c| c.len() >= 2).collect();
+    let mut opt = AdamW::new(
+        varmap.all_vars(),
+        ParamsAdamW {
+            lr,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let windows: Vec<&[u32]> = train_tokens
+        .chunks(train_win)
+        .filter(|c| c.len() >= 2)
+        .collect();
     let t0 = std::time::Instant::now();
     let mut step = 0usize;
     'train: for ep in 0..epochs {
@@ -161,28 +218,59 @@ fn run_harness() {
             ep_loss += loss.to_scalar::<f32>().unwrap();
             ep_steps += 1;
             step += 1;
-            if step >= step_cap { eprintln!("[harness] step cap {step_cap} hit"); break 'train; }
+            if step >= step_cap {
+                eprintln!("[harness] step cap {step_cap} hit");
+                break 'train;
+            }
         }
-        eprintln!("[harness] epoch {} avg_train_loss={:.4} ({} steps, {:.1}s)", ep + 1, ep_loss / ep_steps.max(1) as f32, ep_steps, t0.elapsed().as_secs_f32());
+        eprintln!(
+            "[harness] epoch {} avg_train_loss={:.4} ({} steps, {:.1}s)",
+            ep + 1,
+            ep_loss / ep_steps.max(1) as f32,
+            ep_steps,
+            t0.elapsed().as_secs_f32()
+        );
     }
-    eprintln!("[harness] trained {step} steps in {:.1}s\n", t0.elapsed().as_secs_f32());
+    eprintln!(
+        "[harness] trained {step} steps in {:.1}s\n",
+        t0.elapsed().as_secs_f32()
+    );
 
     // ---- Evaluate ----
     let read = |rel: &str| std::fs::read_to_string(root.join(rel)).unwrap_or_default();
     let mut clean: Vec<(String, f32)> = Vec::new();
     // in-train clean
-    for f in ["axiom_engine_rs/src/mcp_stdio.rs", "axiom_engine_rs/src/vibe_memory.rs"] {
-        clean.push((format!("{f} [in-train]"), chunked_ce(&model, &device, &encode(&tok, &read(f)), vocab)));
+    for f in [
+        "axiom_engine_rs/src/mcp_stdio.rs",
+        "axiom_engine_rs/src/vibe_memory.rs",
+    ] {
+        clean.push((
+            format!("{f} [in-train]"),
+            chunked_ce(&model, &device, &encode(&tok, &read(f)), vocab),
+        ));
     }
     // held-out clean (generalization)
     for p in &held_files {
-        let rel = format!("axiom_engine_rs/src/{}", p.file_name().unwrap().to_str().unwrap());
-        clean.push((format!("{rel} [HELD-OUT]"), chunked_ce(&model, &device, &encode(&tok, &read(&rel)), vocab)));
+        let rel = format!(
+            "axiom_engine_rs/src/{}",
+            p.file_name().unwrap().to_str().unwrap()
+        );
+        clean.push((
+            format!("{rel} [HELD-OUT]"),
+            chunked_ce(&model, &device, &encode(&tok, &read(&rel)), vocab),
+        ));
     }
-    let anomaly_ce = chunked_ce(&model, &device, &encode(&tok, &read("tests/anomaly_target.rs")), vocab);
+    let anomaly_ce = chunked_ce(
+        &model,
+        &device,
+        &encode(&tok, &read("tests/anomaly_target.rs")),
+        vocab,
+    );
 
     eprintln!("[harness] === per-file cross-entropy (BPE, trained) ===");
-    for (name, l) in &clean { eprintln!("   clean   {:>8.4}  {}", l, name); }
+    for (name, l) in &clean {
+        eprintln!("   clean   {:>8.4}  {}", l, name);
+    }
     eprintln!("   ANOMALY {:>8.4}  tests/anomaly_target.rs", anomaly_ce);
 
     let clean_max = clean.iter().map(|c| c.1).fold(0.0f32, f32::max);
@@ -190,9 +278,21 @@ fn run_harness() {
     let margin = anomaly_ce - clean_max;
     eprintln!("\n[harness] clean_mean={:.4} clean_max={:.4} anomaly={:.4} margin(anomaly-clean_max)={:+.4}", clean_mean, clean_max, anomaly_ce, margin);
     let separated = anomaly_ce > clean_max;
-    eprintln!("[harness] SEPARATION: {}", if separated { "ACHIEVED ✓ (anomaly CE > all clean)" } else { "NOT YET ✗ (overlap — tune dims/lr/epochs and retry)" });
+    eprintln!(
+        "[harness] SEPARATION: {}",
+        if separated {
+            "ACHIEVED ✓ (anomaly CE > all clean)"
+        } else {
+            "NOT YET ✗ (overlap — tune dims/lr/epochs and retry)"
+        }
+    );
     // Recommended gate threshold midway between clean_max and anomaly.
-    if separated { eprintln!("[harness] suggested AXIOM_DRIFT_THRESHOLD = {:.4}", (clean_max + anomaly_ce) / 2.0); }
+    if separated {
+        eprintln!(
+            "[harness] suggested AXIOM_DRIFT_THRESHOLD = {:.4}",
+            (clean_max + anomaly_ce) / 2.0
+        );
+    }
 
     assert!(train_tokens.len() > 0);
 }

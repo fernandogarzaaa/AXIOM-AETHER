@@ -335,7 +335,9 @@ fn fetch_base_model(url: &str, target: &Path, expected_sha256: Option<&str>) -> 
     let digest = format!("{:x}", hasher.finalize());
     if let Err(e) = verify_checksum(expected_sha256, &digest) {
         let _ = fs::remove_file(&tmp);
-        return Err(io::Error::other(format!("checkpoint integrity check failed for {url}: {e}")));
+        return Err(io::Error::other(format!(
+            "checkpoint integrity check failed for {url}: {e}"
+        )));
     }
     match expected_sha256 {
         Some(_) => println!("[axiom] checkpoint sha256 verified: {digest}"),

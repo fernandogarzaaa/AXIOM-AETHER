@@ -45,7 +45,10 @@ impl MiniAetherSidecar {
     /// A sidecar with the standard scrub rules and compression on.
     pub fn standard(worker: impl Into<String>) -> Self {
         Self::new(
-            SidecarConfig { worker: worker.into(), compress: true },
+            SidecarConfig {
+                worker: worker.into(),
+                compress: true,
+            },
             TokenScrubber::standard(),
         )
     }
@@ -59,7 +62,10 @@ impl MiniAetherSidecar {
         let scrubbed = self.scrubber.scrub(raw);
         if self.config.compress {
             let (compressed, stats) = compress_context(&scrubbed);
-            SidecarPayload { content: Arc::from(compressed), stats }
+            SidecarPayload {
+                content: Arc::from(compressed),
+                stats,
+            }
         } else {
             let bytes = scrubbed.len();
             let lines = scrubbed.lines().count();

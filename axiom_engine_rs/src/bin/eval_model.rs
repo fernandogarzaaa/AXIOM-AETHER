@@ -13,7 +13,10 @@ use axiom_engine::model_meta::ModelMeta;
 use candle_core::{Device, Tensor};
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 const CHUNK: usize = 512;
@@ -32,10 +35,16 @@ fn chunked_ce(pipeline: &InferencePipeline, ids: &[u32], vocab: usize) -> f32 {
         let m = w.len();
         let mut states = pipeline.init_session_states().unwrap();
         let input = Tensor::from_vec(w[..m - 1].to_vec(), (1, m - 1), dev).unwrap();
-        let logits = pipeline.model().forward_lm(&input, &mut states, false, 0).unwrap();
+        let logits = pipeline
+            .model()
+            .forward_lm(&input, &mut states, false, 0)
+            .unwrap();
         let l2d = logits.squeeze(0).unwrap().reshape((m - 1, vocab)).unwrap();
         let tgt = Tensor::from_vec(w[1..].to_vec(), (m - 1,), dev).unwrap();
-        total += candle_nn::loss::cross_entropy(&l2d, &tgt).unwrap().to_scalar::<f32>().unwrap()
+        total += candle_nn::loss::cross_entropy(&l2d, &tgt)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
             * (m - 1) as f32;
         for s in states.iter_mut() {
             *s = s.detach();
@@ -61,7 +70,9 @@ fn main() {
 fn run() {
     let root = repo_root();
     let ckpt = std::env::var("AXIOM_BPE_CKPT").unwrap_or_else(|_| {
-        root.join("checkpoints/axiom_production_bpe.bin").to_string_lossy().into()
+        root.join("checkpoints/axiom_production_bpe.bin")
+            .to_string_lossy()
+            .into()
     });
     let meta = ModelMeta::load(&ckpt).expect("sidecar .meta.json (run train_semantic first)");
     let bpe = meta.tokenizer.clone();
@@ -74,7 +85,10 @@ fn run() {
         lr_inner: meta.lr_inner,
         norm_eps: meta.norm_eps,
     };
-    let runtime = InferenceRuntimeOptions { tokenizer_path: Some(bpe.clone()), ..Default::default() };
+    let runtime = InferenceRuntimeOptions {
+        tokenizer_path: Some(bpe.clone()),
+        ..Default::default()
+    };
     let pipeline = InferencePipeline::with_checkpoint_and_options(config, device, &ckpt, runtime)
         .expect("load pipeline");
 
@@ -82,18 +96,28 @@ fn run() {
     let enc = |t: &str| pipeline.encode_text(t);
 
     // Held-out perplexity proxy: a clean repo file.
-    let held = chunked_ce(&pipeline, &enc(&read("axiom_engine_rs/src/server.rs")), vocab);
+    let held = chunked_ce(
+        &pipeline,
+        &enc(&read("axiom_engine_rs/src/server.rs")),
+        vocab,
+    );
     // Drift separation: clean vs anomaly.
-    let clean: Vec<f32> = ["axiom_engine_rs/src/model.rs", "axiom_engine_rs/src/inference.rs"]
-        .iter()
-        .map(|f| chunked_ce(&pipeline, &enc(&read(f)), vocab))
-        .collect();
+    let clean: Vec<f32> = [
+        "axiom_engine_rs/src/model.rs",
+        "axiom_engine_rs/src/inference.rs",
+    ]
+    .iter()
+    .map(|f| chunked_ce(&pipeline, &enc(&read(f)), vocab))
+    .collect();
     let anomaly = chunked_ce(&pipeline, &enc(&read("tests/anomaly_target.rs")), vocab);
     let clean_max = clean.iter().cloned().fold(0.0f32, f32::max);
     let margin = anomaly - clean_max;
     let gate = (clean_max + anomaly) / 2.0;
 
-    eprintln!("[eval] model d{}/{}L vocab{} val_ce(train)={:.3}", meta.d_model, meta.n_layers, vocab, meta.val_ce);
+    eprintln!(
+        "[eval] model d{}/{}L vocab{} val_ce(train)={:.3}",
+        meta.d_model, meta.n_layers, vocab, meta.val_ce
+    );
     eprintln!("[eval] held-out CE (server.rs)   = {held:.4}");
     eprintln!("[eval] clean CE                  = {clean:?} (max {clean_max:.4})");
     eprintln!("[eval] anomaly CE                = {anomaly:.4}");
@@ -103,7 +127,10 @@ fn run() {
     if pass {
         let gate_file = root.join("checkpoints/axiom_drift_gate.txt");
         std::fs::write(&gate_file, format!("{gate:.4}")).ok();
-        eprintln!("[eval] recalibrated AXIOM_DRIFT_THRESHOLD={gate:.4} → {}", gate_file.display());
+        eprintln!(
+            "[eval] recalibrated AXIOM_DRIFT_THRESHOLD={gate:.4} → {}",
+            gate_file.display()
+        );
     }
     println!("{}", if pass { "PASS" } else { "FAIL" });
 }

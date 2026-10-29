@@ -134,8 +134,7 @@ impl SignedEnvelope {
     /// hash the whole line for a transport-level audit trail.
     pub fn to_line(&self) -> String {
         let value = serde_json::to_value(self).expect("SignedEnvelope always serializes");
-        canonical::to_canonical(&value)
-            .expect("SignedEnvelope contains only strings")
+        canonical::to_canonical(&value).expect("SignedEnvelope contains only strings")
     }
 
     /// Parse one line of the line-delimited JSON transport.

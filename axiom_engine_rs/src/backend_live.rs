@@ -179,10 +179,8 @@ pub fn router_from_env(pipeline: Arc<RwLock<InferencePipeline>>) -> Option<Route
                 consensus,
                 ..RoutePolicy::default()
             };
-            let mut router = Router::new(policy).with(
-                Provider::Local,
-                Box::new(LocalPipelineBackend { pipeline }),
-            );
+            let mut router = Router::new(policy)
+                .with(Provider::Local, Box::new(LocalPipelineBackend { pipeline }));
 
             if let Some(claude) = claude_from_key() {
                 router = router.with(
@@ -237,10 +235,7 @@ pub fn router_from_env(pipeline: Arc<RwLock<InferencePipeline>>) -> Option<Route
                         model,
                     }),
                 )
-                .with(
-                    Provider::Local,
-                    Box::new(LocalPipelineBackend { pipeline }),
-                );
+                .with(Provider::Local, Box::new(LocalPipelineBackend { pipeline }));
             Some(router)
         }
     }
@@ -277,9 +272,7 @@ mod tests {
     fn opendrop_base_url_defaults_local() {
         // Only meaningful when no env override is present; assert the mode-mapped
         // default rather than mutating process env (parallel-safe).
-        if std::env::var("OPENAI_BASE_URL").is_err()
-            && std::env::var("OPENAI_API_BASE").is_err()
-        {
+        if std::env::var("OPENAI_BASE_URL").is_err() && std::env::var("OPENAI_API_BASE").is_err() {
             assert_eq!(
                 openai_base_url_for(RouterMode::OpenDrop),
                 OPENDROP_ROUTER_BASE_URL

@@ -172,7 +172,11 @@ async fn dedup_does_not_apply_when_flag_is_off() {
     {
         let captured = capture.requests.lock().unwrap();
         let sent_system = captured[0]["system"].as_str().unwrap();
-        assert_eq!(sent_system.matches(&block).count(), 2, "unchanged: both copies must survive");
+        assert_eq!(
+            sent_system.matches(&block).count(),
+            2,
+            "unchanged: both copies must survive"
+        );
         assert!(!sent_system.contains("[AXIOM-DEDUP:"));
     }
 
@@ -205,5 +209,9 @@ async fn dedup_does_not_apply_when_request_does_not_use_cache() {
 
     let captured = capture.requests.lock().unwrap();
     let sent_system = captured[0]["system"].as_str().unwrap();
-    assert_eq!(sent_system.matches(&block).count(), 2, "no cache -> no dedup");
+    assert_eq!(
+        sent_system.matches(&block).count(),
+        2,
+        "no cache -> no dedup"
+    );
 }

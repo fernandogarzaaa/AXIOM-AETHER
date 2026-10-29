@@ -126,7 +126,11 @@ async fn compression_strips_heavy_context_and_forwards_lean_payload() {
     assert_eq!(resp_json["model"], "claude-mock");
 
     let received = captured.lock().await.clone();
-    assert_eq!(received.len(), 1, "mock must receive exactly one upstream call");
+    assert_eq!(
+        received.len(),
+        1,
+        "mock must receive exactly one upstream call"
+    );
     let upstream = &received[0];
 
     // The session_id Axiom-extension must not reach the upstream payload.
@@ -194,7 +198,10 @@ async fn proxy_injects_immunity_advisory_for_known_failing_command() {
         .with_heal_memory_path(Some(mem_path.clone()));
     let app = create_router(state);
 
-    let heavy_text: String = (0..200).map(|i| format!("code{i}")).collect::<Vec<_>>().join(" ");
+    let heavy_text: String = (0..200)
+        .map(|i| format!("code{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let req_body = json!({
         "model": "claude-opus-4-7",
         "max_tokens": 32,
@@ -353,8 +360,10 @@ async fn x_axiom_session_id_header_pins_deterministic_session() {
     // (which never sets a body session_id) accrue persistent fast-weights.
     let (mock_addr, _captured) = start_mock_anthropic().await;
     let pipeline = tokio::task::spawn_blocking(build_pipeline).await.unwrap();
-    let forwarder =
-        AnthropicForwarder::new(Some("test-key".to_string()), Some(format!("http://{mock_addr}")));
+    let forwarder = AnthropicForwarder::new(
+        Some("test-key".to_string()),
+        Some(format!("http://{mock_addr}")),
+    );
     let cfg = CompressorConfig {
         enabled: true,
         heavy_message_threshold_tokens: 20,
@@ -365,7 +374,10 @@ async fn x_axiom_session_id_header_pins_deterministic_session() {
         .with_compressor_config(cfg);
     let app = create_router(state);
 
-    let heavy: String = (0..50).map(|i| format!("h{i}")).collect::<Vec<_>>().join(" ");
+    let heavy: String = (0..50)
+        .map(|i| format!("h{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let req_body = json!({
         "max_tokens": 4,
         "messages": [
@@ -445,7 +457,10 @@ async fn ttt_session_admin_endpoints_reflect_live_state() {
     assert_eq!(stats["compression_active"], true);
 
     // Drive one compressed call.
-    let heavy: String = (0..50).map(|i| format!("x{i}")).collect::<Vec<_>>().join(" ");
+    let heavy: String = (0..50)
+        .map(|i| format!("x{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let req_body = json!({
         "max_tokens": 4,
         "messages": [
@@ -608,7 +623,11 @@ async fn upstream_5xx_retries_once_with_uncompressed_payload() {
     assert_eq!(resp_json["id"], "msg_mock_recovered");
 
     let received = captured.lock().await.clone();
-    assert_eq!(received.len(), 2, "must attempt compressed then fall back once");
+    assert_eq!(
+        received.len(),
+        2,
+        "must attempt compressed then fall back once"
+    );
 
     let content_of = |payload: &Value| -> String {
         payload["messages"]
@@ -622,15 +641,30 @@ async fn upstream_5xx_retries_once_with_uncompressed_payload() {
 
     // Attempt 1: compressed — fingerprint present, raw heavy text stripped.
     let first = content_of(&received[0]);
-    assert!(first.contains("<axiom_context_fingerprint "), "attempt 1 must be compressed");
-    assert!(!first.contains("code199"), "attempt 1 must strip raw heavy text");
+    assert!(
+        first.contains("<axiom_context_fingerprint "),
+        "attempt 1 must be compressed"
+    );
+    assert!(
+        !first.contains("code199"),
+        "attempt 1 must strip raw heavy text"
+    );
 
     // Attempt 2: the uncompressed fallback — raw heavy text restored, no fingerprint,
     // and the Axiom-only session_id extension still scrubbed from the wire.
     let second = content_of(&received[1]);
-    assert!(second.contains("code199"), "fallback must carry the original heavy text");
-    assert!(!second.contains("<axiom_context_fingerprint "), "fallback must not be compressed");
-    assert!(received[1].get("session_id").is_none(), "session_id must not leak upstream");
+    assert!(
+        second.contains("code199"),
+        "fallback must carry the original heavy text"
+    );
+    assert!(
+        !second.contains("<axiom_context_fingerprint "),
+        "fallback must not be compressed"
+    );
+    assert!(
+        received[1].get("session_id").is_none(),
+        "session_id must not leak upstream"
+    );
 }
 
 #[tokio::test]
@@ -647,16 +681,18 @@ async fn upstream_401_does_not_retry() {
     let app401 = Router::new()
         .route(
             "/v1/messages",
-            post(|State(st): State<FlakyState>, Json(body): Json<Value>| async move {
-                use axum::response::IntoResponse;
-                st.captured.lock().await.push(body);
-                st.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"type": "error", "error": {"type": "authentication_error"}})),
-                )
-                    .into_response()
-            }),
+            post(
+                |State(st): State<FlakyState>, Json(body): Json<Value>| async move {
+                    use axum::response::IntoResponse;
+                    st.captured.lock().await.push(body);
+                    st.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({"type": "error", "error": {"type": "authentication_error"}})),
+                    )
+                        .into_response()
+                },
+            ),
         )
         .with_state(st);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -679,7 +715,10 @@ async fn upstream_401_does_not_retry() {
         .with_compressor_config(cfg);
     let app = create_router(state);
 
-    let heavy_text: String = (0..200).map(|i| format!("code{i}")).collect::<Vec<_>>().join(" ");
+    let heavy_text: String = (0..200)
+        .map(|i| format!("code{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let req_body = json!({
         "model": "claude-opus-4-7",
         "max_tokens": 32,
@@ -697,7 +736,15 @@ async fn upstream_401_does_not_retry() {
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "401 must surface to client");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "401 must surface to client"
+    );
     let received = captured.lock().await.clone();
-    assert_eq!(received.len(), 1, "401 must NOT trigger an uncompressed retry");
+    assert_eq!(
+        received.len(),
+        1,
+        "401 must NOT trigger an uncompressed retry"
+    );
 }

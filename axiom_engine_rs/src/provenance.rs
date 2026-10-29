@@ -88,8 +88,14 @@ pub fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
         ipad[i] ^= block[i];
         opad[i] ^= block[i];
     }
-    let inner = Sha256::new().chain_update(ipad).chain_update(msg).finalize();
-    let outer = Sha256::new().chain_update(opad).chain_update(inner).finalize();
+    let inner = Sha256::new()
+        .chain_update(ipad)
+        .chain_update(msg)
+        .finalize();
+    let outer = Sha256::new()
+        .chain_update(opad)
+        .chain_update(inner)
+        .finalize();
     let mut out = String::with_capacity(64);
     for b in outer {
         out.push_str(&format!("{b:02x}"));
@@ -162,7 +168,11 @@ mod tests {
 
     #[test]
     fn full_sha256_not_truncated() {
-        assert_eq!(sha256_hex(b"").len(), 64, "full 256-bit hex, not Chimera's 32");
+        assert_eq!(
+            sha256_hex(b"").len(),
+            64,
+            "full 256-bit hex, not Chimera's 32"
+        );
         // Known SHA-256("abc").
         assert_eq!(
             sha256_hex(b"abc"),

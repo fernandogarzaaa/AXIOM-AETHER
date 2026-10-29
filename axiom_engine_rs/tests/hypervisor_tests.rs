@@ -145,7 +145,9 @@ async fn hypervisor_read_endpoint_absorbs_file_incrementally() {
                 .method(Method::POST)
                 .uri("/v1/hypervisor/mount")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"root": root.to_string_lossy()}).to_string()))
+                .body(Body::from(
+                    json!({"root": root.to_string_lossy()}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -208,7 +210,10 @@ async fn jit_run_endpoint_repairs_source_and_feeds_ttt() {
         serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(v["report"]["passed"], true);
     assert_eq!(v["report"]["patched"], true);
-    assert_eq!(v["source_restored"], false, "a passing repair keeps the patch");
+    assert_eq!(
+        v["source_restored"], false,
+        "a passing repair keeps the patch"
+    );
     assert!(std::fs::read_to_string(&script).unwrap().contains("exit 0"));
 
     let _ = std::fs::remove_dir_all(&root);
@@ -278,6 +283,12 @@ async fn jit_run_endpoint_is_disabled_by_default() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    let body = String::from_utf8(
+        to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
     assert!(body.contains("AXIOM_ENABLE_JIT_EXEC"));
 }

@@ -242,7 +242,10 @@ mod tests {
         m.save(&ckpt).unwrap();
         let loaded = ModelMeta::load_checked(&ckpt).unwrap().unwrap();
         assert_eq!(loaded.schema_version, MODEL_META_SCHEMA_VERSION);
-        assert_eq!(loaded.engine_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            loaded.engine_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
         assert_eq!(loaded.d_model, 256);
     }
 
@@ -291,7 +294,10 @@ mod tests {
     fn missing_sidecar_is_ok_none() {
         let dir = tempfile::tempdir().unwrap();
         let ckpt = dir.path().join("absent.bin");
-        assert_eq!(ModelMeta::load_checked(&ckpt.to_string_lossy()).unwrap(), None);
+        assert_eq!(
+            ModelMeta::load_checked(&ckpt.to_string_lossy()).unwrap(),
+            None
+        );
     }
 
     #[test]

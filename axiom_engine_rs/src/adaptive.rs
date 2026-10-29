@@ -49,7 +49,10 @@ mod tests {
         // Above the gate → higher threshold (fewer msgs compressed, more verbatim).
         let t = adaptive_threshold(200, 10.5, 7.0); // 50% over → ~1.5x
         assert!(t > 200 && t <= 400, "raised but capped: {t}");
-        assert!((t as i64 - 300).abs() <= 1, "≈1.5× at 50% over the gate: {t}");
+        assert!(
+            (t as i64 - 300).abs() <= 1,
+            "≈1.5× at 50% over the gate: {t}"
+        );
     }
 
     #[test]

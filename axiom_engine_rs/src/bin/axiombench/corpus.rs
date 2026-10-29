@@ -1,6 +1,6 @@
 //! Corpus promotion/listing for AxiomBench cost replay.
 
-use axiom_engine::session_recorder::{ExchangeRecord, read_session, scrub, sessions_dir};
+use axiom_engine::session_recorder::{read_session, scrub, sessions_dir, ExchangeRecord};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -30,9 +30,11 @@ fn looks_secret(s: &str) -> bool {
         || upper.starts_with("AKIA")
         || s.starts_with("AIza")
         || s.len() >= 20
-            && ["sk-", "sk_live_", "sk_test_", "ghp_", "gho_", "xoxb-", "eyj"]
-                .iter()
-                .any(|prefix| lower.contains(prefix))
+            && [
+                "sk-", "sk_live_", "sk_test_", "ghp_", "gho_", "xoxb-", "eyj",
+            ]
+            .iter()
+            .any(|prefix| lower.contains(prefix))
 }
 
 fn contains_secret_miss(value: &Value) -> bool {
@@ -184,10 +186,9 @@ mod tests {
         assert!(promoted.contains("[REDACTED]"));
         let rows = list_corpus(&corpus_dir).unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(
-            rows.iter()
-                .any(|(path, records, _)| path == &out && *records == 1)
-        );
+        assert!(rows
+            .iter()
+            .any(|(path, records, _)| path == &out && *records == 1));
     }
 
     #[test]

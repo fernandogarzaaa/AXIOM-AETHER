@@ -332,7 +332,12 @@ impl Router {
 /// compare. Good enough to tell "both models said the same thing" from "they
 /// diverged"; a semantic check is a later refinement.
 fn answers_agree(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let norm = |s: &str| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
     let (na, nb) = (norm(a), norm(b));
     // Two empty (or whitespace-only) answers are not "agreement" — they are two
     // non-answers, and treating them as consensus would manufacture confidence
@@ -475,7 +480,11 @@ mod tests {
             .with(Provider::Anthropic, Box::new(Fixed("The answer is 42")));
         let a = r.generate(TaskKind::General, "q", 256).unwrap();
         // Two providers agreed → confidence above the single-provider baseline.
-        assert!(a.confidence > 0.6, "agreement should raise confidence, got {}", a.confidence);
+        assert!(
+            a.confidence > 0.6,
+            "agreement should raise confidence, got {}",
+            a.confidence
+        );
         assert_eq!(a.consulted.len(), 2);
     }
 
@@ -484,10 +493,20 @@ mod tests {
         let mut policy = RoutePolicy::default();
         policy.consensus = true;
         let r = Router::new(policy)
-            .with(Provider::OpenAi, Box::new(Fixed("totally different alpha beta")))
-            .with(Provider::Anthropic, Box::new(Fixed("unrelated gamma delta epsilon")));
+            .with(
+                Provider::OpenAi,
+                Box::new(Fixed("totally different alpha beta")),
+            )
+            .with(
+                Provider::Anthropic,
+                Box::new(Fixed("unrelated gamma delta epsilon")),
+            );
         let a = r.generate(TaskKind::General, "q", 256).unwrap();
-        assert!(a.confidence < 0.5, "conflict should lower confidence, got {}", a.confidence);
+        assert!(
+            a.confidence < 0.5,
+            "conflict should lower confidence, got {}",
+            a.confidence
+        );
     }
 
     #[test]

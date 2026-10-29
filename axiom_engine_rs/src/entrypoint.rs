@@ -11,9 +11,9 @@ use std::env;
 use std::path::PathBuf;
 
 use candle_core::{bail, Device, Result};
-use cli::{AxiomCommand, DaemonCommand, ParsedCli, SwarmCommand};
 #[cfg(feature = "experimental")]
 use cli::ChimeraCommand;
+use cli::{AxiomCommand, DaemonCommand, ParsedCli, SwarmCommand};
 use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
 use inference::{InferencePipeline, InferenceRuntimeOptions};
 use train::AxiomTrainer;
@@ -613,7 +613,12 @@ fn parse_multifile_response(text: &str, targets: &[PathBuf]) -> agentic::EditSet
 /// values) instead of being dropped entirely. Readable format delimits each
 /// file with `=== path ===` headers for agent navigation; JSON emits an
 /// array of {path, skeleton} objects for tooling.
-fn run_skeleton(path: &std::path::Path, format: &str, max_doc_lines: usize, diagnostic: bool) -> Result<()> {
+fn run_skeleton(
+    path: &std::path::Path,
+    format: &str,
+    max_doc_lines: usize,
+    diagnostic: bool,
+) -> Result<()> {
     let files: Vec<PathBuf> = if path.is_file() {
         vec![path.to_path_buf()]
     } else if path.is_dir() {
@@ -622,13 +627,17 @@ fn run_skeleton(path: &std::path::Path, format: &str, max_doc_lines: usize, diag
         bail!("axiom skeleton: path does not exist: {}", path.display());
     };
     if files.is_empty() {
-        bail!("axiom skeleton: no source files found under {}", path.display());
+        bail!(
+            "axiom skeleton: no source files found under {}",
+            path.display()
+        );
     }
 
     let mut entries: Vec<(String, String)> = Vec::new();
     for file in &files {
-        let text = std::fs::read_to_string(file)
-            .map_err(|e| candle_core::Error::Msg(format!("axiom skeleton: {}: {e}", file.display())))?;
+        let text = std::fs::read_to_string(file).map_err(|e| {
+            candle_core::Error::Msg(format!("axiom skeleton: {}: {e}", file.display()))
+        })?;
         let body = if diagnostic {
             skeleton::skeleton_body_diagnostic(&text, max_doc_lines)
         } else {
@@ -643,9 +652,7 @@ fn run_skeleton(path: &std::path::Path, format: &str, max_doc_lines: usize, diag
             // scope issues; escapes all control characters correctly.
             let arr: Vec<serde_json::Value> = entries
                 .iter()
-                .map(|(p, s)| {
-                    serde_json::json!({"path": p, "skeleton": s})
-                })
+                .map(|(p, s)| serde_json::json!({"path": p, "skeleton": s}))
                 .collect();
             let json = serde_json::to_string_pretty(&arr)
                 .map_err(|e| candle_core::Error::Msg(format!("axiom skeleton: json: {e}")))?;
@@ -709,9 +716,9 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             // is configured (same convention scripts/docker_entrypoint.sh uses) --
             // best-effort, does not affect the legacy bootstrap below either way.
             match config::ensure_production_checkpoint() {
-                Ok(true) => println!(
-                    "[axiom] fetched production checkpoint from AXIOM_CHECKPOINT_URL"
-                ),
+                Ok(true) => {
+                    println!("[axiom] fetched production checkpoint from AXIOM_CHECKPOINT_URL")
+                }
                 Ok(false) => {}
                 Err(err) => eprintln!(
                     "[axiom] production checkpoint fetch skipped: {err}. Falling back to the \
@@ -827,10 +834,20 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             bench::run_bench(
                 &path,
                 &pipeline,
-                bench::BenchOptions { verbose, strict, ranked, budget },
+                bench::BenchOptions {
+                    verbose,
+                    strict,
+                    ranked,
+                    budget,
+                },
             )?;
         }
-        AxiomCommand::Skeleton { path, format, max_doc_lines, diagnostic } => {
+        AxiomCommand::Skeleton {
+            path,
+            format,
+            max_doc_lines,
+            diagnostic,
+        } => {
             run_skeleton(&path, &format, max_doc_lines, diagnostic)?;
         }
         AxiomCommand::Solve {
@@ -1059,9 +1076,9 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 Some(p) if p.as_os_str() == "-" => {
                     use std::io::Read;
                     let mut buf = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut buf)
-                        .map_err(|e| candle_core::Error::Msg(format!("verify-suggest: stdin: {e}")))?;
+                    std::io::stdin().read_to_string(&mut buf).map_err(|e| {
+                        candle_core::Error::Msg(format!("verify-suggest: stdin: {e}"))
+                    })?;
                     Some(buf)
                 }
                 Some(p) => Some(std::fs::read_to_string(p).map_err(|e| {

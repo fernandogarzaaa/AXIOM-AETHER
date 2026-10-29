@@ -49,7 +49,10 @@ impl EvalCase {
     fn new(name: &str, files: &[(&str, &str)], command: &str, args: &[&str]) -> Self {
         EvalCase {
             name: name.to_string(),
-            files: files.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect(),
+            files: files
+                .iter()
+                .map(|(p, c)| (p.to_string(), c.to_string()))
+                .collect(),
             command: command.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             agentic_fix: Vec::new(),
@@ -60,7 +63,10 @@ impl EvalCase {
     /// Attach a held-out verifier: commits require passing both the train
     /// command and this one. Meaningful only on agentic cases.
     fn with_holdout(mut self, command: &str, args: &[&str]) -> Self {
-        self.holdout = Some((command.to_string(), args.iter().map(|s| s.to_string()).collect()));
+        self.holdout = Some((
+            command.to_string(),
+            args.iter().map(|s| s.to_string()).collect(),
+        ));
         self
     }
 
@@ -74,7 +80,10 @@ impl EvalCase {
         fix: &[(&str, &str)],
     ) -> Self {
         let mut c = Self::new(name, files, command, args);
-        c.agentic_fix = fix.iter().map(|(p, c)| (p.to_string(), c.to_string())).collect();
+        c.agentic_fix = fix
+            .iter()
+            .map(|(p, c)| (p.to_string(), c.to_string()))
+            .collect();
         c
     }
 }
@@ -148,10 +157,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         // 1. A script that fails with a self-naming frame; Poly-JIT flips exit 1.
         EvalCase::new(
             "shell-exit-flip",
-            &[(
-                "run.sh",
-                "#!/bin/sh\necho 'run.sh:2:1: boom' >&2\nexit 1\n",
-            )],
+            &[("run.sh", "#!/bin/sh\necho 'run.sh:2:1: boom' >&2\nexit 1\n")],
             &posix_shell(),
             &["run.sh"],
         ),
@@ -170,8 +176,14 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         EvalCase::new(
             "multi-file-pick-failing",
             &[
-                ("helper.sh", "#!/bin/sh\necho 'helper.sh:1:1: note'\nexit 0\n"),
-                ("main.sh", "#!/bin/sh\necho 'main.sh:3:1: boom' >&2\nexit 1\n"),
+                (
+                    "helper.sh",
+                    "#!/bin/sh\necho 'helper.sh:1:1: note'\nexit 0\n",
+                ),
+                (
+                    "main.sh",
+                    "#!/bin/sh\necho 'main.sh:3:1: boom' >&2\nexit 1\n",
+                ),
             ],
             &posix_shell(),
             &["-c", "sh helper.sh; sh main.sh"],
@@ -258,7 +270,10 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         // 10. Java-flavoured `File.java:line:` frame + marker repair.
         EvalCase::new(
             "java-frame-localize",
-            &[("Gate.java", "// AXIOM_POLYJIT_FIXTURE_FAIL\nclass Gate {}\n")],
+            &[(
+                "Gate.java",
+                "// AXIOM_POLYJIT_FIXTURE_FAIL\nclass Gate {}\n",
+            )],
             &posix_shell(),
             &[
                 "-c",
@@ -283,10 +298,7 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         //     root-level file.
         EvalCase::new(
             "nested-path-localize",
-            &[(
-                "src/util/gate.sh",
-                "#!/bin/sh\necho placeholder\nexit 1\n",
-            )],
+            &[("src/util/gate.sh", "#!/bin/sh\necho placeholder\nexit 1\n")],
             &posix_shell(),
             &[
                 "-c",
@@ -514,7 +526,10 @@ mod tests {
         );
         let root = unique_root(&case.name);
         std::fs::create_dir_all(&root).unwrap();
-        assert!(!solve_agentic_case(&case, &root), "escaping fix must be refused");
+        assert!(
+            !solve_agentic_case(&case, &root),
+            "escaping fix must be refused"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -522,8 +537,14 @@ mod tests {
     fn report_score_math() {
         let report = EvalReport {
             results: vec![
-                CaseResult { name: "a".into(), solved: true },
-                CaseResult { name: "b".into(), solved: false },
+                CaseResult {
+                    name: "a".into(),
+                    solved: true,
+                },
+                CaseResult {
+                    name: "b".into(),
+                    solved: false,
+                },
             ],
         };
         assert_eq!(report.total(), 2);

@@ -208,7 +208,10 @@ async fn responses_plain_get_returns_json_diagnostic_instead_of_bare_rejection()
         "responses_requires_post_or_websocket"
     );
     let message = response_json["error"]["message"].as_str().unwrap();
-    assert!(message.contains("POST"), "message should mention the HTTP POST path");
+    assert!(
+        message.contains("POST"),
+        "message should mention the HTTP POST path"
+    );
     assert!(
         message.contains("WebSocket"),
         "message should mention the supported WebSocket upgrade path"

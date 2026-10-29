@@ -47,7 +47,9 @@ fn responses_url(base: &str) -> String {
 /// 3. Default platform API: `{base}/v1/responses`.
 fn responses_upstream_url(base: &str, auth: &OpenAiClientAuth) -> String {
     responses_upstream_url_with(
-        std::env::var("AXIOM_OPENAI_RESPONSES_UPSTREAM").ok().as_deref(),
+        std::env::var("AXIOM_OPENAI_RESPONSES_UPSTREAM")
+            .ok()
+            .as_deref(),
         base,
         auth,
     )
@@ -88,7 +90,10 @@ fn resolve_base_url(
     if let Some(explicit) = openai_base_url.or(openai_api_base) {
         return Some(explicit);
     }
-    if backend.map(|b| b.eq_ignore_ascii_case("opendrop")).unwrap_or(false) {
+    if backend
+        .map(|b| b.eq_ignore_ascii_case("opendrop"))
+        .unwrap_or(false)
+    {
         return Some(OPENDROP_DEFAULT_BASE_URL.to_string());
     }
     None
@@ -361,7 +366,11 @@ mod tests {
             extra_headers: vec![("chatgpt-account-id".into(), "acct-123".into())],
         };
         assert_eq!(
-            responses_upstream_url_with(Some("http://127.0.0.1:9999/x"), "https://api.openai.com", &auth),
+            responses_upstream_url_with(
+                Some("http://127.0.0.1:9999/x"),
+                "https://api.openai.com",
+                &auth
+            ),
             "http://127.0.0.1:9999/x"
         );
         // Blank override falls through to header routing.

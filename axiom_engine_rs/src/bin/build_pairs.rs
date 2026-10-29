@@ -15,14 +15,24 @@ use axiom_engine::pairs::{mine_doc_body, mine_markdown, write_pairs_jsonl, Pair}
 use serde_json::json;
 
 fn repo() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn main() {
     let dirs = std::env::var("AXIOM_PAIR_DIRS").unwrap_or_else(|_| repo().to_string_lossy().into());
-    let out = std::env::var("AXIOM_PAIRS_OUT")
-        .unwrap_or_else(|_| repo().join("checkpoints/pairs.jsonl").to_string_lossy().into());
-    let synth_n: usize = std::env::var("AXIOM_SYNTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let out = std::env::var("AXIOM_PAIRS_OUT").unwrap_or_else(|_| {
+        repo()
+            .join("checkpoints/pairs.jsonl")
+            .to_string_lossy()
+            .into()
+    });
+    let synth_n: usize = std::env::var("AXIOM_SYNTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let _ = std::fs::remove_file(&out); // fresh build
 
     let mut dedup = Deduper::new();
@@ -31,7 +41,9 @@ fn main() {
         let files = collect_files(std::path::Path::new(root.trim()), 50_000, 512 * 1024);
         eprintln!("[pairs] {root}: {} files", files.len());
         for f in files {
-            let Ok(text) = std::fs::read_to_string(&f) else { continue };
+            let Ok(text) = std::fs::read_to_string(&f) else {
+                continue;
+            };
             if !dedup.accept(text.as_bytes()) {
                 continue;
             }
@@ -49,7 +61,8 @@ fn main() {
     // Synthetic queries via the proxy (bounded). Each call asks Claude to produce
     // one natural-language question answered by a content chunk → (question, chunk).
     if synth_n > 0 && !mined.is_empty() {
-        let base = std::env::var("AXIOM_PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
+        let base =
+            std::env::var("AXIOM_PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
         let url = format!("{}/v1/messages", base.trim_end_matches('/'));
         let client = reqwest::blocking::Client::new();
         let step = (mined.len() / synth_n).max(1);
@@ -64,11 +77,24 @@ fn main() {
                 "max_tokens": 64,
                 "messages": [{"role":"user","content": prompt}]
             });
-            match client.post(&url).json(&body).send().and_then(|r| r.json::<serde_json::Value>()) {
+            match client
+                .post(&url)
+                .json(&body)
+                .send()
+                .and_then(|r| r.json::<serde_json::Value>())
+            {
                 Ok(v) => {
-                    let q = v["content"][0]["text"].as_str().unwrap_or("").trim().to_string();
+                    let q = v["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
                     if q.len() > 8 {
-                        synth.push(Pair { anchor: q, positive: p.positive.clone(), source: "synthetic".into() });
+                        synth.push(Pair {
+                            anchor: q,
+                            positive: p.positive.clone(),
+                            source: "synthetic".into(),
+                        });
                     }
                 }
                 Err(e) => eprintln!("[pairs] synth {i} failed (proxy down?): {e}"),

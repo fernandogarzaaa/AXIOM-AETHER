@@ -65,8 +65,15 @@ fn tiny_pipeline() -> InferencePipeline {
 }
 
 async fn start_upstream(reject_haiku: bool) -> (String, Capture, tokio::task::JoinHandle<()>) {
-    async fn handler(State(cap): State<Capture>, Json(body): Json<Value>) -> axum::response::Response {
-        let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    async fn handler(
+        State(cap): State<Capture>,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         cap.requests.lock().unwrap().push(body);
         if cap.reject_haiku && model == "claude-haiku-4-5" {
             return (
@@ -83,7 +90,10 @@ async fn start_upstream(reject_haiku: bool) -> (String, Capture, tokio::task::Jo
         }))
         .into_response()
     }
-    let capture = Capture { reject_haiku, ..Default::default() };
+    let capture = Capture {
+        reject_haiku,
+        ..Default::default()
+    };
     let app = Router::new()
         .route("/v1/messages", post(handler))
         .with_state(capture.clone());
@@ -154,7 +164,8 @@ async fn auto_mode_downgrades_a_mechanical_opus_turn_to_haiku() {
     let reqs = capture.requests.lock().unwrap();
     assert_eq!(reqs.len(), 1);
     assert_eq!(
-        reqs[0]["model"], json!("claude-haiku-4-5"),
+        reqs[0]["model"],
+        json!("claude-haiku-4-5"),
         "a mechanical Opus turn is downgraded to Haiku in auto mode"
     );
 }
@@ -179,7 +190,8 @@ async fn auto_mode_leaves_sonnet_untouched() {
     let reqs = capture.requests.lock().unwrap();
     assert_eq!(reqs.len(), 1);
     assert_eq!(
-        reqs[0]["model"], json!("claude-sonnet-5"),
+        reqs[0]["model"],
+        json!("claude-sonnet-5"),
         "Sonnet is not a high tier -> auto mode leaves it alone"
     );
 }
@@ -204,7 +216,19 @@ async fn routed_turn_that_4xxs_falls_back_once_to_the_original_model() {
         StatusCode::OK
     );
     let reqs = capture.requests.lock().unwrap();
-    assert_eq!(reqs.len(), 2, "one routed attempt + exactly one fallback retry");
-    assert_eq!(reqs[0]["model"], json!("claude-haiku-4-5"), "first attempt is routed");
-    assert_eq!(reqs[1]["model"], json!("claude-opus-4-8"), "fallback uses the original model");
+    assert_eq!(
+        reqs.len(),
+        2,
+        "one routed attempt + exactly one fallback retry"
+    );
+    assert_eq!(
+        reqs[0]["model"],
+        json!("claude-haiku-4-5"),
+        "first attempt is routed"
+    );
+    assert_eq!(
+        reqs[1]["model"],
+        json!("claude-opus-4-8"),
+        "fallback uses the original model"
+    );
 }

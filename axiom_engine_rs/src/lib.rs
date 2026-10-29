@@ -1,6 +1,5 @@
 pub mod adaptive;
 pub mod agent_task;
-pub mod verifier_strength;
 pub mod agentic;
 pub mod agentic_eval;
 #[cfg(feature = "experimental")]
@@ -9,8 +8,8 @@ pub mod anthropic_forwarder;
 pub mod backend_live;
 pub mod backend_router;
 pub mod belief;
-pub mod bincode_compat;
 pub mod bench;
+pub mod bincode_compat;
 pub mod bootstrap;
 pub mod cache_safety;
 pub mod cache_stack;
@@ -20,14 +19,14 @@ pub mod claude_backend;
 pub mod cli;
 pub mod cluster;
 pub mod config;
-pub mod cp1;
-pub mod daemon;
 pub mod context_compressor;
 pub mod context_economics;
 pub mod contrastive;
 pub mod corpus;
 pub mod cost_ledger;
+pub mod cp1;
 pub mod cvm_store;
+pub mod daemon;
 pub mod data_gen;
 pub mod digest;
 pub mod dwe;
@@ -39,8 +38,8 @@ pub mod fault_locate;
 pub mod fuzzy_dedup;
 pub mod gpu_embed;
 pub mod graph_memory;
-pub mod hamiltonian;
 pub mod hallucination;
+pub mod hamiltonian;
 pub mod hardware;
 pub mod heal_memory;
 pub mod hindsight;
@@ -76,21 +75,23 @@ pub mod sandbox;
 pub mod search_ingest;
 pub mod search_scrape;
 pub mod self_heal;
-pub mod solve;
 pub mod server;
-pub mod session_recorder;
 pub mod session_awareness;
+pub mod session_recorder;
 pub mod skeleton;
+pub mod solve;
 #[cfg(feature = "experimental")]
 pub mod state_predictor;
 pub mod surprisal;
 pub mod surprise_triage;
 pub mod swarm_route;
+pub mod verifier_strength;
 // Canonical mesh crate (path dependency). Kept under the historic `mesh_core`
 // name so existing `crate::mesh_core::…` paths keep resolving; the module
 // stays private exactly as before.
 use axiom_mesh_core as mesh_core;
 pub mod mesh_router;
+pub mod resumable_adamw;
 pub mod swarm_router;
 pub mod task_board;
 pub mod test_time_adapter;
@@ -99,7 +100,6 @@ pub mod train;
 #[cfg(feature = "experimental")]
 pub mod trajectory_sampler;
 pub mod ttt_block;
-pub mod resumable_adamw;
 pub mod ttt_mlp;
 pub mod ttt_mlp_model;
 pub mod tui;

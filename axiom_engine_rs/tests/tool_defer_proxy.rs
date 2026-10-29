@@ -146,10 +146,22 @@ async fn defer_marks_unused_tools_when_enabled() {
         .filter(|t| t.get("defer_loading") == Some(&json!(true)))
         .count();
     assert_eq!(deferred, 8, "8 unused tools deferred");
-    let read = sent_tools.iter().find(|t| t["name"] == json!("Read")).unwrap();
-    assert!(read.get("defer_loading").is_none(), "core tool not deferred");
-    let wf = sent_tools.iter().find(|t| t["name"] == json!("WebFetch")).unwrap();
-    assert!(wf.get("defer_loading").is_none(), "recently-used tool not deferred");
+    let read = sent_tools
+        .iter()
+        .find(|t| t["name"] == json!("Read"))
+        .unwrap();
+    assert!(
+        read.get("defer_loading").is_none(),
+        "core tool not deferred"
+    );
+    let wf = sent_tools
+        .iter()
+        .find(|t| t["name"] == json!("WebFetch"))
+        .unwrap();
+    assert!(
+        wf.get("defer_loading").is_none(),
+        "recently-used tool not deferred"
+    );
 }
 
 #[tokio::test]
@@ -171,7 +183,10 @@ async fn defer_output_is_byte_stable_across_two_turns() {
     let captured = capture.requests.lock().unwrap();
     let t1 = serde_json::to_string(&captured[0]["tools"]).unwrap();
     let t2 = serde_json::to_string(&captured[1]["tools"]).unwrap();
-    assert_eq!(t1, t2, "identical input must yield byte-identical tools[] (cache-safe)");
+    assert_eq!(
+        t1, t2,
+        "identical input must yield byte-identical tools[] (cache-safe)"
+    );
 }
 
 #[tokio::test]

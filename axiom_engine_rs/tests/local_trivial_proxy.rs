@@ -210,7 +210,10 @@ async fn streaming_trivial_turn_gets_a_local_sse_stream() {
         content_type.contains("text/event-stream"),
         "a streaming client must get SSE, not JSON (got {content_type})"
     );
-    assert!(text.contains("event: message_start"), "valid SSE event sequence");
+    assert!(
+        text.contains("event: message_start"),
+        "valid SSE event sequence"
+    );
     assert!(text.contains("event: message_stop"));
     assert!(text.contains("axiom-local"), "answered locally");
     assert_eq!(
@@ -232,7 +235,11 @@ async fn error_bearing_turn_is_forwarded_upstream() {
 
     let (status, body) = post_messages(&app, error_bearing("lb-error")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_ne!(body["model"], json!("axiom-local"), "error turn is not local");
+    assert_ne!(
+        body["model"],
+        json!("axiom-local"),
+        "error turn is not local"
+    );
     assert_eq!(
         capture.requests.lock().unwrap().len(),
         1,
@@ -253,7 +260,11 @@ async fn flag_off_always_forwards() {
 
     let (status, body) = post_messages(&app, clean_mechanical("lb-off")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_ne!(body["model"], json!("axiom-local"), "flag off -> never local");
+    assert_ne!(
+        body["model"],
+        json!("axiom-local"),
+        "flag off -> never local"
+    );
     assert_eq!(
         capture.requests.lock().unwrap().len(),
         1,

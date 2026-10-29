@@ -158,9 +158,7 @@ impl StatePredictor {
             let token_budget = (budget_raw.exp().clamp(16.0, 4096.0)) as usize;
 
             // Extract the predicted state as a vector for serialization.
-            let predicted_state_vec = projected
-                .squeeze(0)?
-                .to_vec1::<f32>()?;
+            let predicted_state_vec = projected.squeeze(0)?.to_vec1::<f32>()?;
 
             // Confidence: use the max softmax probability as the point estimate.
             let max_prob = max_value(&label_probs)?;
@@ -186,8 +184,8 @@ impl StatePredictor {
         let overall = if milestones.is_empty() {
             BetaBelief::uniform()
         } else {
-            let mean_alpha: f32 =
-                milestones.iter().map(|m| m.confidence.alpha).sum::<f32>() / milestones.len() as f32;
+            let mean_alpha: f32 = milestones.iter().map(|m| m.confidence.alpha).sum::<f32>()
+                / milestones.len() as f32;
             let mean_beta: f32 =
                 milestones.iter().map(|m| m.confidence.beta).sum::<f32>() / milestones.len() as f32;
             BetaBelief {
@@ -365,7 +363,11 @@ mod tests {
             .unwrap();
         for m in &map.milestones {
             assert!(m.token_budget >= 16, "budget too small: {}", m.token_budget);
-            assert!(m.token_budget <= 4096, "budget too large: {}", m.token_budget);
+            assert!(
+                m.token_budget <= 4096,
+                "budget too large: {}",
+                m.token_budget
+            );
         }
     }
 

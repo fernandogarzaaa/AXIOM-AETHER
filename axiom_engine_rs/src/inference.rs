@@ -236,7 +236,9 @@ impl InferencePipeline {
         if !prompt_ids.is_empty() {
             let prompt_tensor =
                 Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &self.device)?;
-            let _ = self.model.forward_lm(&prompt_tensor, &mut states[..], false, 0)?;
+            let _ = self
+                .model
+                .forward_lm(&prompt_tensor, &mut states[..], false, 0)?;
         }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
@@ -248,7 +250,9 @@ impl InferencePipeline {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             // Snapshot states so a non-finite update can be discarded.
             let states_snapshot = states.clone();
-            let logits = self.model.forward_lm(&token_tensor, &mut states[..], false, 0)?;
+            let logits = self
+                .model
+                .forward_lm(&token_tensor, &mut states[..], false, 0)?;
             if !session_states_are_finite(&states)? {
                 eprintln!(
                     "[emergency] non-finite state detected during generate_with_session; \
@@ -434,7 +438,9 @@ impl InferencePipeline {
         if !prompt_ids.is_empty() {
             let prompt_tensor =
                 Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &self.device)?;
-            let _ = self.model.forward_lm(&prompt_tensor, &mut states[..], false, 0)?;
+            let _ = self
+                .model
+                .forward_lm(&prompt_tensor, &mut states[..], false, 0)?;
         }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
@@ -445,7 +451,9 @@ impl InferencePipeline {
         for _ in 0..max_new_tokens {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             let states_snapshot = states.clone();
-            let logits = self.model.forward_lm(&token_tensor, &mut states[..], false, 0)?;
+            let logits = self
+                .model
+                .forward_lm(&token_tensor, &mut states[..], false, 0)?;
             if !session_states_are_finite(&states)? {
                 eprintln!(
                     "[emergency] non-finite state detected during generate_with_memory; \

@@ -28,11 +28,7 @@ async fn start_mock_upstream(respond_with: Option<(u16, Value)>) -> (String, Cap
     async fn handler(State(capture): State<Capture>, Json(body): Json<Value>) -> Response {
         capture.requests.lock().unwrap().push(body);
         if let Some((status, resp_body)) = capture.respond_with.lock().unwrap().clone() {
-            return (
-                StatusCode::from_u16(status).unwrap(),
-                Json(resp_body),
-            )
-                .into_response();
+            return (StatusCode::from_u16(status).unwrap(), Json(resp_body)).into_response();
         }
         Json(json!({
             "id": "msg_ping",
@@ -116,7 +112,10 @@ async fn ping_shape_has_max_tokens_zero_and_no_stream_thinking_tool_choice() {
     let sent_str = sent.to_string();
     assert!(!sent_str.contains("second turn"));
     let messages = sent["messages"].as_array().unwrap();
-    assert_eq!(messages.last().unwrap(), &json!({"role": "user", "content": "."}));
+    assert_eq!(
+        messages.last().unwrap(),
+        &json!({"role": "user", "content": "."})
+    );
 }
 
 #[tokio::test]
@@ -149,7 +148,11 @@ async fn ping_retries_once_with_max_tokens_one_on_a_max_tokens_400() {
     let _ = send_ping(&forwarder, &fake_headers(), &sample_last_request(), 0).await;
 
     let captured = capture.requests.lock().unwrap();
-    assert_eq!(captured.len(), 2, "must retry exactly once on a max_tokens 400");
+    assert_eq!(
+        captured.len(),
+        2,
+        "must retry exactly once on a max_tokens 400"
+    );
     assert_eq!(captured[0]["max_tokens"], json!(0));
     assert_eq!(captured[1]["max_tokens"], json!(1));
 }
