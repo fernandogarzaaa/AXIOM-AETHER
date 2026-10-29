@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "axiom_engine"
 version = "0.5.0"
 edition = "2021"
@@ -150,7 +150,7 @@ sha2 = "0.10.8"
 rand = "0.8.5"
 # Mesh primitives (KNM/IDC) live in the canonical axiom_mesh_core crate.
 axiom_mesh_core = { version = "0.1", path = "../axiom_mesh_core" }
-ndarray = "0.16"
+ndarray = "0.17"
 indicatif = "0.17.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
