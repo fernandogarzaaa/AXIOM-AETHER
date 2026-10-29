@@ -21,6 +21,41 @@ The pure-Python package at the repo root (`pyproject.toml`, **`axiom-engine`**)
 is a *separate* reference implementation — distinct from the `axiom-aether`
 binary wheel. Keep the names distinct to avoid confusion.
 
+### Release checksums
+
+Every binary archive on a GitHub Release ships with a `.sha256` sidecar,
+written by the `build` job in `release.yml`:
+
+```
+axiom-ttt-<version>-linux-x86_64.tar.gz      axiom-ttt-<version>-linux-x86_64.tar.gz.sha256
+axiom-ttt-<version>-macos-arm64.tar.gz       axiom-ttt-<version>-macos-arm64.tar.gz.sha256
+axiom-ttt-<version>-windows-x86_64.zip       axiom-ttt-<version>-windows-x86_64.zip.sha256
+```
+
+Each sidecar is one line in `sha256sum -c` format (`<lowercase hex>  <filename>`),
+so you can check a manual download with `sha256sum -c <asset>.sha256` (or
+`shasum -a 256 -c` on macOS) from the directory holding both files.
+
+- **Installers verify by default.** `scripts/install.sh` and `scripts/install.ps1`
+  download the sidecar for the archive they selected, hash the archive, and
+  abort on a mismatch ("refusing to install a corrupted or substituted
+  archive"). A match prints `checksum verified (<hex>)`.
+- **Older releases have no sidecar.** The installers then warn
+  (`no .sha256 sidecar published for this release; skipping verification`)
+  and continue. Set `AXIOM_REQUIRE_CHECKSUM=1` to fail instead. `install.sh`
+  also skips with a warning when neither `sha256sum` nor `shasum` is
+  installed, unless `AXIOM_REQUIRE_CHECKSUM=1` is set.
+- **Checkpoint assets** are covered by the separate `SHA256SUMS.txt` published
+  by the `checkpoint` job. To make `axiom init` fail closed on a substituted
+  checkpoint, copy the `axiom_production_bpe.bin` line's hash from that file
+  and export it before fetching: `AXIOM_CHECKPOINT_SHA256=<hex>` (and
+  `AXIOM_TOKENIZER_SHA256` for the tokenizer, from the `axiom_bpe.json` line).
+- **Not signed.** The sidecars and `SHA256SUMS.txt` are plain, unsigned
+  manifests hosted next to the assets. They catch corruption and partial or
+  mismatched downloads, but anyone who can replace a release asset can replace
+  its checksum too. They are not a defence against a compromised release or
+  account. Signing (e.g. cosign/minisign or build attestations) is still open.
+
 ## How the binary set is controlled
 
 The crate defines two user-facing bins (`axiom`, `axiom_engine`) from the same

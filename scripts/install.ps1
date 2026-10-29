@@ -24,6 +24,31 @@ New-Item -ItemType Directory -Path $tmp, $extract | Out-Null
 try {
     Write-Host "axiom installer: downloading $($asset.browser_download_url)"
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
+
+    # Releases built after the checksum-manifest change publish <asset>.sha256
+    # (sha256sum -c format). Older releases have none.
+    $requireChecksum = ($env:AXIOM_REQUIRE_CHECKSUM -eq "1")
+    $sidecarName = $asset.name + ".sha256"
+    $sidecarAsset = $release.assets | Where-Object { $_.name -eq $sidecarName } | Select-Object -First 1
+    if ($sidecarAsset) {
+        $sidecarPath = Join-Path $tmp $sidecarName
+        Invoke-WebRequest -Uri $sidecarAsset.browser_download_url -OutFile $sidecarPath
+        $sidecarText = (Get-Content -LiteralPath $sidecarPath -Raw).Trim()
+        $expected = ($sidecarText -split '\s+')[0].ToLower()
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLower()
+        if ($expected -ne $actual) {
+            throw ("axiom installer: checksum mismatch`n  expected: $expected`n  actual:   $actual`n" +
+                "axiom installer: refusing to install a corrupted or substituted archive")
+        }
+        Write-Host "axiom installer: checksum verified ($actual)"
+    }
+    elseif ($requireChecksum) {
+        throw "axiom installer: no .sha256 sidecar published for this release and AXIOM_REQUIRE_CHECKSUM=1; refusing to install"
+    }
+    else {
+        Write-Warning "axiom installer: no .sha256 sidecar published for this release; skipping verification"
+    }
+
     Expand-Archive -Path $archive -DestinationPath $extract -Force
     $binary = Get-ChildItem -Path $extract -Recurse -Filter "axiom_engine.exe" | Select-Object -First 1
     if (-not $binary) {
