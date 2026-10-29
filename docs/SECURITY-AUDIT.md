@@ -16,7 +16,7 @@ var).
 |---|---|---|---|
 | 1 | `POST /v1/hypervisor/jit_run` — unauthenticated-by-default arbitrary command execution | **P0** | **FIXED** this pass |
 | 2 | Checkpoint downloads had no integrity verification | **P1** | **FIXED** this pass |
-| 3 | `sandbox.rs` naming implies a security boundary it doesn't provide | P2 | Documented, not renamed |
+| 3 | `sandbox.rs` naming implies a security boundary it doesn't provide | P2 | **FIXED** 2026-10-29 (renamed to `compile_verify.rs` / `CompileVerifier`; `AXIOM_SANDBOX_*` accepted as deprecated aliases) |
 | 4 | No execution isolation anywhere (self_heal, solve, poly_jit, sandbox all run real subprocesses) | P1 (architectural), not new in this pass | Documented |
 | 5 | Data-plane bind defaults to `0.0.0.0` with auth opt-in | P1, already flagged and partly mitigated (2026-07-24 audit) | **FIXED** 2026-10 (loopback default, fail closed off-loopback without a key) |
 | 6 | Patch-memory trust model | — | **Strength**, not a finding |
@@ -129,7 +129,7 @@ close that gap; tracked in [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## 3. `sandbox.rs` naming (P2, documented only)
+## 3. `sandbox.rs` naming (P2, FIXED 2026-10-29)
 
 `SandboxController` (`sandbox.rs`) is, by its own module doc, honest about
 what it is: *"a closed-loop local compilation sandbox... creates an isolated
@@ -160,6 +160,18 @@ something that names what it is (`AXIOM_COMPILE_VERIFY` /
 release, and update `sandbox.rs`'s own doc comment to state explicitly
 *"this is a compile-time verifier, not a process isolation boundary"* at the
 top, not three sentences in.
+
+**Resolution (2026-10-29)**: the module was renamed `sandbox.rs` ->
+`compile_verify.rs`, and its types became `CompileVerifier`,
+`CompileDiagnostic`, `CompileRunReport` and `CompileVerifyError`. The module
+doc now opens by stating it is a compile-time verifier, not a process or OS
+isolation boundary. `crate::sandbox` and the four old type names remain as
+`#[deprecated]` aliases for one release. The canonical environment variables
+are `AXIOM_COMPILE_VERIFY`, `AXIOM_COMPILE_VERIFY_ROOT`,
+`AXIOM_COMPILE_VERIFY_MAX_STEPS` and `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS`; the
+old `AXIOM_SANDBOX_*` names are deprecated aliases for one release (the new
+name wins when both are set, and using only an old name prints a one-time
+stderr warning). Log prefixes changed from `[sandbox]` to `[compile-verify]`.
 
 ---
 
@@ -300,8 +312,8 @@ regression test in `src/server/tests.rs`, `src/vfs.rs` or
 | A6 | Synchronous generation (`/v1/completions`, `/v1/chat/completions`, local `/v1/messages`, `/v1/adapt`) ran on async workers; a blocking HTTP backend panics in debug builds and stalls a worker in release | P2 | **FIXED** — moved to `spawn_blocking` |
 | A7 | UTF-8 slicing at a byte offset in `axiom_compress_path` (`max_bytes` cut) and MCP `fetch` id decoding; shape-product overflow on checkpoint upload and DWE apply | P2 (contained: `spawn_blocking` / debug-only) | **FIXED** — char-boundary back-off, `checked_mul` |
 | A8 | Secret comparisons used `==` | P3 | **FIXED** — constant-time compare |
-| A9 | `cvm_store.rs` index is keyed by session id with no eviction; `put` rewrites the whole session file synchronously from the digest hook | P2 | **Open** — bounded per session (64 MB) but not across sessions; needs an LRU over sessions and append-only writes. Tracked in ROADMAP.md |
-| A10 | `HealMemory::load` reads a JSON file on every `/v1/messages` and `/v1/immunity`; `vfs` metadata calls use `std::fs` in async handlers | P3 | **Open** — cheap today; cache the heal memory or move to `tokio::fs` when it shows up in a profile |
+| A9 | `cvm_store.rs` index is keyed by session id with no eviction; `put` rewrites the whole session file synchronously from the digest hook | P2 | **FIXED** (2026-10-29) — `put` appends one JSONL line (rewrite only after a per-session eviction); the in-memory index is bounded by `AXIOM_CVM_MAX_INDEX_BYTES` (256 MiB, LRU sessions dropped from memory, reloaded lazily); the store's on-disk total is bounded by `AXIOM_CVM_MAX_TOTAL_BYTES` (2 GiB, LRU session files deleted, logged); the digest hook's write runs under `spawn_blocking` |
+| A10 | `HealMemory::load` reads a JSON file on every `/v1/messages` and `/v1/immunity`; `vfs` metadata calls use `std::fs` in async handlers | P3 | **FIXED** (2026-10-29) for the heal memory — `HealMemory::load_shared` serves the read-only paths from a process-wide cache validated against the file's `(mtime, len)` per call. The `vfs` metadata calls are `tokio::fs` on the read path; the remaining `std::fs` calls in mount/list/stat are single syscalls and stay as they are |
 
 Checked and found sound: every `/v1/*` route (including the WebSocket
 `GET /v1/responses`) is behind `require_api_key`; the forwarders relay only an

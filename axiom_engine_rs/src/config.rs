@@ -11,6 +11,11 @@ pub const DEFAULT_EOS_TOKEN: u32 = 2;
 pub const DEFAULT_BASE_MODEL_FILE: &str = "axiom_production_bpe.bin";
 pub const DEFAULT_MODEL_URL: &str =
     "https://huggingface.co/fggg23/axiom-multilang-v1/resolve/main/axiom_production_bpe.bin";
+/// Tokenizer published next to the checkpoint on the Hub; fetched by `axiom
+/// init` from the checkpoint URL's directory.
+pub const DEFAULT_TOKENIZER_FILE: &str = "axiom_bpe.json";
+/// Architecture sidecar published next to the checkpoint (see `model_meta`).
+pub const DEFAULT_META_FILE: &str = "axiom_production_bpe.meta.json";
 
 /// Static hyper-parameters for the Axiom-TTT inference engine.
 #[derive(Debug, Clone)]
@@ -104,6 +109,90 @@ impl AxiomPaths {
     pub fn base_model_path(&self, cfg: &UserConfig) -> PathBuf {
         self.models_dir.join(&cfg.models.base_model_file)
     }
+
+    pub fn tokenizer_path(&self, cfg: &UserConfig) -> PathBuf {
+        self.models_dir.join(&cfg.models.tokenizer_file)
+    }
+
+    pub fn meta_path(&self, cfg: &UserConfig) -> PathBuf {
+        self.models_dir.join(&cfg.models.meta_file)
+    }
+
+    /// The installed production model, if `axiom init` (or the user) put both
+    /// the checkpoint and its tokenizer under `models/`.
+    pub fn user_production_model(&self, cfg: &UserConfig) -> Option<UserProductionModel> {
+        let checkpoint = self.base_model_path(cfg);
+        let tokenizer = self.tokenizer_path(cfg);
+        (checkpoint.is_file() && tokenizer.is_file()).then_some(UserProductionModel {
+            checkpoint,
+            tokenizer,
+        })
+    }
+}
+
+/// Look up the production model `axiom init` installed under `~/.axiom`,
+/// reading `config.toml` when present (defaults otherwise) and never writing
+/// anything. `None` when there is no `~/.axiom`, no config, or either file
+/// is missing, so callers fall back to the legacy model exactly as before.
+pub fn installed_production_model() -> Option<UserProductionModel> {
+    let paths = AxiomPaths::discover().ok()?;
+    let cfg = match fs::read_to_string(&paths.config) {
+        Ok(raw) => toml::from_str::<UserConfig>(&raw).ok()?,
+        Err(_) => UserConfig::default(),
+    };
+    paths.user_production_model(&cfg)
+}
+
+/// Which model the runtime should load, decided from the three inputs that
+/// matter and nothing else (pure, so it is unit-testable):
+///
+/// * `flag` is `AXIOM_PRODUCTION_BPE`: `Some("1")` forces the production
+///   path, any other `Some` forces the legacy model, `None` means "auto".
+/// * `env_paths` is `(AXIOM_BPE_CKPT, AXIOM_TOKENIZER)` as set by the user.
+/// * `installed` is what `axiom init` put under `~/.axiom/models/`.
+///
+/// Auto picks the installed model when neither env path is set and both
+/// files exist; otherwise it stays on the legacy model. An explicit `1`
+/// uses the env paths when given and the installed model as the fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductionSelection {
+    Legacy,
+    /// `(checkpoint, tokenizer, auto_selected)`.
+    Production(PathBuf, PathBuf, bool),
+}
+
+pub fn select_production_model(
+    flag: Option<&str>,
+    env_paths: (Option<&str>, Option<&str>),
+    installed: Option<&UserProductionModel>,
+) -> ProductionSelection {
+    let (env_ckpt, env_tok) = env_paths;
+    match flag {
+        Some("1") => {
+            let ckpt = env_ckpt.map(PathBuf::from);
+            let tok = env_tok.map(PathBuf::from);
+            match (ckpt, tok, installed) {
+                (Some(c), Some(t), _) => ProductionSelection::Production(c, t, false),
+                (None, None, Some(m)) => ProductionSelection::Production(
+                    m.checkpoint.clone(),
+                    m.tokenizer.clone(),
+                    false,
+                ),
+                (c, t, _) => ProductionSelection::Production(
+                    c.unwrap_or_else(|| PathBuf::from("checkpoints/axiom_production_bpe.bin")),
+                    t.unwrap_or_else(|| PathBuf::from("checkpoints/axiom_bpe.json")),
+                    false,
+                ),
+            }
+        }
+        Some(_) => ProductionSelection::Legacy,
+        None => match (env_ckpt, env_tok, installed) {
+            (None, None, Some(m)) => {
+                ProductionSelection::Production(m.checkpoint.clone(), m.tokenizer.clone(), true)
+            }
+            _ => ProductionSelection::Legacy,
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -157,6 +246,42 @@ pub struct ModelFetchConfig {
     pub base_model_file: String,
     pub base_model_url: String,
     pub auto_fetch: bool,
+    /// Tokenizer file name, fetched from the same directory as
+    /// `base_model_url` into `~/.axiom/models/`. Older `config.toml` files
+    /// without this field get the default.
+    #[serde(default = "default_tokenizer_file")]
+    pub tokenizer_file: String,
+    /// Architecture sidecar file name, fetched the same way. Optional at
+    /// runtime (the engine falls back to the legacy dims without it) but the
+    /// published checkpoints all ship one.
+    #[serde(default = "default_meta_file")]
+    pub meta_file: String,
+}
+
+fn default_tokenizer_file() -> String {
+    DEFAULT_TOKENIZER_FILE.to_string()
+}
+
+fn default_meta_file() -> String {
+    DEFAULT_META_FILE.to_string()
+}
+
+/// The production model `axiom init` installed under `~/.axiom/models/`, when
+/// both halves the engine needs are present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserProductionModel {
+    pub checkpoint: PathBuf,
+    pub tokenizer: PathBuf,
+}
+
+/// Replace the last path segment of `url` with `file`
+/// (`…/resolve/main/axiom_production_bpe.bin` + `axiom_bpe.json` →
+/// `…/resolve/main/axiom_bpe.json`). A URL with no `/` is returned unchanged.
+pub fn sibling_url(url: &str, file: &str) -> String {
+    match url.rfind('/') {
+        Some(i) => format!("{}/{file}", &url[..i]),
+        None => url.to_string(),
+    }
 }
 
 /// Opt-in server features that were previously configurable only via
@@ -225,6 +350,8 @@ impl Default for UserConfig {
                 base_model_file: DEFAULT_BASE_MODEL_FILE.into(),
                 base_model_url: DEFAULT_MODEL_URL.into(),
                 auto_fetch: true,
+                tokenizer_file: DEFAULT_TOKENIZER_FILE.into(),
+                meta_file: DEFAULT_META_FILE.into(),
             },
             features: FeatureConfig::default(),
         }
@@ -273,13 +400,42 @@ pub fn add_swarm_peer(peer: &str) -> io::Result<(AxiomPaths, UserConfig, bool)> 
 
 pub fn ensure_base_model(paths: &AxiomPaths, cfg: &UserConfig) -> io::Result<Option<PathBuf>> {
     let target = paths.base_model_path(cfg);
-    if target.exists() {
-        return Ok(Some(target));
+    if !target.exists() {
+        if !cfg.models.auto_fetch {
+            return Ok(None);
+        }
+        fetch_base_model(&cfg.models.base_model_url, &target, None)?;
     }
-    if !cfg.models.auto_fetch {
-        return Ok(None);
+    // The checkpoint is useless to the engine without its tokenizer (and the
+    // sidecar carries the dims). Fetch both from the same Hub directory; a
+    // failure here is reported but does not undo the checkpoint download.
+    if cfg.models.auto_fetch {
+        for (file, dest, required) in [
+            (
+                cfg.models.tokenizer_file.as_str(),
+                paths.tokenizer_path(cfg),
+                true,
+            ),
+            (cfg.models.meta_file.as_str(), paths.meta_path(cfg), false),
+        ] {
+            if dest.exists() {
+                continue;
+            }
+            let url = sibling_url(&cfg.models.base_model_url, file);
+            if let Err(e) = fetch_base_model(&url, &dest, None) {
+                if required {
+                    eprintln!(
+                        "[axiom] tokenizer fetch failed ({e}); the production model needs {} next to \
+                         the checkpoint in {} — place it there or set AXIOM_TOKENIZER",
+                        file,
+                        paths.models_dir.display()
+                    );
+                } else {
+                    eprintln!("[axiom] sidecar fetch skipped ({e}); legacy dims will be assumed");
+                }
+            }
+        }
     }
-    fetch_base_model(&cfg.models.base_model_url, &target, None)?;
     Ok(Some(target))
 }
 
@@ -426,6 +582,98 @@ mod tests {
         let parsed: UserConfig = toml::from_str(&raw).unwrap();
         assert_eq!(parsed, cfg);
         assert_eq!(parsed.runtime.vram_budget_mb, 5200);
+    }
+
+    #[test]
+    fn sibling_url_replaces_last_segment() {
+        assert_eq!(
+            sibling_url(DEFAULT_MODEL_URL, "axiom_bpe.json"),
+            "https://huggingface.co/fggg23/axiom-multilang-v1/resolve/main/axiom_bpe.json"
+        );
+        assert_eq!(sibling_url("nofile", "x"), "nofile");
+    }
+
+    #[test]
+    fn old_config_without_tokenizer_fields_still_loads() {
+        // A config.toml written before tokenizer_file/meta_file existed.
+        let mut raw = toml::to_string(&UserConfig::default()).unwrap();
+        raw = raw
+            .lines()
+            .filter(|l| !l.starts_with("tokenizer_file") && !l.starts_with("meta_file"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed: UserConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.models.tokenizer_file, DEFAULT_TOKENIZER_FILE);
+        assert_eq!(parsed.models.meta_file, DEFAULT_META_FILE);
+    }
+
+    #[test]
+    fn user_production_model_needs_both_files() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = AxiomPaths::from_home(home.path().join(".axiom"));
+        paths.create_all().unwrap();
+        let cfg = UserConfig::default();
+        assert_eq!(paths.user_production_model(&cfg), None);
+        fs::write(paths.base_model_path(&cfg), b"ckpt").unwrap();
+        assert_eq!(paths.user_production_model(&cfg), None, "tokenizer missing");
+        fs::write(paths.tokenizer_path(&cfg), b"{}").unwrap();
+        let m = paths.user_production_model(&cfg).unwrap();
+        assert_eq!(m.checkpoint, paths.base_model_path(&cfg));
+        assert_eq!(m.tokenizer, paths.tokenizer_path(&cfg));
+    }
+
+    #[test]
+    fn production_selection_rules() {
+        use ProductionSelection::*;
+        let installed = UserProductionModel {
+            checkpoint: PathBuf::from("/h/.axiom/models/axiom_production_bpe.bin"),
+            tokenizer: PathBuf::from("/h/.axiom/models/axiom_bpe.json"),
+        };
+        // Unset flag, nothing installed → legacy (the historical default).
+        assert_eq!(select_production_model(None, (None, None), None), Legacy);
+        // Unset flag, installed model → auto-selected.
+        assert_eq!(
+            select_production_model(None, (None, None), Some(&installed)),
+            Production(
+                installed.checkpoint.clone(),
+                installed.tokenizer.clone(),
+                true
+            )
+        );
+        // Unset flag but an explicit env path → stays legacy (env paths only
+        // mean something with AXIOM_PRODUCTION_BPE=1, as before).
+        assert_eq!(
+            select_production_model(None, (Some("x.bin"), None), Some(&installed)),
+            Legacy
+        );
+        // Explicit 0 always wins.
+        assert_eq!(
+            select_production_model(Some("0"), (None, None), Some(&installed)),
+            Legacy
+        );
+        // Explicit 1 with env paths uses them verbatim.
+        assert_eq!(
+            select_production_model(Some("1"), (Some("c.bin"), Some("t.json")), Some(&installed)),
+            Production(PathBuf::from("c.bin"), PathBuf::from("t.json"), false)
+        );
+        // Explicit 1 without env paths falls back to the installed model...
+        assert_eq!(
+            select_production_model(Some("1"), (None, None), Some(&installed)),
+            Production(
+                installed.checkpoint.clone(),
+                installed.tokenizer.clone(),
+                false
+            )
+        );
+        // ...and to the historical checkpoints/ defaults when nothing is installed.
+        assert_eq!(
+            select_production_model(Some("1"), (None, None), None),
+            Production(
+                PathBuf::from("checkpoints/axiom_production_bpe.bin"),
+                PathBuf::from("checkpoints/axiom_bpe.json"),
+                false
+            )
+        );
     }
 
     #[test]

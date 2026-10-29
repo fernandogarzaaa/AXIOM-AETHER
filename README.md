@@ -115,6 +115,7 @@ notes and the construction blueprint live at
 | `AXIOM_CACHE_SAFE` | **1** | Never mutates message content at or before a client `cache_control` breakpoint. |
 | `AXIOM_CVM_DIGEST` | **`skeleton`** | Replaces heavy `tool_result` blocks in the newest turn with a code-aware digest + a recoverable stub (`axiom_expand`/`POST /v1/expand` returns the original verbatim). Set `off` to disable, `haiku` to summarize with a real Claude Haiku call (bills your account). |
 | `AXIOM_CVM_DIGEST_THRESHOLD_TOKENS` | **4000** | Minimum token estimate before a `tool_result` block is digested. |
+| `AXIOM_CVM_MAX_INDEX_BYTES` / `AXIOM_CVM_MAX_TOTAL_BYTES` | **256 MiB** / **2 GiB** | Cross-session bounds on the L2 page store: in-memory index budget (least-recently-used sessions drop from memory, reload from disk) and total on-disk size (least-recently-used session files are deleted, logged). Each session is additionally capped at 64 MiB. |
 | `AXIOM_PREFIX_DEDUP` | **0** | Lossless dedup of byte-identical repeated blocks in the system prefix. Off by default: measured 0% real gain on this machine's actual rule files (see below) — shipped but not proven valuable yet. |
 | `AXIOM_KEEPALIVE` | **0** | Actuarial cache-refresh pings to survive the 5-minute cache TTL between turns. Off by default forever unless you opt in — it replays your own API credentials on a timer; read `axiom_engine_rs/src/keepalive.rs` before enabling. |
 
@@ -587,7 +588,7 @@ Useful environment variables:
 | `AXIOM_MERGE_ROOT` | `;`-separated directories `POST /v1/cluster/merge` may read from and write to (default: current directory and `~/.axiom`). |
 | `AXIOM_VFS_ALLOWED_ROOTS` / `AXIOM_VFS_MAX_READ_BYTES` | Restrict `/v1/hypervisor/mount` to these `;`-separated directories (unset ⇒ any), and cap a single `/v1/hypervisor/read` (default 16 MiB). |
 | `AXIOM_ENABLE_JIT_EXEC` | Off by default. Set to `1`/`true`/`on` to enable `POST /v1/hypervisor/jit_run`, which executes a caller-supplied command and can overwrite `source_path` on disk. A `process.execute` capability, distinct from `AXIOM_API_KEY` (which only decides *who* may call it). See [Process execution capability](#process-execution-capability). |
-| `AXIOM_PRODUCTION_BPE` | Enable the trained BPE checkpoint path. |
+| `AXIOM_PRODUCTION_BPE` | Unset = auto: the model `axiom init` installed under `~/.axiom/models/` is used when present. `1` forces the production path (`AXIOM_BPE_CKPT` / `AXIOM_TOKENIZER`), `0` forces the legacy model. |
 | `AXIOM_TOKENIZER` | Path to `axiom_bpe.json`. |
 | `AXIOM_BPE_CKPT` | Path to `axiom_production_bpe.bin`. |
 | `AXIOM_CHECKPOINT_SHA256` / `AXIOM_TOKENIZER_SHA256` | Optional pinned SHA-256 for the artifact fetched via `AXIOM_CHECKPOINT_URL` / `AXIOM_TOKENIZER_URL`. When set, a mismatch deletes the partial download and fails `axiom init` instead of installing an unverified checkpoint. When unset, the fetch still succeeds but the computed hash is printed so you can capture and pin it. |
@@ -736,6 +737,27 @@ upgrades.
 Experimental pieces remain opt-in or documented as research until they have
 repeatable evaluation and clear operational value.
 
+## Terminology
+
+Several subsystems carry names that predate the current code. This table is
+the map a new contributor needs; the longer version with evidence is in
+[`docs/ARCHITECTURE-AUDIT.md`](docs/ARCHITECTURE-AUDIT.md) §6.
+
+| Term | What it actually is | Where it lives |
+|---|---|---|
+| Vibe memory | Persistent EMA-merged adaptation state (the master `W̃` that sessions fold into) | `vibe_memory.rs` |
+| Heal memory / immunity | Learned environment-repair experience, shareable across a fleet | `heal_memory.rs` |
+| Patch memory | Verified source-fix substrate (local + fleet gossip) | `patch_memory.rs` |
+| CVM | Context Virtual Memory: the proxy's cost stack (provider cache as L1, local content-addressed page store as L2) | `cvm_store.rs`, `cost_ledger.rs`, `digest.rs`, `cache_safety.rs` |
+| DWE | Distributed Weight Exchange: signed fast-weight fragments between fleet nodes | `dwe.rs` |
+| PSS | Prolonged-Session Stack: the five levers for 100+ turn sessions | `prefix_diet.rs`, `tool_defer.rs`, `cache_stack.rs`, `keepalive.rs`, `local_trivial.rs` |
+| Graph memory | Directed, weighted edges between memory records; recall seeds a bounded spreading activation from its direct hits and appends graph-only neighbours after them | `graph_memory.rs`, `memory_recall.rs` |
+| Hypervisor | The Poly JIT + Neural VFS surface (`/v1/hypervisor/*`). **Not** a real hypervisor: no VM or OS isolation. The name is kept for API stability. | `server/routes_hypervisor.rs`, `vfs.rs`, `poly_jit.rs` |
+| Compile verifier (formerly "sandbox") | A `cargo check`-only verifier run in an isolated temp directory. **Not** a process or OS security boundary: no seccomp, no container, only a wall-clock timeout. | `compile_verify.rs` (`AXIOM_COMPILE_VERIFY*`; the `AXIOM_SANDBOX_*` names are deprecated aliases) |
+| Q-TTT / Hamiltonian / quantum manifold | A classical, deterministic tensor-network simulator using physics-inspired optimisation terminology; not quantum computing | `hamiltonian.rs`, `q_manifold.rs` |
+| Axiom Mesh (`axiom_mesh_rs`) | A standalone multi-agent orchestration research workspace; only `axiom_mesh_core` is a dependency of the engine | `axiom_mesh_rs/`, `axiom_mesh_core/` |
+| ChimeraLang | A cognition-language DSL, compiled only with `--features experimental` | `chimera.rs` |
+
 ## Audits, Architecture, and Roadmap
 
 This repository is audited repeatedly against its own code and tests, not
@@ -748,6 +770,8 @@ against its own claims. The current set:
 | [`docs/COMPETITIVE-ANALYSIS.md`](docs/COMPETITIVE-ANALYSIS.md) | How AXIOM compares to Letta/Mem0/Zep, LLMLingua, and LiteLLM/Portkey — what's genuinely differentiated vs. unmeasured |
 | [`docs/AXIOMBENCH.md`](docs/AXIOMBENCH.md) | What's actually measured today vs. simulated vs. not built yet, and the spec for the task-success benchmark this project doesn't have |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Every finding, ranked P0–P4, with what's already fixed |
+| [`docs/MODEL-OPERATIONS.md`](docs/MODEL-OPERATIONS.md) | Runbook: whether and how to train the main model further, training and publishing the recall embedder, and fixing the published sidecars |
+| [`docs/LIVE-TEST-2026-10-29.md`](docs/LIVE-TEST-2026-10-29.md) | Deep live test of the release binary against the published Hugging Face checkpoints: loading, compression, proxy + CVM, hardening probes, MCP, first-run journey, with five findings |
 | [`docs/AUDIT_2026-07.md`](docs/AUDIT_2026-07.md), [`docs/ARCHITECTURE-UNIFIED.md`](docs/ARCHITECTURE-UNIFIED.md) | Prior audit passes — Docker/CI, and the AXIOM/EVE/ADAM cross-repository ownership map — still accurate for what they cover |
 
 ## Repository Map

@@ -123,7 +123,7 @@ ones, grouped by pillar:
 | File | Role |
 |---|---|
 | `self_heal.rs`, `heal_memory.rs` | Supervised command runner + learned environment immunity. |
-| `solve.rs`, `poly_jit.rs`, `sandbox.rs`, `fault_locate.rs` | Verifier-driven repair loop, deterministic source-repair patterns, localization. |
+| `solve.rs`, `poly_jit.rs`, `compile_verify.rs`, `fault_locate.rs` | Verifier-driven repair loop, deterministic source-repair patterns, localization. |
 | `agentic.rs` | Verifier-gated, reversible, held-out-split agentic loop. |
 | `agentic_eval.rs` | `axiom eval-agentic` — the built-in seeded broken-repo benchmark. |
 

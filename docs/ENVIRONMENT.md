@@ -34,6 +34,10 @@ unset. When you add a variable, add it here.
 | `AXIOM_RESPONSES_RELAY_EXTRA` | empty | Extra lowercase client header names relayed to the Responses upstream (allowlist extension). |
 | `AXIOM_OPENAI_RESPONSES_WS_UPSTREAM` | derived from headers | Explicit WebSocket upstream for `GET /v1/responses`. |
 | `AXIOM_CACHE_SAFE`, `AXIOM_CVM_DIGEST`, `AXIOM_CVM_DIGEST_THRESHOLD_TOKENS`, `AXIOM_PREFIX_DEDUP`, `AXIOM_KEEPALIVE` | see README § CVM Cost Stack | Cost-stack levers. |
+| `AXIOM_CVM_DIR` | `checkpoints/cvm` | Root of the CVM L2 page store (one JSONL file per session). |
+| `AXIOM_CVM_MAX_INDEX_BYTES` | `268435456` (256 MiB) | Page text the in-memory CVM index may hold across all sessions; least-recently-used sessions are dropped from memory past it (lossless, reloaded from disk on next touch). |
+| `AXIOM_CVM_MAX_TOTAL_BYTES` | `2147483648` (2 GiB) | On-disk size of the CVM store across all session files; least-recently-used session files are deleted past it (lossy, logged). |
+| `AXIOM_CVM_RETAIN` | unset | `1` keeps a session's CVM file when the session is deleted. |
 | `AXIOM_KEEPALIVE_HORIZON_S` | `1800` | Keep-alive ping horizon in seconds (only with `AXIOM_KEEPALIVE=1`; replays your own credentials, read `keepalive.rs` first). |
 | `AXIOM_SESSION_RECORD` | off | `1` records scrubbed per-session request/response JSONL under `~/.axiom/sessions/`. |
 | `AXIOM_PROXY_URL` | `http://127.0.0.1:3000` | Where the MCP server's `axiom_status` / `axiom_expand` reach the running proxy. |
@@ -44,7 +48,7 @@ unset. When you add a variable, add it here.
 | Variable | Default | Effect |
 |---|---|---|
 | `AXIOM_DEVICE` | `auto` | `cpu`, `cuda`, `metal`, `auto`. |
-| `AXIOM_PRODUCTION_BPE` | off | Use the trained BPE checkpoint path. |
+| `AXIOM_PRODUCTION_BPE` | auto | Unset: use the production model `axiom init` installed under `~/.axiom/models/` when both checkpoint and tokenizer are there, else the legacy model. `1`: force the production path (`AXIOM_BPE_CKPT`/`AXIOM_TOKENIZER`, else the installed model, else `checkpoints/`). `0`: force the legacy model. |
 | `AXIOM_TOKENIZER` / `AXIOM_BPE_CKPT` | `checkpoints/axiom_bpe.json` / `checkpoints/axiom_production_bpe.bin` | Tokenizer and checkpoint paths. |
 | `AXIOM_CHECKPOINT_URL` / `AXIOM_TOKENIZER_URL` | unset | Fetch at boot; pair with `AXIOM_CHECKPOINT_SHA256` / `AXIOM_TOKENIZER_SHA256` to fail closed on a mismatch. |
 | `AXIOM_EMB_CKPT` | `checkpoints/axiom_embedder.bin` | Embedding model used by MCP memory recall and `eval_recall`. |
@@ -80,7 +84,7 @@ unset. When you add a variable, add it here.
 | `AXIOM_PEER_RELIABILITY` | `0.8` | Weight given to a peer's immunity claims (clamped to [0, 1]). |
 | `AXIOM_SOLVE_LLM_ATTEMPTS` | `3` | LLM repair attempts per `axiom solve` round. |
 | `AXIOM_SOLVE_VERIFY_TIMEOUT_SECS` | `120` | Verifier timeout; a hung verifier is killed and the candidate rolled back. |
-| `AXIOM_SANDBOX_ROOT` / `AXIOM_SANDBOX_MAX_STEPS` / `AXIOM_SANDBOX_VERIFY` / `AXIOM_SANDBOX_TIMEOUT_SECS` | see `sandbox.rs` | Staging-directory controls for candidate patches (`cargo check` gate; **not** an OS sandbox, see `docs/SECURITY-AUDIT.md` §3). |
+| `AXIOM_COMPILE_VERIFY_ROOT` / `AXIOM_COMPILE_VERIFY_MAX_STEPS` / `AXIOM_COMPILE_VERIFY` / `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS` | see `compile_verify.rs` | Staging-directory controls for the `cargo check` compile verifier (`AXIOM_COMPILE_VERIFY=0\|false\|off` disables it; **not** an OS sandbox, see `docs/SECURITY-AUDIT.md` §3). **Deprecated aliases:** `AXIOM_SANDBOX_ROOT` / `AXIOM_SANDBOX_MAX_STEPS` / `AXIOM_SANDBOX_VERIFY` / `AXIOM_SANDBOX_TIMEOUT_SECS` are still accepted for one release (the new name wins when both are set; using only an old name prints one stderr warning per process). |
 | `AXIOM_EPISTEMIC_*` | see `docs/EPISTEMIC_DRIFT.md` | Epistemic validation thresholds. |
 
 ## Fleet / swarm (experimental)

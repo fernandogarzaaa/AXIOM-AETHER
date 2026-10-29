@@ -116,6 +116,14 @@ jobs:
           cp LICENSE "$staging/" 2>/dev/null || true
           tar -czf "${staging}.tar.gz" "$staging"
           echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
+          # Checksum sidecar in `sha256sum -c` format; installers verify it.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+          else
+            shasum -a 256 "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+          fi
+          cat "${staging}.tar.gz.sha256"
+          echo "ASSET_SHA=${staging}.tar.gz.sha256" >> "$GITHUB_ENV"
 
       - name: Package Windows archive
         if: matrix.ext == 'zip'
@@ -128,12 +136,19 @@ jobs:
           if (Test-Path LICENSE) { Copy-Item LICENSE $staging\ }
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
           "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # Checksum sidecar in `sha256sum -c` format; install.ps1 verifies it.
+          $hash = (Get-FileHash -Algorithm SHA256 -Path "$staging.zip").Hash.ToLower()
+          "$hash  $staging.zip" | Out-File -FilePath "$staging.zip.sha256" -Encoding ascii
+          Get-Content "$staging.zip.sha256"
+          "ASSET_SHA=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
-          files: ${{ env.ASSET }}
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET_SHA }}
           fail_on_unmatched_files: true
 
   checkpoint:

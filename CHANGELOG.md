@@ -6,6 +6,12 @@ releases are described on the GitHub Releases page.
 ## [Unreleased]
 
 ### Security
+- The CVM L2 page store is bounded across sessions: the in-memory index by
+  `AXIOM_CVM_MAX_INDEX_BYTES` (256 MiB, least-recently-used sessions drop
+  from memory and reload lazily) and the on-disk total by
+  `AXIOM_CVM_MAX_TOTAL_BYTES` (2 GiB, least-recently-used session files are
+  deleted, logged). Previously a client rotating `X-Axiom-Session-Id` could
+  grow both without limit.
 - `POST /v1/cluster/merge` confines its input and output paths to
   `AXIOM_MERGE_ROOT` (default: current directory and `~/.axiom`); previously a
   data-plane caller could read any readable file (the error echoed the path)
@@ -26,6 +32,17 @@ releases are described on the GitHub Releases page.
 - API key and MCP token comparisons are constant-time.
 
 ### Fixed
+- `axiom init` now installs a usable production model: it fetches the
+  tokenizer and architecture sidecar next to the checkpoint it already
+  downloaded, and the proxy, MCP server, `bench` and `run` pick that model up
+  automatically when `AXIOM_PRODUCTION_BPE` is unset (`0` forces the legacy
+  model; `1` with `AXIOM_BPE_CKPT`/`AXIOM_TOKENIZER` is unchanged). Before,
+  the download went unused and a fresh install ran the legacy kernel.
+- `CvmStore::put` appends one line per page instead of rewriting the whole
+  session file, and the digest hook's store write runs on the blocking pool.
+- Heal memory is no longer re-read and re-parsed from disk on every proxied
+  `/v1/messages` and `GET /v1/immunity`: a process-wide cache validated
+  against the file's modification time and size serves the read-only paths.
 - Request-reachable panics: multi-byte UTF-8 at a `max_bytes` cut in
   `axiom_compress_path` and in MCP `fetch` id decoding; integer overflow on a
   client-supplied tensor shape in checkpoint upload and DWE fragment apply.
@@ -37,6 +54,22 @@ releases are described on the GitHub Releases page.
   pillars that did not run.
 
 ### Added
+- Graph memory is wired into recall: `recall` seeds spreading activation
+  from its direct hits over `edges.jsonl` (plus `Supersedes` edges derived
+  from records) and appends up to two graph-only neighbours after the
+  direct hits, flagged `via_graph`; `axiom_recall` labels them `via=graph`.
+  `RecallParams.graph = None` disables the stage.
+- Release archives ship a `.sha256` sidecar; `install.sh` / `install.ps1`
+  verify the download against it and refuse a mismatch
+  (`AXIOM_REQUIRE_CHECKSUM=1` also refuses a release without a sidecar).
+- README `## Terminology` table.
+- `docs/LIVE-TEST-2026-10-29.md`: live test of the release binary against the
+  published Hub checkpoints (all three load; 86.3% bench savings; CVM digest
+  97.4% smaller with verbatim expand; every hardening probe behaves as
+  specified) and five findings, led by `axiom init` not wiring the checkpoint
+  it downloads.
+- `axiom bench` prints a caveat when the input is too small (under ~500
+  tokens) for the savings percentage to mean anything.
 - Checkpoint sidecars (`<ckpt>.meta.json`) carry `schema_version` and
   `engine_version`; a sidecar from a newer engine is refused instead of
   silently loading with default dimensions.
@@ -45,6 +78,12 @@ releases are described on the GitHub Releases page.
   images and GitHub Actions.
 
 ### Changed
+- `sandbox.rs` is `compile_verify.rs` (`CompileVerifier`): it is a
+  `cargo check` verifier, not a process sandbox. New env names
+  `AXIOM_COMPILE_VERIFY`, `AXIOM_COMPILE_VERIFY_ROOT`,
+  `AXIOM_COMPILE_VERIFY_MAX_STEPS`, `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS`; the
+  `AXIOM_SANDBOX_*` names and `crate::sandbox` path remain as deprecated
+  aliases for one release.
 - CI gates `cargo fmt --check` and clippy at deny-warnings across all targets
   for every Rust crate graph; the tree was formatted once to establish the
   baseline.

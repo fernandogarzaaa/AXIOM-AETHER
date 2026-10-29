@@ -26,7 +26,7 @@ async fn get_immunity(State(state): State<AppState>) -> Response {
         )
             .into_response();
     };
-    let memory = crate::heal_memory::HealMemory::load(path);
+    let memory = crate::heal_memory::HealMemory::load_shared(path);
     // Wrap the export with tamper-evident provenance (full SHA-256 + optional
     // HMAC when AXIOM_FLEET_KEY is set) so peers can verify before trusting.
     let fleet_key = fleet_key();

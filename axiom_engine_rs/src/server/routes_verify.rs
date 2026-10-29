@@ -299,7 +299,7 @@ fn inject_immunity_advisory(
         return;
     };
     let text = format!("{user_query}\n{heavy_context}");
-    let memory = crate::heal_memory::HealMemory::load(path);
+    let memory = crate::heal_memory::HealMemory::load_shared(path);
     let advisories = memory.advisories_for_text(&text);
     // Cross-reactive (analogical) hints from sibling commands — advisory only.
     let hints = memory.cross_reactive_hints(&text);

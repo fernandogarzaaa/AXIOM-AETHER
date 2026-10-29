@@ -257,6 +257,10 @@ pub fn run_bench(
     Ok(report)
 }
 
+/// Inputs smaller than this many tokens get a caveat: the fixed per-file
+/// digest overhead dominates and the savings percentage is not meaningful.
+const SMALL_INPUT_TOKENS: usize = 500;
+
 fn print_report(target: &Path, r: &BenchReport, verbose: bool) {
     println!("[bench] target: {}", target.display());
     println!("[bench] files measured        : {}", r.files);
@@ -268,6 +272,17 @@ fn print_report(target: &Path, r: &BenchReport, verbose: bool) {
         r.original_tokens,
         r.skeleton_tokens
     );
+    if r.original_tokens < SMALL_INPUT_TOKENS {
+        // Below this size the fixed per-file digest overhead dominates and the
+        // percentage can go negative (the 2026-10-29 live test measured -49%
+        // on a 4-function sample). Say so rather than let a reader quote it.
+        println!(
+            "[bench] caveat: only {} input tokens (< {SMALL_INPUT_TOKENS}); savings on inputs this \
+             small are dominated by fixed digest overhead and are not representative — \
+             benchmark a real project tree instead.",
+            r.original_tokens
+        );
+    }
     println!(
         "[bench] signatures kept        : {} (expand round-trip {}/{} = {:.1}%)",
         r.symbols_total,
