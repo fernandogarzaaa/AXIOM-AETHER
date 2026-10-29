@@ -386,7 +386,7 @@ ValueError: boom";
         assert_eq!(
             sites
                 .iter()
-                .find(|s| s.path == *"/app/pkg/core.py")
+                .find(|s| s.path == Path::new("/app/pkg/core.py"))
                 .unwrap()
                 .line,
             88
