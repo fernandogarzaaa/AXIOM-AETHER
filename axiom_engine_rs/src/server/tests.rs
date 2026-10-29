@@ -1115,22 +1115,38 @@ mod tests {
         assert_eq!(checked_shape_product(&[usize::MAX, 2]), None);
     }
 
+    // The hardening tests below never mutate the process environment: tests
+    // run in parallel threads, and an `AXIOM_*` value set here would leak into
+    // unrelated tests running at the same time.
+
     #[test]
-    fn clamp_max_tokens_respects_default_and_env_ceiling() {
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("AXIOM_MAX_GENERATION_TOKENS");
-        assert_eq!(clamp_max_tokens(8), 8);
-        assert_eq!(clamp_max_tokens(usize::MAX), MAX_GENERATION_TOKENS);
-        assert_eq!(clamp_max_tokens(1_000_000_000_000), MAX_GENERATION_TOKENS);
-        std::env::set_var("AXIOM_MAX_GENERATION_TOKENS", "64");
-        assert_eq!(clamp_max_tokens(1000), 64);
-        assert_eq!(clamp_max_tokens(10), 10);
+    fn clamp_max_tokens_respects_default_and_configured_ceiling() {
+        assert_eq!(clamp_max_tokens_with(8, None), 8);
+        assert_eq!(clamp_max_tokens_with(usize::MAX, None), MAX_GENERATION_TOKENS);
+        assert_eq!(
+            clamp_max_tokens_with(1_000_000_000_000, None),
+            MAX_GENERATION_TOKENS
+        );
+        assert_eq!(clamp_max_tokens_with(1000, Some("64")), 64);
+        assert_eq!(clamp_max_tokens_with(10, Some("64")), 10);
         // Nonsense values fall back to the default rather than disabling the cap.
-        std::env::set_var("AXIOM_MAX_GENERATION_TOKENS", "0");
-        assert_eq!(clamp_max_tokens(usize::MAX), MAX_GENERATION_TOKENS);
-        std::env::set_var("AXIOM_MAX_GENERATION_TOKENS", "lots");
-        assert_eq!(clamp_max_tokens(usize::MAX), MAX_GENERATION_TOKENS);
-        std::env::remove_var("AXIOM_MAX_GENERATION_TOKENS");
+        assert_eq!(
+            clamp_max_tokens_with(usize::MAX, Some("0")),
+            MAX_GENERATION_TOKENS
+        );
+        assert_eq!(
+            clamp_max_tokens_with(usize::MAX, Some("lots")),
+            MAX_GENERATION_TOKENS
+        );
+    }
+
+    #[test]
+    fn parse_positive_usize_falls_back_on_bad_input() {
+        assert_eq!(parse_positive_usize(None, 7), 7);
+        assert_eq!(parse_positive_usize(Some(""), 7), 7);
+        assert_eq!(parse_positive_usize(Some("0"), 7), 7);
+        assert_eq!(parse_positive_usize(Some("-3"), 7), 7);
+        assert_eq!(parse_positive_usize(Some(" 12 "), 7), 12);
     }
 
     #[test]
@@ -1171,15 +1187,11 @@ mod tests {
         assert!(confine_merge_path(FsPath::new(""), &roots, false).is_err());
     }
 
-    // `#[tokio::test]` is a current-thread runtime and nothing else runs on it
-    // while the env guard is held, so holding the std mutex across the awaits
-    // below is intentional: it serialises env mutation against the sync tests.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cluster_merge_refuses_paths_outside_merge_roots() {
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Default roots are the test's cwd (the crate dir) and ~/.axiom; a
+        // fresh temp dir is under neither, so both paths must be refused.
         let root = tempfile::tempdir().unwrap();
-        std::env::set_var("AXIOM_MERGE_ROOT", root.path());
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state);
@@ -1204,7 +1216,6 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("outside the merge roots"), "{text}");
         assert!(!root.path().join("merged.bin").exists());
-        std::env::remove_var("AXIOM_MERGE_ROOT");
         safe_drop(pipeline_arc).await;
     }
 
@@ -1282,15 +1293,9 @@ mod tests {
         safe_drop(pipeline_arc).await;
     }
 
-    // `#[tokio::test]` is a current-thread runtime and nothing else runs on it
-    // while the env guard is held, so holding the std mutex across the awaits
-    // below is intentional: it serialises env mutation against the sync tests.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn session_creation_is_capped() {
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("AXIOM_MAX_SESSIONS", "1");
-        let state = make_test_state().await;
+        let state = make_test_state().await.with_max_sessions(1);
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state);
         let post = || {
@@ -1308,7 +1313,6 @@ mod tests {
         let bytes = axum::body::to_bytes(second.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("AXIOM_MAX_SESSIONS"), "{text}");
-        std::env::remove_var("AXIOM_MAX_SESSIONS");
         safe_drop(pipeline_arc).await;
     }
 

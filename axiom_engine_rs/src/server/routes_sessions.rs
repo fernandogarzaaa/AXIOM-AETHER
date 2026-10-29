@@ -25,7 +25,7 @@ async fn create_session(
             .map_err(|_| ApiError::Internal("session lock poisoned".into()))?;
         // Sessions are only ever freed by an explicit DELETE; without a cap a
         // client can allocate W_tilde tensors until the process dies.
-        let cap = max_legacy_sessions();
+        let cap = state.max_sessions;
         if sessions.len() >= cap {
             return Err(ApiError::Conflict(format!(
                 "session limit reached ({cap} live sessions; DELETE /v1/sessions/{{id}} to free one, \
@@ -451,12 +451,21 @@ fn partition_messages_for_state(
 /// Default for `AXIOM_MAX_SESSIONS`: cap on `/v1/sessions` W_tilde sessions.
 const MAX_LEGACY_SESSIONS: usize = 1024;
 
-fn max_legacy_sessions() -> usize {
-    std::env::var("AXIOM_MAX_SESSIONS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
+/// A positive integer from an env value, or `default` for unset / empty /
+/// zero / unparsable. Pure so tests never mutate the process environment.
+fn parse_positive_usize(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(MAX_LEGACY_SESSIONS)
+        .unwrap_or(default)
+}
+
+/// `AXIOM_MAX_SESSIONS` or [`MAX_LEGACY_SESSIONS`]; read once into
+/// `AppState::max_sessions` at construction.
+fn max_legacy_sessions_from_env() -> usize {
+    parse_positive_usize(
+        std::env::var("AXIOM_MAX_SESSIONS").ok().as_deref(),
+        MAX_LEGACY_SESSIONS,
+    )
 }
 
 /// Hard ceiling on `max_tokens` for any generation served by this process
@@ -466,12 +475,15 @@ fn max_legacy_sessions() -> usize {
 const MAX_GENERATION_TOKENS: usize = 16_384;
 
 fn clamp_max_tokens(requested: usize) -> usize {
-    let ceiling = std::env::var("AXIOM_MAX_GENERATION_TOKENS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(MAX_GENERATION_TOKENS);
-    requested.min(ceiling)
+    clamp_max_tokens_with(
+        requested,
+        std::env::var("AXIOM_MAX_GENERATION_TOKENS").ok().as_deref(),
+    )
+}
+
+/// [`clamp_max_tokens`] with the env value passed in.
+fn clamp_max_tokens_with(requested: usize, ceiling_env: Option<&str>) -> usize {
+    requested.min(parse_positive_usize(ceiling_env, MAX_GENERATION_TOKENS))
 }
 
 /// Run generation, optionally using and updating a named session.

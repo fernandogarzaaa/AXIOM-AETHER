@@ -271,6 +271,9 @@ pub struct AppState {
     /// credentials the `/v1/messages` proxy relays upstream. When `None`, the
     /// data plane is open (the local-first default).
     pub api_key: Arc<Option<String>>,
+    /// Cap on live `/v1/sessions` W_tilde sessions (`AXIOM_MAX_SESSIONS`,
+    /// default 1024). `POST /v1/sessions` returns 409 once it is reached.
+    pub max_sessions: usize,
     /// Capability gate for `POST /v1/hypervisor/jit_run` (`AXIOM_ENABLE_JIT_EXEC`).
     /// That route executes an arbitrary caller-supplied `command`/`args` as a
     /// child process and can overwrite `source_path` with a synthesized patch —
@@ -411,6 +414,7 @@ impl AppState {
             mcp: Arc::new(None),
             mcp_token: Arc::new(None),
             api_key: Arc::new(None),
+            max_sessions: max_legacy_sessions_from_env(),
             jit_exec_enabled: false,
             ttt_sessions: Arc::new(TttSessionStore::new()),
             anthropic_forwarder: Arc::new(None),
@@ -1007,6 +1011,12 @@ impl AppState {
     /// (`X-Axiom-Key` header). `None` leaves the data plane open.
     pub fn with_api_key(mut self, key: Option<String>) -> Self {
         self.api_key = Arc::new(key);
+        self
+    }
+
+    /// Override the `/v1/sessions` cap (normally `AXIOM_MAX_SESSIONS`).
+    pub fn with_max_sessions(mut self, cap: usize) -> Self {
+        self.max_sessions = cap.max(1);
         self
     }
 
