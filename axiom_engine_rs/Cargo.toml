@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "axiom_engine"
 version = "0.5.0"
 edition = "2021"
@@ -167,7 +167,7 @@ bincode = { version = "2", features = ["serde"] }
 axum = { version = "0.7", features = ["json", "ws"] }
 # WS client for the /v1/responses WebSocket passthrough (Codex's preferred transport).
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "decompression-full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "decompression-full"] }
 tower-lsp = "0.20"
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
