@@ -34,6 +34,10 @@ unset. When you add a variable, add it here.
 | `AXIOM_RESPONSES_RELAY_EXTRA` | empty | Extra lowercase client header names relayed to the Responses upstream (allowlist extension). |
 | `AXIOM_OPENAI_RESPONSES_WS_UPSTREAM` | derived from headers | Explicit WebSocket upstream for `GET /v1/responses`. |
 | `AXIOM_CACHE_SAFE`, `AXIOM_CVM_DIGEST`, `AXIOM_CVM_DIGEST_THRESHOLD_TOKENS`, `AXIOM_PREFIX_DEDUP`, `AXIOM_KEEPALIVE` | see README § CVM Cost Stack | Cost-stack levers. |
+| `AXIOM_CVM_DIR` | `checkpoints/cvm` | Root of the CVM L2 page store (one JSONL file per session). |
+| `AXIOM_CVM_MAX_INDEX_BYTES` | `268435456` (256 MiB) | Page text the in-memory CVM index may hold across all sessions; least-recently-used sessions are dropped from memory past it (lossless, reloaded from disk on next touch). |
+| `AXIOM_CVM_MAX_TOTAL_BYTES` | `2147483648` (2 GiB) | On-disk size of the CVM store across all session files; least-recently-used session files are deleted past it (lossy, logged). |
+| `AXIOM_CVM_RETAIN` | unset | `1` keeps a session's CVM file when the session is deleted. |
 | `AXIOM_KEEPALIVE_HORIZON_S` | `1800` | Keep-alive ping horizon in seconds (only with `AXIOM_KEEPALIVE=1`; replays your own credentials, read `keepalive.rs` first). |
 | `AXIOM_SESSION_RECORD` | off | `1` records scrubbed per-session request/response JSONL under `~/.axiom/sessions/`. |
 | `AXIOM_PROXY_URL` | `http://127.0.0.1:3000` | Where the MCP server's `axiom_status` / `axiom_expand` reach the running proxy. |

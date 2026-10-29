@@ -1859,7 +1859,25 @@ async fn apply_digest_admission(
             crate::digest::SkeletonDigestor.digest(&text, budget)
         };
 
-        let page_id = match state.cvm_store.put(session_id, "tool_result", &text) {
+        // The L2 write (JSONL append, or a rewrite after an eviction) is
+        // synchronous file I/O: keep it off the async worker. The text is
+        // moved in and handed back so the (possibly multi-MB) page is not
+        // cloned.
+        let store = state.cvm_store.clone();
+        let sid = session_id.to_string();
+        let (stored, text) = match tokio::task::spawn_blocking(move || {
+            let r = store.put(&sid, "tool_result", &text);
+            (r, text)
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("[axiom-cvm] store task join failed: {e}");
+                continue;
+            }
+        };
+        let page_id = match stored {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("[axiom-cvm] failed to store digested page: {e}");

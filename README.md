@@ -115,6 +115,7 @@ notes and the construction blueprint live at
 | `AXIOM_CACHE_SAFE` | **1** | Never mutates message content at or before a client `cache_control` breakpoint. |
 | `AXIOM_CVM_DIGEST` | **`skeleton`** | Replaces heavy `tool_result` blocks in the newest turn with a code-aware digest + a recoverable stub (`axiom_expand`/`POST /v1/expand` returns the original verbatim). Set `off` to disable, `haiku` to summarize with a real Claude Haiku call (bills your account). |
 | `AXIOM_CVM_DIGEST_THRESHOLD_TOKENS` | **4000** | Minimum token estimate before a `tool_result` block is digested. |
+| `AXIOM_CVM_MAX_INDEX_BYTES` / `AXIOM_CVM_MAX_TOTAL_BYTES` | **256 MiB** / **2 GiB** | Cross-session bounds on the L2 page store: in-memory index budget (least-recently-used sessions drop from memory, reload from disk) and total on-disk size (least-recently-used session files are deleted, logged). Each session is additionally capped at 64 MiB. |
 | `AXIOM_PREFIX_DEDUP` | **0** | Lossless dedup of byte-identical repeated blocks in the system prefix. Off by default: measured 0% real gain on this machine's actual rule files (see below) — shipped but not proven valuable yet. |
 | `AXIOM_KEEPALIVE` | **0** | Actuarial cache-refresh pings to survive the 5-minute cache TTL between turns. Off by default forever unless you opt in — it replays your own API credentials on a timer; read `axiom_engine_rs/src/keepalive.rs` before enabling. |
 

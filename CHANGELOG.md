@@ -6,6 +6,12 @@ releases are described on the GitHub Releases page.
 ## [Unreleased]
 
 ### Security
+- The CVM L2 page store is bounded across sessions: the in-memory index by
+  `AXIOM_CVM_MAX_INDEX_BYTES` (256 MiB, least-recently-used sessions drop
+  from memory and reload lazily) and the on-disk total by
+  `AXIOM_CVM_MAX_TOTAL_BYTES` (2 GiB, least-recently-used session files are
+  deleted, logged). Previously a client rotating `X-Axiom-Session-Id` could
+  grow both without limit.
 - `POST /v1/cluster/merge` confines its input and output paths to
   `AXIOM_MERGE_ROOT` (default: current directory and `~/.axiom`); previously a
   data-plane caller could read any readable file (the error echoed the path)
@@ -26,6 +32,11 @@ releases are described on the GitHub Releases page.
 - API key and MCP token comparisons are constant-time.
 
 ### Fixed
+- `CvmStore::put` appends one line per page instead of rewriting the whole
+  session file, and the digest hook's store write runs on the blocking pool.
+- Heal memory is no longer re-read and re-parsed from disk on every proxied
+  `/v1/messages` and `GET /v1/immunity`: a process-wide cache validated
+  against the file's modification time and size serves the read-only paths.
 - Request-reachable panics: multi-byte UTF-8 at a `max_bytes` cut in
   `axiom_compress_path` and in MCP `fetch` id decoding; integer overflow on a
   client-supplied tensor shape in checkpoint upload and DWE fragment apply.

@@ -287,6 +287,35 @@ impl HealMemory {
         Self { path, data }
     }
 
+    /// Read-only load for hot request paths (`/v1/messages` advisory
+    /// injection, `GET /v1/immunity`), served from a process-wide cache
+    /// keyed by path and validated against the file's `(mtime, len)` on
+    /// every call. A changed file -- including one written by [`save`] in
+    /// this process -- is re-read; an unchanged one costs one `metadata`
+    /// syscall instead of a read plus a JSON parse per request.
+    ///
+    /// [`save`]: HealMemory::save
+    pub fn load_shared(path: impl AsRef<Path>) -> std::sync::Arc<Self> {
+        use std::sync::{Arc, Mutex, OnceLock};
+        type Fingerprint = Option<(std::time::SystemTime, u64)>;
+        type Cache = HashMap<PathBuf, (Fingerprint, Arc<HealMemory>)>;
+        static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+        let path = path.as_ref().to_path_buf();
+        let fingerprint: Fingerprint = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((seen, memory)) = guard.get(&path) {
+            if *seen == fingerprint {
+                return memory.clone();
+            }
+        }
+        let fresh = Arc::new(Self::load(&path));
+        guard.insert(path, (fingerprint, fresh.clone()));
+        fresh
+    }
+
     pub fn record(&self, fp: &str) -> Option<&ProgramRecord> {
         self.data.programs.get(fp)
     }
@@ -848,6 +877,29 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("axiom_healmem_{tag}_{nanos}.json"))
+    }
+
+    #[test]
+    fn load_shared_reflects_on_disk_changes_and_shares_unchanged_files() {
+        let path = tmp("load_shared");
+        let _ = std::fs::remove_file(&path);
+        // Missing file: an empty memory, cached as such.
+        let empty = HealMemory::load_shared(&path);
+        assert!(empty.all_records().is_empty());
+        // Writing through `save` changes (mtime, len): the next call re-reads.
+        let mut mem = HealMemory::load(&path);
+        mem.remember_dirs(
+            &fingerprint("prog", &[]),
+            "prog",
+            std::slice::from_ref(&path),
+        );
+        mem.save().unwrap();
+        let fresh = HealMemory::load_shared(&path);
+        assert_eq!(fresh.all_records().len(), 1);
+        // Unchanged file: the same Arc is handed back, no re-parse.
+        let again = HealMemory::load_shared(&path);
+        assert!(std::sync::Arc::ptr_eq(&fresh, &again));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

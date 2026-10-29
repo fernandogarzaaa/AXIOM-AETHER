@@ -79,10 +79,11 @@ evidence in this repo supports as important.
   `AXIOM_CHECKPOINT_SHA256` has a maintainer-verified source to be pinned
   from, closing the residual gap noted in SECURITY-AUDIT.md §2.
 
-- [ ] **CVM store cross-session bound** (SECURITY-AUDIT.md addendum A9):
-  `cvm_store.rs` bounds each session at 64 MB but never evicts sessions, and
-  `put` rewrites the whole session file. Add an LRU over sessions, a total
-  byte cap, and append-only writes on the digest hook.
+- [x] **DONE (2026-10-29)** — **CVM store cross-session bound**
+  (SECURITY-AUDIT.md addendum A9): `put` is append-only, the in-memory
+  index is LRU-bounded by `AXIOM_CVM_MAX_INDEX_BYTES`, the on-disk total by
+  `AXIOM_CVM_MAX_TOTAL_BYTES`, and the digest hook writes off the async
+  worker.
 
 ## P3 — Performance improvements
 
