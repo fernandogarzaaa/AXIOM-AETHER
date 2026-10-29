@@ -13,7 +13,7 @@ categories = ["science"]
 
 [dependencies]
 ndarray = "0.16"
-rand = "0.8.5"
+rand = "0.9.5"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 
