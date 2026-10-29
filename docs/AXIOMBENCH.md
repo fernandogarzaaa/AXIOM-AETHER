@@ -192,7 +192,7 @@ difficulty of building each fairly:
 | Cache utilization | Partial — `axiom_savings_ratio` exists; no cache-hit-rate metric specifically for the response cache (Python reference implementation has `response_cache.py`/`test_response_cache.py`; the Rust engine's caching is less directly instrumented) |
 | Tool calls | Not currently counted as a distinct metric |
 | Memory recall / wrong-memory rate | Not measured anywhere — new instrumentation needed |
-| Repair success / failure / regression rate | Partial — `SolveReport`/`SandboxRunReport` carry pass/fail per run; no aggregate rate is computed or reported anywhere |
+| Repair success / failure / regression rate | Partial — `SolveReport`/`CompileRunReport` carry pass/fail per run; no aggregate rate is computed or reported anywhere |
 | Task success (the actual outcome metric) | **Does not exist anywhere in this repo.** This is the central gap |
 | Context size | Yes — token counts are already tracked throughout |
 

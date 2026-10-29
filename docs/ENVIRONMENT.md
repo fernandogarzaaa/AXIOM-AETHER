@@ -84,7 +84,7 @@ unset. When you add a variable, add it here.
 | `AXIOM_PEER_RELIABILITY` | `0.8` | Weight given to a peer's immunity claims (clamped to [0, 1]). |
 | `AXIOM_SOLVE_LLM_ATTEMPTS` | `3` | LLM repair attempts per `axiom solve` round. |
 | `AXIOM_SOLVE_VERIFY_TIMEOUT_SECS` | `120` | Verifier timeout; a hung verifier is killed and the candidate rolled back. |
-| `AXIOM_SANDBOX_ROOT` / `AXIOM_SANDBOX_MAX_STEPS` / `AXIOM_SANDBOX_VERIFY` / `AXIOM_SANDBOX_TIMEOUT_SECS` | see `sandbox.rs` | Staging-directory controls for candidate patches (`cargo check` gate; **not** an OS sandbox, see `docs/SECURITY-AUDIT.md` §3). |
+| `AXIOM_COMPILE_VERIFY_ROOT` / `AXIOM_COMPILE_VERIFY_MAX_STEPS` / `AXIOM_COMPILE_VERIFY` / `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS` | see `compile_verify.rs` | Staging-directory controls for the `cargo check` compile verifier (`AXIOM_COMPILE_VERIFY=0\|false\|off` disables it; **not** an OS sandbox, see `docs/SECURITY-AUDIT.md` §3). **Deprecated aliases:** `AXIOM_SANDBOX_ROOT` / `AXIOM_SANDBOX_MAX_STEPS` / `AXIOM_SANDBOX_VERIFY` / `AXIOM_SANDBOX_TIMEOUT_SECS` are still accepted for one release (the new name wins when both are set; using only an old name prints one stderr warning per process). |
 | `AXIOM_EPISTEMIC_*` | see `docs/EPISTEMIC_DRIFT.md` | Epistemic validation thresholds. |
 
 ## Fleet / swarm (experimental)

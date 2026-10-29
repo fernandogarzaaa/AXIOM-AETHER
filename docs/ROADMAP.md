@@ -42,12 +42,19 @@ evidence in this repo supports as important.
   `load_checked` refuses a sidecar from a newer schema, and the production
   load path (`InferencePipeline::with_checkpoint_and_options`) fails loudly
   instead of building the wrong model shape. See ARCHITECTURE-AUDIT.md §3.3.
-- [ ] **`graph_memory.rs` integration**: the edge store + spreading
-  activation merged this pass (ARCHITECTURE-AUDIT.md §3.4) is tested in
-  isolation but not wired into `memory_recall.rs`. Needs a real design
-  decision (which edge kinds auto-seed, how much `spread()` output widens a
-  recall query, interaction with the existing recency/supersession rerank)
-  — do this as its own reviewed PR, and evaluate it against
+- [x] **DONE (2026-10-29)** — **`graph_memory.rs` integration**: `recall`
+  seeds spreading activation from its direct cosine hits over the persisted
+  `edges.jsonl` plus `Supersedes` edges derived from records, and appends up
+  to `GraphRecallParams::max_extra` (default 2) graph-only hits *after* the
+  direct hits (never displacing one, never resurrecting a superseded or
+  tombstoned record; cross-scope neighbours are fetched by id). Hits carry
+  `via_graph` and `axiom_recall` labels them. Decisions taken: only
+  `Supersedes` auto-seeds; no edge is written automatically; spread is 2
+  hops, decay 0.5, 256 nodes. What remains is empirical — whether it helps
+  precision — which is the AXIOMBench wrong-memory-rate metric below.
+  (Original note: needed a design decision on which edge kinds auto-seed, how
+  much `spread()` output widens a recall query, and the interaction with the
+  recency/supersession rerank — evaluate it against
   [AXIOMBENCH.md](AXIOMBENCH.md)'s proposed wrong-memory-rate metric once
   that harness exists, not by feel.
 
@@ -60,24 +67,28 @@ evidence in this repo supports as important.
   measured/simulated/estimated labeling rule — is in
   [AXIOMBENCH.md](AXIOMBENCH.md) §3. This is the single highest-value next
   project for this repository's scientific credibility.
-- [ ] **Wire `graph_memory.rs` into recall** (see P1 above — listed twice
-  deliberately, since it's both an architectural loose end and a research
-  question: does spreading activation improve or hurt recall precision).
-- [ ] **`sandbox.rs` rename**, with a deprecation path for the
-  `AXIOM_SANDBOX_*` env var names. See SECURITY-AUDIT.md §3. Scoped as P2
-  (not P1) because the current naming is a clarity gap, not an active
-  vulnerability — the mechanism itself (`cargo check`, no deps, no
-  build.rs) is low-risk as implemented.
+- [x] **DONE (2026-10-29)** — **Wire `graph_memory.rs` into recall** (see
+  P1 above). The research question — does spreading activation improve or
+  hurt recall precision — stays open until the AXIOMBench harness exists.
+- [x] **DONE (2026-10-29)** — **`sandbox.rs` rename**: the module is
+  `compile_verify.rs` and the type `CompileVerifier`; `AXIOM_COMPILE_VERIFY`,
+  `AXIOM_COMPILE_VERIFY_ROOT`, `AXIOM_COMPILE_VERIFY_MAX_STEPS` and
+  `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS` are the names, with the `AXIOM_SANDBOX_*`
+  names accepted as deprecated aliases (one stderr warning per process) for
+  one release. `crate::sandbox` remains as a deprecated re-export.
 - [ ] **Capability-model pattern, generalized.** `AXIOM_ENABLE_JIT_EXEC` is
   the first instance; the next capability-shaped surface should follow the
   same pattern (dedicated off-by-default flag, checked first, tested with an
   explicit disabled-by-default regression test) rather than accreting a
   generic policy engine speculatively. See SECURITY-AUDIT.md §7.
-- [ ] **Checksum manifest for release checkpoints.** This pass added
-  *support* for pinning a checksum; it didn't publish one. Recommend
-  publishing a signed `SHA256SUMS` alongside GitHub releases so
-  `AXIOM_CHECKPOINT_SHA256` has a maintainer-verified source to be pinned
-  from, closing the residual gap noted in SECURITY-AUDIT.md §2.
+- [x] **DONE (2026-10-29)** — **Checksum manifest for releases.** The
+  checkpoint job already published `SHA256SUMS.txt` for the checkpoint
+  assets; the binary job now publishes a `.sha256` sidecar next to every
+  archive, and `scripts/install.sh` / `scripts/install.ps1` verify the
+  downloaded archive against it (refusing a mismatch; `AXIOM_REQUIRE_CHECKSUM=1`
+  also refuses a release with no sidecar). Pin a checkpoint with
+  `AXIOM_CHECKPOINT_SHA256` from the published `SHA256SUMS.txt`. Signing the
+  manifest (Sigstore/minisign) is still open and needs a maintainer key.
 
 - [x] **DONE (2026-10-29)** — **CVM store cross-session bound**
   (SECURITY-AUDIT.md addendum A9): `put` is append-only, the in-memory
@@ -122,11 +133,9 @@ evidence in this repo supports as important.
   and `ci.yml` runs `cargo fmt --check` on each of them. Clippy is also
   gated at deny-warnings across all targets (bins and tests), not just the
   library.
-- [ ] **Terminology table** (ARCHITECTURE-AUDIT.md §6) should be folded into
-  the top-level README's architecture section for new-contributor
-  discoverability — done partially in this pass's README diff (the security
-  env vars); the full terminology table itself is new to this pass and
-  currently lives only in ARCHITECTURE-AUDIT.md.
+- [x] **DONE (2026-10-29)** — **Terminology table** folded into the README
+  (`## Terminology`, before the audits section), with the compile-verifier
+  rename and graph memory reflected.
 
 ## Explicitly not recommended (considered and rejected this pass)
 

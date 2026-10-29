@@ -61,6 +61,12 @@ impl MemoryStore {
         Ok(Self { root })
     }
 
+    /// The directory this store is rooted at. Sibling stores (e.g. the graph
+    /// `EdgeStore`) live in the same directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Path to a scope's JSONL file. Public for tests that append raw lines.
     pub fn scope_path(&self, scope: &str) -> PathBuf {
         self.root.join(format!("{}.jsonl", scope_file_stem(scope)))

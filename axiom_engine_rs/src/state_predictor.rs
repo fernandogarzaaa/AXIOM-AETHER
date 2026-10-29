@@ -410,7 +410,7 @@ mod tests {
         assert!(hints[0].contains("approach"));
 
         let hints = generate_branch_hints("execution", 3);
-        assert!(hints.len() >= 1);
+        assert!(!hints.is_empty());
     }
 
     #[test]

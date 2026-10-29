@@ -18,6 +18,7 @@ pub mod chimera;
 pub mod claude_backend;
 pub mod cli;
 pub mod cluster;
+pub mod compile_verify;
 pub mod config;
 pub mod context_compressor;
 pub mod context_economics;
@@ -71,7 +72,6 @@ pub mod q_manifold;
 pub mod quantization;
 pub mod rebase;
 pub mod responses_compressor;
-pub mod sandbox;
 pub mod search_ingest;
 pub mod search_scrape;
 pub mod self_heal;
@@ -107,3 +107,12 @@ pub mod verify_suggest;
 pub mod vfs;
 pub mod vibe_memory;
 pub mod weight_merge;
+
+/// Deprecated name for [`compile_verify`]; kept for one release.
+#[deprecated(
+    since = "0.6.0",
+    note = "renamed to `compile_verify`; it is a cargo-check verifier, not a sandbox"
+)]
+pub mod sandbox {
+    pub use crate::compile_verify::*;
+}

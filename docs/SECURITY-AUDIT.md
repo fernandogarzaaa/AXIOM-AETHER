@@ -16,7 +16,7 @@ var).
 |---|---|---|---|
 | 1 | `POST /v1/hypervisor/jit_run` — unauthenticated-by-default arbitrary command execution | **P0** | **FIXED** this pass |
 | 2 | Checkpoint downloads had no integrity verification | **P1** | **FIXED** this pass |
-| 3 | `sandbox.rs` naming implies a security boundary it doesn't provide | P2 | Documented, not renamed |
+| 3 | `sandbox.rs` naming implies a security boundary it doesn't provide | P2 | **FIXED** 2026-10-29 (renamed to `compile_verify.rs` / `CompileVerifier`; `AXIOM_SANDBOX_*` accepted as deprecated aliases) |
 | 4 | No execution isolation anywhere (self_heal, solve, poly_jit, sandbox all run real subprocesses) | P1 (architectural), not new in this pass | Documented |
 | 5 | Data-plane bind defaults to `0.0.0.0` with auth opt-in | P1, already flagged and partly mitigated (2026-07-24 audit) | **FIXED** 2026-10 (loopback default, fail closed off-loopback without a key) |
 | 6 | Patch-memory trust model | — | **Strength**, not a finding |
@@ -129,7 +129,7 @@ close that gap; tracked in [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## 3. `sandbox.rs` naming (P2, documented only)
+## 3. `sandbox.rs` naming (P2, FIXED 2026-10-29)
 
 `SandboxController` (`sandbox.rs`) is, by its own module doc, honest about
 what it is: *"a closed-loop local compilation sandbox... creates an isolated
@@ -160,6 +160,18 @@ something that names what it is (`AXIOM_COMPILE_VERIFY` /
 release, and update `sandbox.rs`'s own doc comment to state explicitly
 *"this is a compile-time verifier, not a process isolation boundary"* at the
 top, not three sentences in.
+
+**Resolution (2026-10-29)**: the module was renamed `sandbox.rs` ->
+`compile_verify.rs`, and its types became `CompileVerifier`,
+`CompileDiagnostic`, `CompileRunReport` and `CompileVerifyError`. The module
+doc now opens by stating it is a compile-time verifier, not a process or OS
+isolation boundary. `crate::sandbox` and the four old type names remain as
+`#[deprecated]` aliases for one release. The canonical environment variables
+are `AXIOM_COMPILE_VERIFY`, `AXIOM_COMPILE_VERIFY_ROOT`,
+`AXIOM_COMPILE_VERIFY_MAX_STEPS` and `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS`; the
+old `AXIOM_SANDBOX_*` names are deprecated aliases for one release (the new
+name wins when both are set, and using only an old name prints a one-time
+stderr warning). Log prefixes changed from `[sandbox]` to `[compile-verify]`.
 
 ---
 

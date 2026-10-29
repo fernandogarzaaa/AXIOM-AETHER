@@ -48,6 +48,15 @@ releases are described on the GitHub Releases page.
   pillars that did not run.
 
 ### Added
+- Graph memory is wired into recall: `recall` seeds spreading activation
+  from its direct hits over `edges.jsonl` (plus `Supersedes` edges derived
+  from records) and appends up to two graph-only neighbours after the
+  direct hits, flagged `via_graph`; `axiom_recall` labels them `via=graph`.
+  `RecallParams.graph = None` disables the stage.
+- Release archives ship a `.sha256` sidecar; `install.sh` / `install.ps1`
+  verify the download against it and refuse a mismatch
+  (`AXIOM_REQUIRE_CHECKSUM=1` also refuses a release without a sidecar).
+- README `## Terminology` table.
 - Checkpoint sidecars (`<ckpt>.meta.json`) carry `schema_version` and
   `engine_version`; a sidecar from a newer engine is refused instead of
   silently loading with default dimensions.
@@ -56,6 +65,12 @@ releases are described on the GitHub Releases page.
   images and GitHub Actions.
 
 ### Changed
+- `sandbox.rs` is `compile_verify.rs` (`CompileVerifier`): it is a
+  `cargo check` verifier, not a process sandbox. New env names
+  `AXIOM_COMPILE_VERIFY`, `AXIOM_COMPILE_VERIFY_ROOT`,
+  `AXIOM_COMPILE_VERIFY_MAX_STEPS`, `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS`; the
+  `AXIOM_SANDBOX_*` names and `crate::sandbox` path remain as deprecated
+  aliases for one release.
 - CI gates `cargo fmt --check` and clippy at deny-warnings across all targets
   for every Rust crate graph; the tree was formatted once to establish the
   baseline.

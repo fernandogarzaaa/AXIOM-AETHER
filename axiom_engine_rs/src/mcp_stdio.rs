@@ -1835,9 +1835,10 @@ fn recall_blocking(query: &str, scope: Option<&str>, ctx: &McpContext) -> Result
     }
     let mut out = String::from("<axiom_recall>\n");
     for h in &hits {
+        let via = if h.via_graph { " via=graph" } else { "" };
         out.push_str(&format!(
-            "• [{:.2}] id={} scope={} ts={}\n  {}\n",
-            h.score, h.record.id, h.record.scope, h.record.ts, h.record.body
+            "• [{:.2}] id={} scope={} ts={}{}\n  {}\n",
+            h.score, h.record.id, h.record.scope, h.record.ts, via, h.record.body
         ));
     }
     out.push_str("</axiom_recall>");

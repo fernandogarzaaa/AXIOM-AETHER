@@ -168,7 +168,11 @@ fn main() {
             &store,
             &["personal".to_string()],
             &q_emb,
-            &RecallParams { min_score: 0.0, k },
+            &RecallParams {
+                min_score: 0.0,
+                k,
+                graph: None,
+            },
         );
         let ids: Vec<&str> = results.iter().map(|h| h.record.id.as_str()).collect();
         if ids.first() == Some(&expected) {

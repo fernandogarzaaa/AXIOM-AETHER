@@ -187,6 +187,7 @@ impl Adjacency {
 }
 
 /// Tuning parameters for `spread`.
+#[derive(Clone, Debug)]
 pub struct SpreadParams {
     pub max_hops: usize,
     pub max_visited: usize,

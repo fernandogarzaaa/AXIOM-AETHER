@@ -1,12 +1,27 @@
-//! Closed-loop local compilation sandbox for synthesized code blocks.
+//! Compile-time verifier for synthesized Rust code blocks: it runs `cargo check`
+//! in an isolated temp Cargo package (no dependencies, no `build.rs`), and is
+//! not a process or OS isolation boundary (no seccomp, no container, no
+//! resource limits beyond a wall-clock timeout).
 //!
-//! The sandbox never writes into the real repository. It creates an isolated
-//! temp Cargo package, runs compiler checks through `tokio::process::Command`,
-//! captures diagnostics, and lets the server feed those diagnostics back into
-//! Axiom's TTT feedback path.
+//! This module was previously named `sandbox`; that name overstated what it
+//! does and is kept only as a deprecated alias for one release. Because
+//! `cargo check` still runs the real toolchain as the current user, treat the
+//! checked code as untrusted input to a compiler, not as contained code.
+//!
+//! The verifier never writes into the real repository. It creates the temp
+//! package under a scratch root, runs `cargo check` through
+//! `tokio::process::Command`, captures diagnostics, and lets the server feed
+//! those diagnostics back into Axiom's TTT feedback path.
+//!
+//! Environment variables (canonical names; the `AXIOM_SANDBOX_*` equivalents
+//! are deprecated aliases and the new name wins when both are set):
+//! `AXIOM_COMPILE_VERIFY`, `AXIOM_COMPILE_VERIFY_ROOT`,
+//! `AXIOM_COMPILE_VERIFY_MAX_STEPS`, `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS`.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -18,7 +33,7 @@ pub const DEFAULT_MAX_OPTIMIZATION_STEPS: usize = 3;
 const DEFAULT_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Debug, Clone)]
-pub struct SandboxController {
+pub struct CompileVerifier {
     root: PathBuf,
     max_steps: usize,
     timeout: Duration,
@@ -31,7 +46,7 @@ pub struct CodeBlock {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SandboxDiagnostic {
+pub struct CompileDiagnostic {
     pub session_id: String,
     pub step: usize,
     pub command: String,
@@ -41,7 +56,7 @@ pub struct SandboxDiagnostic {
     pub stderr: String,
 }
 
-impl SandboxDiagnostic {
+impl CompileDiagnostic {
     pub fn feedback_trace(&self) -> String {
         format!(
             "command: {}\nworkspace: {}\nstdout:\n{}\nstderr:\n{}",
@@ -51,55 +66,67 @@ impl SandboxDiagnostic {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SandboxRunReport {
+pub struct CompileRunReport {
     pub session_id: String,
     pub blocks_checked: usize,
     pub passed: bool,
     pub attempts: usize,
-    pub diagnostics: Vec<SandboxDiagnostic>,
+    pub diagnostics: Vec<CompileDiagnostic>,
 }
 
 #[derive(Debug)]
-pub enum SandboxError {
+pub enum CompileVerifyError {
     Io(String),
     Timeout(String),
     Feedback(String),
 }
 
-impl std::fmt::Display for SandboxError {
+impl std::fmt::Display for CompileVerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SandboxError::Io(msg) => write!(f, "sandbox io error: {msg}"),
-            SandboxError::Timeout(msg) => write!(f, "sandbox timeout: {msg}"),
-            SandboxError::Feedback(msg) => write!(f, "sandbox feedback error: {msg}"),
+            CompileVerifyError::Io(msg) => write!(f, "compile-verify io error: {msg}"),
+            CompileVerifyError::Timeout(msg) => write!(f, "compile-verify timeout: {msg}"),
+            CompileVerifyError::Feedback(msg) => write!(f, "compile-verify feedback error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for SandboxError {}
+impl std::error::Error for CompileVerifyError {}
 
-impl SandboxController {
+#[deprecated(since = "0.6.0", note = "renamed to `CompileVerifier`")]
+pub type SandboxController = CompileVerifier;
+#[deprecated(since = "0.6.0", note = "renamed to `CompileDiagnostic`")]
+pub type SandboxDiagnostic = CompileDiagnostic;
+#[deprecated(since = "0.6.0", note = "renamed to `CompileRunReport`")]
+pub type SandboxRunReport = CompileRunReport;
+#[deprecated(since = "0.6.0", note = "renamed to `CompileVerifyError`")]
+pub type SandboxError = CompileVerifyError;
+
+impl CompileVerifier {
     pub fn from_env() -> Option<Self> {
-        if std::env::var("AXIOM_SANDBOX_VERIFY")
-            .map(|v| matches!(v.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        let verify = env_with_alias("AXIOM_COMPILE_VERIFY", "AXIOM_SANDBOX_VERIFY");
+        if verify
+            .as_deref()
+            .map(|v| matches!(v, "0" | "false" | "FALSE" | "off" | "OFF"))
             .unwrap_or(false)
         {
             return None;
         }
-        let root = std::env::var("AXIOM_SANDBOX_ROOT")
+        let root = env_with_alias("AXIOM_COMPILE_VERIFY_ROOT", "AXIOM_SANDBOX_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join("axiom-sandbox"));
-        let max_steps = std::env::var("AXIOM_SANDBOX_MAX_STEPS")
-            .ok()
+            .unwrap_or_else(|| std::env::temp_dir().join("axiom-compile-verify"));
+        let max_steps = env_with_alias("AXIOM_COMPILE_VERIFY_MAX_STEPS", "AXIOM_SANDBOX_MAX_STEPS")
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_OPTIMIZATION_STEPS)
             .min(DEFAULT_MAX_OPTIMIZATION_STEPS);
-        let timeout_secs = std::env::var("AXIOM_SANDBOX_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = env_with_alias(
+            "AXIOM_COMPILE_VERIFY_TIMEOUT_SECS",
+            "AXIOM_SANDBOX_TIMEOUT_SECS",
+        )
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
         Some(Self::new(
             root,
             max_steps,
@@ -127,13 +154,13 @@ impl SandboxController {
         session_id: &str,
         payload: &str,
         mut feedback: F,
-    ) -> Result<SandboxRunReport, SandboxError>
+    ) -> Result<CompileRunReport, CompileVerifyError>
     where
-        F: FnMut(SandboxDiagnostic) -> Fut,
+        F: FnMut(CompileDiagnostic) -> Fut,
         Fut: Future<Output = Result<(), String>>,
     {
         let blocks = Self::rust_code_blocks(payload);
-        let mut report = SandboxRunReport {
+        let mut report = CompileRunReport {
             session_id: session_id.to_string(),
             blocks_checked: blocks.len(),
             passed: true,
@@ -156,14 +183,14 @@ impl SandboxController {
         session_id: &str,
         code: &str,
         feedback: &mut F,
-    ) -> Result<SandboxRunReport, SandboxError>
+    ) -> Result<CompileRunReport, CompileVerifyError>
     where
-        F: FnMut(SandboxDiagnostic) -> Fut,
+        F: FnMut(CompileDiagnostic) -> Fut,
         Fut: Future<Output = Result<(), String>>,
     {
         tokio::fs::create_dir_all(&self.root)
             .await
-            .map_err(|e| SandboxError::Io(format!("create root failed: {e}")))?;
+            .map_err(|e| CompileVerifyError::Io(format!("create root failed: {e}")))?;
         let workspace = self.root.join(format!(
             "{}-{}",
             sanitize_session_id(session_id),
@@ -171,7 +198,7 @@ impl SandboxController {
         ));
         create_rust_workspace(&workspace, code).await?;
 
-        let mut report = SandboxRunReport {
+        let mut report = CompileRunReport {
             session_id: session_id.to_string(),
             blocks_checked: 1,
             passed: false,
@@ -188,7 +215,7 @@ impl SandboxController {
                 CheckOutcome::Fail(diagnostic) => {
                     feedback(diagnostic.clone())
                         .await
-                        .map_err(SandboxError::Feedback)?;
+                        .map_err(CompileVerifyError::Feedback)?;
                     report.diagnostics.push(diagnostic);
                 }
             }
@@ -202,7 +229,7 @@ impl SandboxController {
         workspace: &Path,
         session_id: &str,
         step: usize,
-    ) -> Result<CheckOutcome, SandboxError> {
+    ) -> Result<CheckOutcome, CompileVerifyError> {
         let command = "cargo check --message-format=json".to_string();
         let output = timeout(
             self.timeout,
@@ -212,13 +239,13 @@ impl SandboxController {
                 .output(),
         )
         .await
-        .map_err(|_| SandboxError::Timeout(command.clone()))?
-        .map_err(|e| SandboxError::Io(format!("cargo check failed to start: {e}")))?;
+        .map_err(|_| CompileVerifyError::Timeout(command.clone()))?
+        .map_err(|e| CompileVerifyError::Io(format!("cargo check failed to start: {e}")))?;
 
         if output.status.success() {
             return Ok(CheckOutcome::Pass);
         }
-        Ok(CheckOutcome::Fail(SandboxDiagnostic {
+        Ok(CheckOutcome::Fail(CompileDiagnostic {
             session_id: session_id.to_string(),
             step,
             command,
@@ -230,9 +257,46 @@ impl SandboxController {
     }
 }
 
+/// Pure resolver for a canonical env var with a deprecated alias. The new name
+/// wins when both are set; the flag is true only when the deprecated value is
+/// the one actually used.
+fn resolve_env(new: Option<&str>, old: Option<&str>) -> (Option<String>, bool) {
+    match (new, old) {
+        (Some(n), _) => (Some(n.to_string()), false),
+        (None, Some(o)) => (Some(o.to_string()), true),
+        (None, None) => (None, false),
+    }
+}
+
+/// Read `new_name`, falling back to the deprecated `old_name`. Warns once per
+/// process per deprecated name actually used.
+fn env_with_alias(new_name: &str, old_name: &'static str) -> Option<String> {
+    let new = std::env::var(new_name).ok();
+    let old = std::env::var(old_name).ok();
+    let (value, used_deprecated) = resolve_env(new.as_deref(), old.as_deref());
+    if used_deprecated {
+        warn_deprecated_once(new_name, old_name);
+    }
+    value
+}
+
+fn warn_deprecated_once(new_name: &str, old_name: &'static str) {
+    static WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let first = warned
+        .lock()
+        .map(|mut set| set.insert(old_name))
+        .unwrap_or(false);
+    if first {
+        eprintln!(
+            "[compile-verify] WARN: {old_name} is deprecated; use {new_name} (the alias will be removed in a future release)"
+        );
+    }
+}
+
 enum CheckOutcome {
     Pass,
-    Fail(SandboxDiagnostic),
+    Fail(CompileDiagnostic),
 }
 
 pub fn extract_fenced_code_blocks(payload: &str) -> Vec<CodeBlock> {
@@ -278,19 +342,19 @@ fn sanitize_session_id(session_id: &str) -> String {
         .collect::<String>()
 }
 
-async fn create_rust_workspace(path: &Path, code: &str) -> Result<(), SandboxError> {
+async fn create_rust_workspace(path: &Path, code: &str) -> Result<(), CompileVerifyError> {
     tokio::fs::create_dir_all(path.join("src"))
         .await
-        .map_err(|e| SandboxError::Io(format!("create workspace failed: {e}")))?;
+        .map_err(|e| CompileVerifyError::Io(format!("create workspace failed: {e}")))?;
     tokio::fs::write(
         path.join("Cargo.toml"),
-        "[package]\nname = \"axiom_sandbox\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        "[package]\nname = \"axiom_compile_verify\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
     )
     .await
-    .map_err(|e| SandboxError::Io(format!("write Cargo.toml failed: {e}")))?;
+    .map_err(|e| CompileVerifyError::Io(format!("write Cargo.toml failed: {e}")))?;
     tokio::fs::write(path.join("src/lib.rs"), code)
         .await
-        .map_err(|e| SandboxError::Io(format!("write src/lib.rs failed: {e}")))?;
+        .map_err(|e| CompileVerifyError::Io(format!("write src/lib.rs failed: {e}")))?;
     Ok(())
 }
 
@@ -301,7 +365,7 @@ mod tests {
     #[test]
     fn extracts_only_rust_fenced_blocks() {
         let payload = "text\n```rust\npub fn ok() {}\n```\n```python\nprint('x')\n```\n```rs\nfn two() {}\n```";
-        let blocks = SandboxController::rust_code_blocks(payload);
+        let blocks = CompileVerifier::rust_code_blocks(payload);
         assert_eq!(blocks.len(), 2);
         assert!(blocks[0].code.contains("pub fn ok"));
         assert!(blocks[1].code.contains("fn two"));
@@ -309,10 +373,11 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_rust_reports_diagnostics() {
-        let root = std::env::temp_dir().join(format!("axiom-sandbox-test-{}", Uuid::new_v4()));
-        let sandbox = SandboxController::new(root, 1, Duration::from_secs(30));
+        let root =
+            std::env::temp_dir().join(format!("axiom-compile-verify-test-{}", Uuid::new_v4()));
+        let verifier = CompileVerifier::new(root, 1, Duration::from_secs(30));
         let mut seen = Vec::new();
-        let report = sandbox
+        let report = verifier
             .verify_rust_code_with_feedback("s1", "pub fn broken( {", &mut |diag| {
                 seen.push(diag.clone());
                 async { Ok(()) }
@@ -323,5 +388,24 @@ mod tests {
         assert_eq!(report.attempts, 1);
         assert_eq!(seen.len(), 1);
         assert!(seen[0].stderr.contains("error") || seen[0].stdout.contains("\"reason\""));
+    }
+
+    #[test]
+    fn resolve_env_new_wins_over_old() {
+        assert_eq!(
+            resolve_env(Some("a"), Some("b")),
+            (Some("a".to_string()), false)
+        );
+        assert_eq!(resolve_env(Some("a"), None), (Some("a".to_string()), false));
+    }
+
+    #[test]
+    fn resolve_env_old_only_flags_deprecated() {
+        assert_eq!(resolve_env(None, Some("b")), (Some("b".to_string()), true));
+    }
+
+    #[test]
+    fn resolve_env_neither_is_none() {
+        assert_eq!(resolve_env(None, None), (None, false));
     }
 }
