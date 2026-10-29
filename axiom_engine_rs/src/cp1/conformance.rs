@@ -95,8 +95,10 @@ pub fn check_corpus(corpus: &str) -> Vec<Failure> {
     // type: verifying a SimulationCompleted edge means reading the referenced
     // document's own subject_id and payload, not just confirming it exists.
     // Collected here rather than in a second pass so each line is parsed once.
-    let mut doc_by_id: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
-    let mut first_seen_at: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut doc_by_id: std::collections::BTreeMap<String, Value> =
+        std::collections::BTreeMap::new();
+    let mut first_seen_at: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     let mut edges: Vec<(usize, String, String, Vec<String>)> = Vec::new();
 
     for (index, line) in corpus.lines().enumerate() {
@@ -299,7 +301,9 @@ fn provenance_edge_problems(
         let completions: Vec<&Value> = derived
             .iter()
             .filter_map(|ref_id| doc_by_id.get(ref_id))
-            .filter(|referenced| referenced.get("type").and_then(Value::as_str) == Some("SimulationCompleted"))
+            .filter(|referenced| {
+                referenced.get("type").and_then(Value::as_str) == Some("SimulationCompleted")
+            })
             .collect();
 
         if completions.is_empty() {
@@ -369,9 +373,7 @@ fn structural_problems(document: &Value) -> Vec<String> {
                 provenance.get("authored_by").and_then(Value::as_str),
                 Some("adam" | "eve" | "axiom")
             ) {
-                problems.push(
-                    "provenance.authored_by must be one of adam, eve, axiom".to_string(),
-                );
+                problems.push("provenance.authored_by must be one of adam, eve, axiom".to_string());
             }
         }
     }
@@ -490,7 +492,10 @@ mod tests {
     }
 
     fn manifest() -> String {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../protocol/cp1/MANIFEST.sha256");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../protocol/cp1/MANIFEST.sha256"
+        );
         std::fs::read_to_string(path)
             .unwrap_or_else(|err| panic!("cannot read the CP/1 manifest at {path}: {err}"))
     }
@@ -545,10 +550,8 @@ mod tests {
             .join("\n");
         let failures = check_corpus(&corpus);
         assert!(
-            failures
-                .iter()
-                .any(|f| f.document_type == "FitnessResult"
-                    && f.detail.contains("names no SimulationCompleted")),
+            failures.iter().any(|f| f.document_type == "FitnessResult"
+                && f.detail.contains("names no SimulationCompleted")),
             "check 5 did not fire; failures were {failures:#?}"
         );
     }
@@ -580,16 +583,22 @@ mod tests {
         // to be the SimulationCompleted for this mutation. Swap the event's
         // subject_id for an unrelated one and the edge must be refused even
         // though a matching-typed document still resolves.
-        let old = "\"subject_id\":\"88888888-8888-4888-8888-888888888888\",\"subject_type\":\"Mutation\"";
+        let old =
+            "\"subject_id\":\"88888888-8888-4888-8888-888888888888\",\"subject_type\":\"Mutation\"";
         let full = corpus();
-        assert!(full.contains(old), "fixture shape changed; update this test");
+        assert!(
+            full.contains(old),
+            "fixture shape changed; update this test"
+        );
         let mutated = full.replace(
             old,
             "\"subject_id\":\"99999999-9999-4999-8999-999999999999\",\"subject_type\":\"Mutation\"",
         );
         let failures = check_corpus(&mutated);
         assert!(
-            failures.iter().any(|f| f.detail.contains("but none has subject_id")),
+            failures
+                .iter()
+                .any(|f| f.detail.contains("but none has subject_id")),
             "{failures:#?}"
         );
     }
@@ -601,11 +610,19 @@ mod tests {
         // 90 runs must not be able to cite a real event that ran once.
         let old = "\"payload\":{\"baseline_runs\":9,\"candidate_runs\":9,";
         let full = corpus();
-        assert!(full.contains(old), "fixture shape changed; update this test");
-        let mutated = full.replace(old, "\"payload\":{\"baseline_runs\":1,\"candidate_runs\":1,");
+        assert!(
+            full.contains(old),
+            "fixture shape changed; update this test"
+        );
+        let mutated = full.replace(
+            old,
+            "\"payload\":{\"baseline_runs\":1,\"candidate_runs\":1,",
+        );
         let failures = check_corpus(&mutated);
         assert!(
-            failures.iter().any(|f| f.detail.contains("but none has subject_id")),
+            failures
+                .iter()
+                .any(|f| f.detail.contains("but none has subject_id")),
             "{failures:#?}"
         );
     }
@@ -625,7 +642,10 @@ mod tests {
                       \"type\":\"SimulationCompleted\"}";
         let full = corpus();
         let old = "\"derived_from\":[\"88888888-8888-4888-8888-888888888888\",\"2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a\"]";
-        assert!(full.contains(old), "fixture shape changed; update this test");
+        assert!(
+            full.contains(old),
+            "fixture shape changed; update this test"
+        );
         let new = "\"derived_from\":[\"88888888-8888-4888-8888-888888888888\",\"4c4c4c4c-4c4c-4c4c-8c4c-4c4c4c4c4c4c\",\"2a2a2a2a-2a2a-4a2a-8a2a-2a2a2a2a2a2a\"]";
         let mutated = format!("{}\n{decoy}", full.replace(old, new));
 
@@ -645,7 +665,10 @@ mod tests {
         // a defect on their own, independent of whether an edge is present.
         let old = "\"baseline\":{\"cognitive_load_bp\":4200,\"composite_bp\":6400,\"frustration_bp\":3100,\"runs\":9,\"task_success_bp\":6667,\"trust_bp\":6000}";
         let full = corpus();
-        assert!(full.contains(old), "fixture shape changed; update this test");
+        assert!(
+            full.contains(old),
+            "fixture shape changed; update this test"
+        );
         let mutated = full.replace(
             old,
             "\"baseline\":{\"cognitive_load_bp\":4200,\"composite_bp\":6400,\"frustration_bp\":3100,\"runs\":8,\"task_success_bp\":6667,\"trust_bp\":6000}",
@@ -675,7 +698,9 @@ mod tests {
 
         let failures = check_corpus(&corpus);
         assert!(
-            failures.iter().any(|f| f.detail.contains("also used at line 1")),
+            failures
+                .iter()
+                .any(|f| f.detail.contains("also used at line 1")),
             "{failures:#?}"
         );
     }
@@ -698,10 +723,15 @@ mod tests {
 
         // The mutated line no longer matches its seal, so check 2 also fires;
         // this test only asserts on check 5's message, which stays correct.
-        let corpus = first.replace("\"derived_from\":[]", &format!("\"derived_from\":[\"{id}\"]"));
+        let corpus = first.replace(
+            "\"derived_from\":[]",
+            &format!("\"derived_from\":[\"{id}\"]"),
+        );
         let failures = check_corpus(&corpus);
         assert!(
-            failures.iter().any(|f| f.detail.contains("derives from itself")),
+            failures
+                .iter()
+                .any(|f| f.detail.contains("derives from itself")),
             "{failures:#?}"
         );
     }
@@ -711,7 +741,9 @@ mod tests {
         let corpus = "{\"type\":\"Identity\",\"cp\":\"cp1\",\"id\":\"x\",\"provenance\":{}}";
         let failures = check_corpus(corpus);
         assert!(
-            failures.iter().any(|f| f.detail.contains("re-encoding changed the bytes")),
+            failures
+                .iter()
+                .any(|f| f.detail.contains("re-encoding changed the bytes")),
             "{failures:#?}"
         );
     }
@@ -734,9 +766,9 @@ mod tests {
         // `delta_bp` is the one signed member, because a mutation may make the
         // organism worse and that is the finding.
         let negative_confidence = r#"{"confidence_bp":-5000,"cp":"cp1","id":"x","provenance":{"authored_by":"adam","content_hash":"","derived_from":[],"evidence":[],"origin":"o","produced_at":"p"},"type":"Belief"}"#;
-        assert!(check_corpus(negative_confidence)
-            .iter()
-            .any(|f| f.detail.contains("outside the basis-point range [0, 10000]")));
+        assert!(check_corpus(negative_confidence).iter().any(|f| f
+            .detail
+            .contains("outside the basis-point range [0, 10000]")));
 
         let negative_delta = r#"{"cp":"cp1","delta_bp":-700,"id":"x","provenance":{"authored_by":"eve","content_hash":"","derived_from":[],"evidence":[],"origin":"o","produced_at":"p"},"type":"FitnessResult"}"#;
         assert!(!check_corpus(negative_delta)
@@ -749,7 +781,9 @@ mod tests {
         let manifest = "this line has no separator\n";
         let failures = check_manifest(manifest, &[("fixtures/canonical.jsonl", b"x")]);
         assert!(
-            failures.iter().any(|f| f.contains("malformed manifest line")),
+            failures
+                .iter()
+                .any(|f| f.contains("malformed manifest line")),
             "{failures:#?}"
         );
     }
@@ -769,7 +803,9 @@ mod tests {
     #[test]
     fn a_missing_type_is_reported_as_a_coverage_gap() {
         let failures = check_corpus("");
-        assert!(failures.iter().any(|f| f.detail.contains("no fixture covers")));
+        assert!(failures
+            .iter()
+            .any(|f| f.detail.contains("no fixture covers")));
     }
 
     #[test]

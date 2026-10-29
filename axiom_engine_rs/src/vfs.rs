@@ -88,12 +88,30 @@ impl NeuralVfs {
     }
 
     pub fn mount(&self, root: impl AsRef<Path>) -> Result<VfsMountReport, String> {
+        self.mount_with_allowed(root, vfs_allowed_roots().as_deref())
+    }
+
+    /// [`NeuralVfs::mount`] with the root allowlist passed in rather than read
+    /// from `AXIOM_VFS_ALLOWED_ROOTS`. `None` allows any directory.
+    pub fn mount_with_allowed(
+        &self,
+        root: impl AsRef<Path>,
+        allowed_roots: Option<&[PathBuf]>,
+    ) -> Result<VfsMountReport, String> {
         let root = root.as_ref();
         let canonical = root
             .canonicalize()
             .map_err(|e| format!("vfs mount root not accessible: {e}"))?;
         if !canonical.is_dir() {
             return Err("vfs mount root must be a directory".into());
+        }
+        if let Some(allowed) = allowed_roots {
+            if !allowed.iter().any(|a| canonical.starts_with(a)) {
+                return Err(format!(
+                    "vfs mount root '{}' is outside AXIOM_VFS_ALLOWED_ROOTS",
+                    canonical.display()
+                ));
+            }
         }
         *self
             .root
@@ -163,6 +181,27 @@ impl NeuralVfs {
         sessions: Arc<TttSessionStore>,
     ) -> Result<VfsReadReport, String> {
         let resolved = self.resolve(path.as_ref())?;
+        // Only regular files, and only up to the read cap: the whole file is
+        // read into memory and then tokenized, so a device node (`/dev/zero`)
+        // or a multi-GB file would otherwise exhaust the server.
+        let meta = tokio::fs::metadata(&resolved)
+            .await
+            .map_err(|e| format!("vfs read failed: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!(
+                "vfs read refused: '{}' is not a regular file",
+                resolved.display()
+            ));
+        }
+        let max_bytes = vfs_max_read_bytes();
+        if meta.len() > max_bytes {
+            return Err(format!(
+                "vfs read refused: '{}' is {} bytes, above the {} byte cap (AXIOM_VFS_MAX_READ_BYTES)",
+                resolved.display(),
+                meta.len(),
+                max_bytes
+            ));
+        }
         let text = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|e| format!("vfs read failed: {e}"))?;
@@ -226,6 +265,47 @@ impl NeuralVfs {
     }
 }
 
+/// Default cap on a single `/v1/hypervisor/read` (16 MiB).
+pub const DEFAULT_VFS_MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
+
+/// `AXIOM_VFS_MAX_READ_BYTES` or the default cap.
+fn vfs_max_read_bytes() -> u64 {
+    parse_max_read_bytes(std::env::var("AXIOM_VFS_MAX_READ_BYTES").ok().as_deref())
+}
+
+/// A positive byte count, or the default for unset / empty / zero / garbage.
+fn parse_max_read_bytes(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_VFS_MAX_READ_BYTES)
+}
+
+/// `AXIOM_VFS_ALLOWED_ROOTS` (directories separated by `;`), canonicalized.
+/// `None` when unset: any directory may be mounted, the local-first default
+/// (the data plane is loopback-only or API-key guarded). Set it on any server
+/// reachable by more than its operator so a caller cannot mount `/`.
+fn vfs_allowed_roots() -> Option<Vec<PathBuf>> {
+    parse_allowed_roots(std::env::var("AXIOM_VFS_ALLOWED_ROOTS").ok().as_deref())
+}
+
+/// Parse a `;`-separated root list. Unset or blank ⇒ `None` (no
+/// restriction). Set but naming only directories that do not exist ⇒
+/// `Some(empty)`, which refuses every mount: a misconfigured allowlist fails
+/// closed rather than silently allowing everything.
+fn parse_allowed_roots(raw: Option<&str>) -> Option<Vec<PathBuf>> {
+    let raw = raw?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(
+        raw.split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| Path::new(s).canonicalize().ok())
+            .collect(),
+    )
+}
+
 pub fn structural_digest_for_vfs(path: &Path, text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(path.to_string_lossy().as_bytes());
@@ -258,6 +338,58 @@ mod tests {
         );
         assert!(digest.contains("fn run"));
         assert!(!digest.contains("secret + 1"));
+    }
+
+    // These tests never touch the process environment: tests run in
+    // parallel threads, so setting AXIOM_VFS_* here would leak into
+    // `mount_readdir_getattr_roundtrip` and others running at the same time.
+
+    #[test]
+    fn mount_honours_allowed_roots() {
+        let allowed = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(allowed.path().join("sub")).unwrap();
+        let roots = parse_allowed_roots(Some(&allowed.path().to_string_lossy())).unwrap();
+        let vfs = NeuralVfs::new();
+        assert!(vfs
+            .mount_with_allowed(allowed.path().join("sub"), Some(&roots))
+            .is_ok());
+        let err = vfs
+            .mount_with_allowed(other.path(), Some(&roots))
+            .unwrap_err();
+        assert!(err.contains("AXIOM_VFS_ALLOWED_ROOTS"), "{err}");
+        // No allowlist → any directory mounts (the local-first default).
+        assert!(vfs.mount_with_allowed(other.path(), None).is_ok());
+    }
+
+    #[test]
+    fn allowed_roots_parsing() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        assert_eq!(parse_allowed_roots(None), None);
+        assert_eq!(parse_allowed_roots(Some("  ")), None);
+        let both = format!("{} ; {};", a.path().display(), b.path().display());
+        let parsed = parse_allowed_roots(Some(&both)).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|p| p.is_absolute()));
+        // Only nonexistent directories: fail closed (an empty allowlist).
+        let missing = parse_allowed_roots(Some("/definitely/not/a/real/dir")).unwrap();
+        assert!(missing.is_empty());
+        let vfs = NeuralVfs::new();
+        assert!(vfs.mount_with_allowed(a.path(), Some(&missing)).is_err());
+    }
+
+    #[test]
+    fn read_cap_defaults_and_parses() {
+        assert_eq!(DEFAULT_VFS_MAX_READ_BYTES, 16 * 1024 * 1024);
+        assert_eq!(parse_max_read_bytes(Some("123")), 123);
+        assert_eq!(parse_max_read_bytes(Some(" 456 ")), 456);
+        assert_eq!(parse_max_read_bytes(Some("0")), DEFAULT_VFS_MAX_READ_BYTES);
+        assert_eq!(
+            parse_max_read_bytes(Some("lots")),
+            DEFAULT_VFS_MAX_READ_BYTES
+        );
+        assert_eq!(parse_max_read_bytes(None), DEFAULT_VFS_MAX_READ_BYTES);
     }
 
     #[test]

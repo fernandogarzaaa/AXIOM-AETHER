@@ -56,7 +56,10 @@ fn bench_reports_savings_and_full_fidelity_on_code() {
         "skeleton must be smaller than source"
     );
     assert!(report.savings_ratio() > 0.0, "must report positive savings");
-    assert!(report.symbols_total >= 2, "add/render/Widget signatures detected");
+    assert!(
+        report.symbols_total >= 2,
+        "add/render/Widget signatures detected"
+    );
     assert_eq!(
         report.symbols_recovered, report.symbols_total,
         "every kept signature must round-trip through expand"

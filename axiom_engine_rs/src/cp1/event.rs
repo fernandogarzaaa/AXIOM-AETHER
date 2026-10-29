@@ -418,7 +418,9 @@ mod tests {
             .collect();
         assert_eq!(
             emitters,
-            ["adam", "axiom", "eve"].into_iter().collect::<std::collections::BTreeSet<_>>()
+            ["adam", "axiom", "eve"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
         );
     }
 

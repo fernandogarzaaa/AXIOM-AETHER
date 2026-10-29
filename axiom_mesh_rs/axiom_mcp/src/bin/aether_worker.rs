@@ -7,7 +7,9 @@
 
 use std::io::{BufRead, Write};
 
-use axiom_mcp::protocol::{DispatchParams, DispatchResult, RpcRequest, RpcResponse, DISPATCH_METHOD};
+use axiom_mcp::protocol::{
+    DispatchParams, DispatchResult, RpcRequest, RpcResponse, DISPATCH_METHOD,
+};
 
 fn handle(req: RpcRequest) -> RpcResponse {
     if req.method != DISPATCH_METHOD {

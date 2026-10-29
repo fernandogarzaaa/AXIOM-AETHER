@@ -210,7 +210,10 @@ mod tests {
     fn is_trivial_false_when_surprisal_absent() {
         let m = vec![json!({"role":"user","content":[
             {"type":"tool_result","tool_use_id":"x","content":"ok"}]})];
-        assert!(!is_trivial(&m, None, 7.03), "unknown surprisal is fail-closed");
+        assert!(
+            !is_trivial(&m, None, 7.03),
+            "unknown surprisal is fail-closed"
+        );
     }
 
     #[test]
@@ -223,10 +226,16 @@ mod tests {
     #[test]
     fn is_trivial_false_for_fresh_user_prose() {
         let m = vec![json!({"role":"user","content":"please refactor the parser"})];
-        assert!(!is_trivial(&m, Some(1.0), 7.03), "a text turn is never trivial");
+        assert!(
+            !is_trivial(&m, Some(1.0), 7.03),
+            "a text turn is never trivial"
+        );
         let m2 = vec![json!({"role":"user","content":[
             {"type":"text","text":"and also add tests"}]})];
-        assert!(!is_trivial(&m2, Some(1.0), 7.03), "a text block is fresh prose");
+        assert!(
+            !is_trivial(&m2, Some(1.0), 7.03),
+            "a text block is fresh prose"
+        );
     }
 
     #[test]
@@ -234,7 +243,10 @@ mod tests {
         let big = "word ".repeat(TRIVIAL_MAX_TOKENS + 50);
         let m = vec![json!({"role":"user","content":[
             {"type":"tool_result","tool_use_id":"x","content": big}]})];
-        assert!(!is_trivial(&m, Some(1.0), 7.03), "a large result is forwarded");
+        assert!(
+            !is_trivial(&m, Some(1.0), 7.03),
+            "a large result is forwarded"
+        );
     }
 
     #[test]
@@ -244,14 +256,20 @@ mod tests {
         let blob = "a".repeat(TRIVIAL_MAX_BYTES + 10);
         let m = vec![json!({"role":"user","content":[
             {"type":"tool_result","tool_use_id":"x","content": blob}]})];
-        assert!(!is_trivial(&m, Some(1.0), 7.03), "byte cap catches token-light blobs");
+        assert!(
+            !is_trivial(&m, Some(1.0), 7.03),
+            "byte cap catches token-light blobs"
+        );
     }
 
     #[test]
     fn is_trivial_false_for_non_user_role() {
         let m = vec![json!({"role":"assistant","content":[
             {"type":"tool_result","tool_use_id":"x","content":"ok"}]})];
-        assert!(!is_trivial(&m, Some(1.0), 7.03), "only a user-role turn may short-circuit");
+        assert!(
+            !is_trivial(&m, Some(1.0), 7.03),
+            "only a user-role turn may short-circuit"
+        );
     }
 
     #[test]
@@ -261,7 +279,10 @@ mod tests {
             {"type":"tool_result","tool_use_id":"x","content":[
                 {"type":"text","text":"ok"},
                 {"type":"image","source":{"type":"base64","data":"..."}}]}]})];
-        assert!(!is_trivial(&m, Some(1.0), 7.03), "non-text part disqualifies the result");
+        assert!(
+            !is_trivial(&m, Some(1.0), 7.03),
+            "non-text part disqualifies the result"
+        );
     }
 
     #[test]

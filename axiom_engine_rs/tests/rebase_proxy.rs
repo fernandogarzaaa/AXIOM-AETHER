@@ -163,7 +163,9 @@ async fn growing_frozen_prefix_is_not_a_break_and_never_rebases() {
 
     let captured = capture.requests.lock().unwrap();
     assert!(
-        !captured.iter().any(|r| r.to_string().contains("AXIOM-PAGE")),
+        !captured
+            .iter()
+            .any(|r| r.to_string().contains("AXIOM-PAGE")),
         "append-only prefix growth must never trigger a rebase (2026-07-12 live-eval regression)"
     );
 }
@@ -185,7 +187,11 @@ async fn rebase_restructures_old_heavy_on_a_detected_break() {
     );
     // Turn 2 changes the frozen prefix (a compaction) -> break -> rebase fires.
     assert_eq!(
-        post_messages(&app, body_with_old_heavy("rebase-brk", "prefix v2 recompacted")).await,
+        post_messages(
+            &app,
+            body_with_old_heavy("rebase-brk", "prefix v2 recompacted")
+        )
+        .await,
         StatusCode::OK
     );
 
@@ -193,11 +199,20 @@ async fn rebase_restructures_old_heavy_on_a_detected_break() {
     let t1 = captured[0].to_string();
     let t2 = captured[1].to_string();
     // Turn 1: no break -> the old heavy block is forwarded raw (no page stub).
-    assert!(!t1.contains("AXIOM-PAGE"), "first turn is not a break -> no rebase");
+    assert!(
+        !t1.contains("AXIOM-PAGE"),
+        "first turn is not a break -> no rebase"
+    );
     // Turn 2: break -> the old heavy block arrives as a page stub, and its raw
     // 9000-token body no longer travels upstream.
-    assert!(t2.contains("AXIOM-PAGE"), "break turn -> old heavy digested to a page");
-    assert!(!t2.contains(&"x ".repeat(9000)), "raw old-heavy body removed on the break turn");
+    assert!(
+        t2.contains("AXIOM-PAGE"),
+        "break turn -> old heavy digested to a page"
+    );
+    assert!(
+        !t2.contains(&"x ".repeat(9000)),
+        "raw old-heavy body removed on the break turn"
+    );
     // The newest turn is preserved verbatim on the break turn.
     assert!(t2.contains("newest small turn"), "newest turn untouched");
 }
@@ -227,7 +242,9 @@ async fn rebase_off_leaves_the_transcript_untouched() {
     let captured = capture.requests.lock().unwrap();
     // Flag off -> no page stubs anywhere, even across the prefix change.
     assert!(
-        !captured.iter().any(|r| r.to_string().contains("AXIOM-PAGE")),
+        !captured
+            .iter()
+            .any(|r| r.to_string().contains("AXIOM-PAGE")),
         "flag off -> transcript is never rebased"
     );
 }
@@ -255,7 +272,9 @@ async fn adaptive_ttl_does_not_fire_without_long_gaps() {
 
     let captured = capture.requests.lock().unwrap();
     assert!(
-        !captured.iter().any(|r| r.to_string().contains("\"ttl\":\"1h\"")),
+        !captured
+            .iter()
+            .any(|r| r.to_string().contains("\"ttl\":\"1h\"")),
         "no long gaps -> adaptive TTL stays at the default 5-minute window"
     );
 }

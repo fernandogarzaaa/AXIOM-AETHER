@@ -106,7 +106,10 @@ pub struct SelfAttention {
 
 impl SelfAttention {
     pub fn new(vb: VarBuilder, d_model: usize, n_heads: usize) -> Result<Self> {
-        assert!(d_model.is_multiple_of(n_heads), "d_model must divide n_heads");
+        assert!(
+            d_model.is_multiple_of(n_heads),
+            "d_model must divide n_heads"
+        );
         Ok(Self {
             w_q: candle_nn::linear(d_model, d_model, vb.pp("w_q"))?,
             w_k: candle_nn::linear(d_model, d_model, vb.pp("w_k"))?,
@@ -389,8 +392,8 @@ mod tests {
         let attn = SelfAttention::new(vb, 16, 4).unwrap();
         let x1 = Tensor::randn(0f32, 1f32, (1usize, 4usize, 16usize), &Device::Cpu).unwrap();
         let mut data: Vec<f32> = x1.flatten_all().unwrap().to_vec1().unwrap();
-        for i in (3 * 16)..(4 * 16) {
-            data[i] += 5.0;
+        for v in &mut data[(3 * 16)..(4 * 16)] {
+            *v += 5.0;
         }
         let x2 = Tensor::from_vec(data, (1, 4, 16), &Device::Cpu).unwrap();
         let y1 = attn.forward(&x1).unwrap();

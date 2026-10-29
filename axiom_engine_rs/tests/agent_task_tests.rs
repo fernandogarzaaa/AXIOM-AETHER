@@ -38,8 +38,8 @@ fn assert_history(task: &AgentTask, outcomes: &[ProposeOutcome]) {
 
 #[test]
 fn starts_with_empty_history_and_normalizes_zero_budget() {
-    let task = AgentTask::start("id".into(), "goal".into(), "exit 0".into(), vec![], 0, None)
-        .unwrap();
+    let task =
+        AgentTask::start("id".into(), "goal".into(), "exit 0".into(), vec![], 0, None).unwrap();
     assert_eq!(task.task_id, "id");
     assert_eq!(task.goal, "goal");
     assert_eq!(task.verify_cmd, "exit 0");
@@ -105,7 +105,7 @@ fn failed_proposal_preserves_the_last_successful_proposal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file.txt");
     fs::write(&path, "initial").unwrap();
-    let mut task = task(&[path.clone()], "exit 0");
+    let mut task = task(std::slice::from_ref(&path), "exit 0");
     let accepted = task.propose(vec![edit(&path, "accepted")]);
     assert!(accepted.passed);
     task.verify_cmd = "exit 1".into();
@@ -149,7 +149,7 @@ fn equivalent_rejected_edits_are_deduplicated_even_when_reordered() {
 fn successful_proposals_are_not_added_to_rejection_memory() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file.txt");
-    let mut task = task(&[path.clone()], "exit 0");
+    let mut task = task(std::slice::from_ref(&path), "exit 0");
     let first = task.propose(vec![edit(&path, "accepted")]);
     let second = task.propose(vec![edit(&path, "accepted")]);
     assert!(first.passed && second.passed);
@@ -192,9 +192,10 @@ fn abort_restores_initial_snapshot_after_multiple_successes() {
     fs::write(&path, original).unwrap();
     let mut task = task(&[path.clone(), created.clone()], "exit 0");
     assert!(task.propose(vec![edit(&path, "v1")]).passed);
-    assert!(task
-        .propose(vec![edit(&path, "v2"), edit(&created, "new")])
-        .passed);
+    assert!(
+        task.propose(vec![edit(&path, "v2"), edit(&created, "new")])
+            .passed
+    );
 
     task.finish(false).unwrap();
     assert_eq!(fs::read(&path).unwrap(), original);
@@ -208,7 +209,7 @@ fn finish_is_idempotent_and_rejects_further_proposals() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
         fs::write(&path, "initial").unwrap();
-        let mut task = task(&[path.clone()], "exit 0");
+        let mut task = task(std::slice::from_ref(&path), "exit 0");
         let accepted = task.propose(vec![edit(&path, "accepted")]);
         assert!(accepted.passed);
         task.finish(commit).unwrap();
@@ -246,11 +247,18 @@ fn attempt_budget_prevents_additional_file_changes() {
         )
         .unwrap();
         for attempt in 0..budget.max(1) {
-            assert!(!task.propose(vec![edit(&path, &format!("bad-{attempt}"))]).passed);
+            assert!(
+                !task
+                    .propose(vec![edit(&path, &format!("bad-{attempt}"))])
+                    .passed
+            );
         }
         task.verify_cmd = "exit 0".into();
         let over_budget = task.propose(vec![edit(&path, "must not apply")]);
-        assert!(!over_budget.passed, "exhausted budget {budget} must reject edits");
+        assert!(
+            !over_budget.passed,
+            "exhausted budget {budget} must reject edits"
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), "initial");
     }
 }
@@ -264,10 +272,17 @@ fn registry_keeps_tasks_independent_and_removal_returns_the_task() {
     second.task_id = "other".into();
     registry.insert(first);
     registry.insert(second);
-    assert!(shared.with_task("missing", |_| panic!("must not run")).is_none());
+    assert!(shared
+        .with_task("missing", |_| panic!("must not run"))
+        .is_none());
     assert!(shared.remove("missing").is_none());
-    shared.with_task("test-task", |t| t.propose(vec![])).unwrap();
-    assert_eq!(registry.with_task("test-task", |t| t.history().len()), Some(1));
+    shared
+        .with_task("test-task", |t| t.propose(vec![]))
+        .unwrap();
+    assert_eq!(
+        registry.with_task("test-task", |t| t.history().len()),
+        Some(1)
+    );
     assert_eq!(registry.with_task("other", |t| t.history().len()), Some(0));
     let removed = shared.remove("test-task").unwrap();
     assert_eq!(removed.task_id, "test-task");
@@ -293,7 +308,7 @@ mod verifier {
         let path = dir.path().join("file with 'quotes'.txt");
         fs::write(&path, "old").unwrap();
         let command = format!("test \"$(cat {})\" = expected", shell_quote(&path));
-        let mut task = task(&[path.clone()], &command);
+        let mut task = task(std::slice::from_ref(&path), &command);
         assert!(!task.propose(vec![edit(&path, "incorrect")]).passed);
         assert_eq!(fs::read_to_string(&path).unwrap(), "old");
         assert!(task.propose(vec![edit(&path, "expected")]).passed);
@@ -314,7 +329,7 @@ mod verifier {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("file.txt");
-            let mut task = task(&[path.clone()], command);
+            let mut task = task(std::slice::from_ref(&path), command);
             let outcome = task.propose(vec![edit(&path, "new")]);
             assert_eq!(outcome.passed, passed, "{command}");
             assert_eq!(outcome.output, expected, "{command}");
@@ -329,7 +344,7 @@ mod verifier {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("file.txt");
             let command = format!("printf '%s' '{}'", "x".repeat(length));
-            let mut task = task(&[path.clone()], &command);
+            let mut task = task(std::slice::from_ref(&path), &command);
             let outcome = task.propose(vec![edit(&path, "new")]);
             assert!(outcome.passed);
             let mut expected = "x".repeat(length.min(8000));
@@ -347,7 +362,10 @@ mod verifier {
         let path = dir.path().join("file.txt");
         // The 8,000-byte limit falls in the middle of this three-byte character.
         let output = format!("{}\u{20ac}tail", "x".repeat(7999));
-        let mut task = task(&[path.clone()], &format!("printf '%s' '{output}'"));
+        let mut task = task(
+            std::slice::from_ref(&path),
+            &format!("printf '%s' '{output}'"),
+        );
         let outcome = task.propose(vec![edit(&path, "accepted")]);
         assert!(outcome.passed);
         let prefix = outcome.output.strip_suffix("\n...[truncated]").unwrap();

@@ -6,7 +6,7 @@
 
 use crate::cognition::PillarResult;
 use crate::corpus::default_corpus_dir;
-use axiom_engine::session_recorder::{ExchangeRecord, read_session};
+use axiom_engine::session_recorder::{read_session, ExchangeRecord};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -160,6 +160,8 @@ pub fn run_cost_with(base_url: &str, dir: &Path) -> PillarResult {
         return PillarResult {
             name: "cost".into(),
             headline: "skipped - no corpus (add bench/corpus/*.jsonl and run with --live)".into(),
+            n: "0".into(),
+            read_as: "skipped".into(),
             detail: json!({ "skipped": true, "reason": "no corpus", "corpus_dir": dir.display().to_string() }),
         };
     }
@@ -173,6 +175,8 @@ pub fn run_cost_with(base_url: &str, dir: &Path) -> PillarResult {
             return PillarResult {
                 name: "cost".into(),
                 headline: format!("skipped - HTTP client unavailable ({error})"),
+                n: "0".into(),
+                read_as: "skipped".into(),
                 detail: json!({ "skipped": true, "reason": "client", "error": error.to_string() }),
             };
         }
@@ -181,6 +185,8 @@ pub fn run_cost_with(base_url: &str, dir: &Path) -> PillarResult {
         return PillarResult {
             name: "cost".into(),
             headline: format!("skipped - proxy metrics unavailable at {base_url}"),
+            n: "0".into(),
+            read_as: "skipped".into(),
             detail: json!({ "skipped": true, "reason": "proxy unavailable", "base_url": base_url, "error": error }),
         };
     }
@@ -278,6 +284,8 @@ pub fn run_cost_with(base_url: &str, dir: &Path) -> PillarResult {
     PillarResult {
         name: "cost".into(),
         headline,
+        n: format!("**{replayed} replayed records from {sessions} sessions**"),
+        read_as: "indicative only".into(),
         detail: json!({
             "skipped": false,
             "base_url": base_url,

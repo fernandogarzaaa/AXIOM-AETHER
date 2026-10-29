@@ -77,13 +77,81 @@ pub type SessionStates = Arc<AsyncMutex<Vec<Tensor>>>;
 /// mutation is serialised by the inner [`AsyncMutex`].
 pub struct TttSessionStore {
     sessions: DashMap<String, SessionStates>,
+    /// Monotonic "last touched" stamp per session, for LRU eviction.
+    touched: DashMap<String, u64>,
+    clock: std::sync::atomic::AtomicU64,
+    /// Upper bound on live sessions. Session ids are client-chosen
+    /// (`X-Axiom-Session-Id`, `/v1/ttt/feedback`), and each session holds
+    /// `n_layers × d_model²` floats, so an unbounded map is a trivial
+    /// memory-exhaustion vector. When full, the least recently touched
+    /// session is dropped to make room (its W̃ is lost; the next request
+    /// for that id starts from identity again).
+    max_sessions: usize,
 }
+
+/// Default for `AXIOM_MAX_TTT_SESSIONS`.
+pub const DEFAULT_MAX_TTT_SESSIONS: usize = 512;
 
 impl TttSessionStore {
     pub fn new() -> Self {
+        let max_sessions = std::env::var("AXIOM_MAX_TTT_SESSIONS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MAX_TTT_SESSIONS);
+        Self::with_capacity(max_sessions)
+    }
+
+    /// A store that holds at most `max_sessions` live sessions.
+    pub fn with_capacity(max_sessions: usize) -> Self {
         Self {
             sessions: DashMap::new(),
+            touched: DashMap::new(),
+            clock: std::sync::atomic::AtomicU64::new(1),
+            max_sessions: max_sessions.max(1),
         }
+    }
+
+    fn touch(&self, session_id: &str) {
+        let now = self
+            .clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.touched.insert(session_id.to_string(), now);
+    }
+
+    /// Drop least-recently-touched sessions until there is room for one more
+    /// (never evicts `keep`). Returns the ids evicted.
+    fn make_room(&self, keep: &str) -> Vec<String> {
+        let mut evicted = Vec::new();
+        while self.sessions.len() >= self.max_sessions {
+            let victim = self
+                .touched
+                .iter()
+                .filter(|kv| kv.key() != keep)
+                .min_by_key(|kv| *kv.value())
+                .map(|kv| kv.key().clone())
+                // A session with no stamp (inserted via `insert_states`
+                // before any touch) is the oldest by definition.
+                .or_else(|| {
+                    self.sessions
+                        .iter()
+                        .map(|kv| kv.key().clone())
+                        .find(|k| k != keep && !self.touched.contains_key(k))
+                });
+            let Some(victim) = victim else { break };
+            self.sessions.remove(&victim);
+            self.touched.remove(&victim);
+            evicted.push(victim);
+        }
+        if !evicted.is_empty() {
+            eprintln!(
+                "[axiom-ttt] session cap {} reached; evicted {} least-recently-used session(s) \
+                 (raise AXIOM_MAX_TTT_SESSIONS to keep more)",
+                self.max_sessions,
+                evicted.len()
+            );
+        }
+        evicted
     }
 
     /// Resolve an existing session or create a fresh one with
@@ -94,23 +162,38 @@ impl TttSessionStore {
         pipeline: &InferencePipeline,
     ) -> CResult<SessionStates> {
         if let Some(s) = self.sessions.get(session_id) {
-            return Ok(s.clone());
+            let s = s.clone();
+            self.touch(session_id);
+            return Ok(s);
         }
+        self.make_room(session_id);
         // Build the fresh state outside the map, then insert-if-absent
         // atomically via the entry API so two concurrent first-touch requests
         // for the same session can't both insert and clobber each other's W̃.
         let states = pipeline.init_session_states()?;
         let arc = Arc::new(AsyncMutex::new(states));
         let entry = self.sessions.entry(session_id.to_string()).or_insert(arc);
-        Ok(entry.value().clone())
+        let handle = entry.value().clone();
+        drop(entry);
+        self.touch(session_id);
+        Ok(handle)
     }
 
     /// Insert a fully materialized session state, replacing any existing handle.
     /// Used when hydrating persisted compression cache snapshots on startup.
     pub fn insert_states(&self, session_id: String, states: Vec<Tensor>) -> SessionStates {
+        if !self.sessions.contains_key(&session_id) {
+            self.make_room(&session_id);
+        }
         let handle = Arc::new(AsyncMutex::new(states));
-        self.sessions.insert(session_id, handle.clone());
+        self.sessions.insert(session_id.clone(), handle.clone());
+        self.touch(&session_id);
         handle
+    }
+
+    /// Configured cap on live sessions.
+    pub fn capacity(&self) -> usize {
+        self.max_sessions
     }
 
     /// Number of live sessions; used by the metrics + stats endpoints.
@@ -126,6 +209,7 @@ impl TttSessionStore {
     /// Remove a single session and return its state handle, so the caller can
     /// (e.g.) EMA-merge the adapted W̃ into a master before it is freed.
     pub fn take_session(&self, session_id: &str) -> Option<SessionStates> {
+        self.touched.remove(session_id);
         self.sessions.remove(session_id).map(|(_, states)| states)
     }
 
@@ -142,6 +226,7 @@ impl TttSessionStore {
     /// Drop every session.
     pub fn clear(&self) {
         self.sessions.clear();
+        self.touched.clear();
     }
 }
 
@@ -664,6 +749,46 @@ mod tests {
     use crate::inference::InferencePipeline;
     use candle_core::Device;
 
+    #[test]
+    fn ttt_session_store_evicts_least_recently_touched_when_full() {
+        let store = TttSessionStore::with_capacity(2);
+        assert_eq!(store.capacity(), 2);
+        store.insert_states("a".into(), Vec::new());
+        store.insert_states("b".into(), Vec::new());
+        assert_eq!(store.len(), 2);
+        // Re-touching "a" makes "b" the eviction candidate.
+        store.insert_states("a".into(), Vec::new());
+        store.insert_states("c".into(), Vec::new());
+        assert_eq!(store.len(), 2);
+        let live: std::collections::BTreeSet<String> = store
+            .snapshot_handles()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            live.contains("a") && live.contains("c") && !live.contains("b"),
+            "{live:?}"
+        );
+        // Replacing an existing id never evicts anything else.
+        store.insert_states("c".into(), Vec::new());
+        assert_eq!(store.len(), 2);
+        // take_session frees a slot without an eviction.
+        assert!(store.take_session("a").is_some());
+        store.insert_states("d".into(), Vec::new());
+        assert_eq!(store.len(), 2);
+        store.clear();
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn ttt_session_store_capacity_is_at_least_one() {
+        let store = TttSessionStore::with_capacity(0);
+        assert_eq!(store.capacity(), 1);
+        store.insert_states("a".into(), Vec::new());
+        store.insert_states("b".into(), Vec::new());
+        assert_eq!(store.len(), 1);
+    }
+
     fn tiny_pipeline() -> InferencePipeline {
         let cfg = AxiomConfig {
             d_model: 16,
@@ -709,7 +834,7 @@ mod tests {
 
     #[test]
     fn adapt_chunk_cap_stays_below_phase3_ceiling() {
-        assert!(MAX_ADAPT_CHUNK_TOKENS < 512);
+        const { assert!(MAX_ADAPT_CHUNK_TOKENS < 512) };
     }
 
     #[test]

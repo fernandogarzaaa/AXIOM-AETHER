@@ -48,7 +48,10 @@ pub struct MeshSupervisor {
 
 impl MeshSupervisor {
     pub fn new(config: MeshConfig) -> Self {
-        Self { region_mesh: KineticNeuralMesh::new(config), regions: Vec::new() }
+        Self {
+            region_mesh: KineticNeuralMesh::new(config),
+            regions: Vec::new(),
+        }
     }
 
     /// Register a region with a routing affinity in the supervisor's own
@@ -63,8 +66,12 @@ impl MeshSupervisor {
     ) -> Result<NodeId, MeshError> {
         let name = name.into();
         let id = self.regions.len();
-        let region_id =
-            self.region_mesh.add_node(WorkerNode::new(id, name.clone(), NodeKind::Tool("region".into()), affinity))?;
+        let region_id = self.region_mesh.add_node(WorkerNode::new(
+            id,
+            name.clone(),
+            NodeKind::Tool("region".into()),
+            affinity,
+        ))?;
         self.regions.push(Region { name, mesh });
         Ok(region_id)
     }
@@ -108,31 +115,62 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     fn leaf_mesh(dim: usize, names: &[&str]) -> KineticNeuralMesh {
-        let mut mesh = KineticNeuralMesh::new(MeshConfig { dim, tau: 0.1, ..Default::default() });
+        let mut mesh = KineticNeuralMesh::new(MeshConfig {
+            dim,
+            tau: 0.1,
+            ..Default::default()
+        });
         for (i, name) in names.iter().enumerate() {
             let mut affinity = vec![0.0; dim];
             affinity[i % dim] = 5.0;
-            mesh.add_node(WorkerNode::new(i, *name, NodeKind::Llm(name.to_string()), affinity)).unwrap();
+            mesh.add_node(WorkerNode::new(
+                i,
+                *name,
+                NodeKind::Llm(name.to_string()),
+                affinity,
+            ))
+            .unwrap();
         }
         mesh
     }
 
     #[test]
     fn select_region_picks_the_best_affinity_region() {
-        let mut supervisor = MeshSupervisor::new(MeshConfig { dim: 2, tau: 0.05, ..Default::default() });
-        supervisor.add_region("codegen", vec![1.0, 0.0], leaf_mesh(3, &["codex-1", "codex-2"])).unwrap();
-        supervisor.add_region("research", vec![0.0, 1.0], leaf_mesh(3, &["gemini-1"])).unwrap();
+        let mut supervisor = MeshSupervisor::new(MeshConfig {
+            dim: 2,
+            tau: 0.05,
+            ..Default::default()
+        });
+        supervisor
+            .add_region(
+                "codegen",
+                vec![1.0, 0.0],
+                leaf_mesh(3, &["codex-1", "codex-2"]),
+            )
+            .unwrap();
+        supervisor
+            .add_region("research", vec![0.0, 1.0], leaf_mesh(3, &["gemini-1"]))
+            .unwrap();
 
         let mut rng = StdRng::seed_from_u64(3);
-        let (region, _) = supervisor.select_region(&array![0.0, 1.0], None, &mut rng).unwrap();
+        let (region, _) = supervisor
+            .select_region(&array![0.0, 1.0], None, &mut rng)
+            .unwrap();
         assert_eq!(region.name, "research");
     }
 
     #[test]
     fn each_region_keeps_its_own_independently_addressable_mesh() {
-        let mut supervisor = MeshSupervisor::new(MeshConfig { dim: 2, ..Default::default() });
-        supervisor.add_region("a", vec![1.0, 0.0], leaf_mesh(3, &["w1", "w2"])).unwrap();
-        supervisor.add_region("b", vec![0.0, 1.0], leaf_mesh(3, &["w3"])).unwrap();
+        let mut supervisor = MeshSupervisor::new(MeshConfig {
+            dim: 2,
+            ..Default::default()
+        });
+        supervisor
+            .add_region("a", vec![1.0, 0.0], leaf_mesh(3, &["w1", "w2"]))
+            .unwrap();
+        supervisor
+            .add_region("b", vec![0.0, 1.0], leaf_mesh(3, &["w3"]))
+            .unwrap();
 
         assert_eq!(supervisor.region("a").unwrap().mesh.nodes().len(), 2);
         assert_eq!(supervisor.region("b").unwrap().mesh.nodes().len(), 1);
@@ -148,7 +186,10 @@ mod tests {
 
     #[test]
     fn empty_supervisor_is_an_error() {
-        let supervisor = MeshSupervisor::new(MeshConfig { dim: 2, ..Default::default() });
+        let supervisor = MeshSupervisor::new(MeshConfig {
+            dim: 2,
+            ..Default::default()
+        });
         let mut rng = StdRng::seed_from_u64(0);
         assert!(matches!(
             supervisor.select_region(&array![1.0, 0.0], None, &mut rng),
@@ -163,12 +204,22 @@ mod tests {
     /// built from the unmodified flat-demo machinery run twice.
     #[test]
     fn regions_run_independent_prime_fsm_loops() {
-        let mut supervisor = MeshSupervisor::new(MeshConfig { dim: 2, tau: 0.1, ..Default::default() });
-        supervisor.add_region("region-a", vec![1.0, 0.0], leaf_mesh(2, &["a-worker"])).unwrap();
-        supervisor.add_region("region-b", vec![0.0, 1.0], leaf_mesh(2, &["b-worker"])).unwrap();
+        let mut supervisor = MeshSupervisor::new(MeshConfig {
+            dim: 2,
+            tau: 0.1,
+            ..Default::default()
+        });
+        supervisor
+            .add_region("region-a", vec![1.0, 0.0], leaf_mesh(2, &["a-worker"]))
+            .unwrap();
+        supervisor
+            .add_region("region-b", vec![0.0, 1.0], leaf_mesh(2, &["b-worker"]))
+            .unwrap();
 
         let mut rng = StdRng::seed_from_u64(5);
-        let (region, _) = supervisor.select_region(&array![1.0, 0.0], None, &mut rng).unwrap();
+        let (region, _) = supervisor
+            .select_region(&array![1.0, 0.0], None, &mut rng)
+            .unwrap();
         assert_eq!(region.name, "region-a");
 
         // The selected region now runs its own Axiom Prime loop, entirely
@@ -183,9 +234,13 @@ mod tests {
         let worker_mesh = &supervisor.region("region-a").unwrap().mesh;
         let goal = StateVector(array![0.0, 0.0]);
         let residual = Residual::between(&goal, &StateVector::zeros(2));
-        let adhesion = worker_mesh.forward(&array![1.0, 0.0], Some(&residual), &mut rng).unwrap();
+        let adhesion = worker_mesh
+            .forward(&array![1.0, 0.0], Some(&residual), &mut rng)
+            .unwrap();
 
-        cmds = region_fsm.step(PrimeEvent::Routed { nodes: adhesion.active });
+        cmds = region_fsm.step(PrimeEvent::Routed {
+            nodes: adhesion.active,
+        });
         assert!(matches!(cmds[0], PrimeCommand::Dispatch { .. }));
 
         cmds = region_fsm.step(PrimeEvent::WorkerDone);

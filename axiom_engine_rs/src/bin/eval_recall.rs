@@ -54,9 +54,11 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 fn main() {
     // Prefer the real production tokenizer + checkpoint if present, so the eval
     // reflects the deployed model; else fall back to a tiny random pipeline.
-    let tok = std::env::var("AXIOM_TOKENIZER").ok().filter(|p| !p.trim().is_empty());
-    let ckpt =
-        std::env::var("AXIOM_BPE_CKPT").unwrap_or_else(|_| "____no_such_checkpoint____".to_string());
+    let tok = std::env::var("AXIOM_TOKENIZER")
+        .ok()
+        .filter(|p| !p.trim().is_empty());
+    let ckpt = std::env::var("AXIOM_BPE_CKPT")
+        .unwrap_or_else(|_| "____no_such_checkpoint____".to_string());
 
     // Prefer dims from the checkpoint sidecar (matches entrypoint.rs's production
     // load path) so this eval scores the real deployed model instead of silently
@@ -69,16 +71,25 @@ fn main() {
             lr_inner: m.lr_inner,
             norm_eps: m.norm_eps,
         },
-        None => {
-            AxiomConfig { d_model: 256, n_layers: 4, vocab_size: 16000, lr_inner: 1e-3, norm_eps: 1e-6 }
-        }
+        None => AxiomConfig {
+            d_model: 256,
+            n_layers: 4,
+            vocab_size: 16000,
+            lr_inner: 1e-3,
+            norm_eps: 1e-6,
+        },
     };
-    let runtime = InferenceRuntimeOptions { tokenizer_path: tok, ..Default::default() };
+    let runtime = InferenceRuntimeOptions {
+        tokenizer_path: tok,
+        ..Default::default()
+    };
     let pipeline =
         match InferencePipeline::with_checkpoint_and_options(config, Device::Cpu, &ckpt, runtime) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[eval_recall] could not build production pipeline ({e}); using tiny random model");
+                eprintln!(
+                "[eval_recall] could not build production pipeline ({e}); using tiny random model"
+            );
                 let tiny = AxiomConfig {
                     d_model: 64,
                     n_layers: 2,
@@ -91,12 +102,16 @@ fn main() {
         };
 
     // Prefer the trained contrastive embedder (Phase 2.0.1) when present.
-    let emb_ckpt =
-        std::env::var("AXIOM_EMB_CKPT").unwrap_or_else(|_| "checkpoints/axiom_embedder.bin".to_string());
+    let emb_ckpt = std::env::var("AXIOM_EMB_CKPT")
+        .unwrap_or_else(|_| "checkpoints/axiom_embedder.bin".to_string());
     let trained = axiom_engine::embedder::EmbeddingModel::load(&emb_ckpt, Device::Cpu);
     eprintln!(
         "[eval_recall] embedder: {}",
-        if trained.is_some() { "TRAINED contrastive" } else { "TTT pooling (no axiom_embedder.bin)" }
+        if trained.is_some() {
+            "TRAINED contrastive"
+        } else {
+            "TTT pooling (no axiom_embedder.bin)"
+        }
     );
     let embed = |text: &str| -> Vec<f32> {
         match &trained {
@@ -149,8 +164,12 @@ fn main() {
     let mut hits_at_k = 0usize;
     for (q, expected) in queries {
         let q_emb = embed(q);
-        let results =
-            recall(&store, &["personal".to_string()], &q_emb, &RecallParams { min_score: 0.0, k });
+        let results = recall(
+            &store,
+            &["personal".to_string()],
+            &q_emb,
+            &RecallParams { min_score: 0.0, k },
+        );
         let ids: Vec<&str> = results.iter().map(|h| h.record.id.as_str()).collect();
         if ids.first() == Some(&expected) {
             hits_at_1 += 1;
@@ -221,8 +240,14 @@ fn main() {
         }
     }
     println!("\n=== Diagnostic ===");
-    println!("mean inter-QUERY cosine = {:.4} (1.0 = all queries identical → no signal)", q_pair_sum / q_pairs.max(1) as f32);
-    println!("mean inter-SEED  cosine = {:.4}", s_pair_sum / s_pairs.max(1) as f32);
+    println!(
+        "mean inter-QUERY cosine = {:.4} (1.0 = all queries identical → no signal)",
+        q_pair_sum / q_pairs.max(1) as f32
+    );
+    println!(
+        "mean inter-SEED  cosine = {:.4}",
+        s_pair_sum / s_pairs.max(1) as f32
+    );
     // Score vector for the first query against each seed (do scores vary?).
     print!("query[0] cosine to each seed: ");
     for (l, e) in &seed_embs {

@@ -82,6 +82,13 @@ or preserve it, or move it to a separate file the generator doesn't touch)
 rather than overwrite the whole file with only the pillars it happened to
 run this time.
 
+**FIXED (2026-10-29).** The generator now rewrites only the block between
+`<!-- axiombench:table:begin -->` / `<!-- axiombench:table:end -->` in
+`RESULTS.md`, emits the `n` / "read as" columns itself (every pillar carries
+them), carries over rows for pillars that did not run (the `cost` row
+survives a deterministic-only run), and leaves everything outside the markers
+untouched. Covered by unit tests in `axiom_engine_rs/src/bin/axiombench/main.rs`.
+
 ## 3. What AXIOMBench does not yet measure (gap, not built)
 
 Every existing pillar measures a **mechanism working** (compression ratio,
@@ -220,6 +227,6 @@ cargo run --release --bin axiom -- bench axiom_engine_rs/src
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_axiombench_cost_mock.ps1
 ```
 
-Note: running `axiombench` without also running the cost pillar will
-overwrite `RESULTS.md`'s hand-maintained caveats (§2) — review the diff
-before committing, or restore from git if it drops content you need.
+Note: `axiombench` only rewrites the marked table block in `RESULTS.md` (§2);
+the hand-maintained caveats below it are preserved, and the `cost` row is
+carried over when the pillar is not run.

@@ -82,7 +82,10 @@ mod tests {
         // First call trains and writes a real checkpoint.
         let trained = ensure_checkpoint(&path, Device::Cpu).expect("bootstrap must succeed");
         assert!(trained, "first call should train");
-        assert!(std::path::Path::new(&path).exists(), "checkpoint must be written");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "checkpoint must be written"
+        );
 
         // The persisted checkpoint must load back into a pipeline (i.e. it is a
         // real, dimension-correct model, not random in-memory weights).

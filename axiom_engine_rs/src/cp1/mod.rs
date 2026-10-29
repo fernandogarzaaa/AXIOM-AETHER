@@ -85,8 +85,8 @@ mod tests {
     #[test]
     fn version_matches_the_normative_source() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../protocol/cp1/VERSION");
-        let declared = std::fs::read_to_string(path)
-            .unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
+        let declared =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("cannot read {path}: {err}"));
         assert_eq!(
             declared.trim(),
             VERSION,

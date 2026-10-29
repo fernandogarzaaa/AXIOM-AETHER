@@ -31,13 +31,25 @@ async fn readyz(State(state): State<AppState>) -> Response {
 // Router construction
 // ---------------------------------------------------------------------------
 
+/// Constant-time string equality for pre-shared secrets. Every byte of the
+/// longer input is visited regardless of where the first mismatch is, so the
+/// comparison's timing does not reveal how much of a guess was correct.
+/// (The lengths themselves are not hidden; a fixed-length key leaks nothing.)
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff: u8 = u8::from(a.len() != b.len());
+    for i in 0..a.len().max(b.len()) {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
+}
+
 /// Data-plane auth guard. When `AXIOM_API_KEY` is set (`state.api_key` is
 /// `Some`), every guarded route must present the header `X-Axiom-Key: <key>`.
 /// A dedicated header — not `Authorization`/`x-api-key` — is used so this never
 /// collides with the client credentials the `/v1/messages` proxy relays
 /// upstream. When the key is unset this middleware is a no-op passthrough, which
-/// preserves the open, local-first default. The key is a pre-shared secret
-/// carried over the transport, so a plain equality check is acceptable.
+/// preserves the open, local-first default.
 async fn require_api_key(State(state): State<AppState>, req: axum::extract::Request, next: Next) -> Response {
     if let Some(expected) = state.api_key.as_ref().as_ref() {
         let presented = req
@@ -45,7 +57,7 @@ async fn require_api_key(State(state): State<AppState>, req: axum::extract::Requ
             .get("x-axiom-key")
             .and_then(|v| v.to_str().ok())
             .map(str::trim);
-        if presented != Some(expected.as_str()) {
+        if !presented.is_some_and(|p| constant_time_eq(p, expected)) {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({

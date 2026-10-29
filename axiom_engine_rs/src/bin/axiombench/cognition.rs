@@ -10,14 +10,30 @@ use serde_json::json;
 pub struct PillarResult {
     pub name: String,
     pub headline: String,
+    /// Sample size the headline was measured over, as prose (`"3"`,
+    /// `"240 calibration claims"`). Rendered as the `n` column of RESULTS.md
+    /// so a percentage can never be mistaken for a rate.
+    pub n: String,
+    /// How to read the headline: `"smoke check, not a rate"`,
+    /// `"calibrated result"`, `"pass/fail, not a benchmark"`, ...
+    pub read_as: String,
     pub detail: serde_json::Value,
 }
 
 fn samples() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("adder", "pub fn adder(a: i32, b: i32) -> i32 {\n    let s = a + b;\n    s\n}"),
-        ("greet", "pub fn greet(name: &str) -> String {\n    format!(\"hi {name}\")\n}"),
-        ("twice", "pub fn twice(x: u64) -> u64 {\n    x.wrapping_mul(2)\n}"),
+        (
+            "adder",
+            "pub fn adder(a: i32, b: i32) -> i32 {\n    let s = a + b;\n    s\n}",
+        ),
+        (
+            "greet",
+            "pub fn greet(name: &str) -> String {\n    format!(\"hi {name}\")\n}",
+        ),
+        (
+            "twice",
+            "pub fn twice(x: u64) -> u64 {\n    x.wrapping_mul(2)\n}",
+        ),
     ]
 }
 
@@ -42,7 +58,9 @@ pub fn run_cognition() -> PillarResult {
     let rate = recovered as f64 / total as f64;
     PillarResult {
         name: "cognition".into(),
-        headline: format!("{:.0}% symbol exact-recovery ({recovered}/{total})", rate * 100.0),
+        headline: format!("{recovered}/{total} symbol exact-recovery"),
+        n: format!("**{total}**"),
+        read_as: "smoke check, not a rate".into(),
         detail: json!({ "recovered": recovered, "total": total, "rate": rate }),
     }
 }

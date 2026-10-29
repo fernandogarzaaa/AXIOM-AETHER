@@ -289,8 +289,13 @@ pub fn partition_messages(
 
         let content_value = raw.get("content").cloned().unwrap_or(Value::Null);
         let is_newest = newest_idx == Some(i);
-        let (kept_content, mut extracted) =
-            split_content(&role, &content_value, threshold_tokens, is_newest, &token_counter);
+        let (kept_content, mut extracted) = split_content(
+            &role,
+            &content_value,
+            threshold_tokens,
+            is_newest,
+            &token_counter,
+        );
 
         heavy_context.append(&mut extracted);
 
@@ -707,7 +712,11 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
         ];
         let part = partition_messages(&messages, 100, ws);
-        assert_eq!(part.surviving.len(), 3, "the directive-only system message is kept");
+        assert_eq!(
+            part.surviving.len(),
+            3,
+            "the directive-only system message is kept"
+        );
         assert_eq!(part.surviving[0]["role"], "system");
         assert_eq!(part.surviving[0]["content"], json!([]));
         assert_eq!(part.surviving[0]["output_config"], json!({"effort": "low"}));
@@ -718,13 +727,19 @@ mod tests {
         // Even a large, genuinely heavy system-role message must pass through
         // byte-identical: it is positionally significant and never a
         // compression candidate.
-        let big_text = (0..400).map(|i| format!("tok{i}")).collect::<Vec<_>>().join(" ");
+        let big_text = (0..400)
+            .map(|i| format!("tok{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let messages = vec![
             json!({"role": "system", "content": big_text.clone()}),
             json!({"role": "assistant", "content": "ok"}),
         ];
         let part = partition_messages(&messages, 100, ws);
-        assert!(part.heavy_context.is_empty(), "system content is never extracted");
+        assert!(
+            part.heavy_context.is_empty(),
+            "system content is never extracted"
+        );
         assert_eq!(part.surviving.len(), 2);
         assert_eq!(part.surviving[0]["content"], json!(big_text));
     }
@@ -764,9 +779,8 @@ mod tests {
             .map(|i| format!("envfact{i}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let text = format!(
-            "<system-reminder>{reminder_body}</system-reminder>\nwhat does this repo do?"
-        );
+        let text =
+            format!("<system-reminder>{reminder_body}</system-reminder>\nwhat does this repo do?");
         let messages = vec![json!({"role": "user", "content": text.clone()})];
         let part = partition_messages(&messages, 100, ws);
         assert!(
@@ -863,7 +877,10 @@ mod tests {
         };
         let payload = build_compressed_payload(&original, &fp, &partitioned);
         let messages = payload["messages"].as_array().unwrap();
-        assert!(messages.is_empty(), "no phantom carrier turn when there was nothing to compress");
+        assert!(
+            messages.is_empty(),
+            "no phantom carrier turn when there was nothing to compress"
+        );
     }
 
     #[test]
@@ -904,7 +921,7 @@ mod tests {
         assert!(content.contains("raw_context=elided"));
         assert!(!content.contains("tok399"));
         assert!(content.len() < big.len()); // raw heavy text was compressed
-        // #2: the opaque neural noise must NOT reach the wire.
+                                            // #2: the opaque neural noise must NOT reach the wire.
         assert!(!content.contains("recall_top_k_indices"));
         assert!(!content.contains("layer_frobenius_norms"));
         assert!(!content.contains("associative_recall_l1"));
@@ -963,7 +980,10 @@ pub fn run() -> usize {
         // Not the newest message -- S3 (`apply_digest_admission`) owns the
         // newest turn's heavy tool_result exclusively; see
         // `partition_never_extracts_heavy_tool_result_from_the_newest_turn`.
-        let big = (0..400).map(|i| format!("line{i}")).collect::<Vec<_>>().join(" ");
+        let big = (0..400)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let messages = vec![
             json!({
                 "role": "user",
@@ -974,13 +994,28 @@ pub fn run() -> usize {
             json!({"role": "assistant", "content": "ok"}),
         ];
         let part = partition_messages(&messages, 100, ws);
-        assert_eq!(part.heavy_context.len(), 1, "heavy tool_result must be extracted");
+        assert_eq!(
+            part.heavy_context.len(),
+            1,
+            "heavy tool_result must be extracted"
+        );
         assert_eq!(part.heavy_context[0].text, big);
         let blocks = part.surviving[0]["content"].as_array().unwrap();
-        assert_eq!(blocks.len(), 1, "the tool_result block itself is never dropped");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "the tool_result block itself is never dropped"
+        );
         assert_eq!(blocks[0]["type"], "tool_result");
-        assert_eq!(blocks[0]["tool_use_id"], "t1", "tool_use pairing is preserved");
-        assert_ne!(blocks[0]["content"], json!(big), "raw text removed from the wire payload");
+        assert_eq!(
+            blocks[0]["tool_use_id"], "t1",
+            "tool_use pairing is preserved"
+        );
+        assert_ne!(
+            blocks[0]["content"],
+            json!(big),
+            "raw text removed from the wire payload"
+        );
         assert!(
             blocks[0]["content"].as_str().unwrap().contains("absorbed"),
             "a marker is left so the block is never blank"
@@ -992,8 +1027,14 @@ pub fn run() -> usize {
         // tool_result content can also be an array of {type:"text", text}
         // parts (e.g. stdout + stderr) -- must flatten the same way
         // rebase::tool_result_text does for S1/P2 digestion.
-        let stdout = (0..250).map(|i| format!("out{i}")).collect::<Vec<_>>().join(" ");
-        let stderr = (0..250).map(|i| format!("err{i}")).collect::<Vec<_>>().join(" ");
+        let stdout = (0..250)
+            .map(|i| format!("out{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let stderr = (0..250)
+            .map(|i| format!("err{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let messages = vec![
             json!({
                 "role": "user",
@@ -1027,7 +1068,10 @@ pub fn run() -> usize {
     fn partition_never_extracts_heavy_tool_result_from_a_system_message() {
         // Same positional-safety contract as text content: system messages
         // are never a compression candidate regardless of block type.
-        let big = (0..400).map(|i| format!("tok{i}")).collect::<Vec<_>>().join(" ");
+        let big = (0..400)
+            .map(|i| format!("tok{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let messages = vec![
             json!({"role": "system", "content": [
                 {"type": "tool_result", "tool_use_id": "t4", "content": big.clone()}
@@ -1045,7 +1089,10 @@ pub fn run() -> usize {
         // heavy tool_result in the same (non-newest) message. Only the
         // tool_result block is extracted; the message survives with both
         // blocks present.
-        let big = (0..400).map(|i| format!("row{i}")).collect::<Vec<_>>().join(" ");
+        let big = (0..400)
+            .map(|i| format!("row{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let messages = vec![
             json!({
                 "role": "user",
@@ -1074,7 +1121,10 @@ pub fn run() -> usize {
         // marker before S3 ever sees it), silently double-processing one
         // block through two different compression paths and leaking S0's
         // own structural-digest signatures where S3's tests expect none.
-        let big = (0..400).map(|i| format!("line{i}")).collect::<Vec<_>>().join(" ");
+        let big = (0..400)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let messages = vec![json!({
             "role": "user",
             "content": [
@@ -1082,7 +1132,10 @@ pub fn run() -> usize {
             ]
         })];
         let part = partition_messages(&messages, 100, ws);
-        assert!(part.heavy_context.is_empty(), "newest-turn tool_result is left for S3");
+        assert!(
+            part.heavy_context.is_empty(),
+            "newest-turn tool_result is left for S3"
+        );
         assert_eq!(part.surviving[0]["content"][0]["content"], json!(big));
     }
 
@@ -1091,7 +1144,10 @@ pub fn run() -> usize {
         // The newest-turn exclusion is `tool_result`-specific (S3's scope);
         // `text` block extraction on the newest turn is unaffected and
         // stays covered by `partition_extracts_heavy_string_content`.
-        let big = (0..400).map(|i| format!("tok{i}")).collect::<Vec<_>>().join(" ");
+        let big = (0..400)
+            .map(|i| format!("tok{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let messages = vec![json!({"role": "user", "content": big.clone()})];
         let part = partition_messages(&messages, 100, ws);
         assert_eq!(part.heavy_context.len(), 1);

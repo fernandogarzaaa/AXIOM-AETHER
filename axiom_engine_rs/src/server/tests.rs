@@ -331,14 +331,14 @@ mod tests {
     #[tokio::test]
     async fn pipeline_lock_allows_concurrent_readers() {
         let state = make_test_state().await;
-        let first = state.pipeline.read().unwrap();
-        let second = state
-            .pipeline
-            .try_read()
-            .expect("a second concurrent reader must not block behind the first");
-        assert_eq!(first.token_count("same pipeline"), second.token_count("same pipeline"));
-        drop(first);
-        drop(second);
+        {
+            let first = state.pipeline.read().unwrap();
+            let second = state
+                .pipeline
+                .try_read()
+                .expect("a second concurrent reader must not block behind the first");
+            assert_eq!(first.token_count("same pipeline"), second.token_count("same pipeline"));
+        }
         safe_drop(state.pipeline.clone()).await;
     }
 
@@ -473,12 +473,17 @@ mod tests {
         ));
 
         {
-            let pipeline = state.pipeline.read().unwrap();
-            let handle = state
-                .ttt_sessions
-                .get_or_create("persist-s1", &pipeline)
-                .unwrap();
+            // Take the async session lock first so the std pipeline read guard
+            // is never held across an `.await`.
+            let handle = {
+                let pipeline = state.pipeline.read().unwrap();
+                state
+                    .ttt_sessions
+                    .get_or_create("persist-s1", &pipeline)
+                    .unwrap()
+            };
             let mut states = handle.lock().await;
+            let pipeline = state.pipeline.read().unwrap();
             let tokens = pipeline.encode_text("fn persisted() { cache(); }");
             adapt_session_blocking(&pipeline, &mut states, &tokens).unwrap();
         }
@@ -1082,6 +1087,279 @@ mod tests {
             let session = sessions.get("quantized-session").unwrap();
             assert!(!session.is_quantized());
         }
+        safe_drop(pipeline_arc).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Hardening regressions (Oct 2026 audit): request-reachable panics,
+    // unbounded allocation, filesystem confinement, /mcp auth parity.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_strings() {
+        assert!(constant_time_eq("k3y", "k3y"));
+        assert!(constant_time_eq("", ""));
+        assert!(!constant_time_eq("k3y", "k3Y"));
+        assert!(!constant_time_eq("k3y", "k3y "));
+        assert!(!constant_time_eq("k3y", ""));
+        assert!(!constant_time_eq("", "k3y"));
+        assert!(!constant_time_eq("abc", "abcd"));
+    }
+
+    #[test]
+    fn checked_shape_product_detects_overflow() {
+        assert_eq!(checked_shape_product(&[2, 3, 4]), Some(24));
+        assert_eq!(checked_shape_product(&[]), Some(1));
+        assert_eq!(checked_shape_product(&[0, 7]), Some(0));
+        assert_eq!(checked_shape_product(&[1 << 40, 1 << 40]), None);
+        assert_eq!(checked_shape_product(&[usize::MAX, 2]), None);
+    }
+
+    // The hardening tests below never mutate the process environment: tests
+    // run in parallel threads, and an `AXIOM_*` value set here would leak into
+    // unrelated tests running at the same time.
+
+    #[test]
+    fn clamp_max_tokens_respects_default_and_configured_ceiling() {
+        assert_eq!(clamp_max_tokens_with(8, None), 8);
+        assert_eq!(clamp_max_tokens_with(usize::MAX, None), MAX_GENERATION_TOKENS);
+        assert_eq!(
+            clamp_max_tokens_with(1_000_000_000_000, None),
+            MAX_GENERATION_TOKENS
+        );
+        assert_eq!(clamp_max_tokens_with(1000, Some("64")), 64);
+        assert_eq!(clamp_max_tokens_with(10, Some("64")), 10);
+        // Nonsense values fall back to the default rather than disabling the cap.
+        assert_eq!(
+            clamp_max_tokens_with(usize::MAX, Some("0")),
+            MAX_GENERATION_TOKENS
+        );
+        assert_eq!(
+            clamp_max_tokens_with(usize::MAX, Some("lots")),
+            MAX_GENERATION_TOKENS
+        );
+    }
+
+    #[test]
+    fn parse_positive_usize_falls_back_on_bad_input() {
+        assert_eq!(parse_positive_usize(None, 7), 7);
+        assert_eq!(parse_positive_usize(Some(""), 7), 7);
+        assert_eq!(parse_positive_usize(Some("0"), 7), 7);
+        assert_eq!(parse_positive_usize(Some("-3"), 7), 7);
+        assert_eq!(parse_positive_usize(Some(" 12 "), 7), 12);
+    }
+
+    #[test]
+    fn confine_merge_path_keeps_inputs_and_outputs_inside_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let inside = root.path().join("cache.bin");
+        std::fs::write(&inside, b"x").unwrap();
+        let outside = other.path().join("cache.bin");
+        std::fs::write(&outside, b"x").unwrap();
+        let roots = vec![root.path().canonicalize().unwrap()];
+
+        // Existing input under the root: accepted, canonicalized.
+        let ok = confine_merge_path(&inside, &roots, true).unwrap();
+        assert!(ok.starts_with(&roots[0]));
+        // Existing input outside every root: refused, and the message names
+        // the override so an operator knows how to allow it deliberately.
+        let err = confine_merge_path(&outside, &roots, true).unwrap_err();
+        assert!(err.contains("outside the merge roots"), "{err}");
+        assert!(err.contains("AXIOM_MERGE_ROOT"), "{err}");
+        // Missing input: refused (not silently accepted as a future file).
+        assert!(confine_merge_path(&root.path().join("nope.bin"), &roots, true).is_err());
+
+        // Output that does not exist yet, under the root, nested in a
+        // directory that does not exist yet either: accepted.
+        let out = confine_merge_path(&root.path().join("new/dir/merged.bin"), &roots, false).unwrap();
+        assert!(out.starts_with(&roots[0]), "{}", out.display());
+        assert!(out.ends_with("new/dir/merged.bin"), "{}", out.display());
+        // Output outside the root: refused.
+        assert!(confine_merge_path(&other.path().join("merged.bin"), &roots, false).is_err());
+        // `..` is refused outright even when it would resolve back inside.
+        let dotdot = root.path().join("sub/../cache.bin");
+        let err = confine_merge_path(&dotdot, &roots, true).unwrap_err();
+        assert!(err.contains(".."), "{err}");
+        let dotdot_out = root.path().join("../escape.bin");
+        assert!(confine_merge_path(&dotdot_out, &roots, false).is_err());
+        // Empty path is an error, not the current directory.
+        assert!(confine_merge_path(FsPath::new(""), &roots, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn cluster_merge_refuses_paths_outside_merge_roots() {
+        // Default roots are the test's cwd (the crate dir) and ~/.axiom; a
+        // fresh temp dir is under neither, so both paths must be refused.
+        let root = tempfile::tempdir().unwrap();
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let outside_in = tempfile::NamedTempFile::new().unwrap();
+        let body = serde_json::json!({
+            "inputs": [outside_in.path()],
+            "output": root.path().join("merged.bin"),
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/cluster/merge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("outside the merge roots"), "{text}");
+        assert!(!root.path().join("merged.bin").exists());
+        safe_drop(pipeline_arc).await;
+    }
+
+    async fn mcp_status(app: Router, headers: &[(&str, &str)]) -> StatusCode {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        app.oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn mcp_requires_data_plane_key_when_no_mcp_token_is_set() {
+        // /mcp is outside the require_api_key layer (so AXIOM_MCP_TOKEN can
+        // guard it alone), but with only AXIOM_API_KEY configured it must not
+        // be more open than the data plane it reaches.
+        let state = make_test_state().await.with_api_key(Some("k3y".into()));
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        assert_eq!(mcp_status(app.clone(), &[]).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            mcp_status(app.clone(), &[("x-axiom-key", "wrong")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // The data-plane key is accepted in either header form; auth passing
+        // is proven by any non-401 (the MCP transport itself is off → 503).
+        assert_ne!(
+            mcp_status(app.clone(), &[("x-axiom-key", "k3y")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_ne!(
+            mcp_status(app, &[("authorization", "Bearer k3y")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_token_takes_precedence_over_data_plane_key() {
+        let state = make_test_state()
+            .await
+            .with_api_key(Some("k3y".into()))
+            .with_mcp_token(Some("mcp-t0k".into()));
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        // The data-plane key alone is not enough once a dedicated MCP token exists.
+        assert_eq!(
+            mcp_status(app.clone(), &[("x-axiom-key", "k3y")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            mcp_status(app.clone(), &[("authorization", "Bearer k3y")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_ne!(
+            mcp_status(app, &[("authorization", "Bearer mcp-t0k")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_stays_open_when_nothing_is_configured() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        assert_ne!(mcp_status(app, &[]).await, StatusCode::UNAUTHORIZED);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn session_creation_is_capped() {
+        let state = make_test_state().await.with_max_sessions(1);
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let post = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(post()).await.unwrap();
+        assert!(first.status().is_success(), "{}", first.status());
+        let second = app.oneshot(post()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("AXIOM_MAX_SESSIONS"), "{text}");
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_upload_with_overflowing_shape_is_rejected_not_panicking() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(create.into_body(), usize::MAX).await.unwrap();
+        let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let body = serde_json::json!({
+            "session_id": sid,
+            "version": 1,
+            "created_at": 0,
+            "layers": [{ "shape": [1u64 << 40, 1u64 << 40], "data": [0.0] }],
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/v1/sessions/{sid}/checkpoint"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error() || resp.status().is_server_error(),
+            "{}",
+            resp.status()
+        );
         safe_drop(pipeline_arc).await;
     }
 }

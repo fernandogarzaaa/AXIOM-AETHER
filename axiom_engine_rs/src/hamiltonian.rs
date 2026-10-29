@@ -23,14 +23,12 @@ pub struct HamiltonianFault {
     pub source: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QuantumRuntimeStatus {
     pub total_optimizations: u64,
     pub total_collapses: u64,
     pub last_state: QuantumManifoldTelemetry,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct QuantumPatchCandidate {

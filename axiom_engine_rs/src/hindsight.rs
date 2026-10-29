@@ -305,8 +305,14 @@ mod tests {
         }];
         let n = write_corpus(&examples, &dir).unwrap();
         assert_eq!(n, 1);
-        assert!(!dir.join("hindsight_999999.rs").exists(), "stale file must be pruned");
-        assert!(dir.join("keep.txt").exists(), "non-generated files must be left alone");
+        assert!(
+            !dir.join("hindsight_999999.rs").exists(),
+            "stale file must be pruned"
+        );
+        assert!(
+            dir.join("keep.txt").exists(),
+            "non-generated files must be left alone"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -356,7 +362,10 @@ mod tests {
         assert_eq!(report.examples, 2);
         assert!(report.corpus_files >= 2);
         let loss = report.final_loss.expect("should have trained");
-        assert!(loss.is_finite() && loss >= 0.0, "loss must be finite (got {loss})");
+        assert!(
+            loss.is_finite() && loss >= 0.0,
+            "loss must be finite (got {loss})"
+        );
         assert!(Path::new(&ckpt).exists(), "checkpoint must be written");
         let _ = std::fs::remove_dir_all(&dir);
     }

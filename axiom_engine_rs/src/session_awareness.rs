@@ -243,8 +243,7 @@ impl AwarenessState {
             digest_blocks: self.digest_blocks.load(Ordering::Relaxed) as u64,
             digest_bytes_in: self.digest_bytes_in.load(Ordering::Relaxed) as u64,
             digest_bytes_out: self.digest_bytes_out.load(Ordering::Relaxed) as u64,
-            quota_units_total: self.quota_units_micros.load(Ordering::Relaxed) as f64
-                / 1_000_000.0,
+            quota_units_total: self.quota_units_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             local_answered_turns: self.local_answered_turns.load(Ordering::Relaxed) as u64,
             routed_turns: self.routed_turns.load(Ordering::Relaxed) as u64,
             route_fallbacks: self.route_fallbacks.load(Ordering::Relaxed) as u64,
@@ -272,8 +271,7 @@ impl AwarenessState {
     /// value from `cost_ledger::quota_units` for this turn.
     pub fn record_turn_quota(&self, units: f64) {
         let micros = (units.max(0.0) * 1_000_000.0).round() as usize;
-        self.quota_units_micros
-            .fetch_add(micros, Ordering::Relaxed);
+        self.quota_units_micros.fetch_add(micros, Ordering::Relaxed);
     }
 
     /// Record one turn answered locally by the L-B short-circuit (P3/PSS) --
@@ -316,8 +314,7 @@ impl AwarenessState {
     /// Token target for the compressor: 60 % of remaining budget, minimum 512.
     /// Returns `None` when no budget has been set.
     pub fn compression_target_tokens(&self) -> Option<usize> {
-        self.budget()
-            .map(|b| ((b as f64 * 0.6) as usize).max(512))
+        self.budget().map(|b| ((b as f64 * 0.6) as usize).max(512))
     }
 
     /// Running compression ratio (bytes_out / bytes_in), or `None` if no data yet.
@@ -326,10 +323,7 @@ impl AwarenessState {
         if bytes_in == 0 {
             None
         } else {
-            Some(
-                self.bytes_compressed_out.load(Ordering::Relaxed) as f32
-                    / bytes_in as f32,
-            )
+            Some(self.bytes_compressed_out.load(Ordering::Relaxed) as f32 / bytes_in as f32)
         }
     }
 
@@ -346,9 +340,7 @@ impl AwarenessState {
         let expansions = self.expansion_calls.load(Ordering::Relaxed);
         let mut msgs = Vec::new();
         if budget < 20_000 {
-            msgs.push(
-                "Budget < 20 k — Axiom is in compact-response mode.".to_string(),
-            );
+            msgs.push("Budget < 20 k — Axiom is in compact-response mode.".to_string());
         } else if budget < 50_000 {
             msgs.push(format!(
                 "Budget at {} k remaining ({pct}% spent on Axiom responses).                  Consider pre-compressing large paths.",

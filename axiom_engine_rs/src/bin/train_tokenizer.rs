@@ -57,7 +57,11 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| repo.join("checkpoints/corpus").to_string_lossy().into());
     let mut files = Vec::new();
     if std::path::Path::new(&corpus_dir).exists() {
-        for e in std::fs::read_dir(&corpus_dir).into_iter().flatten().flatten() {
+        for e in std::fs::read_dir(&corpus_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("txt") {
                 files.push(p.to_string_lossy().to_string());
@@ -68,7 +72,10 @@ fn main() -> Result<()> {
         collect_rs(&repo.join("axiom_engine_rs/src"), &mut files);
         collect_rs(&repo.join("tests"), &mut files);
     }
-    eprintln!("[bpe] corpus: {} file(s); target vocab={vocab}", files.len());
+    eprintln!(
+        "[bpe] corpus: {} file(s); target vocab={vocab}",
+        files.len()
+    );
     if files.is_empty() {
         return Err("no .rs corpus files found".into());
     }

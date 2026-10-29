@@ -92,12 +92,15 @@ pub mod bert_backend {
             // fully into memory first, which matters more as models get
             // bigger. Requires the file not be mutated while mapped, which
             // holds here: it's a read-only Hub-cache download.
-            let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device)?
-            };
+            let vb =
+                unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device)? };
             let model = BertModel::load(vb, &config)?;
 
-            Ok(Self { model, tokenizer, device })
+            Ok(Self {
+                model,
+                tokenizer,
+                device,
+            })
         }
 
         /// Convenience: try CUDA device 0 first (only when the `cuda`

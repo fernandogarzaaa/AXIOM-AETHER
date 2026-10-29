@@ -14,34 +14,57 @@ use candle_nn::{Optimizer, VarBuilder, VarMap};
 use tokenizers::Tokenizer;
 
 fn main() {
-    std::thread::Builder::new().stack_size(512 * 1024 * 1024).spawn(run).unwrap().join().unwrap();
+    std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(run)
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 fn run() {
-    let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+    let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let tok = Tokenizer::from_file(repo.join("checkpoints/axiom_bpe.json")).expect("tokenizer");
     let vocab = tok.get_vocab_size(true);
     let device = Device::Cpu;
 
     // Mine pairs from this repo's source + docs.
     let mut pairs: Vec<Pair> = Vec::new();
-    for entry in std::fs::read_dir(repo.join("axiom_engine_rs/src")).unwrap().flatten() {
+    for entry in std::fs::read_dir(repo.join("axiom_engine_rs/src"))
+        .unwrap()
+        .flatten()
+    {
         if let Ok(t) = std::fs::read_to_string(entry.path()) {
             pairs.extend(mine_doc_body(&t, 25));
         }
     }
-    for entry in std::fs::read_dir(repo.join("axiom_engine_rs/src/bin")).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(repo.join("axiom_engine_rs/src/bin"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         if let Ok(t) = std::fs::read_to_string(entry.path()) {
             pairs.extend(mine_doc_body(&t, 25));
         }
     }
-    for entry in std::fs::read_dir(repo.join("docs/superpowers/specs")).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(repo.join("docs/superpowers/specs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         if let Ok(t) = std::fs::read_to_string(entry.path()) {
             pairs.extend(mine_markdown(&t, 40));
         }
     }
     eprintln!("[smoke] mined {} pairs", pairs.len());
-    assert!(pairs.len() >= 16, "need >=16 pairs to train; got {}", pairs.len());
+    assert!(
+        pairs.len() >= 16,
+        "need >=16 pairs to train; got {}",
+        pairs.len()
+    );
 
     // CRITICAL: shuffle so a batch spans many source files. Mined pairs are in
     // file order; without this, every in-batch negative is near-identical to the
@@ -69,12 +92,18 @@ fn run() {
     let enc = BiEncoder::new(vb, cfg.clone()).unwrap();
 
     let encode = |text: &str| -> Tensor {
-        let ids = tok.encode(text, false).map(|e| e.get_ids().to_vec()).unwrap_or_default();
+        let ids = tok
+            .encode(text, false)
+            .map(|e| e.get_ids().to_vec())
+            .unwrap_or_default();
         let t = enc.ids_tensor(&ids, &device).unwrap();
         enc.encode(&t).unwrap()
     };
     let stack = |texts: &[String]| -> Tensor {
-        let rows: Vec<Tensor> = texts.iter().map(|s| encode(s).unsqueeze(0).unwrap()).collect();
+        let rows: Vec<Tensor> = texts
+            .iter()
+            .map(|s| encode(s).unsqueeze(0).unwrap())
+            .collect();
         Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0).unwrap()
     };
 
@@ -93,8 +122,14 @@ fn run() {
         let probe: Vec<&Pair> = train.iter().take(8).collect();
         let a: Vec<String> = probe.iter().map(|p| p.anchor.clone()).collect();
         let p: Vec<String> = probe.iter().map(|p| p.positive.clone()).collect();
-        let mut probe_opt =
-            AdamW::new(varmap.all_vars(), ParamsAdamW { lr: 1e-3, ..Default::default() }).unwrap();
+        let mut probe_opt = AdamW::new(
+            varmap.all_vars(),
+            ParamsAdamW {
+                lr: 1e-3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         eprintln!("[probe] overfitting one fixed 8-pair batch (loss should fall toward 0):");
         let vars = varmap.all_vars();
         eprintln!("[probe] n_vars={}", vars.len());
@@ -108,14 +143,27 @@ fn run() {
                 for v in &vars {
                     if let Some(gr) = g.get(v.as_tensor()) {
                         with_grad += 1;
-                        total += gr.sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap() as f64;
+                        total += gr
+                            .sqr()
+                            .unwrap()
+                            .sum_all()
+                            .unwrap()
+                            .to_scalar::<f32>()
+                            .unwrap() as f64;
                     }
                 }
-                eprintln!("[probe] vars_with_grad={with_grad}/{} grad_norm={:.6}", vars.len(), total.sqrt());
+                eprintln!(
+                    "[probe] vars_with_grad={with_grad}/{} grad_norm={:.6}",
+                    vars.len(),
+                    total.sqrt()
+                );
             }
             probe_opt.step(&g).unwrap();
             if s % 40 == 0 {
-                eprintln!("[probe]   step {s} loss={:.4}", loss.to_scalar::<f32>().unwrap());
+                eprintln!(
+                    "[probe]   step {s} loss={:.4}",
+                    loss.to_scalar::<f32>().unwrap()
+                );
             }
         }
         let final_r = batch_recall_at_1(&stack(&a), &stack(&p)).unwrap();
@@ -124,9 +172,22 @@ fn run() {
 
     let lr = 3e-4f64;
     let warmup = 100usize;
-    let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW { lr, ..Default::default() }).unwrap();
-    let bs: usize = std::env::var("SMOKE_BS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-    let steps: usize = std::env::var("SMOKE_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let mut opt = AdamW::new(
+        varmap.all_vars(),
+        ParamsAdamW {
+            lr,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let bs: usize = std::env::var("SMOKE_BS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let steps: usize = std::env::var("SMOKE_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
     for step in 0..steps {
         // linear LR warmup
         if step < warmup {
@@ -157,7 +218,14 @@ fn run() {
     let trained = batch_recall_at_1(&stack(&va), &stack(&vp)).unwrap();
     let av = stack(&va);
     let avv: Vec<Vec<f32>> = (0..va.len())
-        .map(|i| av.narrow(0, i, 1).unwrap().flatten_all().unwrap().to_vec1().unwrap())
+        .map(|i| {
+            av.narrow(0, i, 1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        })
         .collect();
     let mut s = 0.0f32;
     let mut n = 0usize;

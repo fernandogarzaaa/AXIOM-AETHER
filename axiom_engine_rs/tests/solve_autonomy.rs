@@ -26,7 +26,11 @@ fn unique_tmp(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("axiom_solve_{tag}_{n}"))
 }
 
-fn run_solve(cmd: String, args: Vec<String>, opts: SolveOptions) -> axiom_engine::solve::SolveReport {
+fn run_solve(
+    cmd: String,
+    args: Vec<String>,
+    opts: SolveOptions,
+) -> axiom_engine::solve::SolveReport {
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || solve(&tiny_pipeline(), &cmd, &args, &opts).unwrap())
@@ -59,7 +63,10 @@ fn solve_via_environment_heal_only() {
     );
     assert!(report.solved);
     assert_eq!(report.rounds, 1, "first round's env heal should suffice");
-    assert!(report.env_heals.iter().any(|h| h.contains("created directory")));
+    assert!(report
+        .env_heals
+        .iter()
+        .any(|h| h.contains("created directory")));
     assert!(!report.source_patched);
     assert!(target.exists());
 
@@ -115,7 +122,10 @@ fn solve_auto_localizes_source_from_trace_without_source_path() {
             ..SolveOptions::default()
         },
     );
-    assert!(report.solved, "auto-localized source repair should solve it");
+    assert!(
+        report.solved,
+        "auto-localized source repair should solve it"
+    );
     assert!(report.source_patched, "the localized file was patched");
     assert!(
         std::fs::read_to_string(&prog).unwrap().contains("exit 0"),
@@ -135,8 +145,16 @@ fn solve_tries_multiple_localized_candidates_until_one_repairs() {
     std::fs::create_dir_all(&base).unwrap();
     let first = base.join("first.sh");
     let second = base.join("second.sh");
-    std::fs::write(&first, "#!/bin/sh\necho 'first.sh:1:1: just a warning'\nexit 0\n").unwrap();
-    std::fs::write(&second, "#!/bin/sh\necho 'second.sh:2:1: boom' >&2\nexit 1\n").unwrap();
+    std::fs::write(
+        &first,
+        "#!/bin/sh\necho 'first.sh:1:1: just a warning'\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &second,
+        "#!/bin/sh\necho 'second.sh:2:1: boom' >&2\nexit 1\n",
+    )
+    .unwrap();
 
     let report = run_solve(
         "sh".into(),

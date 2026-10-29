@@ -74,7 +74,10 @@ impl InferencePipeline {
         // adds `w_alpha` weights, so the architecture must match the checkpoint
         // to load. Missing/old sidecar → learned_gate=false → parameter-identical
         // to the original model, so existing checkpoints load unchanged.
-        let meta = ModelMeta::load(checkpoint);
+        // A sidecar from a *newer* engine is refused outright: falling back to
+        // defaults would build a model whose shape silently disagrees with the
+        // weights on disk.
+        let meta = ModelMeta::load_checked(checkpoint).map_err(candle_core::Error::Msg)?;
         let learned_gate = meta.as_ref().map(|m| m.learned_gate).unwrap_or(false);
 
         let varmap = VarMap::new();
@@ -100,14 +103,10 @@ impl InferencePipeline {
             // (zeros, lr schedule, surprise gate, …) for tensors the checkpoint
             // predates. Older checkpoints (pre-fast_bias, pre-w_lr, …) load
             // instead of hard-failing on `cannot find tensor`.
-            let file_bytes =
-                std::fs::read(checkpoint).map_err(|e| {
-                    candle_core::Error::Msg(format!(
-                        "cannot read checkpoint {checkpoint}: {e}"
-                    ))
-                })?;
-            let file_tensors =
-                candle_core::safetensors::load_buffer(&file_bytes, &device)?;
+            let file_bytes = std::fs::read(checkpoint).map_err(|e| {
+                candle_core::Error::Msg(format!("cannot read checkpoint {checkpoint}: {e}"))
+            })?;
+            let file_tensors = candle_core::safetensors::load_buffer(&file_bytes, &device)?;
             let mut tensor_data = varmap.data().lock().unwrap();
             let mut skipped: Vec<String> = Vec::new();
             for (name, var) in tensor_data.iter_mut() {
@@ -267,17 +266,23 @@ impl InferencePipeline {
         if !prompt_ids.is_empty() {
             let prompt_tensor =
                 Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &self.device)?;
-            let _ = self.model.forward_lm(&prompt_tensor, &mut states[..], false, 0)?;
+            let _ = self
+                .model
+                .forward_lm(&prompt_tensor, &mut states[..], false, 0)?;
         }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
-        let mut generated = Vec::with_capacity(max_new_tokens);
+        // Never pre-size from a caller-supplied count: the server clamps
+        // `max_tokens`, but library callers may not.
+        let mut generated = Vec::with_capacity(max_new_tokens.min(4096));
 
         for _ in 0..max_new_tokens {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             // Snapshot states so a non-finite update can be discarded.
             let states_snapshot = states.clone();
-            let logits = self.model.forward_lm(&token_tensor, &mut states[..], false, 0)?;
+            let logits = self
+                .model
+                .forward_lm(&token_tensor, &mut states[..], false, 0)?;
             if !session_states_are_finite(&states)? {
                 eprintln!(
                     "[emergency] non-finite state detected during generate_with_session; \
@@ -463,16 +468,22 @@ impl InferencePipeline {
         if !prompt_ids.is_empty() {
             let prompt_tensor =
                 Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &self.device)?;
-            let _ = self.model.forward_lm(&prompt_tensor, &mut states[..], false, 0)?;
+            let _ = self
+                .model
+                .forward_lm(&prompt_tensor, &mut states[..], false, 0)?;
         }
 
         let mut last_token = *prompt_ids.last().unwrap_or(&0);
-        let mut generated = Vec::with_capacity(max_new_tokens);
+        // Never pre-size from a caller-supplied count: the server clamps
+        // `max_tokens`, but library callers may not.
+        let mut generated = Vec::with_capacity(max_new_tokens.min(4096));
 
         for _ in 0..max_new_tokens {
             let token_tensor = Tensor::from_vec(vec![last_token], (1, 1), &self.device)?;
             let states_snapshot = states.clone();
-            let logits = self.model.forward_lm(&token_tensor, &mut states[..], false, 0)?;
+            let logits = self
+                .model
+                .forward_lm(&token_tensor, &mut states[..], false, 0)?;
             if !session_states_are_finite(&states)? {
                 eprintln!(
                     "[emergency] non-finite state detected during generate_with_memory; \

@@ -166,11 +166,7 @@ impl TrajectorySampler {
             .iter()
             .map(|b| b.state_vector.clone())
             .collect();
-        let labels: Vec<String> = result
-            .branches
-            .iter()
-            .map(|b| b.label.clone())
-            .collect();
+        let labels: Vec<String> = result.branches.iter().map(|b| b.label.clone()).collect();
 
         // Build edges based on cosine similarity
         let mut edges = Vec::new();
@@ -231,11 +227,15 @@ impl TrajectorySampler {
         novelty.clamp(0.0, 1.0)
     }
 
-    fn compute_coherence(state: &[f32], milestones: &[crate::state_predictor::SemanticMilestone]) -> f32 {
+    fn compute_coherence(
+        state: &[f32],
+        milestones: &[crate::state_predictor::SemanticMilestone],
+    ) -> f32 {
         if milestones.is_empty() || state.is_empty() {
             return 0.5;
         }
-        let avg_conf: f32 = milestones.iter().map(|m| m.confidence.mean()).sum::<f32>() / milestones.len() as f32;
+        let avg_conf: f32 =
+            milestones.iter().map(|m| m.confidence.mean()).sum::<f32>() / milestones.len() as f32;
         let norm: f32 = state.iter().map(|v| v * v).sum::<f32>().sqrt();
         (avg_conf * 0.7 + (norm / 10.0).min(1.0) * 0.3).clamp(0.0, 1.0)
     }
@@ -244,7 +244,10 @@ impl TrajectorySampler {
         if milestones.is_empty() {
             return 0.5;
         }
-        let avg_budget: f32 = milestones.iter().map(|m| m.token_budget as f32).sum::<f32>()
+        let avg_budget: f32 = milestones
+            .iter()
+            .map(|m| m.token_budget as f32)
+            .sum::<f32>()
             / milestones.len() as f32
             / 4096.0;
         avg_budget.clamp(0.0, 1.0)
@@ -308,8 +311,8 @@ pub fn render_trajectory_result(result: &TrajectorySampleResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state_predictor::{SemanticStateMap, SemanticMilestone};
     use crate::belief::BetaBelief;
+    use crate::state_predictor::{SemanticMilestone, SemanticStateMap};
 
     fn make_state_map() -> SemanticStateMap {
         let milestones = vec![
@@ -381,11 +384,10 @@ mod tests {
         let sampler = TrajectorySampler::default_config();
         let map = make_state_map();
         let result = sampler.sample(&map);
-        let best = result.branches.iter().max_by(|a, b| {
-            a.composite_score
-                .partial_cmp(&b.composite_score)
-                .unwrap()
-        });
+        let best = result
+            .branches
+            .iter()
+            .max_by(|a, b| a.composite_score.partial_cmp(&b.composite_score).unwrap());
         assert!(best.is_some(), "should have a best branch");
     }
 
@@ -397,8 +399,15 @@ mod tests {
         let before: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();
         sampler.evolve_branches(&mut result, 0.5);
         let after: Vec<f32> = result.branches.iter().map(|b| b.composite_score).collect();
-        assert_eq!(before.len(), after.len(), "evolve should not change branch count");
-        let changed = before.iter().zip(after.iter()).any(|(a, b)| (a - b).abs() > 1e-6);
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "evolve should not change branch count"
+        );
+        let changed = before
+            .iter()
+            .zip(after.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
         assert!(changed, "evolution should change scores");
     }
 
@@ -408,8 +417,14 @@ mod tests {
         let map = make_state_map();
         let result = sampler.sample(&map);
         let rendered = render_trajectory_result(&result);
-        assert!(rendered.contains("Trajectory Sample"), "render should contain title");
-        assert!(rendered.contains("session: test"), "render should contain session id");
+        assert!(
+            rendered.contains("Trajectory Sample"),
+            "render should contain title"
+        );
+        assert!(
+            rendered.contains("session: test"),
+            "render should contain session id"
+        );
     }
 
     #[test]
@@ -417,7 +432,10 @@ mod tests {
         let sampler = TrajectorySampler::default_config();
         let map = SemanticStateMap::default();
         let result = sampler.sample(&map);
-        assert!(result.total_explored > 0, "should explore even with empty map");
+        assert!(
+            result.total_explored > 0,
+            "should explore even with empty map"
+        );
     }
 
     #[test]
@@ -425,7 +443,10 @@ mod tests {
         let sampler = TrajectorySampler::new(8, 0.001);
         let map = make_state_map();
         let (result, manifold) = sampler.sample_with_manifold(&map, "test context");
-        assert!(!manifold.nodes.is_empty(), "manifold should be created from non-pruned branches");
+        assert!(
+            !manifold.nodes.is_empty(),
+            "manifold should be created from non-pruned branches"
+        );
         assert_eq!(
             manifold.nodes.len(),
             result.branches.len(),

@@ -1239,7 +1239,10 @@ mod tests {
     #[test]
     fn tecp_nonconformity_high_support_low_entropy_is_conforming() {
         let s = tecp_nonconformity_with_support(1.0, &[-0.01, -0.02]);
-        assert!(s < 0.1, "perfect support + confident tokens should conform, got {s}");
+        assert!(
+            s < 0.1,
+            "perfect support + confident tokens should conform, got {s}"
+        );
     }
 
     #[test]

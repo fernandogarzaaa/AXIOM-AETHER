@@ -143,15 +143,20 @@ async fn post_chimera_run(State(state): State<AppState>, body: String) -> axum::
     }
 }
 
-/// Check the `Authorization: Bearer <token>` header against the configured
-/// `AXIOM_MCP_TOKEN`. Returns `None` when access is allowed (no token configured,
-/// or the presented token matches) and `Some(401 response)` when it must be
-/// rejected. The token is a pre-shared secret carried over TLS, so a plain
-/// equality check (not constant-time) is acceptable here.
+/// Guard for the remote MCP transport. Returns `None` when access is allowed
+/// and `Some(401 response)` when it must be rejected:
+///
+/// * `AXIOM_MCP_TOKEN` set → `Authorization: Bearer <token>` must match.
+/// * otherwise, `AXIOM_API_KEY` set → the data-plane key must be presented,
+///   as `X-Axiom-Key: <key>` or `Authorization: Bearer <key>`. `/mcp` sits
+///   outside the `require_api_key` layer (so a dedicated MCP token can guard
+///   it), but it reaches the same tools (`axiom_compress_path` reads local
+///   files, the task board and memory store write), so it must never be more
+///   open than the data plane on a server that configured a key.
+/// * neither set → open, the local-first default.
 fn mcp_unauthorized(state: &AppState, headers: &axum::http::HeaderMap) -> Option<Response> {
     use axum::response::IntoResponse;
-    let expected = state.mcp_token.as_ref().as_ref()?; // None ⇒ open access
-    let presented = headers
+    let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
@@ -159,14 +164,29 @@ fn mcp_unauthorized(state: &AppState, headers: &axum::http::HeaderMap) -> Option
                 .or_else(|| v.strip_prefix("bearer "))
         })
         .map(str::trim);
-    if presented == Some(expected.as_str()) {
+    let allowed = match (
+        state.mcp_token.as_ref().as_ref(),
+        state.api_key.as_ref().as_ref(),
+    ) {
+        (Some(token), _) => bearer.is_some_and(|p| constant_time_eq(p, token)),
+        (None, Some(key)) => {
+            let x_key = headers
+                .get("x-axiom-key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim);
+            x_key.is_some_and(|p| constant_time_eq(p, key))
+                || bearer.is_some_and(|p| constant_time_eq(p, key))
+        }
+        (None, None) => true,
+    };
+    if allowed {
         None
     } else {
         Some(
             (
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
-                    "error": "missing or invalid bearer token for /mcp (set Authorization: Bearer <AXIOM_MCP_TOKEN>)"
+                    "error": "missing or invalid credentials for /mcp (Authorization: Bearer <AXIOM_MCP_TOKEN>, or the AXIOM_API_KEY via X-Axiom-Key when no MCP token is configured)"
                 })),
             )
                 .into_response(),

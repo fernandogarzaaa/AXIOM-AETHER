@@ -438,9 +438,15 @@ mod tests {
 
     #[test]
     fn auto_mode_routes_only_high_tier_mechanical_turns() {
-        assert_eq!(route("claude-opus-4-8", true, 0, "auto"), Some("claude-haiku-4-5"));
+        assert_eq!(
+            route("claude-opus-4-8", true, 0, "auto"),
+            Some("claude-haiku-4-5")
+        );
         assert_eq!(route("claude-sonnet-5", true, 0, "auto"), None);
-        assert_eq!(route("claude-fable-5", true, 0, "auto"), Some("claude-haiku-4-5"));
+        assert_eq!(
+            route("claude-fable-5", true, 0, "auto"),
+            Some("claude-haiku-4-5")
+        );
         assert_eq!(route("claude-opus-4-8", false, 0, "auto"), None); // hard turn
         assert_eq!(route("claude-opus-4-8", true, 2, "auto"), None); // cooldown
         assert_eq!(route("claude-haiku-4-5", true, 0, "auto"), None); // never touch haiku
@@ -448,7 +454,10 @@ mod tests {
 
     #[test]
     fn on_mode_routes_any_claude_but_never_non_claude() {
-        assert_eq!(route("claude-sonnet-5", true, 0, "on"), Some("claude-haiku-4-5"));
+        assert_eq!(
+            route("claude-sonnet-5", true, 0, "on"),
+            Some("claude-haiku-4-5")
+        );
         assert_eq!(route("openai-fable-5", true, 0, "on"), None);
         assert_eq!(route("gpt-5", true, 0, "on"), None);
     }
@@ -465,7 +474,10 @@ mod tests {
         assert!(is_high_tier("claude-fable-5"));
         assert!(!is_high_tier("claude-sonnet-5"));
         assert!(!is_high_tier("claude-haiku-4-5"));
-        assert!(!is_high_tier("openai-fable-5"), "non-Claude fable is not high-tier");
+        assert!(
+            !is_high_tier("openai-fable-5"),
+            "non-Claude fable is not high-tier"
+        );
     }
 
     #[test]
@@ -482,22 +494,37 @@ mod tests {
 
     #[test]
     fn case_a_mechanical_selects_haiku() {
-        let d = select_model("claude-opus-4-8", &declared(Capability::Mechanical), CAPABILITY);
+        let d = select_model(
+            "claude-opus-4-8",
+            &declared(Capability::Mechanical),
+            CAPABILITY,
+        );
         assert_eq!(d.selected_model, "claude-haiku-4-5");
         assert_eq!(d.reason, RoutingReason::CapabilityMatched);
-        assert!(!d.economic_downgrade, "a capability match is not a cost move");
+        assert!(
+            !d.economic_downgrade,
+            "a capability match is not a cost move"
+        );
     }
 
     #[test]
     fn case_b_general_selects_sonnet() {
-        let d = select_model("claude-haiku-4-5", &declared(Capability::General), CAPABILITY);
+        let d = select_model(
+            "claude-haiku-4-5",
+            &declared(Capability::General),
+            CAPABILITY,
+        );
         assert_eq!(d.selected_model, "claude-sonnet-5");
         assert_eq!(d.reason, RoutingReason::CapabilityMatched);
     }
 
     #[test]
     fn case_c_reasoning_selects_opus() {
-        let d = select_model("claude-haiku-4-5", &declared(Capability::Reasoning), CAPABILITY);
+        let d = select_model(
+            "claude-haiku-4-5",
+            &declared(Capability::Reasoning),
+            CAPABILITY,
+        );
         assert_eq!(d.selected_model, "claude-opus-4-8");
     }
 
@@ -514,7 +541,10 @@ mod tests {
 
     #[test]
     fn reasoning_and_high_risk_share_a_tier_but_remain_distinct_values() {
-        assert_eq!(Capability::Reasoning.tier(), Capability::HighRiskReasoning.tier());
+        assert_eq!(
+            Capability::Reasoning.tier(),
+            Capability::HighRiskReasoning.tier()
+        );
         assert_ne!(Capability::Reasoning, Capability::HighRiskReasoning);
         assert!(Capability::HighRiskReasoning > Capability::Reasoning);
     }
@@ -568,8 +598,11 @@ mod tests {
         assert_eq!(economic.reason, RoutingReason::AlreadyCheapestTier);
         assert_eq!(economic.capability, None);
 
-        let declared_match =
-            select_model("claude-haiku-4-5", &declared(Capability::Mechanical), CAPABILITY);
+        let declared_match = select_model(
+            "claude-haiku-4-5",
+            &declared(Capability::Mechanical),
+            CAPABILITY,
+        );
         assert_eq!(declared_match.reason, RoutingReason::CapabilitySatisfied);
         assert_ne!(economic.reason, declared_match.reason);
     }
@@ -579,13 +612,20 @@ mod tests {
         // `original_model` is client-controlled and the line goes to stderr, so
         // a newline must not be able to fabricate a second log record.
         let signals = mechanical_turn();
-        let d = select_model("claude-opus-4-8\n[axiom-routing] forged=true", &signals, AUTO);
+        let d = select_model(
+            "claude-opus-4-8\n[axiom-routing] forged=true",
+            &signals,
+            AUTO,
+        );
         let line = d.telemetry_line();
         assert!(
             !line.contains('\n'),
             "a newline in a model id must not break the line framing: {line:?}"
         );
-        assert!(line.contains("\\n"), "the newline should be escaped, not dropped");
+        assert!(
+            line.contains("\\n"),
+            "the newline should be escaped, not dropped"
+        );
     }
 
     #[test]
@@ -605,8 +645,11 @@ mod tests {
         assert_eq!(cost_move.reason, RoutingReason::MechanicalDowngrade);
         assert_eq!(cost_move.capability, None);
 
-        let capability_move =
-            select_model("claude-haiku-4-5", &declared(Capability::Reasoning), CAPABILITY);
+        let capability_move = select_model(
+            "claude-haiku-4-5",
+            &declared(Capability::Reasoning),
+            CAPABILITY,
+        );
         assert!(
             !capability_move.economic_downgrade,
             "a capability selection must never be flagged as a cost move"
@@ -636,7 +679,10 @@ mod tests {
 
     #[test]
     fn capability_parses_declared_labels_and_rejects_unknown_ones() {
-        assert_eq!(Capability::parse("mechanical"), Some(Capability::Mechanical));
+        assert_eq!(
+            Capability::parse("mechanical"),
+            Some(Capability::Mechanical)
+        );
         assert_eq!(Capability::parse("General"), Some(Capability::General));
         assert_eq!(Capability::parse("reasoning"), Some(Capability::Reasoning));
         assert_eq!(
@@ -673,8 +719,14 @@ mod tests {
     #[test]
     fn task_kind_maps_to_capability_with_general_undeclared() {
         use crate::backend_router::TaskKind as T;
-        assert_eq!(capability_for_task(T::CodeRepair), Some(Capability::General));
-        assert_eq!(capability_for_task(T::Reasoning), Some(Capability::Reasoning));
+        assert_eq!(
+            capability_for_task(T::CodeRepair),
+            Some(Capability::General)
+        );
+        assert_eq!(
+            capability_for_task(T::Reasoning),
+            Some(Capability::Reasoning)
+        );
         assert_eq!(
             capability_for_task(T::General),
             None,

@@ -349,7 +349,7 @@ mod tests {
     use super::*;
 
     fn block(byte: char, len: usize) -> String {
-        let word: String = std::iter::repeat(byte).take(4).collect();
+        let word: String = std::iter::repeat_n(byte, 4).collect();
         let mut s = String::new();
         while s.len() < len {
             if !s.is_empty() {
@@ -432,7 +432,10 @@ mod tests {
         let (out, report) = fuzzy_diet(&text, &backend, 0.9);
 
         assert!(report.backend_active);
-        assert_eq!(report.blocks_marked, 1, "only the later near-duplicate should be marked");
+        assert_eq!(
+            report.blocks_marked, 1,
+            "only the later near-duplicate should be marked"
+        );
         assert!(out.contains(FUZZY_DEDUP_MARKER));
         assert!(out.contains(a.trim()), "first occurrence is kept in full");
         assert!(out.contains(c.trim()), "unrelated block is untouched");

@@ -79,7 +79,11 @@ async fn create_message(
             return ApiError::BadRequest(format!("invalid /v1/messages body: {e}")).into_response();
         }
     };
-    local_messages_path(state, req).map_or_else(|e| e.into_response(), |json| json.into_response())
+    // Local generation is synchronous; keep it off the async workers.
+    match spawn_blocking(move || local_messages_path(state, req)).await {
+        Ok(result) => result.map_or_else(|e| e.into_response(), |json| json.into_response()),
+        Err(e) => ApiError::Internal(format!("generation task join failed: {e}")).into_response(),
+    }
 }
 
 fn local_messages_path(

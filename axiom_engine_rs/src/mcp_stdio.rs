@@ -86,7 +86,8 @@ pub struct McpContext {
     /// with the number of distinct session_ids used, same as `awareness`.
     /// Experimental: only present with `--features experimental`.
     #[cfg(feature = "experimental")]
-    align_states: Arc<Mutex<std::collections::HashMap<String, crate::alignment_loop::AlignmentLoopState>>>,
+    align_states:
+        Arc<Mutex<std::collections::HashMap<String, crate::alignment_loop::AlignmentLoopState>>>,
 }
 
 /// Assemble an [`McpContext`] (pipeline + vibe + memory + embedder) from config,
@@ -178,15 +179,13 @@ pub async fn build_context(
         max_bytes,
         proxy_url: std::env::var("AXIOM_PROXY_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
-        task_board: Arc::new(
-            if std::env::var("AXIOM_TASK_DIR").is_ok() {
-                crate::task_board::TaskBoard::from_env()
-                    .map_err(|e| format!("AXIOM_TASK_DIR open failed: {e}"))?
-            } else {
-                crate::task_board::TaskBoard::open("checkpoints/tasks")
-                    .map_err(|e| format!("task board init failed: {e}"))?
-            }
-        ),
+        task_board: Arc::new(if std::env::var("AXIOM_TASK_DIR").is_ok() {
+            crate::task_board::TaskBoard::from_env()
+                .map_err(|e| format!("AXIOM_TASK_DIR open failed: {e}"))?
+        } else {
+            crate::task_board::TaskBoard::open("checkpoints/tasks")
+                .map_err(|e| format!("task board init failed: {e}"))?
+        }),
         awareness: Arc::new(AwarenessStore::new()),
         #[cfg(feature = "experimental")]
         align_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -621,13 +620,15 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
                 Ok(block) => {
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_compress_path", &block);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_compress_path", &block);
                     success_response(id, tool_text_result(&text, false))
                 }
                 Err(e) => {
                     eprintln!("[mcp] axiom_compress_path failed: {e}");
                     let msg = format!("compression failed: {e}");
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_compress_path", &msg);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_compress_path", &msg);
                     success_response(id, tool_text_result(&text, true))
                 }
             }
@@ -653,13 +654,19 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
                 Ok((report, is_drift)) => {
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_evaluate_drift", &report);
+                    let text = record_and_annotate(
+                        &awareness,
+                        &session_id,
+                        "axiom_evaluate_drift",
+                        &report,
+                    );
                     success_response(id, tool_text_result(&text, is_drift))
                 }
                 Err(e) => {
                     eprintln!("[mcp] axiom_evaluate_drift failed: {e}");
                     let msg = format!("evaluation failed: {e}");
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_evaluate_drift", &msg);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_evaluate_drift", &msg);
                     success_response(id, tool_text_result(&text, true))
                 }
             }
@@ -686,13 +693,23 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                     .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
                 Ok((text, is_err)) => {
-                    let text = record_and_annotate(&awareness, &awareness_session_id, "axiom_expand", &text);
+                    let text = record_and_annotate(
+                        &awareness,
+                        &awareness_session_id,
+                        "axiom_expand",
+                        &text,
+                    );
                     success_response(id, tool_text_result(&text, is_err))
                 }
                 Err(e) => {
                     eprintln!("[mcp] axiom_expand failed: {e}");
                     let msg = format!("expand failed: {e}");
-                    let text = record_and_annotate(&awareness, &awareness_session_id, "axiom_expand", &msg);
+                    let text = record_and_annotate(
+                        &awareness,
+                        &awareness_session_id,
+                        "axiom_expand",
+                        &msg,
+                    );
                     success_response(id, tool_text_result(&text, true))
                 }
             }
@@ -758,7 +775,8 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
                 Ok(report) => {
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_recall", &report);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_recall", &report);
                     success_response(id, tool_text_result(&text, false))
                 }
                 Err(e) => {
@@ -881,8 +899,9 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 Ok(evaluation) => {
                     let is_error = evaluation.report.decision
                         != crate::epistemic_drift::EpistemicDecision::Allow;
-                    let text = serde_json::to_string_pretty(&evaluation)
-                        .unwrap_or_else(|error| format!("evaluation serialization failed: {error}"));
+                    let text = serde_json::to_string_pretty(&evaluation).unwrap_or_else(|error| {
+                        format!("evaluation serialization failed: {error}")
+                    });
                     success_response(id, tool_text_result(&text, is_error))
                 }
                 Err(error) => success_response(id, tool_text_result(&error, true)),
@@ -899,9 +918,13 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .unwrap_or("default")
                 .to_string();
             let awareness = ctx.awareness.clone();
-            let outcome = tokio::task::spawn_blocking(move || match crate::heal_memory::HealMemory::default_path() {
-                Some(path) => crate::heal_memory::HealMemory::load(&path).report_text(query.as_deref()),
-                None => "Axiom heal memory is disabled (AXIOM_HEAL_MEMORY=0).".to_string(),
+            let outcome = tokio::task::spawn_blocking(move || {
+                match crate::heal_memory::HealMemory::default_path() {
+                    Some(path) => {
+                        crate::heal_memory::HealMemory::load(&path).report_text(query.as_deref())
+                    }
+                    None => "Axiom heal memory is disabled (AXIOM_HEAL_MEMORY=0).".to_string(),
+                }
             })
             .await
             .unwrap_or_else(|e| format!("worker join error: {e}"));
@@ -980,19 +1003,28 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             let awareness = ctx.awareness.clone();
             let awareness_session_id = session_id.clone();
             let ctx_for_status = ctx.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                status_blocking(&session_id, &ctx_for_status)
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
+            let outcome =
+                tokio::task::spawn_blocking(move || status_blocking(&session_id, &ctx_for_status))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("worker join error: {e}")));
             match outcome {
                 Ok(report) => {
-                    let text = record_and_annotate(&awareness, &awareness_session_id, "axiom_status", &report);
+                    let text = record_and_annotate(
+                        &awareness,
+                        &awareness_session_id,
+                        "axiom_status",
+                        &report,
+                    );
                     success_response(id, tool_text_result(&text, false))
                 }
                 Err(e) => {
                     let msg = format!("status unavailable: {e}");
-                    let text = record_and_annotate(&awareness, &awareness_session_id, "axiom_status", &msg);
+                    let text = record_and_annotate(
+                        &awareness,
+                        &awareness_session_id,
+                        "axiom_status",
+                        &msg,
+                    );
                     success_response(id, tool_text_result(&text, true))
                 }
             }
@@ -1006,10 +1038,19 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             };
             let channel = channel.to_string();
             let description = description.to_string();
-            let context_digest = args.get("context_digest").and_then(Value::as_str).map(str::to_string);
-            let budget_snapshot = args.get("budget_snapshot").and_then(Value::as_u64).map(|n| n as usize);
+            let context_digest = args
+                .get("context_digest")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let budget_snapshot = args
+                .get("budget_snapshot")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
             let priority = args.get("priority").and_then(Value::as_u64).unwrap_or(0) as u8;
-            let posted_by = args.get("posted_by").and_then(Value::as_str).map(str::to_string);
+            let posted_by = args
+                .get("posted_by")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let session_id = args
                 .get("session_id")
                 .and_then(Value::as_str)
@@ -1018,7 +1059,14 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             let awareness = ctx.awareness.clone();
             let board = ctx.task_board.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                board.post_task(&channel, description, context_digest, budget_snapshot, priority, posted_by)
+                board.post_task(
+                    &channel,
+                    description,
+                    context_digest,
+                    budget_snapshot,
+                    priority,
+                    posted_by,
+                )
             })
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
@@ -1028,12 +1076,14 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                         "Task posted.\ntask_id : {}\nchannel : {}\nstatus  : pending\ndescription: {}",
                         task.task_id, task.channel, task.description
                     );
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_post_task", &msg);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_post_task", &msg);
                     success_response(id, tool_text_result(&text, false))
                 }
                 Err(e) => {
                     let msg = format!("post_task failed: {e}");
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_post_task", &msg);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_post_task", &msg);
                     success_response(id, tool_text_result(&text, true))
                 }
             }
@@ -1043,7 +1093,10 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 return error_response(id, -32602, "axiom_claim_task requires string 'channel'");
             };
             let channel = channel.to_string();
-            let agent_id = args.get("agent_id").and_then(Value::as_str).map(str::to_string);
+            let agent_id = args
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let session_id = args
                 .get("session_id")
                 .and_then(Value::as_str)
@@ -1051,23 +1104,24 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .to_string();
             let awareness = ctx.awareness.clone();
             let board = ctx.task_board.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                board.claim_task(&channel, agent_id)
-            })
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
+            let outcome = tokio::task::spawn_blocking(move || board.claim_task(&channel, agent_id))
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
             match outcome {
                 Ok(None) => {
                     let msg = "No pending tasks in this channel.";
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_claim_task", msg);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_claim_task", msg);
                     success_response(id, tool_text_result(&text, false))
                 }
                 Ok(Some(task)) => {
-                    let digest_line = task.context_digest
+                    let digest_line = task
+                        .context_digest
                         .as_deref()
                         .map(|d| format!("\ncontext_digest:\n{d}"))
                         .unwrap_or_default();
-                    let budget_line = task.budget_snapshot
+                    let budget_line = task
+                        .budget_snapshot
                         .map(|b| format!("\nbudget_snapshot: {b} tokens"))
                         .unwrap_or_default();
                     let msg = format!(
@@ -1076,12 +1130,14 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                         task.posted_by.as_deref().unwrap_or("unknown"),
                         task.priority, budget_line, digest_line
                     );
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_claim_task", &msg);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_claim_task", &msg);
                     success_response(id, tool_text_result(&text, false))
                 }
                 Err(e) => {
                     let msg = format!("claim_task failed: {e}");
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_claim_task", &msg);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_claim_task", &msg);
                     success_response(id, tool_text_result(&text, true))
                 }
             }
@@ -1103,25 +1159,27 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .to_string();
             let awareness = ctx.awareness.clone();
             let board = ctx.task_board.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                board.task_result(&task_id, result, success)
-            })
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
+            let outcome =
+                tokio::task::spawn_blocking(move || board.task_result(&task_id, result, success))
+                    .await
+                    .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))));
             match outcome {
                 Ok(true) => {
                     let msg = format!("Task marked {}.", if success { "done" } else { "failed" });
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_task_result", &msg);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_task_result", &msg);
                     success_response(id, tool_text_result(&text, false))
                 }
                 Ok(false) => {
                     let msg = "task_id not found.";
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_task_result", msg);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_task_result", msg);
                     success_response(id, tool_text_result(&text, true))
                 }
                 Err(e) => {
                     let msg = format!("task_result failed: {e}");
-                    let text = record_and_annotate(&awareness, &session_id, "axiom_task_result", &msg);
+                    let text =
+                        record_and_annotate(&awareness, &session_id, "axiom_task_result", &msg);
                     success_response(id, tool_text_result(&text, true))
                 }
             }
@@ -1131,7 +1189,10 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 return error_response(id, -32602, "axiom_list_tasks requires string 'channel'");
             };
             let channel = channel.to_string();
-            let status_filter = args.get("status").and_then(Value::as_str).map(str::to_string);
+            let status_filter = args
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let session_id = args
                 .get("session_id")
                 .and_then(Value::as_str)
@@ -1145,19 +1206,30 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             .await
             .unwrap_or_default();
             if tasks.is_empty() {
-                let text = record_and_annotate(&awareness, &session_id, "axiom_list_tasks", "No tasks found.");
+                let text = record_and_annotate(
+                    &awareness,
+                    &session_id,
+                    "axiom_list_tasks",
+                    "No tasks found.",
+                );
                 return success_response(id, tool_text_result(&text, false));
             }
-            let lines: Vec<String> = tasks.iter().map(|t| {
-                format!(
-                    "[{}] {} | {} | {}{}",
-                    t.status,
-                    t.task_id.get(..8).unwrap_or(&t.task_id),
-                    t.description,
-                    t.posted_by.as_deref().unwrap_or("?"),
-                    t.result.as_deref().map(|r| format!(" → {}", r.lines().next().unwrap_or(r))).unwrap_or_default()
-                )
-            }).collect();
+            let lines: Vec<String> = tasks
+                .iter()
+                .map(|t| {
+                    format!(
+                        "[{}] {} | {} | {}{}",
+                        t.status,
+                        t.task_id.get(..8).unwrap_or(&t.task_id),
+                        t.description,
+                        t.posted_by.as_deref().unwrap_or("?"),
+                        t.result
+                            .as_deref()
+                            .map(|r| format!(" → {}", r.lines().next().unwrap_or(r)))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect();
             let msg = lines.join("\n");
             let text = record_and_annotate(&awareness, &session_id, "axiom_list_tasks", &msg);
             success_response(id, tool_text_result(&text, false))
@@ -1191,7 +1263,11 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
                 .and_then(Value::as_str)
                 .is_none_or(|s| s.trim().is_empty())
             {
-                return error_response(id, -32602, "axiom_predict_states requires string 'context_summary'");
+                return error_response(
+                    id,
+                    -32602,
+                    "axiom_predict_states requires string 'context_summary'",
+                );
             }
             let session_id = args
                 .get("session_id")
@@ -1214,7 +1290,11 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
         #[cfg(feature = "experimental")]
         "axiom_sample_trajectories" => {
             if args.get("state_map_json").and_then(Value::as_str).is_none() {
-                return error_response(id, -32602, "axiom_sample_trajectories requires string 'state_map_json'");
+                return error_response(
+                    id,
+                    -32602,
+                    "axiom_sample_trajectories requires string 'state_map_json'",
+                );
             }
             let session_id = args
                 .get("session_id")
@@ -1225,13 +1305,21 @@ async fn handle_tools_call(id: Value, params: Option<&Value>, ctx: &McpContext) 
             let result = crate::predictive_tools::handle_sample_trajectories(&args);
             let is_error = result.get("error").is_some();
             let mirror = serde_json::to_string(&result).unwrap_or_default();
-            record_and_annotate(&awareness, &session_id, "axiom_sample_trajectories", &mirror);
+            record_and_annotate(
+                &awareness,
+                &session_id,
+                "axiom_sample_trajectories",
+                &mirror,
+            );
             success_response(id, tool_structured_result(result, is_error))
         }
         #[cfg(feature = "experimental")]
         "axiom_align_generation" => {
             if args.get("state_map_json").and_then(Value::as_str).is_none()
-                || args.get("generation_state").and_then(Value::as_str).is_none()
+                || args
+                    .get("generation_state")
+                    .and_then(Value::as_str)
+                    .is_none()
             {
                 return error_response(
                     id,
@@ -1297,11 +1385,7 @@ fn status_blocking(session_id: &str, ctx: &McpContext) -> Result<String, String>
             .and_then(|g| g.clone())
             .unwrap_or_else(|| "unknown".to_string());
         let rec = local.recommendation().unwrap_or_else(|| "—".to_string());
-        let vibe_ready = ctx
-            .vibe
-            .lock()
-            .map(|v| v.is_initialized())
-            .unwrap_or(false);
+        let vibe_ready = ctx.vibe.lock().map(|v| v.is_initialized()).unwrap_or(false);
         return Ok(format!(
             "=== Axiom MCP Session Awareness: {session_id} ===
              model            : {model}
@@ -1502,7 +1586,13 @@ fn compress_path_blocking(path: &str, ctx: &McpContext) -> Result<String, String
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
                 let remaining = ctx.max_bytes.saturating_sub(total_bytes);
                 let slice = if text.len() > remaining {
-                    &text[..remaining]
+                    // Back off to a char boundary: slicing a multi-byte
+                    // character in half would panic.
+                    let mut cut = remaining;
+                    while cut > 0 && !text.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    &text[..cut]
                 } else {
                     &text[..]
                 };
@@ -1588,7 +1678,9 @@ fn should_skip_compression_path(path: &Path) -> bool {
             return false;
         };
         let name = name.to_string_lossy();
-        SKIP_NAMES.iter().any(|skip| name.eq_ignore_ascii_case(skip))
+        SKIP_NAMES
+            .iter()
+            .any(|skip| name.eq_ignore_ascii_case(skip))
     })
 }
 
@@ -1652,15 +1744,14 @@ fn drift_states(
     ctx: &McpContext,
     pipeline: &InferencePipeline,
 ) -> Result<(Vec<Tensor>, bool), String> {
-    let primed = ctx
-        .vibe
-        .lock()
-        .ok()
-        .and_then(|vibe| vibe.prime_states());
+    let primed = ctx.vibe.lock().ok().and_then(|vibe| vibe.prime_states());
     if let Some(states) = primed {
         Ok((states, true))
     } else {
-        Ok((pipeline.init_session_states().map_err(|e| e.to_string())?, false))
+        Ok((
+            pipeline.init_session_states().map_err(|e| e.to_string())?,
+            false,
+        ))
     }
 }
 
@@ -1777,7 +1868,12 @@ fn pct_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 3 <= bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            // `get` (not `[..]`) so a multi-byte char right after '%' cannot
+            // make the slice land off a char boundary and panic.
+            if let Some(b) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
                 out.push(b);
                 i += 3;
                 continue;
@@ -1819,7 +1915,11 @@ fn parse_qualified_id(doc_id: &str) -> Option<(String, String)> {
 
 /// A short single-line title from a record body (first non-empty line, truncated).
 fn title_for(body: &str) -> String {
-    let line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let line = body
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     const MAX: usize = 80;
     if line.chars().count() > MAX {
         let truncated: String = line.chars().take(MAX - 1).collect();
@@ -2084,9 +2184,18 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"axiom_predict_states"), "axiom_predict_states not exposed");
-        assert!(names.contains(&"axiom_sample_trajectories"), "axiom_sample_trajectories not exposed");
-        assert!(names.contains(&"axiom_align_generation"), "axiom_align_generation not exposed");
+        assert!(
+            names.contains(&"axiom_predict_states"),
+            "axiom_predict_states not exposed"
+        );
+        assert!(
+            names.contains(&"axiom_sample_trajectories"),
+            "axiom_sample_trajectories not exposed"
+        );
+        assert!(
+            names.contains(&"axiom_align_generation"),
+            "axiom_align_generation not exposed"
+        );
     }
 
     #[test]
@@ -2098,7 +2207,9 @@ mod tests {
         let mut offenders = Vec::new();
         let mut stack = vec![std::path::PathBuf::from("src")];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
@@ -2112,14 +2223,23 @@ mod tests {
                 }
             }
         }
-        assert!(offenders.is_empty(), "source files with a UTF-8 BOM: {offenders:?}");
+        assert!(
+            offenders.is_empty(),
+            "source files with a UTF-8 BOM: {offenders:?}"
+        );
     }
 
     #[test]
     fn compression_path_filter_skips_generated_and_vendor_dirs() {
-        assert!(should_skip_compression_path(Path::new("repo/.venv/lib/site.py")));
-        assert!(should_skip_compression_path(Path::new("repo/target/debug/lib.rs")));
-        assert!(should_skip_compression_path(Path::new("repo/app/__pycache__/x.pyc")));
+        assert!(should_skip_compression_path(Path::new(
+            "repo/.venv/lib/site.py"
+        )));
+        assert!(should_skip_compression_path(Path::new(
+            "repo/target/debug/lib.rs"
+        )));
+        assert!(should_skip_compression_path(Path::new(
+            "repo/app/__pycache__/x.pyc"
+        )));
         assert!(!should_skip_compression_path(Path::new("repo/src/lib.rs")));
     }
 
@@ -2138,7 +2258,11 @@ mod tests {
         assert_eq!(title_for("   "), "(untitled memory)");
         let long = "x".repeat(200);
         let t = title_for(&long);
-        assert!(t.chars().count() <= 80, "title too long: {}", t.chars().count());
+        assert!(
+            t.chars().count() <= 80,
+            "title too long: {}",
+            t.chars().count()
+        );
         assert!(t.ends_with('…'));
     }
 
@@ -2197,7 +2321,7 @@ mod tests {
             "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
         });
         assert_eq!(result["protocolVersion"], "2026-07-28");
-        assert!(result["supportedVersions"].as_array().unwrap().len() >= 1);
+        assert!(!result["supportedVersions"].as_array().unwrap().is_empty());
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
     }

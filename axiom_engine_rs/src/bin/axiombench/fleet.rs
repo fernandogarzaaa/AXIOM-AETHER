@@ -72,6 +72,8 @@ pub fn run_fleet() -> PillarResult {
             "node B pre-immunized in {elapsed_ms:.2} ms; signed DWE applied in {dwe_apply_ms:.2} ms ({})",
             if ok { "pass" } else { "FAIL" }
         ),
+        n: "2 nodes".into(),
+        read_as: "pass/fail, not a benchmark".into(),
         detail: json!({
             "ok": ok,
             "pre_immunized": pre_immunized,

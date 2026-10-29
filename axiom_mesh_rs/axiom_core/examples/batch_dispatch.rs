@@ -21,9 +21,25 @@ fn main() {
     // popular node gets flooded precisely because it's the correct choice
     // for many payloads at once, with nothing to notice or care that it's
     // already full.
-    let mut mesh = KineticNeuralMesh::new(MeshConfig { dim: DIM, tau: 0.1, ..Default::default() });
-    mesh.add_node(WorkerNode::new(0, "worker-a", NodeKind::Llm("a".into()), vec![1.0, 0.0])).unwrap();
-    mesh.add_node(WorkerNode::new(1, "worker-b", NodeKind::Llm("b".into()), vec![0.3, 0.0])).unwrap();
+    let mut mesh = KineticNeuralMesh::new(MeshConfig {
+        dim: DIM,
+        tau: 0.1,
+        ..Default::default()
+    });
+    mesh.add_node(WorkerNode::new(
+        0,
+        "worker-a",
+        NodeKind::Llm("a".into()),
+        vec![1.0, 0.0],
+    ))
+    .unwrap();
+    mesh.add_node(WorkerNode::new(
+        1,
+        "worker-b",
+        NodeKind::Llm("b".into()),
+        vec![0.3, 0.0],
+    ))
+    .unwrap();
 
     // Six payloads all pulling toward worker A's specialty.
     let payloads: Vec<Array1<f32>> = vec![

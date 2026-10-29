@@ -413,6 +413,9 @@ fn run() {
                 );
             }
             let _ = ModelMeta {
+                // `save` stamps schema_version / engine_version itself.
+                schema_version: axiom_engine::model_meta::MODEL_META_SCHEMA_VERSION,
+                engine_version: None,
                 d_model,
                 n_layers,
                 vocab_size: vocab,

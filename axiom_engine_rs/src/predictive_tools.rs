@@ -13,8 +13,8 @@
 use serde_json::{json, Value};
 
 use crate::alignment_loop::AlignmentLoop;
-use crate::state_predictor::{SemanticStateMap, StatePredictor, render_state_map};
-use crate::trajectory_sampler::{TrajectorySampler, render_trajectory_result};
+use crate::state_predictor::{render_state_map, SemanticStateMap, StatePredictor};
+use crate::trajectory_sampler::{render_trajectory_result, TrajectorySampler};
 
 /// Return the JSON tool definitions for the three predictive tools.
 ///
@@ -151,11 +151,7 @@ pub fn handle_predict_states(
         ..crate::config::AxiomConfig::runtime_small()
     };
     let varmap = candle_nn::VarMap::new();
-    let vb = candle_nn::VarBuilder::from_varmap(
-        &varmap,
-        candle_core::DType::F32,
-        device,
-    );
+    let vb = candle_nn::VarBuilder::from_varmap(&varmap, candle_core::DType::F32, device);
     let predictor = match StatePredictor::new(vb.pp("predictor"), &config) {
         Ok(p) => p,
         Err(e) => {
@@ -165,7 +161,8 @@ pub fn handle_predict_states(
         }
     };
 
-    let map = match predictor.predict_from_vec(&context_state, &session_id, max_milestones, device) {
+    let map = match predictor.predict_from_vec(&context_state, &session_id, max_milestones, device)
+    {
         Ok(m) => m,
         Err(e) => {
             return json!({
@@ -196,10 +193,7 @@ pub fn handle_sample_trajectories(args: &Value) -> Value {
         .get("state_map_json")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let context = args
-        .get("context")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let context = args.get("context").and_then(Value::as_str).unwrap_or("");
     let prune_threshold = args
         .get("prune_threshold")
         .and_then(Value::as_f64)
@@ -310,7 +304,11 @@ pub fn handle_align_generation_with_state(
         }
     };
 
-    let loop_ = AlignmentLoop::new(drift_threshold, correction_lr, crate::alignment_loop::MAX_CORRECTIONS);
+    let loop_ = AlignmentLoop::new(
+        drift_threshold,
+        correction_lr,
+        crate::alignment_loop::MAX_CORRECTIONS,
+    );
     let mut loop_state = match existing_state {
         Some(s) if s.state_map.session_id == state_map.session_id => s,
         _ => loop_.init(state_map),

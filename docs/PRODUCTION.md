@@ -58,12 +58,13 @@ server-route integration tests under `tests/`).
 ### 2.2 Lints
 
 ```bash
-cargo clippy --lib --locked -- -D warnings
+cargo fmt --check
+cargo clippy --locked --all-targets --features tools -- -D warnings
 ```
 
-**Expected:** `Finished` with no warnings.
-**Pass:** the library (the shipped product) is warning-free. Bin/test targets
-carry known dead-code warnings and are not gated here.
+**Expected:** both finish silently.
+**Pass:** the tree is rustfmt-clean and the library, every bin and every test
+target are warning-free. CI gates both (`ci.yml`, `test` job).
 
 ### 2.3 End-to-end smoke
 
@@ -107,6 +108,10 @@ variables*. The production-relevant subset:
 | `AXIOM_CHECKPOINT_URL` / `AXIOM_TOKENIZER_URL` | Fetch the trained checkpoint + tokenizer at boot. | Pair with `AXIOM_CHECKPOINT_SHA256` / `AXIOM_TOKENIZER_SHA256` so a substituted asset fails closed. |
 | `AXIOM_ENABLE_JIT_EXEC` | Enables `POST /v1/hypervisor/jit_run` (runs a caller-supplied command, can overwrite files). | **Leave unset** unless you specifically need it; if set, `AXIOM_API_KEY` must be set too. Experimental. |
 | `AXIOM_FLEET_KEY` | HMAC key for fleet gossip + DWE fragments. | **Required for fleet mode**, identical on every trusted node. Experimental. |
+| `AXIOM_MAX_GENERATION_TOKENS` | Ceiling on request `max_tokens` for local generation (default 16384). | Lower it on small CPU hosts; a single request cannot ask for more than this. |
+| `AXIOM_MAX_SESSIONS` / `AXIOM_MAX_TTT_SESSIONS` | Caps on `/v1/sessions` (default 1024) and proxy TTT sessions (default 512, LRU-evicted). | Size to RAM/VRAM: each session holds `n_layers × d_model²` floats. |
+| `AXIOM_MERGE_ROOT` | Directories `POST /v1/cluster/merge` may read/write (`;`-separated; default cwd + `~/.axiom`). | Point at the checkpoint volume only. |
+| `AXIOM_VFS_ALLOWED_ROOTS` / `AXIOM_VFS_MAX_READ_BYTES` | Restrict `/v1/hypervisor/mount` roots; cap one `/v1/hypervisor/read` (default 16 MiB). | **Set the roots** on any network-reachable host; unset means any directory can be mounted. |
 
 ---
 
@@ -183,7 +188,7 @@ Set `AXIOM_FLEET_KEY` identically on all nodes and configure peers via
 ## 6. Pre-deploy checklist
 
 - [ ] `cargo build --release --locked` succeeds on a clean checkout.
-- [ ] `cargo test --release --locked` green; `cargo clippy --lib --locked -- -D warnings` clean.
+- [ ] `cargo test --release --locked` green; `cargo fmt --check` and `cargo clippy --locked --all-targets --features tools -- -D warnings` clean.
 - [ ] `./scripts/demo_end_to_end.sh` ends `FAIL 0`.
 - [ ] `axiom eval-agentic` reports `N/N = 100%`.
 - [ ] `AXIOM_API_KEY` set (any bind other than `127.0.0.1`), served over TLS.

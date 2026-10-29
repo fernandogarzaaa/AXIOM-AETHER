@@ -103,8 +103,21 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, LexError> {
             continue;
         }
         // numbers
-        if c.is_ascii_digit() || (c == b'-' && i + 1 < b.len() && b[i + 1].is_ascii_digit()
-            && matches!(out.last(), None | Some(Tok::LParen | Tok::LBracket | Tok::Comma | Tok::Colon | Tok::ColonAssign | Tok::Assign)))
+        if c.is_ascii_digit()
+            || (c == b'-'
+                && i + 1 < b.len()
+                && b[i + 1].is_ascii_digit()
+                && matches!(
+                    out.last(),
+                    None | Some(
+                        Tok::LParen
+                            | Tok::LBracket
+                            | Tok::Comma
+                            | Tok::Colon
+                            | Tok::ColonAssign
+                            | Tok::Assign
+                    )
+                ))
         {
             let start = i;
             if c == b'-' {
@@ -127,9 +140,15 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, LexError> {
             }
             let text = &src[start..i];
             if is_float {
-                out.push(Tok::Float(text.parse().map_err(|_| LexError(format!("bad float {text}")))?));
+                out.push(Tok::Float(
+                    text.parse()
+                        .map_err(|_| LexError(format!("bad float {text}")))?,
+                ));
             } else {
-                out.push(Tok::Int(text.parse().map_err(|_| LexError(format!("bad int {text}")))?));
+                out.push(Tok::Int(
+                    text.parse()
+                        .map_err(|_| LexError(format!("bad int {text}")))?,
+                ));
             }
             continue;
         }
@@ -160,11 +179,31 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, LexError> {
         // multi-char operators
         let two = if i + 1 < b.len() { &src[i..i + 2] } else { "" };
         match two {
-            ":=" => { out.push(Tok::ColonAssign); i += 2; continue; }
-            "<=" => { out.push(Tok::Le); i += 2; continue; }
-            ">=" => { out.push(Tok::Ge); i += 2; continue; }
-            "==" => { out.push(Tok::EqEq); i += 2; continue; }
-            "!=" => { out.push(Tok::Ne); i += 2; continue; }
+            ":=" => {
+                out.push(Tok::ColonAssign);
+                i += 2;
+                continue;
+            }
+            "<=" => {
+                out.push(Tok::Le);
+                i += 2;
+                continue;
+            }
+            ">=" => {
+                out.push(Tok::Ge);
+                i += 2;
+                continue;
+            }
+            "==" => {
+                out.push(Tok::EqEq);
+                i += 2;
+                continue;
+            }
+            "!=" => {
+                out.push(Tok::Ne);
+                i += 2;
+                continue;
+            }
             _ => {}
         }
         let single = match c {
@@ -204,8 +243,15 @@ pub enum Expr {
     Bool(bool),
     Ident(String),
     List(Vec<Expr>),
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Member { base: Box<Expr>, field: String },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Member {
+        base: Box<Expr>,
+        field: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -224,14 +270,35 @@ pub enum BinOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
-    Val { name: String, value: Expr },
+    Val {
+        name: String,
+        value: Expr,
+    },
     Emit(Expr),
-    For { var: String, iter: Expr, body: Vec<Stmt> },
+    For {
+        var: String,
+        iter: Expr,
+        body: Vec<Stmt>,
+    },
     // CIR / belief path
-    Belief { name: String, prompt: String, agents: Vec<String>, ttl: u64 },
-    Resolve { name: String, threshold: f32 },
-    Guard { name: String, max_risk: f32 },
-    Evolve { name: String, max_iter: u32 },
+    Belief {
+        name: String,
+        prompt: String,
+        agents: Vec<String>,
+        ttl: u64,
+    },
+    Resolve {
+        name: String,
+        threshold: f32,
+    },
+    Guard {
+        name: String,
+        max_risk: f32,
+    },
+    Evolve {
+        name: String,
+        max_iter: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,7 +355,10 @@ impl Parser {
             self.pos += 1;
             Ok(())
         } else {
-            Err(ParseError(format!("expected keyword `{kw}`, found {:?}", self.peek())))
+            Err(ParseError(format!(
+                "expected keyword `{kw}`, found {:?}",
+                self.peek()
+            )))
         }
     }
 
@@ -377,7 +447,10 @@ impl Parser {
             let e = self.parse_expr()?;
             return Ok(Stmt::Emit(e));
         }
-        Err(ParseError(format!("unexpected token at statement start: {:?}", self.peek())))
+        Err(ParseError(format!(
+            "unexpected token at statement start: {:?}",
+            self.peek()
+        )))
     }
 
     fn parse_inquire(&mut self, name: String) -> Result<Stmt, ParseError> {
@@ -395,7 +468,11 @@ impl Parser {
             match key.as_str() {
                 "prompt" => match self.next() {
                     Some(Tok::Str(s)) => prompt = s,
-                    other => return Err(ParseError(format!("prompt must be a string, got {other:?}"))),
+                    other => {
+                        return Err(ParseError(format!(
+                            "prompt must be a string, got {other:?}"
+                        )))
+                    }
                 },
                 "agents" => {
                     self.eat(&Tok::LBracket)?;
@@ -418,7 +495,12 @@ impl Parser {
             }
         }
         self.eat(&Tok::RBrace)?;
-        Ok(Stmt::Belief { name, prompt, agents, ttl })
+        Ok(Stmt::Belief {
+            name,
+            prompt,
+            agents,
+            ttl,
+        })
     }
 
     /// Parse `{ key: value, ... }` where values are numeric or identifiers.
@@ -432,12 +514,20 @@ impl Parser {
             let key = self.ident()?;
             self.eat(&Tok::Colon)?;
             match self.next() {
-                Some(Tok::Float(f)) => { map.insert(key, f as f32); }
-                Some(Tok::Int(n)) => { map.insert(key, n as f32); }
+                Some(Tok::Float(f)) => {
+                    map.insert(key, f as f32);
+                }
+                Some(Tok::Int(n)) => {
+                    map.insert(key, n as f32);
+                }
                 // identifier-valued options (e.g. strategy: dempster_shafer) are
                 // accepted and ignored in this core subset.
                 Some(Tok::Ident(_)) => {}
-                other => return Err(ParseError(format!("bad option value for `{key}`: {other:?}"))),
+                other => {
+                    return Err(ParseError(format!(
+                        "bad option value for `{key}`: {other:?}"
+                    )))
+                }
             }
             if matches!(self.peek(), Some(Tok::Comma)) {
                 self.pos += 1;
@@ -465,7 +555,11 @@ impl Parser {
             };
             self.pos += 1;
             let rhs = self.parse_add()?;
-            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -479,7 +573,11 @@ impl Parser {
             };
             self.pos += 1;
             let rhs = self.parse_mul()?;
-            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -493,7 +591,11 @@ impl Parser {
             };
             self.pos += 1;
             let rhs = self.parse_postfix()?;
-            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -502,7 +604,10 @@ impl Parser {
         while matches!(self.peek(), Some(Tok::Dot)) {
             self.pos += 1;
             let field = self.ident()?;
-            e = Expr::Member { base: Box::new(e), field };
+            e = Expr::Member {
+                base: Box::new(e),
+                field,
+            };
         }
         Ok(e)
     }
@@ -532,7 +637,9 @@ impl Parser {
                 self.eat(&Tok::RBracket)?;
                 Ok(Expr::List(items))
             }
-            other => Err(ParseError(format!("unexpected token in expression: {other:?}"))),
+            other => Err(ParseError(format!(
+                "unexpected token in expression: {other:?}"
+            ))),
         }
     }
 }
@@ -585,7 +692,10 @@ pub enum Value {
 
 impl CValue {
     fn certain(v: Value) -> Self {
-        CValue { value: v, confidence: 1.0 }
+        CValue {
+            value: v,
+            confidence: 1.0,
+        }
     }
     fn display(&self) -> String {
         match &self.value {
@@ -644,7 +754,11 @@ fn exec_vm_stmt(
     match s {
         Stmt::Val { name, value } => {
             let v = eval(value, env)?;
-            res.trace.push(format!("val {name} = {} (conf {:.2})", v.display(), v.confidence));
+            res.trace.push(format!(
+                "val {name} = {} (conf {:.2})",
+                v.display(),
+                v.confidence
+            ));
             env.insert(name.clone(), v);
             Ok(())
         }
@@ -657,7 +771,10 @@ fn exec_vm_stmt(
             let it = eval(iter, env)?;
             let items = match it.value {
                 Value::List(xs) => xs,
-                Value::Str(s) => s.chars().map(|c| CValue::certain(Value::Str(c.to_string()))).collect(),
+                Value::Str(s) => s
+                    .chars()
+                    .map(|c| CValue::certain(Value::Str(c.to_string())))
+                    .collect(),
                 other => return Err(RunError(format!("cannot iterate over {other:?}"))),
             };
             for item in items {
@@ -669,7 +786,9 @@ fn exec_vm_stmt(
             Ok(())
         }
         // belief statements never reach the VM path
-        other => Err(RunError(format!("belief construct on the VM path: {other:?}"))),
+        other => Err(RunError(format!(
+            "belief construct on the VM path: {other:?}"
+        ))),
     }
 }
 
@@ -691,14 +810,20 @@ fn eval(e: &Expr, env: &BTreeMap<String, CValue>) -> Result<CValue, RunError> {
                 conf = conf.min(v.confidence);
                 xs.push(v);
             }
-            Ok(CValue { value: Value::List(xs), confidence: conf })
+            Ok(CValue {
+                value: Value::List(xs),
+                confidence: conf,
+            })
         }
         Expr::Member { base, field } => {
             let b = eval(base, env)?;
             match field.as_str() {
                 // confidence is itself a certain float
                 "confidence" => Ok(CValue::certain(Value::Float(b.confidence as f64))),
-                "raw" => Ok(CValue { confidence: 1.0, ..b }),
+                "raw" => Ok(CValue {
+                    confidence: 1.0,
+                    ..b
+                }),
                 other => Err(RunError(format!("unknown member `.{other}`"))),
             }
         }
@@ -709,7 +834,10 @@ fn eval(e: &Expr, env: &BTreeMap<String, CValue>) -> Result<CValue, RunError> {
             // as trustworthy as its least-trusted input).
             let conf = a.confidence.min(c.confidence);
             let v = eval_binop(*op, &a.value, &c.value)?;
-            Ok(CValue { value: v, confidence: conf })
+            Ok(CValue {
+                value: v,
+                confidence: conf,
+            })
         }
     }
 }
@@ -779,7 +907,11 @@ fn values_eq(a: &Value, b: &Value) -> bool {
 }
 
 fn display_value(v: &Value) -> String {
-    CValue { value: v.clone(), confidence: 1.0 }.display()
+    CValue {
+        value: v.clone(),
+        confidence: 1.0,
+    }
+    .display()
 }
 
 // ===========================================================================
@@ -889,7 +1021,12 @@ fn run_cir(program: &Program, adapter: &dyn InquiryAdapter) -> Result<RunResult,
 
     for s in &program.stmts {
         match s {
-            Stmt::Belief { name, prompt, agents, ttl } => {
+            Stmt::Belief {
+                name,
+                prompt,
+                agents,
+                ttl,
+            } => {
                 // Inquire each agent and fuse with Dempster-Shafer (the same
                 // combine_ds AXIOM uses for swarm immunity). Single agent ⇒ just
                 // that belief.
@@ -935,7 +1072,12 @@ fn run_cir(program: &Program, adapter: &dyn InquiryAdapter) -> Result<RunResult,
                 ));
                 states.insert(
                     name.clone(),
-                    BeliefState { belief, answer: last_answer, agents: agent_list, prompt: prompt.clone() },
+                    BeliefState {
+                        belief,
+                        answer: last_answer,
+                        agents: agent_list,
+                        prompt: prompt.clone(),
+                    },
                 );
             }
             Stmt::Resolve { name, threshold } => {
@@ -948,7 +1090,9 @@ fn run_cir(program: &Program, adapter: &dyn InquiryAdapter) -> Result<RunResult,
                         "resolve {name}: mean {mean:.3} below consensus threshold {threshold:.3}"
                     ));
                 }
-                res.trace.push(format!("resolve {name}: mean {mean:.3} (threshold {threshold:.3})"));
+                res.trace.push(format!(
+                    "resolve {name}: mean {mean:.3} (threshold {threshold:.3})"
+                ));
             }
             Stmt::Guard { name, max_risk } => {
                 let st = states
@@ -965,7 +1109,10 @@ fn run_cir(program: &Program, adapter: &dyn InquiryAdapter) -> Result<RunResult,
                         1.0 - *max_risk
                     ));
                 }
-                res.trace.push(format!("guard {name}: {}", if ok { "pass" } else { "FAIL" }));
+                res.trace.push(format!(
+                    "guard {name}: {}",
+                    if ok { "pass" } else { "FAIL" }
+                ));
             }
             Stmt::Evolve { name, max_iter } => {
                 let st = states
@@ -999,7 +1146,8 @@ fn run_cir(program: &Program, adapter: &dyn InquiryAdapter) -> Result<RunResult,
                 let mean = st.belief.mean();
                 res.beliefs.insert(name.clone(), mean);
                 let ans = st.answer.clone().unwrap_or_default();
-                res.emitted.push(format!("{name}={ans} (confidence {mean:.3})"));
+                res.emitted
+                    .push(format!("{name}={ans} (confidence {mean:.3})"));
             }
             // VM statements (val / emit / for) are allowed inside a belief
             // program too, sharing one environment.
@@ -1101,7 +1249,10 @@ mod tests {
             emit cause
         "#;
         let prog = parse(src).unwrap();
-        assert!(prog.uses_belief, "belief construct must route to the CIR path");
+        assert!(
+            prog.uses_belief,
+            "belief construct must route to the CIR path"
+        );
         let res = run(&prog, &MockAdapter).unwrap();
         assert!(res.beliefs.contains_key("cause"));
         // The mock returns 0.75; after evolve reinforcement the mean should be
@@ -1117,7 +1268,10 @@ mod tests {
         struct LowAdapter;
         impl InquiryAdapter for LowAdapter {
             fn inquire(&self, _p: &str, _a: &[String]) -> InquiryResponse {
-                InquiryResponse { confidence: 0.30, answer: Some("unsure".into()) }
+                InquiryResponse {
+                    confidence: 0.30,
+                    answer: Some("unsure".into()),
+                }
             }
         }
         let src = r#"
@@ -1161,8 +1315,8 @@ mod tests {
             }
         }
         // Reasoning routes to OpenAi by default; register a backend there.
-        let router = Router::new(RoutePolicy::default())
-            .with(Provider::OpenAi, Box::new(Confident));
+        let router =
+            Router::new(RoutePolicy::default()).with(Provider::OpenAi, Box::new(Confident));
         let adapter = RouterAdapter { router: &router };
 
         let src = r#"

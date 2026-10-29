@@ -63,10 +63,7 @@ pub fn ensure_static_breakpoint(body: &mut Value, static_len: usize) -> bool {
             let Some(last) = blocks.iter_mut().rev().find_map(|b| b.as_object_mut()) else {
                 return false;
             };
-            last.insert(
-                "cache_control".to_string(),
-                json!({"type": "ephemeral"}),
-            );
+            last.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
             true
         }
         Value::String(text) => {
@@ -86,9 +83,7 @@ pub fn ensure_static_breakpoint(body: &mut Value, static_len: usize) -> bool {
 
 fn has_marker(v: &Value) -> bool {
     match v {
-        Value::Object(map) => {
-            map.contains_key("cache_control") || map.values().any(has_marker)
-        }
+        Value::Object(map) => map.contains_key("cache_control") || map.values().any(has_marker),
         Value::Array(arr) => arr.iter().any(has_marker),
         _ => false,
     }
@@ -101,7 +96,12 @@ fn has_marker(v: &Value) -> bool {
 /// Cache key: SHA-256 over canonical JSON of
 /// `{"model","system","messages","max_tokens"}`. Missing fields canonicalize
 /// to `null`, so two requests hash equal iff these four fields are equal.
-pub fn exact_cache_key(model: &str, system: &Value, messages: &Value, max_tokens: &Value) -> String {
+pub fn exact_cache_key(
+    model: &str,
+    system: &Value,
+    messages: &Value,
+    max_tokens: &Value,
+) -> String {
     let canon = json!({
         "model": model,
         "system": system,
@@ -128,7 +128,13 @@ pub struct ExactCache {
 impl ExactCache {
     /// `capacity == 0` disables storage (every lookup misses).
     pub fn new(capacity: usize) -> Self {
-        Self { capacity, map: HashMap::new(), order: VecDeque::new(), hits: 0, misses: 0 }
+        Self {
+            capacity,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+        }
     }
 
     pub fn lookup(&mut self, key: &str) -> Option<Value> {
@@ -209,14 +215,21 @@ fn u64_field(v: &Value, key: &str) -> u64 {
 pub fn parse_openai_usage(response: &Value) -> OpenAiUsage {
     let usage = response.get("usage");
     let (input, output) = match usage {
-        Some(u) => (u64_field(u, "prompt_tokens"), u64_field(u, "completion_tokens")),
+        Some(u) => (
+            u64_field(u, "prompt_tokens"),
+            u64_field(u, "completion_tokens"),
+        ),
         None => (0, 0),
     };
     let cached = usage
         .and_then(|u| u.get("prompt_tokens_details"))
         .map(|d| u64_field(d, "cached_tokens"))
         .unwrap_or(0);
-    OpenAiUsage { input_tokens: input, cached_read_tokens: cached.min(input), output_tokens: output }
+    OpenAiUsage {
+        input_tokens: input,
+        cached_read_tokens: cached.min(input),
+        output_tokens: output,
+    }
 }
 
 #[cfg(test)]
@@ -292,7 +305,10 @@ mod tests {
         assert_eq!(k1, k2);
         assert_eq!(k1.len(), 64);
         assert_ne!(k1, exact_cache_key("m2", &sys, &msgs, &mt));
-        assert_ne!(k1, exact_cache_key("m", &sys, &json!([{"role": "user", "content": "bye"}]), &mt));
+        assert_ne!(
+            k1,
+            exact_cache_key("m", &sys, &json!([{"role": "user", "content": "bye"}]), &mt)
+        );
     }
 
     #[test]
@@ -330,7 +346,14 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 900, "audio_tokens": 0},
         }});
         let u = parse_openai_usage(&r);
-        assert_eq!(u, OpenAiUsage { input_tokens: 1000, cached_read_tokens: 900, output_tokens: 50 });
+        assert_eq!(
+            u,
+            OpenAiUsage {
+                input_tokens: 1000,
+                cached_read_tokens: 900,
+                output_tokens: 50
+            }
+        );
         assert!((u.cache_hit_ratio().unwrap() - 0.9).abs() < 1e-12);
     }
 
