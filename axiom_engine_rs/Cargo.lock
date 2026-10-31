@@ -2588,18 +2588,19 @@ dependencies = [
 
 [[package]]
 name = "model2vec-rs"
-version = "0.1.4"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23693c16304bc11674c991f47aa33794e641204e67547e0cef31c794c38ea00f"
+checksum = "3ca11a52a52721b3305bd03ee42d66d8026f54f00235b81746662f2b25a743f1"
 dependencies = [
  "anyhow",
- "clap",
  "half",
  "hf-hub",
  "ndarray 0.15.6",
  "safetensors 0.5.3",
+ "serde",
  "serde_json",
  "tokenizers 0.21.4",
+ "ureq",
 ]
 
 [[package]]
@@ -4608,7 +4609,6 @@ dependencies = [
  "derive_builder 0.20.2",
  "esaxx-rs",
  "getrandom 0.3.4",
- "hf-hub",
  "indicatif",
  "itertools 0.14.0",
  "log",
