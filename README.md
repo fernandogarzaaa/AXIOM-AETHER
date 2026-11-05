@@ -367,7 +367,7 @@ POST   /v1/hypervisor/jit_run               # VFS hypervisor — also needs AXIO
 GET    /v1/hypervisor/jit_status            # VFS hypervisor
 POST   /v1/hypervisor/list                  # VFS hypervisor
 POST   /v1/hypervisor/stat                  # VFS hypervisor
-GET    /v1/hypervisor/quantum_coherent_state # VFS hypervisor
+GET    /v1/hypervisor/patch_ranker_state   # patch-ranker telemetry (deprecated alias: /v1/hypervisor/quantum_coherent_state)
 ```
 
 This list is maintained by hand against the `.route(...)` registrations in
@@ -762,7 +762,7 @@ the map a new contributor needs; the longer version with evidence is in
 | Graph memory | Directed, weighted edges between memory records; recall seeds a bounded spreading activation from its direct hits and appends graph-only neighbours after them | `graph_memory.rs`, `memory_recall.rs` |
 | Hypervisor | The Poly JIT + Neural VFS surface (`/v1/hypervisor/*`). **Not** a real hypervisor: no VM or OS isolation. The name is kept for API stability. | `server/routes_hypervisor.rs`, `vfs.rs`, `poly_jit.rs` |
 | Compile verifier (formerly "sandbox") | A `cargo check`-only verifier run in an isolated temp directory. **Not** a process or OS security boundary: no seccomp, no container, only a wall-clock timeout. | `compile_verify.rs` (`AXIOM_COMPILE_VERIFY*`; the `AXIOM_SANDBOX_*` names are deprecated aliases) |
-| Q-TTT / Hamiltonian / quantum manifold | A classical, deterministic tensor-network simulator using physics-inspired optimisation terminology; not quantum computing | `hamiltonian.rs`, `q_manifold.rs` |
+| Patch ranker / branch weights (formerly "Q-TTT", `hamiltonian.rs`, `q_manifold.rs`) | Scores Poly-JIT repair candidates with cheap deterministic signals and picks one via an exponential reweighting over candidates. Classical, CPU-only; the old physics vocabulary described exactly this arithmetic. Old module paths remain as deprecated aliases for one release; JSON keys (`quantum`) are unchanged. | `patch_ranker.rs`, `branch_weights.rs` |
 | Axiom Mesh (`axiom_mesh_rs`) | A standalone multi-agent orchestration research workspace; only `axiom_mesh_core` is a dependency of the engine | `axiom_mesh_rs/`, `axiom_mesh_core/` |
 | ChimeraLang | A cognition-language DSL, compiled only with `--features experimental` | `chimera.rs` |
 

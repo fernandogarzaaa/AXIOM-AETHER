@@ -117,6 +117,22 @@ releases are described on the GitHub Releases page.
   images and GitHub Actions.
 
 ### Changed
+- **Physics-flavoured module names renamed to what they do.** `hamiltonian.rs`
+  is `patch_ranker.rs` (`VariationalHamiltonian` → `PatchRanker`,
+  `HamiltonianFault` → `FaultContext`, `HamiltonianOptimization` →
+  `RankedPatches` with `selected_patch` / `selected_label` /
+  `energies_tensor`, `QuantumRuntimeStatus` → `PatchRankerStatus`,
+  `optimize_fault` → `rank`); `q_manifold.rs` is `branch_weights.rs`
+  (`QuantumStateManifold` → `BranchWeights`, `ManifoldVariation` →
+  `BranchCandidate`, `QuantumManifoldTelemetry` → `BranchWeightTelemetry`,
+  `evolve_probabilities` → `reweight_by_energy`, `collapse` → `select`). The
+  arithmetic is unchanged: a deterministic score per candidate and an
+  exponential reweighting, which is what the names now say. `crate::hamiltonian`
+  and `crate::q_manifold` remain as deprecated re-exports for one release.
+  New route `GET /v1/hypervisor/patch_ranker_state` (`{"ranker": …}`);
+  `/v1/hypervisor/quantum_coherent_state` stays for one release with its old
+  `{"quantum": …}` body, and `PolyJitStatus` keeps the `quantum` JSON key so
+  `/v1/hypervisor/jit_status` consumers are unaffected.
 - Dependency majors brought current together, since they cross crate
   boundaries and could not land one PR at a time: `ndarray` 0.17 and `rand`
   0.9 in both `axiom_engine_rs` and `axiom_mesh_core` (the engine passes

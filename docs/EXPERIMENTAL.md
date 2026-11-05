@@ -56,9 +56,9 @@ references each candidate, outside itself:
 | `state_predictor` / `trajectory_sampler` / `alignment_loop` / `predictive_tools` | each other + `mcp_stdio.rs` only | **Yes** — as one cluster. |
 | `dwe` / `cluster` / `swarm_route` / `swarm_router` / `mesh_router` / `vfs` | **`server/prelude_state.rs`** (shared state *struct fields*), `server/run.rs`, `server/routes_fleet.rs`, `bin/axiombench/fleet.rs` | Only via a `#[cfg]`-field refactor of the server state — real work. |
 | `daemon` | **`config.rs`**, **`tui.rs`**, `entrypoint.rs` | Entangled with core config + the TUI. Gating needs those refs gated too. |
-| `hamiltonian` / `q_manifold` | **`poly_jit.rs`** (the core repair engine), `server/prelude_state.rs` | **No — stays core.** Do not gate. |
+| `patch_ranker` / `branch_weights` (formerly `hamiltonian` / `q_manifold`) | **`poly_jit.rs`** (the core repair engine), `server/prelude_state.rs` | **No — stays core.** Do not gate. |
 
-So the earlier "gate 14 modules" plan was wrong: `hamiltonian`/`q_manifold`
+So the earlier "gate 14 modules" plan was wrong: `patch_ranker`/`branch_weights`
 are load-bearing for the spearhead, and `daemon` is wired into core config.
 
 ## Staged plan
