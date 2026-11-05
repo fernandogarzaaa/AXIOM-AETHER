@@ -81,6 +81,12 @@ releases are described on the GitHub Releases page.
   modules they import (Python, JS/TS, Ruby, shell `.`/`source`, C
   `#include` → `.c`, Rust `mod`, Go package siblings) are tried first, so a
   failing assertion is repaired in the code under test, not in the test.
+- `bench/repair/` + `scripts/bench_repair.sh`: the on-disk repair corpus and
+  runner from `docs/BENCH-REPAIR.md` Phase 2. Each fixture is a `broken/` tree
+  plus `meta.json` (and an optional `expected.diff`); the runner checks the
+  no-op baseline fails, drives the real `axiom solve` CLI from a scratch copy,
+  re-verifies, and checks rollback correctness on failure, labelling passes
+  *authored fix* / *different fix*. Three seed fixtures; `--check` runs in CI.
 - `axiom eval-agentic`: eighteen real-interpreter fixtures (python3, node,
   sh, go, rustc, gcc, ruby) — a genuinely buggy module plus a genuine test,
   with the test file pinned so an overfit "fix" scores as a failure; fixtures

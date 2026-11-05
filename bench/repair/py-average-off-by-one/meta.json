@@ -1,0 +1,1 @@
+{ "lang": "python", "verify": ["python3", "test_stats.py"], "kind": "single", "source": "seed: authored 2026-11-05" }

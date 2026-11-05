@@ -1,0 +1,1 @@
+{ "lang": "shell", "verify": ["sh", "test.sh"], "kind": "single", "source": "seed: authored 2026-11-05" }
