@@ -198,9 +198,12 @@ fn render_array(items: &[Value], k: Knobs, out: &mut String, indent: &str) {
 
 /// Union of keys across the sampled objects, each with its type; string
 /// fields with at most four distinct values get a histogram.
+/// Per key: how often each JSON type occurred, and (for strings) how often
+/// each distinct value occurred while the field still looks enum-like.
+type KeyStats = (BTreeMap<&'static str, usize>, BTreeMap<String, usize>);
+
 fn schema_line(objects: &[&serde_json::Map<String, Value>], str_width: usize) -> String {
-    let mut keys: BTreeMap<&str, (BTreeMap<&'static str, usize>, BTreeMap<String, usize>)> =
-        BTreeMap::new();
+    let mut keys: BTreeMap<&str, KeyStats> = BTreeMap::new();
     for obj in objects {
         for (key, v) in obj.iter() {
             let entry = keys.entry(key.as_str()).or_default();
@@ -451,12 +454,23 @@ mod tests {
         let doc = json!({"total_count": 637, "workflow_runs": runs});
         let text = serde_json::to_string(&doc).unwrap();
         let before = est_tokens(&text);
-        let d = digest(&doc, 4000);
+        // Production budget: 15% of the admission estimate (routes_messages).
+        let budget = ((before as f64) * 0.15).round() as usize;
+        let d = digest(&doc, budget);
         let after = est_tokens(&d);
-        assert!(before > 8000, "fixture should be heavy: {before}");
         assert!(
-            after * 10 < before,
-            "expected >90% reduction, got {before} -> {after} tokens:\n{d}"
+            before > 4000,
+            "fixture should cross the admission threshold: {before}"
+        );
+        assert!(
+            after <= budget,
+            "digest must fit its budget: {after} > {budget}\n{d}"
+        );
+        // The five real responses measured 85-98% reduction at this budget
+        // (bench/cvm/JSON-DIGEST-2026-11-05.md); hold the floor of that range.
+        assert!(
+            after * 100 <= before * 15,
+            "expected >=85% reduction, got {before} -> {after} tokens:\n{d}"
         );
         // Fidelity: the count, every key, and the status histogram survive.
         assert!(d.contains("total_count: 637"));

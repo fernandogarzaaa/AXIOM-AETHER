@@ -44,7 +44,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 use uuid::Uuid;
 
 use crate::anthropic_forwarder::{
-    build_compressed_payload, partition_messages, whitespace_token_count, AnthropicForwarder,
+    build_compressed_payload, partition_messages, AnthropicForwarder,
     ClientAuth, ForwarderError,
 };
 use crate::backend_router::{Router as BackendRouter, TaskKind};
