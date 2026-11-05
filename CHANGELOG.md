@@ -111,6 +111,16 @@ releases are described on the GitHub Releases page.
   images and GitHub Actions.
 
 ### Changed
+- Dependency majors brought current together, since they cross crate
+  boundaries and could not land one PR at a time: `ndarray` 0.17 and `rand`
+  0.9 in both `axiom_engine_rs` and `axiom_mesh_core` (the engine passes
+  `ndarray` arrays and `impl Rng` into the mesh crate, so the versions must
+  match), `thiserror` 2 in `axiom_mesh_core`, `tokenizers` 0.22 (its
+  `with_pre_tokenizer`/`with_decoder` now take `Option`, `initial_alphabet`
+  a `std::collections::HashSet`), `model2vec-rs` 0.3 (`--features
+  fuzzy-embed` verified to compile). `rand` 0.9 renames applied
+  (`random_range`, `random_bool`, `rand::rng()`, `StdRng::from_os_rng`).
+  Supersedes Dependabot PRs #229, #234, #236, #242, #243, #244.
 - `sandbox.rs` is `compile_verify.rs` (`CompileVerifier`): it is a
   `cargo check` verifier, not a process sandbox. New env names
   `AXIOM_COMPILE_VERIFY`, `AXIOM_COMPILE_VERIFY_ROOT`,

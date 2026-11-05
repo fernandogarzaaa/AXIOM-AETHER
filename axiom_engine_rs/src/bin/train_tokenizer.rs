@@ -82,13 +82,13 @@ fn main() -> Result<()> {
 
     // ByteLevel BPE: full-byte alphabet ⇒ no UNK; reversible.
     let mut tokenizer = Tokenizer::new(BPE::default());
-    tokenizer.with_pre_tokenizer(ByteLevel::new(false, true, true));
-    tokenizer.with_decoder(ByteLevel::new(false, true, true));
+    tokenizer.with_pre_tokenizer(Some(ByteLevel::new(false, true, true)));
+    tokenizer.with_decoder(Some(ByteLevel::new(false, true, true)));
 
     let bpe_trainer = BpeTrainerBuilder::new()
         .vocab_size(vocab)
         .min_frequency(2)
-        .initial_alphabet(ByteLevel::alphabet())
+        .initial_alphabet(ByteLevel::alphabet().into_iter().collect())
         .special_tokens(vec![
             AddedToken::from("<unk>", true),
             AddedToken::from("<pad>", true),

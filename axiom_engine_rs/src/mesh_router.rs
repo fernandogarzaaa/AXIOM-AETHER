@@ -82,7 +82,7 @@ impl MeshModelSelector {
         }
         Self {
             mesh: Mutex::new(mesh),
-            rng: Mutex::new(StdRng::from_entropy()),
+            rng: Mutex::new(StdRng::from_os_rng()),
             nodes,
         }
     }

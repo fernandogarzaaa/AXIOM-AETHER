@@ -147,16 +147,16 @@ candle-core = "0.10.2"
 candle-nn = "0.10.2"
 tokio = { version = "1.35", features = ["full"] }
 sha2 = "0.10.8"
-rand = "0.8.5"
+rand = "0.9"
 # Mesh primitives (KNM/IDC) live in the canonical axiom_mesh_core crate.
 axiom_mesh_core = { version = "0.1", path = "../axiom_mesh_core" }
-ndarray = "0.16"
+ndarray = "0.17"
 indicatif = "0.17.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1"
-tokenizers = "0.15"
+tokenizers = "0.22"
 scraper = "0.27"
 tree-sitter = "0.26.9"
 tree-sitter-rust = "0.24.2"
@@ -186,7 +186,7 @@ crossterm = "0.28"
 # (`cargo install`, the pip wheel, Docker, release binaries) carry no
 # dependency on an external model. Enable with `--features fuzzy-embed`.
 # See docs/EXPERIMENTAL.md.
-model2vec-rs = { version = "0.1", optional = true }
+model2vec-rs = { version = "0.3", optional = true }
 anyhow = { version = "1", optional = true }
 # GPU-first fuzzy-dedup backend (src/gpu_embed.rs): a larger, pretrained
 # contextual encoder (BAAI/bge-base-en-v1.5) used purely as a similarity
