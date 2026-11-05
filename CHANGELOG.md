@@ -32,6 +32,17 @@ releases are described on the GitHub Releases page.
 - API key and MCP token comparisons are constant-time.
 
 ### Fixed
+- Candidate writes in the repair loops (`solve` single-file path and
+  `agentic::Transaction`) now give the file a modification time distinct from
+  the original and from every earlier candidate (`agentic::mark_fresh`).
+  Python's `__pycache__` and other mtime+size-keyed caches otherwise ran the
+  *original* bytecode for a same-size candidate written within the same
+  second, so the verifier rejected correct fixes (observed: swapping two call
+  arguments failed 2 runs in 3).
+- `scripts/proof_loop.sh` parses the current `axiom bench` wording again
+  (`token savings : N% (A -> B tokens)`, `expand round-trip K/K = 100.0%`);
+  the compression row of the proof-loop table had read `parse-failed` since
+  the bench output was reworded.
 - `axiom init` now installs a usable production model: it fetches the
   tokenizer and architecture sidecar next to the checkpoint it already
   downloaded, and the proxy, MCP server, `bench` and `run` pick that model up
@@ -54,6 +65,28 @@ releases are described on the GitHub Releases page.
   pillars that did not run.
 
 ### Added
+- **General deterministic repair** (`mutation_repair.rs`, Phase 2.1 of
+  `axiom solve`): a bounded (`AXIOM_REPAIR_MAX_CANDIDATES`, default 64),
+  trace-ranked set of single-edit mutations — comparison operators,
+  off-by-one (`± 1`, `len(x) - 1`, `range(n + 1)`, Rust `..=`), boolean
+  inversion, `and`/`or`, arithmetic operators, swapped call arguments,
+  missing `return` (incl. Rust's trailing `;`), shell `test` operators, and
+  a misspelled import rewritten to the closest sibling source file when the
+  trace reports a missing module (Python, Node, Ruby, C, Rust, Go wordings) —
+  focused on the lines the verifier blames, never on an assertion line, each
+  kept only if the real verifier goes green (byte-for-byte rollback
+  otherwise). Replaces reliance on the four fixture-shaped Poly-JIT flips.
+- **Test-aware localization** (`fault_locate::repair_targets`,
+  `is_test_path`, `import_targets`): test/spec files are demoted and the
+  modules they import (Python, JS/TS, Ruby, shell `.`/`source`, C
+  `#include` → `.c`, Rust `mod`, Go package siblings) are tried first, so a
+  failing assertion is repaired in the code under test, not in the test.
+- `axiom eval-agentic`: eighteen real-interpreter fixtures (python3, node,
+  sh, go, rustc, gcc, ruby) — a genuinely buggy module plus a genuine test,
+  with the test file pinned so an overfit "fix" scores as a failure; fixtures
+  whose toolchain is missing are reported `[SKIP]` and excluded from the
+  score; `--require-all` / `AXIOM_EVAL_REQUIRE_ALL=1` fails on any skip (set
+  in CI). Suite is now 32 fixtures, 32/32, ~15 s.
 - Graph memory is wired into recall: `recall` seeds spreading activation
   from its direct hits over `edges.jsonl` (plus `Supersedes` edges derived
   from records) and appends up to two graph-only neighbours after the

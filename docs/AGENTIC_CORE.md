@@ -57,38 +57,59 @@ axiom task -- pytest -q
 axiom task --file src/lib.rs -- cargo test
 
 # Measure the autonomous loop's capability (deterministic, no LLM needed)
-axiom eval-agentic
+axiom eval-agentic                 # skips fixtures whose toolchain is missing
+axiom eval-agentic --require-all   # CI: a skipped fixture fails the run
 ```
 
 ## Measured capability
 
 `axiom eval-agentic` runs the built-in seeded broken-repo fixtures through the
-real `solve` loop (localize → deterministic Poly-JIT repair → verify, all
-reversible) and reports the fraction it fixes end-to-end. The fixtures are
-deterministic so the score is reproducible in CI with **no model or network**:
+real `solve` loop (localize → deterministic repair → verify, all reversible)
+and reports the fraction it fixes end-to-end. The fixtures are deterministic so
+the score is reproducible in CI with **no model or network**:
 
 ```text
 [axiom-eval-agentic] autonomous repair capability:
   [PASS] shell-exit-flip
-  [PASS] fixture-marker
-  [PASS] multi-file-pick-failing
-  [PASS] rust-assert-flip
-  [PASS] python-frame-localize
-  [PASS] js-stack-localize
-  [PASS] go-frame-localize
-  [PASS] agentic-multi-file-both-broken
-score: 8/8 = 100%
+  …
+  [PASS] agentic-holdout-split
+  [PASS] py-off-by-one-range
+  [PASS] py-wrong-comparison
+  [PASS] py-missing-return
+  [PASS] py-swapped-args
+  [PASS] py-boolean-inversion
+  [PASS] py-logical-op
+  [PASS] py-index-exception
+  [PASS] js-off-by-one-loop
+  [PASS] js-missing-return
+  [PASS] js-wrong-arith
+  [PASS] sh-wrong-test-op
+  [PASS] go-off-by-one
+  [PASS] rust-missing-return-semicolon
+  [PASS] rust-off-by-one-range
+  [PASS] c-wrong-comparison
+  [PASS] rb-off-by-one
+  [PASS] py-wrong-import
+  [PASS] js-wrong-import
+score: 32/32 = 100%
 ```
 
 This is the honest headline: **the deterministic autonomous loop repairs 100% of
-the built-in fixtures with no LLM.** The suite spans fault localization across
-five trace dialects (shell, Rust `-->`, Python `File "…"`, JS stack, Go
-`file.go:line`) and multiple deterministic repair patterns, plus a multi-file
-case where the loop must pick the failing file among several. The final case
-certifies the strictly harder class of **coordinated multi-file repair**: the
-verifier requires two independently-broken files to both go green, so no
-single-file fix passes — only the agentic loop's atomic multi-file transaction
-(fix both → verify → commit, else roll back) can solve it. The LLM-driven `axiom
-task` extends the same verified loop to open-ended objectives; its success rate
-depends on the backing model and is bounded by the same verifier gate. Grow the
-suite (LLM-required cases) to make the number mean more.
+the built-in fixtures with no LLM, eighteen of them against the real toolchain.**
+Fixtures 1–14 cover fault localization across nine trace dialects (shell, Rust
+`-->`, Python `File "…"`, JS stack, Go, C, TS, Java, Ruby), the pick-the-failing-file
+case, and the strictly harder class of **coordinated multi-file repair** (the
+verifier requires two independently-broken files to both go green, so only the
+agentic loop's atomic transaction — fix both → verify → commit, else roll back —
+can solve it) plus the train/held-out split. Fixtures 15–32 are a genuinely
+buggy module plus a genuine test, verified by `python3`, `node`, `sh`, `go test`,
+`rustc`, `gcc` or `ruby`; the fix comes from the general mutation layer
+(`mutation_repair.rs`: comparison, off-by-one, boolean, logic, arithmetic,
+swapped arguments, missing `return`, shell `test` operators, misspelled import
+paths), the module is
+reached by **hopping through the test's imports**, and the test file is
+**pinned** — a green verifier obtained by editing the test scores as a failure.
+Full fixture table and caveats: [`BENCH-REPAIR.md`](BENCH-REPAIR.md). The
+LLM-driven `axiom task` extends the same verified loop to open-ended
+objectives; its success rate depends on the backing model and is bounded by
+the same verifier gate.

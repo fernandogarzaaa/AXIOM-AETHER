@@ -52,6 +52,9 @@ jobs:
 
       - name: Run the proof loop (gates on autonomous repair)
         run: bash scripts/proof_loop.sh --check
+        env:
+          # A repair fixture skipped for a missing toolchain must fail here too.
+          AXIOM_EVAL_REQUIRE_ALL: "1"
 
       - name: Upload proof-loop table
         if: always()

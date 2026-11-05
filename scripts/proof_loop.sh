@@ -50,8 +50,18 @@ parse_bench() {
   # pull the two figures out of the bench output independently, then join them
   local blob savings roundtrip
   blob="$(printf '%s\n' "$1" | tr '\n' ' ' | sed -E 's/  +/ /g')"
-  savings="$(printf '%s' "$blob"   | grep -oiE '[0-9]+(\.[0-9]+)?% token savings( \([0-9,]+ ?-> ?[0-9,]+\))?' | head -1)"
-  roundtrip="$(printf '%s' "$blob" | grep -oiE '[0-9]+/[0-9]+ = [0-9]+(\.[0-9]+)?% (signature )?round-trip' | head -1)"
+  # Current `axiom bench` wording:
+  #   [bench] token savings : 84.1% (245070 -> 39004 tokens)
+  #   [bench] signatures kept : 2978 (expand round-trip 2978/2978 = 100.0%)
+  savings="$(printf '%s' "$blob" \
+    | grep -oiE 'token savings ?: ?[0-9]+(\.[0-9]+)?% \([0-9]+ ?-> ?[0-9]+ tokens\)' | head -1 \
+    | sed -E 's/^[Tt]oken savings ?: ?([0-9.]+%) \(([0-9]+) ?-> ?([0-9]+) tokens\)$/\1 token savings (\2 -> \3)/')"
+  roundtrip="$(printf '%s' "$blob" \
+    | grep -oiE 'round-trip [0-9]+/[0-9]+ = [0-9]+(\.[0-9]+)?%' | head -1 \
+    | sed -E 's/^[Rr]ound-trip ([0-9]+\/[0-9]+ = [0-9.]+%)$/\1 round-trip/')"
+  # Older wording ("84.1% token savings (245070 -> 39004)", "N/N = 100% round-trip").
+  [ -n "$savings" ]   || savings="$(printf '%s' "$blob"   | grep -oiE '[0-9]+(\.[0-9]+)?% token savings( \([0-9,]+ ?-> ?[0-9,]+\))?' | head -1)"
+  [ -n "$roundtrip" ] || roundtrip="$(printf '%s' "$blob" | grep -oiE '[0-9]+/[0-9]+ = [0-9]+(\.[0-9]+)?% (signature )?round-trip' | head -1)"
   if [ -n "$savings" ] && [ -n "$roundtrip" ]; then
     printf '%s with %s' "$savings" "$roundtrip"
   fi

@@ -1072,7 +1072,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 std::process::exit(1);
             }
         }
-        AxiomCommand::EvalAgentic {} => {
+        AxiomCommand::EvalAgentic { require_all } => {
             let device = device_from_str(
                 &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
             )?;
@@ -1096,6 +1096,17 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 "[axiom-eval-agentic] autonomous repair capability:\n{}",
                 report.summary()
             );
+            let require_all = require_all
+                || std::env::var("AXIOM_EVAL_REQUIRE_ALL")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+            if require_all && report.skipped() > 0 {
+                eprintln!(
+                    "[axiom-eval-agentic] {} fixture(s) skipped for a missing toolchain and --require-all is set",
+                    report.skipped()
+                );
+                std::process::exit(1);
+            }
             if report.solved() != report.total() {
                 std::process::exit(1);
             }

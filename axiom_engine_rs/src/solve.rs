@@ -9,10 +9,16 @@
 //!      command under the supervisor: missing dirs / exec-bit / transient faults
 //!      are repaired, the failure trace is absorbed into W̃ (tension), and
 //!      learned immunity is applied. If it goes green, we are done.
-//!   2. **Source repair** (hypervisor / `poly_jit`) — if a `source_path` is
-//!      given and the environment heal did not suffice, drive the Poly JIT
-//!      closed loop: bounded, Q-TTT-ranked, *reversible* source patches. The
-//!      source is backed up and restored byte-for-byte if the repair fails.
+//!   2. **Source repair** — if the environment heal did not suffice, localize
+//!      the blamed files (`fault_locate::repair_targets`: non-test files first,
+//!      then the modules a blamed test imports, then the test itself) and, per
+//!      file, run the Poly JIT closed loop (bounded, Q-TTT-ranked legacy
+//!      patches) and then the general deterministic mutation layer
+//!      (`mutation_repair`: comparison / off-by-one / boolean / logic /
+//!      arithmetic / swapped-args / missing-return / shell-test candidates,
+//!      blamed lines first, never an assertion line). Every candidate is
+//!      *reversible*: the source is restored byte-for-byte unless the verify
+//!      command goes green.
 //!   3. **Verify + remember** — success persists what was learned (heal memory
 //!      via the supervisor); the round's provenance is reported.
 //!
@@ -134,7 +140,7 @@ pub fn solve(
                 .clone()
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
-            let cands = crate::fault_locate::candidate_sources(&trace, &root);
+            let cands = crate::fault_locate::repair_targets(&trace, &root);
             if let Some(first) = cands.first() {
                 println!(
                     "[axiom-solve] round {round}: localized {} candidate file(s); first: {}",
@@ -172,7 +178,8 @@ pub fn solve(
 }
 
 /// Run the reversible repair phases against ONE target file:
-/// Phase 2 (Poly-JIT deterministic patches) → Phase 2.5 (fleet patch reuse,
+/// Phase 2 (Poly-JIT deterministic patches) → Phase 2.1 (general mutation
+/// repair, `crate::mutation_repair`) → Phase 2.5 (fleet patch reuse,
 /// re-verified locally) → Phase 3 (verifier-gated LLM repair). Returns
 /// `Ok(true)` and sets the matching `report` flags if some phase made the verify
 /// command pass; `Ok(false)` if none did — each phase rolls its own candidate
@@ -220,6 +227,64 @@ fn attempt_source_repair(
     // Failed repair → restore the artifact byte-for-byte.
     if let Some(b) = backup {
         let _ = std::fs::write(src, b);
+    }
+
+    // --- Phase 2.1: deterministic mutation repair (verifier-gated) ----------
+    // The general successor to the fixture-shaped Poly-JIT flips above: a
+    // bounded, ranked set of single-edit mutations (comparison / off-by-one /
+    // boolean / logic / arithmetic / swapped args / missing return / shell
+    // test operators), focused on the lines the failure blames and never on an
+    // assertion line. Each candidate is one verifier run under the same
+    // reversible policy as the LLM path: kept only if the command goes green,
+    // otherwise rolled back byte-for-byte. No model, no network.
+    {
+        let working_dir = opts.anchor.as_deref();
+        let (_still_failing, trace) = run_verify_capture(command, args, working_dir);
+        if let Ok(original) = std::fs::read_to_string(src) {
+            let plan = crate::mutation_repair::plan(
+                &original,
+                src,
+                &trace,
+                crate::mutation_repair::max_candidates(),
+            );
+            if !plan.is_empty() {
+                let budget = plan.len();
+                let mut queue = plan.into_iter();
+                let mut applied: Option<String> = None;
+                let solved = apply_verified_patch_iterative(
+                    command,
+                    args,
+                    working_dir,
+                    src,
+                    budget,
+                    &trace,
+                    |_failure, _original| {
+                        let c = queue.next()?;
+                        applied = Some(c.label);
+                        Some(c.source)
+                    },
+                );
+                if solved {
+                    report.source_patched = true;
+                    report.solved = true;
+                    report.final_exit = Some(0);
+                    println!(
+                        "[axiom-solve] round {round}: mutation repair verified green ({}) in {}",
+                        applied.as_deref().unwrap_or("?"),
+                        rel
+                    );
+                    if let Some(pm_path) = opts.patch_memory_path.as_deref() {
+                        if let Ok(content) = std::fs::read_to_string(src) {
+                            let fp = crate::heal_memory::fingerprint(command, args);
+                            let mut pm = crate::patch_memory::PatchMemory::load(pm_path);
+                            pm.record_verified(&fp, &rel, &content);
+                            let _ = pm.save(pm_path);
+                        }
+                    }
+                    return Ok(true);
+                }
+            }
+        }
     }
 
     // --- Phase 2.5: fleet patch reuse (re-verified locally) -----------------
@@ -414,16 +479,23 @@ where
         if candidate.trim().is_empty() || candidate == original {
             break;
         }
+        let before = std::fs::metadata(source_path)
+            .and_then(|m| m.modified())
+            .ok();
         if let Err(e) = std::fs::write(source_path, &candidate) {
             // A failed write may have already truncated the file — restore first.
             eprintln!("[axiom-solve] patch write failed; restoring original ({e})");
             let _ = std::fs::write(source_path, &original);
             break;
         }
+        // Same-size candidate in the same second: without this, Python's
+        // __pycache__ (and other mtime-keyed caches) run the ORIGINAL and the
+        // verifier rejects a correct fix. See `agentic::mark_fresh`.
+        crate::agentic::mark_fresh(source_path, before);
         let (green, trace) = run_verify_capture(command, args, working_dir);
         if green {
             if attempt > 1 {
-                eprintln!("[axiom-solve] LLM repair verified green on attempt {attempt}");
+                eprintln!("[axiom-solve] repair verified green on attempt {attempt}");
             }
             return true;
         }
