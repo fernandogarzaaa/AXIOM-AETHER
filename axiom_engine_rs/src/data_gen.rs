@@ -32,8 +32,8 @@ impl ProceduralDataset {
         }
 
         let mut seq = Vec::with_capacity(seq_len);
-        let mut var_a: u32 = rng.gen_range(0..32);
-        let mut var_b: u32 = rng.gen_range(0..32);
+        let mut var_a: u32 = rng.random_range(0..32);
+        let mut var_b: u32 = rng.random_range(0..32);
 
         for step in 0..seq_len {
             if step == 0 {
@@ -43,11 +43,11 @@ impl ProceduralDataset {
 
             match step % 4 {
                 0 => {
-                    let delta = rng.gen_range(1..8);
+                    let delta = rng.random_range(1..8);
                     var_a = (var_a + delta) % 64;
                 }
                 1 => {
-                    let delta = rng.gen_range(1..8);
+                    let delta = rng.random_range(1..8);
                     var_b = (var_b + delta) % 64;
                 }
                 2 => {
@@ -81,14 +81,14 @@ impl ProceduralDataset {
         let mut seq = Vec::with_capacity(seq_len);
         for idx in 0..seq_len {
             let tok = match idx % 6 {
-                0 => 4,                                  // logic-stream marker
-                1 => symbol_base + rng.gen_range(0..32), // X
-                2 => op_base,                            // ->
-                3 => symbol_base + rng.gen_range(0..32), // Y
-                4 => op_base + 1,                        // and
+                0 => 4,                                     // logic-stream marker
+                1 => symbol_base + rng.random_range(0..32), // X
+                2 => op_base,                               // ->
+                3 => symbol_base + rng.random_range(0..32), // Y
+                4 => op_base + 1,                           // and
                 _ => {
-                    let x = symbol_base + rng.gen_range(0..32);
-                    if rng.gen_bool(0.5) {
+                    let x = symbol_base + rng.random_range(0..32);
+                    if rng.random_bool(0.5) {
                         x
                     } else {
                         op_base + 2 // not
@@ -107,12 +107,12 @@ impl ProceduralDataset {
         seq_len: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut inputs = Vec::with_capacity(batch_size * seq_len);
         let mut targets = Vec::with_capacity(batch_size * seq_len);
 
         for _ in 0..batch_size {
-            let sample = if rng.gen_bool(0.5) {
+            let sample = if rng.random_bool(0.5) {
                 self.generate_variable_trace_sequence(seq_len, &mut rng)
             } else {
                 self.generate_logic_tree_sequence(seq_len, &mut rng)

@@ -12,10 +12,10 @@ keywords = ["neural", "mesh", "routing", "agents"]
 categories = ["science"]
 
 [dependencies]
-ndarray = "0.16"
-rand = "0.8.5"
+ndarray = "0.17"
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
-thiserror = "1"
+thiserror = "2"
 
 [dev-dependencies]
 proptest = "1"
