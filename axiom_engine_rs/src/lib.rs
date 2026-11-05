@@ -46,6 +46,7 @@ pub mod heal_memory;
 pub mod hindsight;
 pub mod inference;
 pub mod jit_streamer;
+pub mod json_digest;
 pub mod keepalive;
 pub mod kernel;
 pub mod local_trivial;

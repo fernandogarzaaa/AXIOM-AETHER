@@ -1824,7 +1824,10 @@ async fn apply_digest_admission(
         .enumerate()
         .filter_map(|(i, block)| {
             let text = tool_result_text(block)?;
-            (whitespace_token_count(&text) >= threshold_tokens).then_some((i, text))
+            // JSON is estimated by chars/4 (whitespace tokens undercount it
+            // 5-10x); code and prose keep the whitespace count.
+            (crate::digest::admission_token_estimate(&text) >= threshold_tokens)
+                .then_some((i, text))
         })
         .collect();
     if candidates.is_empty() {
@@ -1837,7 +1840,7 @@ async fn apply_digest_admission(
     let mut bytes_out = 0usize;
 
     for (i, text) in candidates {
-        let orig_tokens = whitespace_token_count(&text);
+        let orig_tokens = crate::digest::admission_token_estimate(&text);
         let budget = ((orig_tokens as f64) * 0.15).round() as usize;
 
         let digest_text = if digest_mode == "haiku" {

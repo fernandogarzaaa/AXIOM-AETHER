@@ -65,6 +65,22 @@ releases are described on the GitHub Releases page.
   pillars that did not run.
 
 ### Added
+- **Structure-preserving JSON digest** (`json_digest.rs`) and a JSON-aware
+  admission estimate for the CVM tool-result digest. Every MCP server answers
+  in JSON, and minified JSON has few whitespace tokens: a 37 KB GitHub
+  `list_workflow_runs` response is ~9.3k model tokens but 2.7k whitespace
+  tokens, so under the whitespace-only estimate none of the five real MCP
+  responses recorded from a Claude Code session (2.1k–9.3k tokens each) ever
+  crossed the 4000-token threshold — they reached upstream verbatim and then
+  sat in the cached transcript for the rest of the session. Admission now
+  estimates text that parses as a JSON object or array by
+  `max(whitespace, chars/4)` (code and prose are unchanged), and the digest
+  keeps what an agent reasons about — top-level scalars, array lengths, the
+  union of item keys with types and a value histogram for enum-like fields,
+  a sample of items, truncated-string markers — instead of the prose
+  head+tail excerpt that kept part of item 1 and the end of item N. Still
+  recoverable verbatim through the same `axiom_expand` stub. Measured on the
+  five responses in `bench/cvm/JSON-DIGEST-2026-11-05.md`.
 - **General deterministic repair** (`mutation_repair.rs`, Phase 2.1 of
   `axiom solve`): a bounded (`AXIOM_REPAIR_MAX_CANDIDATES`, default 64),
   trace-ranked set of single-edit mutations — comparison operators,

@@ -193,6 +193,104 @@ async fn digest_replaces_heavy_tool_result_with_stub_and_original_is_expandable(
     let _ = fs::remove_dir_all(&cvm_dir);
 }
 
+/// Minified JSON (the shape of every MCP tool result) has few whitespace
+/// tokens: a 37 KB GitHub API response is ~9k model tokens but ~2.7k
+/// whitespace tokens, so under the whitespace-only estimate it never crossed
+/// the 4000-token threshold and reached upstream verbatim, then sat in the
+/// cached transcript for the rest of the session. Admission now estimates
+/// JSON by chars/4 and the digest is structure-preserving (count, keys,
+/// sample), not a head+tail prose excerpt.
+fn heavy_json_tool_result_text() -> String {
+    let runs: Vec<Value> = (0..40)
+        .map(|i| {
+            json!({
+                "id": 41238600731u64 + i,
+                "name": "CI",
+                "status": "completed",
+                "conclusion": if i % 7 == 0 { "failure" } else { "success" },
+                "head_sha": "7989f8daae53e0de9f350c87780edf3e6c8cb9",
+                "html_url": format!("https://github.com/o/r/actions/runs/{}", 41238600731u64 + i),
+                "head_commit": {"message": "x".repeat(600)},
+            })
+        })
+        .collect();
+    serde_json::to_string(&json!({"total_count": 637, "workflow_runs": runs})).unwrap()
+}
+
+#[tokio::test]
+async fn digest_admits_minified_json_by_char_estimate_and_keeps_its_shape() {
+    let _guard = env_lock().lock().await;
+    std::env::set_var("AXIOM_CVM_DIGEST", "skeleton");
+    let _cleanup = EnvVarGuard(&["AXIOM_CVM_DIGEST", "AXIOM_CVM_DIGEST_THRESHOLD_TOKENS"]);
+
+    let heavy = heavy_json_tool_result_text();
+    let ws = axiom_engine::anthropic_forwarder::whitespace_token_count(&heavy);
+    assert!(
+        ws < 4000 && heavy.len() / 4 > 4000,
+        "fixture must be under the whitespace threshold yet heavy in chars: ws={ws} chars={}",
+        heavy.len()
+    );
+
+    let cvm_dir = cvm_tempdir("json");
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream, &cvm_dir).await;
+    let app = create_router(state);
+    let session_id = "digest-json";
+    let body = json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 16,
+        "session_id": session_id,
+        "tools": [{"name": "axiom_expand"}],
+        "messages": [
+            {"role": "user", "content": "list the workflow runs"},
+            tool_result_message(&heavy),
+        ],
+    });
+    let status = post_json(&app, "/v1/messages", body).await.0;
+    assert_eq!(status, StatusCode::OK);
+
+    let sent_str = {
+        let captured = capture.requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        captured[0].to_string()
+    };
+    assert!(
+        sent_str.contains("AXIOM-PAGE"),
+        "JSON must be admitted: {sent_str}"
+    );
+    assert!(
+        !sent_str.contains(&"x".repeat(600)),
+        "the repeated 600-char payload must not reach upstream verbatim"
+    );
+    // Structure survives: count, array shape, key schema with the histogram.
+    assert!(sent_str.contains("total_count: 637"), "{sent_str}");
+    assert!(
+        sent_str.contains("workflow_runs: array · 40 object(s)"),
+        "{sent_str}"
+    );
+    assert!(sent_str.contains("conclusion (string:"), "{sent_str}");
+    assert!(
+        sent_str.len() < heavy.len() / 4,
+        "digested request should be well under a quarter of the original: {} vs {}",
+        sent_str.len(),
+        heavy.len()
+    );
+
+    // And the original is recoverable verbatim.
+    let stub_start = sent_str.find("AXIOM-PAGE ").unwrap() + "AXIOM-PAGE ".len();
+    let page_id = &sent_str[stub_start..stub_start + 16];
+    let (expand_status, expand_body) = post_json(
+        &app,
+        "/v1/expand",
+        json!({"session_id": session_id, "symbol": page_id}),
+    )
+    .await;
+    assert_eq!(expand_status, StatusCode::OK);
+    assert_eq!(expand_body["body"], json!(heavy));
+
+    let _ = fs::remove_dir_all(&cvm_dir);
+}
+
 #[tokio::test]
 async fn digest_flag_off_passes_bytes_through_unchanged() {
     let _guard = env_lock().lock().await;
