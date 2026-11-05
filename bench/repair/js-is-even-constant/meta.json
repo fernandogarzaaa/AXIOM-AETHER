@@ -1,1 +1,1 @@
-{ "lang": "javascript", "verify": ["node", "parity.test.js"], "kind": "single", "source": "seed: authored 2026-11-05" }
+{"lang": "javascript", "verify": ["node", "parity.test.js"], "kind": "single", "source": "seed: authored 2026-11-05", "pinned": ["parity.test.js"]}

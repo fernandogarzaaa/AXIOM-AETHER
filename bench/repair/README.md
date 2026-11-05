@@ -9,7 +9,8 @@ touching the engine, and a runner that scores it with a baseline column.
 
 ```
 bench/repair/<name>/
-  meta.json      # { "lang", "verify": ["cmd", "args"...], "kind": "single|agentic", "source": "..." }
+  meta.json      # { "lang", "verify": ["cmd", "args"...], "kind": "single|agentic", "source": "...",
+                 #   "pinned": ["test_x.py", ...] }   # files the solver must not touch (default: test-looking files)
   broken/        # the project tree that fails `verify`
   expected.diff  # optional: a known-good patch, so the report can say "found the authored fix" vs "found a fix"
 ```
@@ -23,9 +24,14 @@ scripts/bench_repair.sh --check    # CI: exit non-zero if any fixture is not act
 ```
 
 For each fixture the runner (1) confirms **No-op** — `verify` fails on the
-untouched tree, so a "pass" means something; (2) runs `axiom solve` in a scratch
+untouched tree, so a "pass" means something — and snapshots the tree *after*
+that run, so verifier by-products (`__pycache__`, `.pytest_cache`, build
+output) are never mistaken for solver edits; (2) runs `axiom solve` in a scratch
 copy with no file named, so the loop must localize and repair on its own;
-(3) re-runs `verify`; (4) on failure checks **rollback correctness** — the tree
-is byte-identical to `broken/`. The three seed fixtures here are deliberately
+(3) re-runs `verify` and checks the **pinned** files (`meta.json` `"pinned"`,
+default: every test-looking file) are byte-identical — a green verifier obtained
+by editing the oracle scores **OVERFIT**, not PASS; (4) on failure checks
+**rollback correctness** — the tree is byte-identical to the post-baseline
+snapshot. The three seed fixtures here are deliberately
 small and distinct from the built-in suite; they exist to prove the runner, not
 to inflate the number.
