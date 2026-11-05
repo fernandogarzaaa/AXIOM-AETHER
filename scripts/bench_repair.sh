@@ -20,7 +20,13 @@
 # expected.diff exists, a pass is labelled "authored fix" or "different fix".
 #
 # Env: AXIOM_BIN (default: axiom_engine_rs/target/release/axiom, built if absent),
-#      AXIOM_REPAIR_CORPUS (default: bench/repair). CPU-only, no network, no API key.
+#      AXIOM_REPAIR_CORPUS (default: bench/repair), AXIOM_BENCH_KEEP=1 (keep each
+#      scratch tree and print its path, for post-hoc inspection), AXIOM_BENCH_LABEL
+#      (suffix for the results file). CPU-only, no network, no API key.
+#
+# meta.json may also carry "test_region": {"file": ..., "from_line": N} for
+# fixtures whose tests live in the same file as the code (Rust #[cfg(test)]):
+# any edit at or below that line is scored OVERFIT, like a pinned file.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -94,10 +100,16 @@ for dir in "$CORPUS"/*/; do
   snap="$(mktemp -d "${TMPDIR:-/tmp}/axiom_bench_repair_${name}_snap_XXXXXX")"
   cp -R "$work/." "$snap/"
   mapfile -t PINNED < <(pinned_files "$meta" "$dir/broken")
+  region_file="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])).get("test_region") or {}; print(m.get("file",""))' "$meta")"
+  region_from="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])).get("test_region") or {}; print(m.get("from_line",0))' "$meta")"
 
-  # 2. Autonomous solve, no file named.
+  # 2. Autonomous solve, no file named. Solver state (heal memory and the
+  #    verified-patch store derived from it, ~/.axiom) is isolated per fixture:
+  #    fixtures in one corpus often share a verify command, and a patch learned
+  #    on one would otherwise be replayed on the next and score as a repair.
+  state="$(mktemp -d "${TMPDIR:-/tmp}/axiom_bench_repair_${name}_state_XXXXXX")"
   start="$(date +%s.%N)"
-  log="$( cd "$work" && "$BIN" solve --max-rounds 2 -- "${VERIFY[@]}" 2>&1 )"
+  log="$( cd "$work" && HOME="$state" AXIOM_HEAL_MEMORY="$state/heal_memory.json" "$BIN" solve --max-rounds 2 -- "${VERIFY[@]}" 2>&1 )"
   end="$(date +%s.%N)"
   secs="$(python3 -c "print(f'{$end-$start:.1f}')")"
   how="$(printf '%s\n' "$log" | grep -oE 'mutation repair verified green \([^)]*\)|source repair solved it \(patched=[a-z]+\)|environment heal solved it|fleet patch [0-9a-f]+ verified green locally|LLM-proposed patch verified green' | head -1)"
@@ -108,6 +120,11 @@ for dir in "$CORPUS"/*/; do
     for p in ${PINNED[@]+"${PINNED[@]}"}; do
       cmp -s "$dir/broken/$p" "$work/$p" || touched+=("$p")
     done
+    if [ -n "$region_file" ] && [ "$region_from" -gt 0 ] && [ -f "$work/$region_file" ]; then
+      if ! cmp -s <(tail -n "+$region_from" "$dir/broken/$region_file") <(tail -n "+$region_from" "$work/$region_file"); then
+        touched+=("$region_file:$region_from+ (test region)")
+      fi
+    fi
     if [ "${#touched[@]}" -gt 0 ]; then
       rows+=("| $name | $lang | OVERFIT | ${how:-?} | ${secs}s, pinned file(s) modified: ${touched[*]} |"); fail=$((fail+1))
     else
@@ -133,15 +150,16 @@ for dir in "$CORPUS"/*/; do
     if diff -rq "$snap" "$work" >/dev/null 2>&1; then rb="tree intact"; else rb="TREE MODIFIED: $(diff -rq "$snap" "$work" 2>/dev/null | head -3 | tr '\n' ' ')"; dirty=$((dirty+1)); fi
     rows+=("| $name | $lang | FAIL | ${how:-no repair found} | ${secs}s, $rb |"); fail=$((fail+1))
   fi
-  rm -rf "$work" "$snap"
+  if [ "${AXIOM_BENCH_KEEP:-0}" = 1 ]; then say "kept $work"; else rm -rf "$work"; fi
+  rm -rf "$snap" "$state"
 done
 
 mkdir -p "$OUTDIR"
-TABLE="$OUTDIR/repair-$DATE.md"
+TABLE="$OUTDIR/repair${AXIOM_BENCH_LABEL:+-$AXIOM_BENCH_LABEL}-$DATE.md"
 {
   echo "# Repair corpus — $DATE"
   echo
-  echo "Corpus: \`${CORPUS#"$REPO"/}\` · runner: \`scripts/bench_repair.sh\` · deterministic, no LLM."
+  echo "Corpus: \`${CORPUS#"$REPO"/}\` · runner: \`scripts/bench_repair.sh\` · deterministic, no LLM · candidate cap: \`AXIOM_REPAIR_MAX_CANDIDATES=${AXIOM_REPAIR_MAX_CANDIDATES:-64}\`."
   echo
   echo "| Fixture | Lang | Result | How | Notes |"
   echo "|---|---|---|---|---|"
