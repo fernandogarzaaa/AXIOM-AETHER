@@ -663,6 +663,45 @@ pub fn builtin_cases() -> Vec<EvalCase> {
         )
         .requires(&["ruby"])
         .unchanged(&["test.rb"]),
+        // 31. Python: a misspelled import. The traceback names the missing
+        //     module; the repair rewrites the import to the closest sibling file.
+        EvalCase::new(
+            "py-wrong-import",
+            &[
+                ("calculator.py", "def add(a, b):\n    return a + b\n"),
+                (
+                    "app.py",
+                    "from calcualtor import add\n\n\ndef total(a, b):\n    return add(a, b)\n",
+                ),
+                (
+                    "test_app.py",
+                    "from app import total\n\nassert total(2, 3) == 5\nassert total(0, 0) == 0\n",
+                ),
+            ],
+            "python3",
+            &["test_app.py"],
+        )
+        .requires(&["python3"])
+        .unchanged(&["test_app.py", "calculator.py"]),
+        // 32. JavaScript: a misspelled `require` path.
+        EvalCase::new(
+            "js-wrong-import",
+            &[
+                ("calculator.js", "module.exports = (a, b) => a + b;\n"),
+                (
+                    "app.js",
+                    "const add = require('./calcualtor');\nmodule.exports = (a, b) => add(a, b);\n",
+                ),
+                (
+                    "app.test.js",
+                    "const assert = require('assert');\nconst total = require('./app');\nassert.strictEqual(total(2, 3), 5);\n",
+                ),
+            ],
+            "node",
+            &["app.test.js"],
+        )
+        .requires(&["node"])
+        .unchanged(&["app.test.js", "calculator.js"]),
     ]
 }
 

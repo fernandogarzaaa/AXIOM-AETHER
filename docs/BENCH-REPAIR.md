@@ -21,7 +21,7 @@ Deterministic, offline, no model required, so the score is reproducible in CI.
 
 ```bash
 cargo run --release --bin axiom -- eval-agentic --require-all
-# → [PASS] shell-exit-flip … score: 30/30 = 100%   (exit 0; non-zero on any regression)
+# → [PASS] shell-exit-flip … score: 32/32 = 100%   (exit 0; non-zero on any regression)
 ```
 
 The repair itself comes from two deterministic layers in `solve.rs`:
@@ -36,10 +36,13 @@ The repair itself comes from two deterministic layers in `solve.rs`:
    enumerates at most 64 single-edit candidates — comparison operators,
    off-by-one (`± 1`, `len(x) - 1`, `range(n + 1)`, `..=`), boolean
    inversion, `and`/`or`, arithmetic operators, swapped call arguments, missing
-   `return` (incl. Rust's trailing `;`), shell `test` operators — blamed lines
-   first, class order steered by the trace (`IndexError` → off-by-one first,
-   `undefined`/`NoneType` → missing return first, …), and **never an
-   assertion line**. Each candidate is one verifier run under the same
+   `return` (incl. Rust's trailing `;`), shell `test` operators, and a
+   misspelled import rewritten to the closest sibling file when the trace says
+   `No module named` / `Cannot find module` / `cannot load such file` /
+   `fatal error: x.h: No such file` / `file not found for module` — blamed
+   lines first, class order steered by the trace (`IndexError` → off-by-one
+   first, `undefined`/`NoneType` → missing return first, a missing module →
+   import path first, …), and **never an assertion line**. Each candidate is one verifier run under the same
    byte-for-byte rollback as the LLM path.
 
 | # | Fixture | Verifier | Exercises |
@@ -63,15 +66,17 @@ The repair itself comes from two deterministic layers in `solve.rs`:
 | 28 | `rust-off-by-one-range` | `rustc --test && ./t` | `0..xs.len() - 1` in the same file as its `#[test]`; the assertion line is never mutated |
 | 29 | `c-wrong-comparison` | `gcc … && ./t` | `>` → `>=`; `#include "calc.h"` → `calc.c` |
 | 30 | `rb-off-by-one` | `ruby test.rb` | `xs[xs.length]`; `require_relative` hop |
+| 31 | `py-wrong-import` | `python3` | `from calcualtor import add` → `calculator` (sibling file, Levenshtein 2); the correct module is pinned too |
+| 32 | `js-wrong-import` | `node` | `require('./calcualtor')` → `./calculator` |
 
-Fixtures 15–30 pin their test file: a run where the verifier goes green because
+Fixtures 15–32 pin their test file: a run where the verifier goes green because
 the test was edited is scored **FAIL**. A fixture whose toolchain is not on
 `PATH` is reported `[SKIP]` and left out of the denominator; `--require-all`
 (or `AXIOM_EVAL_REQUIRE_ALL=1`) makes any skip fail the run, which is what
 `.github/workflows/eval.yml` and the proof loop use. Whole suite: ~15 s on a
 4-core CPU.
 
-**Limitation:** 30 fixtures, hand-built, each with a known one-edit fix. It is
+**Limitation:** 32 fixtures, hand-built, each with a known one-edit fix. It is
 a capability *gate* ("the loop still works end-to-end, on real toolchains"),
 not a *rate* ("AXIOM repairs X% of real bugs"). Several passes land an
 *equivalent* fix rather than the authored one (`age > 17` for `age >= 18`,
@@ -86,14 +91,15 @@ The goal is a rate on bugs AXIOM's authors did not design for.
 
 ### Phase 1 — expand the deterministic set (no LLM) — **done 2026-11-05**
 
-`builtin_cases()` now holds 30 fixtures across Python, JavaScript, shell, Go,
+`builtin_cases()` now holds 32 fixtures across Python, JavaScript, shell, Go,
 Rust, C and Ruby, covering off-by-one loop bounds, wrong comparison operators,
 swapped arguments, missing `return`, inverted booleans, `and`/`or`, arithmetic
-operators and shell `test` operators, each verified by the real toolchain and
-each pinning its test file. The repair patterns are implemented generally in
-`mutation_repair.rs` rather than as per-fixture flips. Still open from the
-original list: a wrong import path and a stale constant (both need a
-cross-file signal the single-edit mutator does not have yet). Each fixture is
+operators, shell `test` operators and misspelled import paths, each verified
+by the real toolchain and each pinning its test file. The repair patterns are
+implemented generally in `mutation_repair.rs` rather than as per-fixture flips.
+Still open from the original list: a stale constant whose correct value is not
+within ±1 (that needs a value the trace or another file supplies, which the
+single-edit mutator does not read yet). Each fixture is
 an `EvalCase` (single-file or module+test) or `EvalCase::new_agentic`
 (multi-file, optionally `.with_holdout(...)`), with `.requires(&[...])` naming
 its toolchain and `.unchanged(&[...])` pinning its oracle.
@@ -155,7 +161,7 @@ headline into the proof-loop table.
 
 ## Why this is the spearhead
 
-- It **works now** — `30/30` on real toolchains, reversible, verifier-gated,
+- It **works now** — `32/32` on real toolchains, reversible, verifier-gated,
   never editing the test, with cross-session immunity memory.
 - It has an **obvious external yardstick** (SWE-bench, Defects4J).
 - The competition (SWE-agent, Aider, OpenHands, coding agents generally) is

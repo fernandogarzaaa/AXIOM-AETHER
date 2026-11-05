@@ -27,7 +27,7 @@ general answer-quality claims that are not proven by the repository.
 | Session recording & receipts | Opt-in scrubbed per-session request/response JSONL (`AXIOM_SESSION_RECORD=1`, `~/.axiom/sessions/`), plus always-on token-savings receipts: `axiom_savings_*` counters on `/metrics` and a one-line receipt when a session drops. | `session_recorder.rs`, `server/routes_responses.rs`, `server/routes_hypervisor.rs` |
 | MCP server | Exposes Axiom as 17 stdio/HTTP JSON-RPC tools (20 with `--features experimental`, which adds the untrained predictive-reasoning tools): compression, drift, expansion, memory, grounding, epistemic validation, immunity, status, a multi-agent task board, ChatGPT connector `search`/`fetch`. | `mcp_stdio.rs`, `predictive_tools.rs` |
 | Self-healing runner | Runs a command, detects supported environment failures, applies bounded heals, and records learned immunity. | `self_heal.rs`, `heal_memory.rs`, `entrypoint.rs` |
-| Autonomous solve loop | Uses the runner plus source repair attempts to drive a verifier command toward green: localize the blamed file (demoting test files and hopping through their imports to the module under test), enumerate a bounded, ranked set of single-edit mutations (comparison, off-by-one, boolean, logic, arithmetic, swapped args, missing `return`, shell `test` operators) focused on the blamed lines, and keep only what the real verifier accepts — never editing an assertion line. | `solve.rs`, `mutation_repair.rs`, `fault_locate.rs`, `poly_jit.rs`, `compile_verify.rs` |
+| Autonomous solve loop | Uses the runner plus source repair attempts to drive a verifier command toward green: localize the blamed file (demoting test files and hopping through their imports to the module under test), enumerate a bounded, ranked set of single-edit mutations (comparison, off-by-one, boolean, logic, arithmetic, swapped args, missing `return`, shell `test` operators, misspelled import paths) focused on the blamed lines, and keep only what the real verifier accepts — never editing an assertion line. | `solve.rs`, `mutation_repair.rs`, `fault_locate.rs`, `poly_jit.rs`, `compile_verify.rs` |
 | Grounding verification | Checks whether response claims are supported by supplied evidence and can expand dropped symbols when a session digest is available. | `hallucination.rs`, `/v1/verify` in `server/routes_verify.rs` |
 | Provenance & belief | Signed immunity export/merge verification and `BetaBelief` conflict-aware peer confidence; DARE/TIES checkpoint + peer weight merge. | `belief.rs`, `provenance.rs`, `weight_merge.rs`, `patch_memory.rs` |
 | Calibrated trust gate | `/v1/verify` ships a data-calibrated conformal threshold (calibrated on `bench/trust/claims.jsonl` at δ=0.10 for ≥90% coverage of genuinely supported claims), plus a neural contradiction-catch-rate benchmark. A `calibrate` request mode retunes it for your own labeled data. | `hallucination.rs`, `bench/trust/`, `server/routes_verify.rs` |
@@ -80,7 +80,7 @@ regenerates them on every push and fails if the repair gate regresses.
 
 | Metric | Value | Config | Measured |
 |---|---|---|---|
-| **Autonomous repair** — `axiom eval-agentic` | 30/30 = 100% | 14 localization fixtures + 16 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, 15 s | 2026-11-05 |
+| **Autonomous repair** — `axiom eval-agentic` | 32/32 = 100% | 14 localization fixtures + 18 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, ~15 s | 2026-11-05 |
 | **Compression** — `axiom bench axiom_engine_rs/src` | 86.7% savings, 2229/2229 = 100% round-trip | `AXIOM_PRODUCTION_BPE=1` | 2026-08-09 |
 | **Compression** — same, legacy tokenizer | 82.4% savings, 2181/2181 = 100% round-trip | `AXIOM_PRODUCTION_BPE=0` | 2026-08-09 |
 | **Cost, real traffic** — `/metrics` delta | 65.1% / 41.4% quota savings | two live Claude Code sessions | 2026-07-17 |
@@ -91,7 +91,7 @@ simulated](#cvm-cost-stack) below and in [`RESULTS.md`](RESULTS.md) — don't
 quote one without its caveat. The autonomous-repair line is a capability gate,
 not yet a rate; the plan to make it one is in
 [`docs/BENCH-REPAIR.md`](docs/BENCH-REPAIR.md). Since 2026-11-05 the gate
-includes sixteen fixtures where the verifier is the real toolchain running a
+includes eighteen fixtures where the verifier is the real toolchain running a
 real test against a genuinely buggy module and the test file is pinned (a fix
 that edits the test scores as a failure) — still a gate on authored bugs, not
 a rate on bugs nobody designed for.

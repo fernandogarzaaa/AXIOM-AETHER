@@ -70,7 +70,9 @@ releases are described on the GitHub Releases page.
   trace-ranked set of single-edit mutations — comparison operators,
   off-by-one (`± 1`, `len(x) - 1`, `range(n + 1)`, Rust `..=`), boolean
   inversion, `and`/`or`, arithmetic operators, swapped call arguments,
-  missing `return` (incl. Rust's trailing `;`), shell `test` operators —
+  missing `return` (incl. Rust's trailing `;`), shell `test` operators, and
+  a misspelled import rewritten to the closest sibling source file when the
+  trace reports a missing module (Python, Node, Ruby, C, Rust, Go wordings) —
   focused on the lines the verifier blames, never on an assertion line, each
   kept only if the real verifier goes green (byte-for-byte rollback
   otherwise). Replaces reliance on the four fixture-shaped Poly-JIT flips.
@@ -79,12 +81,12 @@ releases are described on the GitHub Releases page.
   modules they import (Python, JS/TS, Ruby, shell `.`/`source`, C
   `#include` → `.c`, Rust `mod`, Go package siblings) are tried first, so a
   failing assertion is repaired in the code under test, not in the test.
-- `axiom eval-agentic`: sixteen real-interpreter fixtures (python3, node,
+- `axiom eval-agentic`: eighteen real-interpreter fixtures (python3, node,
   sh, go, rustc, gcc, ruby) — a genuinely buggy module plus a genuine test,
   with the test file pinned so an overfit "fix" scores as a failure; fixtures
   whose toolchain is missing are reported `[SKIP]` and excluded from the
   score; `--require-all` / `AXIOM_EVAL_REQUIRE_ALL=1` fails on any skip (set
-  in CI). Suite is now 30 fixtures, 30/30, ~15 s.
+  in CI). Suite is now 32 fixtures, 32/32, ~15 s.
 - Graph memory is wired into recall: `recall` seeds spreading activation
   from its direct hits over `edges.jsonl` (plus `Supersedes` edges derived
   from records) and appends up to two graph-only neighbours after the

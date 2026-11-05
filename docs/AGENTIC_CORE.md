@@ -89,21 +89,24 @@ the score is reproducible in CI with **no model or network**:
   [PASS] rust-off-by-one-range
   [PASS] c-wrong-comparison
   [PASS] rb-off-by-one
-score: 30/30 = 100%
+  [PASS] py-wrong-import
+  [PASS] js-wrong-import
+score: 32/32 = 100%
 ```
 
 This is the honest headline: **the deterministic autonomous loop repairs 100% of
-the built-in fixtures with no LLM, sixteen of them against the real toolchain.**
+the built-in fixtures with no LLM, eighteen of them against the real toolchain.**
 Fixtures 1–14 cover fault localization across nine trace dialects (shell, Rust
 `-->`, Python `File "…"`, JS stack, Go, C, TS, Java, Ruby), the pick-the-failing-file
 case, and the strictly harder class of **coordinated multi-file repair** (the
 verifier requires two independently-broken files to both go green, so only the
 agentic loop's atomic transaction — fix both → verify → commit, else roll back —
-can solve it) plus the train/held-out split. Fixtures 15–30 are a genuinely
+can solve it) plus the train/held-out split. Fixtures 15–32 are a genuinely
 buggy module plus a genuine test, verified by `python3`, `node`, `sh`, `go test`,
 `rustc`, `gcc` or `ruby`; the fix comes from the general mutation layer
 (`mutation_repair.rs`: comparison, off-by-one, boolean, logic, arithmetic,
-swapped arguments, missing `return`, shell `test` operators), the module is
+swapped arguments, missing `return`, shell `test` operators, misspelled import
+paths), the module is
 reached by **hopping through the test's imports**, and the test file is
 **pinned** — a green verifier obtained by editing the test scores as a failure.
 Full fixture table and caveats: [`BENCH-REPAIR.md`](BENCH-REPAIR.md). The

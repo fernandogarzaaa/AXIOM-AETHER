@@ -26,7 +26,7 @@ cargo run --release --bin axiom -- eval-agentic
 built-in set is authored, not sampled; see [`BENCH-REPAIR.md`](BENCH-REPAIR.md)
 for the plan to grow it into a held-out benchmark with a baseline comparison).
 Fourteen fixtures exercise localization across trace dialects with a scripted
-verifier; sixteen run the **real toolchain** (`python3`, `node`, `sh`, `go`,
+verifier; eighteen run the **real toolchain** (`python3`, `node`, `sh`, `go`,
 `rustc`, `gcc`, `ruby`) against a genuinely buggy module and pin the test file,
 so a fix that edits the oracle scores as a failure. A fixture whose toolchain
 is missing is reported as skipped and left out of the denominator;
@@ -76,7 +76,7 @@ it. Update **both** on every release.
 
 | Metric | Value | Config | Measured | Release |
 |---|---|---|---|---|
-| Autonomous repair | **30/30 = 100%** | 14 localization + 16 real-interpreter fixtures, CPU, no LLM, 15 s wall clock | 2026-11-05 | (post-0.5.0) |
+| Autonomous repair | **32/32 = 100%** | 14 localization + 18 real-interpreter fixtures, CPU, no LLM, ~15 s wall clock | 2026-11-05 | (post-0.5.0) |
 | Autonomous repair | 14/14 = 100% | built-in fixtures, CPU, no LLM | 2026-10-29 | v0.5.0 |
 | Autonomous repair | 9/9 = 100% | built-in fixtures, CPU, no LLM | 2026-08-28 | (pre-v0.4.2) |
 | Compression | **86.7% savings, 2229/2229 = 100% round-trip** | `AXIOM_PRODUCTION_BPE=1`, 121-file tree | 2026-08-09 | v0.4.x |

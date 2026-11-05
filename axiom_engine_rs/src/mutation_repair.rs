@@ -62,10 +62,16 @@ pub enum MutationClass {
     /// POSIX `test` operators: `-lt`/`-le`/`-gt`/`-ge`/`-eq`/`-ne`, `-z`/`-n`,
     /// `-a`/`-o`, `=`/`!=`.
     ShellTest,
+    /// A misspelled import target (`from calcualtor import add`,
+    /// `require('./calcualtor')`, `require_relative 'calcualtor'`,
+    /// `#include "calcualtor.h"`, `mod calcualtor;`) rewritten to the sibling
+    /// source file whose name is closest. Needs the trace's "module not found"
+    /// name and the directory listing, so it is planned per file, not per line.
+    ImportPath,
 }
 
 impl MutationClass {
-    pub const ALL: [MutationClass; 8] = [
+    pub const ALL: [MutationClass; 9] = [
         MutationClass::Comparison,
         MutationClass::OffByOne,
         MutationClass::Boolean,
@@ -74,6 +80,7 @@ impl MutationClass {
         MutationClass::SwapArgs,
         MutationClass::MissingReturn,
         MutationClass::ShellTest,
+        MutationClass::ImportPath,
     ];
 
     pub fn name(self) -> &'static str {
@@ -86,6 +93,7 @@ impl MutationClass {
             MutationClass::SwapArgs => "swap-args",
             MutationClass::MissingReturn => "missing-return",
             MutationClass::ShellTest => "shell-test",
+            MutationClass::ImportPath => "import-path",
         }
     }
 }
@@ -287,6 +295,9 @@ pub fn class_order(trace: &str) -> Vec<MutationClass> {
     ]) {
         bump(MutationClass::ShellTest, -30);
     }
+    if !missing_module_names(trace).is_empty() {
+        bump(MutationClass::ImportPath, -60);
+    }
     match numeric_mismatch(&t) {
         Some(1) => bump(MutationClass::OffByOne, -35),
         Some(_) => {
@@ -425,6 +436,36 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
         visit(*li, pos, 1, &mut keyed, &mut seq);
     }
 
+    // Import-path repairs are planned per file (they need the trace's missing
+    // name and the directory listing); rank them as tier 0 when the trace
+    // names a missing module, since nothing else can fix that failure.
+    for (li, what, new_line) in import_path_candidates(source, path, trace) {
+        let (content, eol) = split_eol(lines[li]);
+        if new_line == content {
+            continue;
+        }
+        let mut src = String::with_capacity(source.len() + 16);
+        for l in &lines[..li] {
+            src.push_str(l);
+        }
+        src.push_str(&new_line);
+        src.push_str(eol);
+        for l in &lines[li + 1..] {
+            src.push_str(l);
+        }
+        let cr = class_rank(MutationClass::ImportPath);
+        keyed.push((
+            (0, 0, cr, seq),
+            Candidate {
+                label: format!("{}:L{} {}", MutationClass::ImportPath.name(), li + 1, what),
+                class: MutationClass::ImportPath,
+                line: li + 1,
+                source: src,
+            },
+        ));
+        seq += 1;
+    }
+
     keyed.sort_by_key(|(k, _)| *k);
     let mut seen: HashSet<&str> = HashSet::new();
     let mut out = Vec::new();
@@ -475,7 +516,192 @@ pub fn line_mutations(
         MutationClass::SwapArgs => swap_args(line, &mask),
         MutationClass::MissingReturn => missing_return(line, lang, &mask, next_line),
         MutationClass::ShellTest => shell_test(line, lang, &mask),
+        // Planned per file in `plan` (needs the trace and the directory).
+        MutationClass::ImportPath => Vec::new(),
     }
+}
+
+/// Module / file names the trace says could not be resolved, across the
+/// toolchains the localizer knows. Dotted Python paths keep their last segment
+/// (`pkg.calcualtor` → `calcualtor`); JS/Ruby relative specs lose their `./`.
+pub fn missing_module_names(trace: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |raw: &str| {
+        // Last path segment, minus a source extension, then the last dotted
+        // segment (Python packages): `./pkg/calcualtor.py` → `calcualtor`.
+        let name = raw
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"' || c == '`' || c == ';' || c == ',' || c == '.')
+            .trim_start_matches("./")
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+        let name = match name.rsplit_once('.') {
+            Some((stem, ext)) if ["py", "js", "ts", "rb", "h", "rs", "go", "sh"].contains(&ext) => {
+                stem
+            }
+            _ => name,
+        };
+        let name = name.rsplit('.').next().unwrap_or("").to_string();
+        if !name.is_empty() && !out.contains(&name) {
+            out.push(name);
+        }
+    };
+    for line in trace.lines() {
+        // Python: No module named 'calcualtor' / No module named 'pkg.calcualtor'
+        if let Some(i) = line.find("No module named ") {
+            push(&line[i + "No module named ".len()..]);
+        }
+        // Node: Cannot find module './calcualtor'
+        if let Some(i) = line.find("Cannot find module ") {
+            push(&line[i + "Cannot find module ".len()..]);
+        }
+        // Ruby: cannot load such file -- /abs/dir/calcualtor
+        if let Some(i) = line.find("cannot load such file -- ") {
+            let rest = &line[i + "cannot load such file -- ".len()..];
+            push(rest.split_whitespace().next().unwrap_or(""));
+        }
+        // C: fatal error: calcualtor.h: No such file or directory
+        if line.contains("No such file or directory") {
+            if let Some(i) = line.find("fatal error: ") {
+                let rest = &line[i + "fatal error: ".len()..];
+                if let Some(end) = rest.find(':') {
+                    push(&rest[..end]);
+                }
+            }
+        }
+        // Rust: file not found for module `calcualtor`
+        if let Some(i) = line.find("file not found for module ") {
+            push(&line[i + "file not found for module ".len()..]);
+        }
+        // Go: package calc/calcualtor is not in std
+        if let Some(i) = line.find("package ") {
+            if line.contains(" is not in ") {
+                let rest = &line[i + "package ".len()..];
+                push(rest.split_whitespace().next().unwrap_or(""));
+            }
+        }
+    }
+    out
+}
+
+/// Sibling source files (stems) next to `path` that could be what a
+/// misspelled import meant: same extension family, Levenshtein distance at
+/// most 3 from `missing` (or one a prefix of the other), never the file itself.
+fn import_replacements(path: &Path, missing: &str) -> Vec<String> {
+    let Some(dir) = path.parent() else {
+        return Vec::new();
+    };
+    let own = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let lang = Lang::from_path(path);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut scored: Vec<(usize, String)> = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let same_family = match lang {
+            Lang::C => matches!(
+                p.extension().and_then(|x| x.to_str()),
+                Some("h" | "hpp" | "hh" | "c" | "cc" | "cpp")
+            ),
+            _ => Lang::from_path(&p) == lang,
+        };
+        if !same_family {
+            continue;
+        }
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if stem.is_empty() || stem == own || stem == missing {
+            continue;
+        }
+        let d = levenshtein(&stem.to_ascii_lowercase(), &missing.to_ascii_lowercase());
+        let related = d <= 3 || stem.starts_with(missing) || missing.starts_with(&stem);
+        if related && !scored.iter().any(|(_, s)| *s == stem) {
+            scored.push((d, stem));
+        }
+    }
+    scored.sort();
+    scored.into_iter().map(|(_, s)| s).collect()
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Import-path candidates for a whole file: every line that names a module the
+/// trace could not resolve, rewritten to each plausible sibling.
+fn import_path_candidates(source: &str, path: &Path, trace: &str) -> Vec<(usize, String, String)> {
+    let mut out = Vec::new();
+    for missing in missing_module_names(trace) {
+        let replacements = import_replacements(path, &missing);
+        if replacements.is_empty() {
+            continue;
+        }
+        for (li, raw) in source.split_inclusive('\n').enumerate() {
+            let (content, _) = split_eol(raw);
+            let mask = code_mask(content, Lang::from_path(path));
+            // Imports name the module inside quotes (JS/Ruby/C) or as a bare
+            // word (Python/Rust/Go): accept either, but only whole words.
+            let hits: Vec<(usize, usize)> = word_spans_any(content, &mask, &missing);
+            if hits.is_empty() {
+                continue;
+            }
+            for repl in &replacements {
+                let mut new_line = String::with_capacity(content.len() + 8);
+                let mut last = 0;
+                for (s, e) in &hits {
+                    new_line.push_str(&content[last..*s]);
+                    new_line.push_str(repl);
+                    last = *e;
+                }
+                new_line.push_str(&content[last..]);
+                out.push((li, format!("import `{missing}` -> `{repl}`"), new_line));
+            }
+        }
+    }
+    out
+}
+
+/// Like [`word_spans`] but also inside string literals (an import spec is a
+/// string in several languages), still requiring word boundaries.
+fn word_spans_any(line: &str, _mask: &[bool], word: &str) -> Vec<(usize, usize)> {
+    let b = line.as_bytes();
+    let w = word.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + w.len() <= b.len() {
+        if &b[i..i + w.len()] == w
+            && (i == 0 || !is_ident(b[i - 1]))
+            && (i + w.len() == b.len() || !is_ident(b[i + w.len()]))
+        {
+            out.push((i, i + w.len()));
+            i += w.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 // --- lexical helpers ---------------------------------------------------------
@@ -1607,6 +1833,84 @@ mod tests {
             "{:?}",
             p.iter().map(|c| &c.label).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn missing_module_names_cover_the_toolchains() {
+        assert_eq!(
+            missing_module_names("ModuleNotFoundError: No module named 'calcualtor'"),
+            vec!["calcualtor"]
+        );
+        assert_eq!(
+            missing_module_names("ModuleNotFoundError: No module named 'pkg.calcualtor'"),
+            vec!["calcualtor"]
+        );
+        assert_eq!(
+            missing_module_names("Error: Cannot find module './calcualtor'\nRequire stack:"),
+            vec!["calcualtor"]
+        );
+        assert_eq!(
+            missing_module_names("app.rb:1:in 'require_relative': cannot load such file -- /tmp/x/calcualtor (LoadError)"),
+            vec!["calcualtor"]
+        );
+        assert_eq!(
+            missing_module_names(
+                "app.c:1:10: fatal error: calcualtor.h: No such file or directory"
+            ),
+            vec!["calcualtor"]
+        );
+        assert_eq!(
+            missing_module_names("error[E0583]: file not found for module `calcualtor`"),
+            vec!["calcualtor"]
+        );
+        assert!(missing_module_names("AssertionError: expected 6 got 5").is_empty());
+        assert_eq!(levenshtein("calcualtor", "calculator"), 2);
+        assert_eq!(
+            class_order("No module named 'x'")[0],
+            MutationClass::ImportPath
+        );
+    }
+
+    #[test]
+    fn import_path_candidates_rewrite_to_the_closest_sibling() {
+        let dir = std::env::temp_dir().join(format!("axiom_mut_import_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("calculator.py"),
+            "def add(a, b):\n    return a + b\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("unrelated.py"), "").unwrap();
+        std::fs::write(dir.join("notes.txt"), "").unwrap();
+        let app = dir.join("app.py");
+        let src = "from calcualtor import add\n\n\ndef total(a, b):\n    return add(a, b)\n";
+        std::fs::write(&app, src).unwrap();
+        let trace = "  File \"app.py\", line 1, in <module>\nModuleNotFoundError: No module named 'calcualtor'";
+        let p = plan(src, &app, trace, 64);
+        assert_eq!(p[0].class, MutationClass::ImportPath, "{}", p[0].label);
+        assert!(
+            p[0].source.starts_with("from calculator import add\n"),
+            "{}",
+            p[0].source
+        );
+        assert!(
+            !p.iter().any(|c| c.source.contains("unrelated")),
+            "an unrelated sibling is not a candidate"
+        );
+        // JS: the spec is a quoted string.
+        let js = dir.join("app.js");
+        std::fs::write(dir.join("calculator.js"), "module.exports = 1;\n").unwrap();
+        let js_src = "const add = require('./calcualtor');\nmodule.exports = add;\n";
+        std::fs::write(&js, js_src).unwrap();
+        let p = plan(js_src, &js, "Error: Cannot find module './calcualtor'", 64);
+        assert!(
+            p[0].source
+                .starts_with("const add = require('./calculator');"),
+            "{}",
+            p[0].source
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
