@@ -43,6 +43,17 @@ pub struct EvalCase {
     /// split: a fix shaped against the train verifier that fails held-out
     /// checks is rolled back instead of trusted.
     pub holdout: Option<(String, Vec<String>)>,
+    /// Programs that must be on `PATH` for this case to run (`python3`, `go`,
+    /// …). A case whose requirement is missing is reported as **skipped** and
+    /// excluded from the score rather than counted as a failure, so the suite
+    /// stays honest on a machine without that toolchain; `--require-all`
+    /// turns a skip into a failure for CI.
+    pub requires: Vec<String>,
+    /// Files that must be byte-identical after the solve for the case to count
+    /// as solved. Used on every module+test fixture to pin the test file: a
+    /// "repair" that edits the oracle instead of the code under test is an
+    /// overfit and is scored as a failure, however green the verifier is.
+    pub expect_unchanged: Vec<String>,
 }
 
 impl EvalCase {
@@ -57,7 +68,21 @@ impl EvalCase {
             args: args.iter().map(|s| s.to_string()).collect(),
             agentic_fix: Vec::new(),
             holdout: None,
+            requires: Vec::new(),
+            expect_unchanged: Vec::new(),
         }
+    }
+
+    /// Require these programs on `PATH` (skip the case otherwise).
+    fn requires(mut self, programs: &[&str]) -> Self {
+        self.requires = programs.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    /// Pin these files: they must be byte-identical after the solve.
+    fn unchanged(mut self, files: &[&str]) -> Self {
+        self.expect_unchanged = files.iter().map(|s| s.to_string()).collect();
+        self
     }
 
     /// Attach a held-out verifier: commits require passing both the train
@@ -106,6 +131,9 @@ impl Proposer for ScriptedProposer {
 pub struct CaseResult {
     pub name: String,
     pub solved: bool,
+    /// `Some(reason)` when the case did not run (a required program is
+    /// missing). Skipped cases are excluded from `total()` and the score.
+    pub skipped: Option<String>,
 }
 
 /// Aggregate evaluation report.
@@ -115,11 +143,16 @@ pub struct EvalReport {
 }
 
 impl EvalReport {
+    /// Cases that ran (skipped cases are not counted).
     pub fn total(&self) -> usize {
-        self.results.len()
+        self.results.iter().filter(|r| r.skipped.is_none()).count()
     }
     pub fn solved(&self) -> usize {
         self.results.iter().filter(|r| r.solved).count()
+    }
+    /// Cases that did not run because a required program was missing.
+    pub fn skipped(&self) -> usize {
+        self.results.iter().filter(|r| r.skipped.is_some()).count()
     }
     /// Success rate in [0, 1]; an empty suite scores 0.
     pub fn score(&self) -> f64 {
@@ -133,11 +166,14 @@ impl EvalReport {
     pub fn summary(&self) -> String {
         let mut s = String::new();
         for r in &self.results {
-            s.push_str(&format!(
-                "  [{}] {}\n",
-                if r.solved { "PASS" } else { "FAIL" },
-                r.name
-            ));
+            match &r.skipped {
+                Some(reason) => s.push_str(&format!("  [SKIP] {} ({reason})\n", r.name)),
+                None => s.push_str(&format!(
+                    "  [{}] {}\n",
+                    if r.solved { "PASS" } else { "FAIL" },
+                    r.name
+                )),
+            }
         }
         s.push_str(&format!(
             "score: {}/{} = {:.0}%",
@@ -145,13 +181,23 @@ impl EvalReport {
             self.total(),
             self.score() * 100.0
         ));
+        if self.skipped() > 0 {
+            s.push_str(&format!(" ({} skipped)", self.skipped()));
+        }
         s
     }
 }
 
-/// The built-in deterministic fixture suite. Each case's failure is repairable
-/// by the Poly-JIT layer (e.g. an `exit 1` flip or a fixture marker), so the
-/// whole suite is offline and reproducible.
+/// The built-in deterministic fixture suite — offline, reproducible, no LLM.
+///
+/// Cases 1–14 are **localization and loop fixtures**: the verifier is a tiny
+/// shell script that prints a compiler/test-runner-shaped trace, and the repair
+/// is one of the legacy Poly-JIT flips or a scripted multi-file transaction.
+/// Cases 15+ are **real-interpreter fixtures**: a genuinely buggy module, a
+/// genuine test, and the actual toolchain as the verifier; the fix comes from
+/// the general mutation layer (`crate::mutation_repair`) and the test file is
+/// pinned so an overfit "fix" scores as a failure. Cases that need a toolchain
+/// not on `PATH` are reported as skipped, never as failed.
 pub fn builtin_cases() -> Vec<EvalCase> {
     vec![
         // 1. A script that fails with a self-naming frame; Poly-JIT flips exit 1.
@@ -344,6 +390,279 @@ pub fn builtin_cases() -> Vec<EvalCase> {
             ],
         )
         .with_holdout(&posix_shell(), &["-c", "sh b.sh"]),
+        // ------------------------------------------------------------------
+        // Real-interpreter fixtures. From here on the verifier is the actual
+        // language toolchain (python3, node, sh, go, rustc, gcc, ruby) running
+        // a genuine test against a genuinely buggy module, and the repair comes
+        // from the deterministic mutation layer (`crate::mutation_repair`):
+        // localize the module through the test's imports, mutate the blamed
+        // code, keep only what the real test accepts. Each case pins its test
+        // file: editing the oracle is scored as a failure.
+        // ------------------------------------------------------------------
+        // 15. Python: `range(len(xs) - 1)` drops the last element.
+        EvalCase::new(
+            "py-off-by-one-range",
+            &[
+                (
+                    "total.py",
+                    "def total(xs):\n    s = 0\n    for i in range(len(xs) - 1):\n        s += xs[i]\n    return s\n",
+                ),
+                (
+                    "test_total.py",
+                    "from total import total\n\nassert total([1, 2, 3]) == 6, \"expected 6 got %d\" % total([1, 2, 3])\nassert total([]) == 0\n",
+                ),
+            ],
+            "python3",
+            &["test_total.py"],
+        )
+        .requires(&["python3"])
+        .unchanged(&["test_total.py"]),
+        // 16. Python: `>` where `>=` was meant.
+        EvalCase::new(
+            "py-wrong-comparison",
+            &[
+                ("age.py", "def is_adult(age):\n    return age > 18\n"),
+                (
+                    "test_age.py",
+                    "from age import is_adult\n\nassert is_adult(18) is True\nassert is_adult(17) is False\nassert is_adult(40) is True\n",
+                ),
+            ],
+            "python3",
+            &["test_age.py"],
+        )
+        .requires(&["python3"])
+        .unchanged(&["test_age.py"]),
+        // 17. Python: the computed value is never returned.
+        EvalCase::new(
+            "py-missing-return",
+            &[
+                ("dbl.py", "def double(x):\n    x * 2\n"),
+                (
+                    "test_dbl.py",
+                    "from dbl import double\n\nassert double(3) == 6, \"expected 6 got %r\" % double(3)\nassert double(0) == 0\n",
+                ),
+            ],
+            "python3",
+            &["test_dbl.py"],
+        )
+        .requires(&["python3"])
+        .unchanged(&["test_dbl.py"]),
+        // 18. Python: arguments passed in the wrong order.
+        EvalCase::new(
+            "py-swapped-args",
+            &[
+                (
+                    "names.py",
+                    "def fullname(first, last):\n    return first + \" \" + last\n\n\ndef greet(first, last):\n    return \"Hello, \" + fullname(last, first)\n",
+                ),
+                (
+                    "test_names.py",
+                    "from names import greet\n\nassert greet(\"Ada\", \"Lovelace\") == \"Hello, Ada Lovelace\", greet(\"Ada\", \"Lovelace\")\n",
+                ),
+            ],
+            "python3",
+            &["test_names.py"],
+        )
+        .requires(&["python3"])
+        .unchanged(&["test_names.py"]),
+        // 19. Python: an inverted boolean.
+        EvalCase::new(
+            "py-boolean-inversion",
+            &[
+                ("empty.py", "def is_empty(xs):\n    return not len(xs) == 0\n"),
+                (
+                    "test_empty.py",
+                    "from empty import is_empty\n\nassert is_empty([]) is True\nassert is_empty([1]) is False\nassert is_empty([1, 2]) is False\n",
+                ),
+            ],
+            "python3",
+            &["test_empty.py"],
+        )
+        .requires(&["python3"])
+        .unchanged(&["test_empty.py"]),
+        // 20. Python: `or` where `and` was meant.
+        EvalCase::new(
+            "py-logical-op",
+            &[
+                ("rng.py", "def in_range(x):\n    return x >= 0 or x <= 10\n"),
+                (
+                    "test_rng.py",
+                    "from rng import in_range\n\nassert in_range(5) is True\nassert in_range(0) is True\nassert in_range(10) is True\nassert in_range(20) is False\nassert in_range(-1) is False\n",
+                ),
+            ],
+            "python3",
+            &["test_rng.py"],
+        )
+        .requires(&["python3"])
+        .unchanged(&["test_rng.py"]),
+        // 21. Python: an IndexError raised *inside* the module, so the traceback
+        //     blames the module directly (no import hop needed) and the
+        //     `index out of range` text steers the class order.
+        EvalCase::new(
+            "py-index-exception",
+            &[
+                ("last.py", "def last(xs):\n    return xs[len(xs)]\n"),
+                (
+                    "test_last.py",
+                    "from last import last\n\nassert last([1, 2, 3]) == 3\nassert last([7]) == 7\n",
+                ),
+            ],
+            "python3",
+            &["test_last.py"],
+        )
+        .requires(&["python3"])
+        .unchanged(&["test_last.py"]),
+        // 22. JavaScript: `<=` runs one past the end (NaN).
+        EvalCase::new(
+            "js-off-by-one-loop",
+            &[
+                (
+                    "sum.js",
+                    "function sum(xs) {\n  let total = 0;\n  for (let i = 0; i <= xs.length; i++) {\n    total += xs[i];\n  }\n  return total;\n}\nmodule.exports = sum;\n",
+                ),
+                (
+                    "sum.test.js",
+                    "const assert = require('assert');\nconst sum = require('./sum');\nassert.strictEqual(sum([1, 2, 3]), 6);\nassert.strictEqual(sum([]), 0);\n",
+                ),
+            ],
+            "node",
+            &["sum.test.js"],
+        )
+        .requires(&["node"])
+        .unchanged(&["sum.test.js"]),
+        // 23. JavaScript: missing `return` (the test sees `undefined`).
+        EvalCase::new(
+            "js-missing-return",
+            &[
+                (
+                    "dbl.js",
+                    "function double(x) {\n  x * 2;\n}\nmodule.exports = double;\n",
+                ),
+                (
+                    "dbl.test.js",
+                    "const assert = require('assert');\nconst double = require('./dbl');\nassert.strictEqual(double(3), 6);\nassert.strictEqual(double(0), 0);\n",
+                ),
+            ],
+            "node",
+            &["dbl.test.js"],
+        )
+        .requires(&["node"])
+        .unchanged(&["dbl.test.js"]),
+        // 24. JavaScript: wrong arithmetic operator.
+        EvalCase::new(
+            "js-wrong-arith",
+            &[
+                (
+                    "area.js",
+                    "function area(w, h) {\n  return w + h;\n}\nmodule.exports = area;\n",
+                ),
+                (
+                    "area.test.js",
+                    "const assert = require('assert');\nconst area = require('./area');\nassert.strictEqual(area(3, 4), 12);\nassert.strictEqual(area(2, 5), 10);\n",
+                ),
+            ],
+            "node",
+            &["area.test.js"],
+        )
+        .requires(&["node"])
+        .unchanged(&["area.test.js"]),
+        // 25. POSIX shell: a `test` operator with the wrong sense, reached
+        //     through the test script's `. ./lib.sh`.
+        EvalCase::new(
+            "sh-wrong-test-op",
+            &[
+                ("lib.sh", "is_positive() {\n  [ \"$1\" -lt 0 ]\n}\n"),
+                (
+                    "test.sh",
+                    "#!/bin/sh\n. ./lib.sh\nis_positive 5 || { echo \"test.sh:3: is_positive 5 should succeed\"; exit 1; }\nif is_positive -2; then echo \"test.sh:4: is_positive -2 should fail\"; exit 1; fi\nif is_positive 0; then echo \"test.sh:5: is_positive 0 should fail\"; exit 1; fi\n",
+                ),
+            ],
+            &posix_shell(),
+            &["test.sh"],
+        )
+        .unchanged(&["test.sh"]),
+        // 26. Go: `go test` blames `calc_test.go`; the package sibling is the
+        //     repair target. Toolchain-heavy, so it is skipped without `go`.
+        EvalCase::new(
+            "go-off-by-one",
+            &[
+                ("go.mod", "module calc\n\ngo 1.18\n"),
+                (
+                    "calc.go",
+                    "package calc\n\nfunc Sum(xs []int) int {\n\ts := 0\n\tfor i := 0; i < len(xs)-1; i++ {\n\t\ts += xs[i]\n\t}\n\treturn s\n}\n",
+                ),
+                (
+                    "calc_test.go",
+                    "package calc\n\nimport \"testing\"\n\nfunc TestSum(t *testing.T) {\n\tif got := Sum([]int{1, 2, 3}); got != 6 {\n\t\tt.Fatalf(\"expected 6 got %d\", got)\n\t}\n\tif got := Sum(nil); got != 0 {\n\t\tt.Fatalf(\"expected 0 got %d\", got)\n\t}\n}\n",
+                ),
+            ],
+            "go",
+            &["test", "./..."],
+        )
+        .requires(&["go"])
+        .unchanged(&["calc_test.go", "go.mod"]),
+        // 27. Rust: a trailing `;` turns the tail expression into `()`; rustc's
+        //     own diagnostic ("remove this semicolon") steers the repair.
+        EvalCase::new(
+            "rust-missing-return-semicolon",
+            &[("lib.rs", "pub fn inc(x: i32) -> i32 {\n    x + 1;\n}\n")],
+            &posix_shell(),
+            &[
+                "-c",
+                "rustc --edition 2021 --crate-type lib -o ./libinc.rlib lib.rs",
+            ],
+        )
+        .requires(&["rustc"]),
+        // 28. Rust: an off-by-one range in the same file as its `#[test]`; the
+        //     panic blames the assertion line, which is an oracle line and is
+        //     never mutated, so the search falls through to the loop bound.
+        EvalCase::new(
+            "rust-off-by-one-range",
+            &[(
+                "calc.rs",
+                "pub fn sum(xs: &[i32]) -> i32 {\n    let mut s = 0;\n    for i in 0..xs.len() - 1 {\n        s += xs[i];\n    }\n    s\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn sums_everything() {\n        assert_eq!(super::sum(&[1, 2, 3]), 6);\n        assert_eq!(super::sum(&[]), 0);\n    }\n}\n",
+            )],
+            &posix_shell(),
+            &[
+                "-c",
+                "rustc --edition 2021 --test -o ./calc_test calc.rs && ./calc_test",
+            ],
+        )
+        .requires(&["rustc"]),
+        // 29. C: the test blames itself; `#include \"calc.h\"` leads to calc.c.
+        EvalCase::new(
+            "c-wrong-comparison",
+            &[
+                ("calc.h", "int is_adult(int age);\n"),
+                (
+                    "calc.c",
+                    "#include \"calc.h\"\n\nint is_adult(int age) {\n    return age > 18;\n}\n",
+                ),
+                (
+                    "test.c",
+                    "#include <stdio.h>\n#include \"calc.h\"\n\nint main(void) {\n    if (!is_adult(18)) {\n        fprintf(stderr, \"test.c:%d: is_adult(18) should be true\\n\", __LINE__);\n        return 1;\n    }\n    if (is_adult(17)) {\n        fprintf(stderr, \"test.c:%d: is_adult(17) should be false\\n\", __LINE__);\n        return 1;\n    }\n    return 0;\n}\n",
+                ),
+            ],
+            &posix_shell(),
+            &["-c", "gcc -o ./t test.c calc.c && ./t"],
+        )
+        .requires(&["gcc"])
+        .unchanged(&["test.c"]),
+        // 30. Ruby: `xs[xs.length]` is nil; `require_relative` leads to calc.rb.
+        EvalCase::new(
+            "rb-off-by-one",
+            &[
+                ("calc.rb", "def last(xs)\n  xs[xs.length]\nend\n"),
+                (
+                    "test.rb",
+                    "require_relative 'calc'\nraise \"test.rb:2: expected 3 got #{last([1, 2, 3]).inspect}\" unless last([1, 2, 3]) == 3\nraise \"test.rb:3: expected 7\" unless last([7]) == 7\n",
+                ),
+            ],
+            "ruby",
+            &["test.rb"],
+        )
+        .requires(&["ruby"])
+        .unchanged(&["test.rb"]),
     ]
 }
 
@@ -354,13 +673,45 @@ pub fn builtin_cases() -> Vec<EvalCase> {
 pub fn run_eval(pipeline: &InferencePipeline, cases: &[EvalCase]) -> EvalReport {
     let mut results = Vec::with_capacity(cases.len());
     for case in cases {
+        let missing: Vec<&str> = case
+            .requires
+            .iter()
+            .map(String::as_str)
+            .filter(|p| !program_available(p))
+            .collect();
+        if !missing.is_empty() {
+            results.push(CaseResult {
+                name: case.name.clone(),
+                solved: false,
+                skipped: Some(format!("missing: {}", missing.join(", "))),
+            });
+            continue;
+        }
         let solved = run_one(pipeline, case).unwrap_or(false);
         results.push(CaseResult {
             name: case.name.clone(),
             solved,
+            skipped: None,
         });
     }
     EvalReport { results }
+}
+
+/// Is `program` runnable from `PATH`? (A `which` without spawning anything.)
+pub fn program_available(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let direct = dir.join(program);
+        if direct.is_file() {
+            return true;
+        }
+        cfg!(windows)
+            && ["exe", "cmd", "bat"]
+                .iter()
+                .any(|ext| dir.join(format!("{program}.{ext}")).is_file())
+    })
 }
 
 fn run_one(pipeline: &InferencePipeline, case: &EvalCase) -> std::io::Result<bool> {
@@ -381,7 +732,13 @@ fn run_one(pipeline: &InferencePipeline, case: &EvalCase) -> std::io::Result<boo
         }
         std::fs::write(&path, content)?;
     }
-    let solved = if case.agentic_fix.is_empty() {
+    let pinned: Vec<(String, Vec<u8>)> = case
+        .expect_unchanged
+        .iter()
+        .filter(|rel| is_safe_rel(rel))
+        .filter_map(|rel| std::fs::read(root.join(rel)).ok().map(|b| (rel.clone(), b)))
+        .collect();
+    let mut solved = if case.agentic_fix.is_empty() {
         // Single-file repair path: the autonomous solve loop must localize and
         // fix the fault itself (no caller-named source).
         let opts = SolveOptions {
@@ -398,6 +755,16 @@ fn run_one(pipeline: &InferencePipeline, case: &EvalCase) -> std::io::Result<boo
     } else {
         solve_agentic_case(case, &root)
     };
+    // A green verifier is not enough if the fix landed in a pinned file (the
+    // test): that is an overfit, scored as a failure.
+    if solved {
+        for (rel, before) in &pinned {
+            if std::fs::read(root.join(rel)).ok().as_deref() != Some(before.as_slice()) {
+                println!("[axiom-eval-agentic] {}: pinned file {rel} was modified — overfit, scored FAIL", case.name);
+                solved = false;
+            }
+        }
+    }
     let _ = std::fs::remove_dir_all(&root);
     Ok(solved)
 }
@@ -540,16 +907,67 @@ mod tests {
                 CaseResult {
                     name: "a".into(),
                     solved: true,
+                    skipped: None,
                 },
                 CaseResult {
                     name: "b".into(),
                     solved: false,
+                    skipped: None,
+                },
+                CaseResult {
+                    name: "c".into(),
+                    solved: false,
+                    skipped: Some("missing: unobtainium".into()),
                 },
             ],
         };
-        assert_eq!(report.total(), 2);
+        assert_eq!(
+            report.total(),
+            2,
+            "skipped cases are not in the denominator"
+        );
         assert_eq!(report.solved(), 1);
+        assert_eq!(report.skipped(), 1);
         assert!((report.score() - 0.5).abs() < f64::EPSILON);
+        assert!(report.summary().contains("[SKIP] c (missing: unobtainium)"));
+        assert!(report.summary().ends_with("score: 1/2 = 50% (1 skipped)"));
         assert!(EvalReport { results: vec![] }.score() == 0.0);
+    }
+
+    #[test]
+    fn missing_requirement_skips_instead_of_failing() {
+        let case = EvalCase::new(
+            "needs-unobtainium",
+            &[("a.sh", "#!/bin/sh\nexit 1\n")],
+            &posix_shell(),
+            &["a.sh"],
+        )
+        .requires(&["axiom-definitely-not-installed-binary"]);
+        let report = run_eval(&tiny_pipeline(), &[case]);
+        assert_eq!(report.total(), 0);
+        assert_eq!(report.skipped(), 1);
+        assert!(report.results[0]
+            .skipped
+            .as_deref()
+            .unwrap()
+            .contains("missing:"));
+        assert!(program_available(&posix_shell()) || cfg!(windows));
+        assert!(!program_available("axiom-definitely-not-installed-binary"));
+    }
+
+    #[test]
+    fn a_fix_that_edits_a_pinned_file_is_scored_as_overfit() {
+        // The only file is the "test" and it is pinned: the legacy exit flip
+        // makes the verifier green, but the case must still score FAIL.
+        let case = EvalCase::new(
+            "pinned-oracle",
+            &[("run.sh", "#!/bin/sh\necho 'run.sh:2:1: boom' >&2\nexit 1\n")],
+            &posix_shell(),
+            &["run.sh"],
+        )
+        .unchanged(&["run.sh"]);
+        let report = run_eval(&tiny_pipeline(), &[case]);
+        assert_eq!(report.total(), 1);
+        assert_eq!(report.solved(), 0, "{}", report.summary());
     }
 }

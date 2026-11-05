@@ -24,9 +24,43 @@
 //! success-rate over seeded broken-repo fixtures — a number, never a claim.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use crate::provenance::sha256_hex;
+
+/// Process-wide counter behind [`mark_fresh`]: every candidate write gets its
+/// own backward offset, so no two writes in one process share an mtime.
+static FRESHNESS_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// Give `path` a modification time no other candidate write in this process has
+/// used, so mtime-keyed build caches never serve a stale artifact for it.
+///
+/// Why this exists: the repair loops write a candidate, run the verifier, and
+/// decide on the result. Python's `__pycache__` (and `make`-style tools)
+/// decide whether to recompile by comparing the source's **mtime (seconds) and
+/// size** to what they recorded. A candidate the same size as the original,
+/// written within the same second, is therefore run from the *stale* bytecode
+/// of the original — the verifier reports the original's failure and a correct
+/// fix is rolled back as rejected. Observed on `py-swapped-args` (swapping two
+/// arguments never changes the size).
+///
+/// The fix sets the mtime to `base - (1 + n) s` where `n` is a process-wide
+/// counter: distinct from the original, distinct from every earlier candidate,
+/// and never in the future (a future-dated source trips clock-skew warnings in
+/// other tools). Best-effort: a filesystem that refuses `set_modified` leaves
+/// the file as written.
+pub fn mark_fresh(path: &Path, base: Option<SystemTime>) {
+    let tick = FRESHNESS_TICK.fetch_add(1, Ordering::Relaxed);
+    let base = base.unwrap_or_else(SystemTime::now);
+    let Some(stamp) = base.checked_sub(Duration::from_secs(1 + tick)) else {
+        return;
+    };
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_modified(stamp);
+    }
+}
 
 /// One proposed edit: the full intended contents of a single file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,11 +148,17 @@ impl Transaction {
                     std::fs::create_dir_all(parent)?;
                 }
             }
+            let before = std::fs::metadata(&edit.path)
+                .and_then(|m| m.modified())
+                .ok();
             if let Err(e) = std::fs::write(&edit.path, &edit.content) {
                 // Roll back whatever we already wrote, then surface the error.
                 tx.rollback();
                 return Err(e);
             }
+            // A same-size rewrite in the same second must still look new to
+            // mtime-keyed caches (see `mark_fresh`).
+            mark_fresh(&edit.path, before);
         }
         tx.applied = true;
         Ok(tx)
@@ -354,6 +394,40 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("axiom_agentic_{tag}_{n}"))
+    }
+
+    #[test]
+    fn mark_fresh_gives_every_write_a_distinct_past_mtime() {
+        let dir = tmp("fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("m.py");
+        std::fs::write(&f, "a").unwrap();
+        let original = std::fs::metadata(&f).unwrap().modified().unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            std::fs::write(&f, "b").unwrap(); // same size as the original
+            mark_fresh(&f, Some(original));
+            let m = std::fs::metadata(&f).unwrap().modified().unwrap();
+            assert_ne!(m, original, "must differ from the original mtime");
+            assert!(m < original, "never future-dated");
+            assert!(!seen.contains(&m), "distinct across writes");
+            seen.push(m);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transaction_apply_changes_mtime_even_for_same_size_rewrite() {
+        let dir = tmp("txfresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("m.py");
+        std::fs::write(&f, "x = 1").unwrap();
+        let before = std::fs::metadata(&f).unwrap().modified().unwrap();
+        let tx = Transaction::apply(&EditSet::new().with(f.clone(), "x = 2")).unwrap();
+        let after = std::fs::metadata(&f).unwrap().modified().unwrap();
+        assert_ne!(before, after);
+        tx.commit();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -103,7 +103,7 @@ a simulated version. Building it is real infrastructure work:
 - A task suite spanning single-file fixes, multi-file refactors, long
   conversations, tool-heavy workloads, and deliberately injected
   failure/recovery scenarios — none of which exist as fixtures in this repo
-  today (the closest is `axiom eval-agentic`'s 9 fixtures, which test
+  today (the closest is `axiom eval-agentic`'s 30 fixtures, which test
   AXIOM's *own* repair loop in isolation, not an agent's task success with
   vs. without AXIOM as a dependency).
 - A cost/latency measurement harness that can attribute tokens/dollars/time
@@ -178,7 +178,7 @@ difficulty of building each fairly:
    new module.
 6. **Failure-recovery tasks** — deliberately broken environments/code,
    measuring repair success/failure/regression rate. `axiom eval-agentic`'s
-   9 fixtures are the closest existing artifact but test AXIOM's repair
+   30 fixtures are the closest existing artifact but test AXIOM's repair
    loop directly, not an agent using AXIOM as infrastructure — worth
    reusing as seed fixtures, not as the whole suite.
 

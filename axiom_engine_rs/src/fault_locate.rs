@@ -353,6 +353,275 @@ pub fn line_hints_for(trace: &str, target: &Path) -> Vec<u32> {
     order
 }
 
+/// Does this path look like a test or spec file — i.e. the verifier's oracle
+/// rather than the code under test? Matches the common conventions across the
+/// languages the localizer knows: `test_*.py`, `*_test.go`, `*.test.js`,
+/// `*_spec.rb`, `FooTest.java`, a bare `test.<ext>`, or any file under a
+/// `test/`, `tests/`, `spec/`, `__tests__/` directory.
+///
+/// The autonomous solver uses this to **demote** such files: when a failure
+/// blames only the test, the repair should land in the module it imports, and a
+/// test file is edited only as a last resort. Heuristic by design — a wrong
+/// guess reorders candidates, it never widens what may be written.
+pub fn is_test_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let stem = match name.rsplit_once('.') {
+        Some((s, _)) => s.to_string(),
+        None => name.clone(),
+    };
+    let by_name = name.starts_with("test_")
+        || name.starts_with("test-")
+        || stem == "test"
+        || stem == "tests"
+        || stem.ends_with("_test")
+        || stem.ends_with("-test")
+        || stem.ends_with(".test")
+        || stem.ends_with("_spec")
+        || stem.ends_with(".spec")
+        || stem.starts_with("spec_")
+        || (stem.ends_with("test") && stem.len() > 4 && name.ends_with(".java"))
+        || (stem.ends_with("tests") && stem.len() > 5 && name.ends_with(".java"));
+    if by_name {
+        return true;
+    }
+    path.parent()
+        .map(|parent| {
+            parent.components().any(|c| {
+                let c = c.as_os_str().to_string_lossy().to_ascii_lowercase();
+                matches!(
+                    c.as_str(),
+                    "test" | "tests" | "spec" | "specs" | "__tests__" | "testing"
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Source files `file` pulls in — the modules a test exercises — resolved to
+/// real files under `root`. Understands the import forms of the languages the
+/// localizer knows (Python `import`/`from`, JS `require`/`import`, Ruby
+/// `require_relative`, shell `.`/`source`, C `#include "x.h"` (plus the `x.c`
+/// sibling), Rust `mod x;`) and, for Go `_test.go` files, every non-test `.go`
+/// file in the same package directory. Test-looking targets and `file` itself
+/// are excluded; the result is deduplicated in first-seen order.
+pub fn import_targets(file: &Path, root: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return Vec::new();
+    };
+    let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+    let ext = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let self_canon = file.canonicalize().ok();
+
+    // Relative specs (without extension, slashes already normalised) and the
+    // extensions to try for each.
+    let mut specs: Vec<(String, &[&str])> = Vec::new();
+    let mut push = |spec: &str, exts: &'static [&'static str]| {
+        let spec = spec
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"' || c == ';');
+        if !spec.is_empty() && !spec.contains("..") {
+            specs.push((spec.to_string(), exts));
+        }
+    };
+
+    match ext.as_str() {
+        "py" => {
+            for raw in text.lines() {
+                let l = raw.trim();
+                if let Some(rest) = l.strip_prefix("from ") {
+                    if let Some((module, _)) = rest.split_once(" import ") {
+                        let module = module.trim().trim_start_matches('.');
+                        push(&module.replace('.', "/"), &["py", "/__init__.py"]);
+                    }
+                } else if let Some(rest) = l.strip_prefix("import ") {
+                    for module in rest.split(',') {
+                        let module = module.split(" as ").next().unwrap_or("").trim();
+                        push(&module.replace('.', "/"), &["py", "/__init__.py"]);
+                    }
+                }
+            }
+        }
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => {
+            for raw in text.lines() {
+                let l = raw.trim();
+                let spec = if let Some(i) = l.find("require(") {
+                    quoted_after(&l[i + "require(".len()..])
+                } else if l.starts_with("import ") {
+                    l.find(" from ")
+                        .and_then(|i| quoted_after(&l[i + " from ".len()..]))
+                        .or_else(|| quoted_after(&l["import ".len()..]))
+                } else {
+                    None
+                };
+                if let Some(spec) = spec {
+                    if spec.starts_with('.') {
+                        let spec = spec.trim_start_matches("./");
+                        push(
+                            spec,
+                            &[
+                                "",
+                                "js",
+                                "mjs",
+                                "cjs",
+                                "ts",
+                                "tsx",
+                                "jsx",
+                                "/index.js",
+                                "/index.ts",
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+        "rb" => {
+            for raw in text.lines() {
+                let l = raw.trim();
+                for kw in ["require_relative ", "require "] {
+                    if let Some(rest) = l.strip_prefix(kw) {
+                        if let Some(spec) = quoted_after(rest) {
+                            let spec = spec.trim_start_matches("./");
+                            push(spec, &["", "rb"]);
+                        }
+                    }
+                }
+            }
+        }
+        "sh" | "bash" | "zsh" | "ksh" => {
+            for raw in text.lines() {
+                let l = raw.trim();
+                let rest = l.strip_prefix(". ").or_else(|| l.strip_prefix("source "));
+                if let Some(rest) = rest {
+                    let spec = rest.split_whitespace().next().unwrap_or("");
+                    let spec = spec
+                        .trim_start_matches("./")
+                        .trim_start_matches("\"$(dirname \"$0\")\"/");
+                    push(spec, &[""]);
+                }
+            }
+        }
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" => {
+            for raw in text.lines() {
+                let l = raw.trim();
+                if let Some(rest) = l.strip_prefix("#include") {
+                    if let Some(spec) = quoted_after(rest) {
+                        let base = spec.rsplit_once('.').map(|(b, _)| b).unwrap_or(spec);
+                        // The implementation first — that is where behaviour lives.
+                        push(base, &["c", "cc", "cpp", "cxx"]);
+                        push(spec, &[""]);
+                    }
+                }
+            }
+        }
+        "rs" => {
+            for raw in text.lines() {
+                let l = raw.trim();
+                if let Some(rest) = l.strip_prefix("mod ") {
+                    if let Some(name) = rest.strip_suffix(';') {
+                        push(name.trim(), &["rs", "/mod.rs"]);
+                    }
+                }
+            }
+        }
+        "go" => {
+            // Same-package siblings: a `_test.go` exercises the other files in
+            // its directory, no import statement names them.
+            let mut out = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut names: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                names.sort();
+                for p in names {
+                    let is_go = p.extension().and_then(|e| e.to_str()) == Some("go");
+                    if is_go && !is_test_path(&p) {
+                        if let Some(r) = resolve_under_root(&p, root) {
+                            if Some(&r) != self_canon.as_ref() && !out.contains(&r) {
+                                out.push(r);
+                            }
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+        _ => {}
+    }
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    for (spec, exts) in specs {
+        for ext in exts {
+            let rel = if ext.is_empty() {
+                spec.clone()
+            } else if ext.starts_with('/') {
+                format!("{spec}{ext}")
+            } else {
+                format!("{spec}.{ext}")
+            };
+            for base in [&dir, root] {
+                if let Some(r) = resolve_under_root(Path::new(&rel), base) {
+                    if r.starts_with(root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
+                        && Some(&r) != self_canon.as_ref()
+                        && !is_test_path(&r)
+                        && !out.contains(&r)
+                    {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// First single- or double-quoted string in `s`.
+fn quoted_after(s: &str) -> Option<&str> {
+    let s = s.trim_start();
+    let q = s.chars().next()?;
+    if q != '\'' && q != '"' {
+        return None;
+    }
+    let rest = &s[1..];
+    let end = rest.find(q)?;
+    Some(&rest[..end])
+}
+
+/// The files the autonomous solver should try to repair, in order: every
+/// non-test file the trace blames (most-blamed first), then the modules each
+/// blamed test file imports (the code under test, which an assertion failure
+/// in the test never names directly), and only then the test files themselves.
+/// This is [`candidate_sources`] plus the test-awareness that keeps the solver
+/// from "fixing" a failing test by editing the test.
+pub fn repair_targets(trace: &str, root: &Path) -> Vec<PathBuf> {
+    let direct = candidate_sources(trace, root);
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in &direct {
+        if !is_test_path(p) && !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    for p in &direct {
+        if is_test_path(p) {
+            for hop in import_targets(p, root) {
+                if !out.contains(&hop) {
+                    out.push(hop);
+                }
+            }
+        }
+    }
+    for p in &direct {
+        if is_test_path(p) && !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +858,123 @@ src/unrelated.rs:3:1: error";
         assert_eq!(detect_language(&mdir), Some(Language::Java));
         assert_eq!(default_verify(Language::Java).0, "mvn");
         let _ = std::fs::remove_dir_all(&mdir);
+    }
+
+    #[test]
+    fn test_paths_are_recognised_by_convention() {
+        for p in [
+            "test_calc.py",
+            "calc_test.go",
+            "sum.test.js",
+            "calc_spec.rb",
+            "CalcTest.java",
+            "test.sh",
+            "tests/unit/x.py",
+            "src/__tests__/a.ts",
+        ] {
+            assert!(is_test_path(Path::new(p)), "{p} should be a test path");
+        }
+        for p in [
+            "calc.py",
+            "calc.go",
+            "sum.js",
+            "lib.sh",
+            "src/util/gate.sh",
+            "Gate.java",
+            "contest.py",
+        ] {
+            assert!(!is_test_path(Path::new(p)), "{p} should not be a test path");
+        }
+    }
+
+    #[test]
+    fn import_targets_follow_the_languages_import_forms() {
+        let dir = std::env::temp_dir().join(format!("axiom_floc_imports_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        let w = |rel: &str, body: &str| std::fs::write(dir.join(rel), body).unwrap();
+        w("calc.py", "def f(): pass\n");
+        w("pkg/__init__.py", "");
+        w(
+            "test_calc.py",
+            "import os\nfrom calc import f\nimport pkg\n",
+        );
+        w("sum.js", "module.exports = 1;\n");
+        w(
+            "sum.test.js",
+            "const assert = require('assert');\nconst sum = require('./sum');\n",
+        );
+        w("calc.rb", "def f; end\n");
+        w("test.rb", "require_relative 'calc'\n");
+        w("lib.sh", "f() { :; }\n");
+        w("test.sh", "#!/bin/sh\n. ./lib.sh\n");
+        w("calc.h", "int f(void);\n");
+        w("calc.c", "int f(void) { return 1; }\n");
+        w("test.c", "#include <assert.h>\n#include \"calc.h\"\n");
+        w("calc.go", "package calc\n");
+        w("calc_test.go", "package calc\n");
+        w("other_test.go", "package calc\n");
+
+        let c = |rel: &str| dir.join(rel).canonicalize().unwrap();
+        assert_eq!(
+            import_targets(&dir.join("test_calc.py"), &dir),
+            vec![c("calc.py"), c("pkg/__init__.py")]
+        );
+        assert_eq!(
+            import_targets(&dir.join("sum.test.js"), &dir),
+            vec![c("sum.js")]
+        );
+        assert_eq!(
+            import_targets(&dir.join("test.rb"), &dir),
+            vec![c("calc.rb")]
+        );
+        assert_eq!(
+            import_targets(&dir.join("test.sh"), &dir),
+            vec![c("lib.sh")]
+        );
+        assert_eq!(
+            import_targets(&dir.join("test.c"), &dir),
+            vec![c("calc.c"), c("calc.h")]
+        );
+        assert_eq!(
+            import_targets(&dir.join("calc_test.go"), &dir),
+            vec![c("calc.go")]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_targets_put_the_module_under_test_before_the_test() {
+        let dir = std::env::temp_dir().join(format!("axiom_floc_targets_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("calc.py"), "def f(): pass\n").unwrap();
+        std::fs::write(
+            dir.join("test_calc.py"),
+            "from calc import f\nassert f() == 1\n",
+        )
+        .unwrap();
+        let c = |rel: &str| dir.join(rel).canonicalize().unwrap();
+
+        // An assertion failure names only the test; the module is reached by hop.
+        let trace = "  File \"test_calc.py\", line 2, in <module>\nAssertionError";
+        assert_eq!(
+            repair_targets(trace, &dir),
+            vec![c("calc.py"), c("test_calc.py")]
+        );
+
+        // A directly blamed non-test file outranks everything.
+        let trace = "  File \"test_calc.py\", line 2, in <module>\n  File \"calc.py\", line 1, in f\nIndexError";
+        assert_eq!(
+            repair_targets(trace, &dir),
+            vec![c("calc.py"), c("test_calc.py")]
+        );
+
+        // Without test-awareness the plain ranking would have led with the test.
+        assert_eq!(
+            candidate_sources("  File \"test_calc.py\", line 2, in <module>", &dir)[0],
+            c("test_calc.py")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

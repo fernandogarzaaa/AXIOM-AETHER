@@ -16,7 +16,7 @@ weights, O(1)/step, no fine-tune pipeline.
 |---|---|---|
 | **1. Context compression** | Absorb heavy context into `W̃`, forward compact fingerprints, recover bodies on demand, and compress safe-prefix `/v1/responses` transcripts by replacing contiguous assistant runs in place. | `context_compressor.rs`, `responses_compressor.rs`, `skeleton.rs`, `/v1/messages`, `/v1/responses` |
 | **2. Self-healing runtime** | Run a program; on failure, feel the tension (CE), absorb it, heal the environment, and learn immunity. | `self_heal.rs`, `heal_memory.rs`, `axiom run` |
-| **3. Autonomy** | Drive a failing verify command to green by chaining environment-heal + source-repair + verify. | `solve.rs`, `axiom solve` |
+| **3. Autonomy** | Drive a failing verify command to green by chaining environment-heal + source-repair + verify. Source repair is deterministic and verifier-gated: test-aware localization, then bounded single-edit mutations (comparison, off-by-one, boolean, logic, arithmetic, swapped args, missing `return`, shell `test` ops). 30/30 fixtures incl. 16 on real toolchains. | `solve.rs`, `mutation_repair.rs`, `fault_locate.rs`, `axiom solve`, `axiom eval-agentic` |
 | **Grounding (anti-hallucination)** | Flag response claims unsupported by the evidence with a shipped conformal threshold, and benchmark neural-tier contradiction catch-rate against a lexical baseline. | `hallucination.rs`, `bench/trust/claims.jsonl`, `/v1/verify` |
 
 Cross-cutting: a **verifiable epistemic swarm** (Beta-belief confidence +
@@ -111,7 +111,7 @@ read-only cwd), `search`, `fetch`; plus, only with `--features experimental`,
 - **DWE** (`dwe.rs`, `server/routes_fleet.rs`) — binary `W̃`-delta exchange between peers, HMAC authenticated, replay guarded, and observable through live counters/status.
 - **AxiomBench** (`src/bin/axiombench/`) — reproducible cognition, trust, fleet, and live cost evidence; `RESULTS.md` carries the current headline table.
 - **CVM cost stack** (`cache_safety.rs`, `cvm_store.rs`, `digest.rs`, `prefix_diet.rs`, `keepalive.rs`, `cost_ledger.rs`) — dollar-true cost reduction for `/v1/messages` traffic: never rewrites bytes at/before a client cache breakpoint, digests heavy tool results into a recoverable content-addressed store, and tracks real USD cost (not byte counts) per session. Design + measured-vs-simulated status: [`docs/superpowers/plans/2026-07-10-cvm-cost-stack.md`](superpowers/plans/2026-07-10-cvm-cost-stack.md), README's [CVM Cost Stack](../README.md#cvm-cost-stack) section.
-- **Hypervisor** — Neural VFS (`vfs.rs`), Poly JIT source repair (`poly_jit.rs`) ranked by a Q-TTT simulator (`q_manifold.rs`, `hamiltonian.rs`), compile-check verifier (`compile_verify.rs`, formerly `sandbox.rs`).
+- **Hypervisor** — Neural VFS (`vfs.rs`), Poly JIT source repair (`poly_jit.rs`) ranked by a Q-TTT simulator (`q_manifold.rs`, `hamiltonian.rs`), general mutation repair (`mutation_repair.rs`), compile-check verifier (`compile_verify.rs`, formerly `sandbox.rs`).
 - **Training** — `train_tokenizer`, `train_semantic` (early-stopping on held-out CE), `eval_model` (acceptance + drift-gate calibration); `scripts/train_cpu_quickstart.sh`.
 
 ## Try it

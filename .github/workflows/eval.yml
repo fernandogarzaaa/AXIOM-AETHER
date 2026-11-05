@@ -57,9 +57,24 @@ jobs:
         working-directory: axiom_engine_rs
         run: cargo build --release --locked --bin axiom
 
+      # The real-interpreter fixtures need these on PATH; ubuntu-22.04 ships
+      # all of them (rustc comes from the toolchain step). Print the versions
+      # so a skip or a failure can be read against the exact toolchain.
+      - name: Toolchains for the real-interpreter fixtures
+        run: |
+          python3 --version
+          node --version
+          go version
+          rustc --version
+          gcc --version | head -1
+          ruby --version
+
+      # --require-all: a fixture skipped for a missing toolchain fails the run,
+      # so this job proves the whole suite executed, not just the subset the
+      # runner happened to support.
       - name: Run agentic eval (deterministic offline fixtures)
         working-directory: axiom_engine_rs
-        run: cargo run --release --locked --bin axiom -- eval-agentic
+        run: cargo run --release --locked --bin axiom -- eval-agentic --require-all
         env:
           RUST_LOG: info
           AXIOM_DEVICE: cpu

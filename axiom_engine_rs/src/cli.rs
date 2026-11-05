@@ -124,7 +124,15 @@ pub enum AxiomCommand {
     /// Measure the autonomous loop's capability as a reproducible score: run the
     /// built-in seeded broken-repo fixtures through the real solve loop and report
     /// how many it repairs end-to-end (deterministic, no LLM required).
-    EvalAgentic {},
+    /// Fixtures whose toolchain (python3, node, go, rustc, gcc, ruby) is not on
+    /// PATH are reported as skipped and left out of the score.
+    EvalAgentic {
+        /// Fail (exit 1) if any fixture was skipped for a missing toolchain,
+        /// so CI proves the whole suite ran. Also enabled by
+        /// `AXIOM_EVAL_REQUIRE_ALL=1`.
+        #[arg(long, default_value_t = false)]
+        require_all: bool,
+    },
     /// Suggest verifier commands for a change: analyzes changed files (and an
     /// optional unified diff) and proposes the compile checks, test commands,
     /// lints, and security callouts an agent should use as its task-loop

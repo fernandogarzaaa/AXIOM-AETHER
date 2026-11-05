@@ -23,10 +23,15 @@ end-to-end, reversibly. Deterministic; no LLM or network.
 cargo run --release --bin axiom -- eval-agentic
 ```
 **Read as:** `score: N/N` — a pass/fail capability gate, not yet a rate (the
-built-in set is small; see [`BENCH-REPAIR.md`](BENCH-REPAIR.md) for the plan to
-grow it into a held-out benchmark with a baseline comparison). The command
-exits non-zero if any fixture regresses, so CI enforces it
-(`.github/workflows/eval.yml`).
+built-in set is authored, not sampled; see [`BENCH-REPAIR.md`](BENCH-REPAIR.md)
+for the plan to grow it into a held-out benchmark with a baseline comparison).
+Fourteen fixtures exercise localization across trace dialects with a scripted
+verifier; sixteen run the **real toolchain** (`python3`, `node`, `sh`, `go`,
+`rustc`, `gcc`, `ruby`) against a genuinely buggy module and pin the test file,
+so a fix that edits the oracle scores as a failure. A fixture whose toolchain
+is missing is reported as skipped and left out of the denominator;
+`--require-all` (set in CI) fails the run instead. The command exits non-zero
+if any fixture regresses, so CI enforces it (`.github/workflows/eval.yml`).
 
 ### 2. Context compression at fixed fidelity
 
@@ -71,7 +76,9 @@ it. Update **both** on every release.
 
 | Metric | Value | Config | Measured | Release |
 |---|---|---|---|---|
-| Autonomous repair | **9/9 = 100%** | built-in fixtures, CPU, no LLM | 2026-08-28 | (pre-v0.4.2) |
+| Autonomous repair | **30/30 = 100%** | 14 localization + 16 real-interpreter fixtures, CPU, no LLM, 15 s wall clock | 2026-11-05 | (post-0.5.0) |
+| Autonomous repair | 14/14 = 100% | built-in fixtures, CPU, no LLM | 2026-10-29 | v0.5.0 |
+| Autonomous repair | 9/9 = 100% | built-in fixtures, CPU, no LLM | 2026-08-28 | (pre-v0.4.2) |
 | Compression | **86.7% savings, 2229/2229 = 100% round-trip** | `AXIOM_PRODUCTION_BPE=1`, 121-file tree | 2026-08-09 | v0.4.x |
 | Compression | **82.4% savings, 2181/2181 = 100% round-trip** | `AXIOM_PRODUCTION_BPE=0`, 120-file tree | 2026-08-09 | v0.4.x |
 | Cost (real traffic) | **65.1% / 41.4% quota savings** | two live Claude Code sessions, `/metrics` delta | 2026-07-17 | v0.2.x |
