@@ -120,9 +120,13 @@ transaction loop. This run needs an API key and is **not** part of the CI gate;
 it is a periodic measurement recorded in `bench/results/` and the proof-loop
 table with its date and the exact instance list.
 
-### Fixture format for an on-disk corpus (`bench/repair/<name>/`)
+### Fixture format for an on-disk corpus (`bench/repair/<name>/`) — **runner shipped 2026-11-05**
 
-When Phase 2 fixtures outgrow `builtin_cases()`, store them as directories:
+`bench/repair/` and `scripts/bench_repair.sh` exist now (see
+[`bench/repair/README.md`](../bench/repair/README.md)); three seed fixtures prove
+the runner and CI runs it with `--check` on every push (`eval.yml`). Fixtures
+that outgrow `builtin_cases()` — and any external bug set — go here as
+directories:
 
 ```
 bench/repair/<name>/
@@ -131,9 +135,17 @@ bench/repair/<name>/
   expected.diff    # a known-good patch, for scoring "did it find *a* fix" vs "the canonical fix"
 ```
 
-A thin `scripts/bench_repair.sh` runner (Phase 2 deliverable) iterates
-`bench/repair/*`, runs `axiom solve` (or `axiom task --goal …`) in a copy of
-`broken/`, checks `verify`, and prints a pass-rate table.
+`scripts/bench_repair.sh` iterates `bench/repair/*`, and for each fixture:
+confirms the **No-op** baseline (`verify` must fail on the untouched tree, so a
+pass means something), runs `axiom solve` in a scratch copy with no file named
+(the loop must localize and repair on its own), re-runs `verify`, and on failure
+checks **rollback correctness** (the tree is byte-identical to `broken/`). When
+`expected.diff` is present a pass is labelled *authored fix* or *different fix*.
+It prints a markdown table, writes `bench/results/repair-<date>.md`, and with
+`--check` exits non-zero on any unrepaired, not-actually-broken, or
+tree-modifying fixture (`AXIOM_EVAL_REQUIRE_ALL=1` also fails a skip). Driving
+it with `axiom task --goal …` against SWE-bench checkouts is the remaining Phase
+2 step; the harness it needs is in place.
 
 ---
 

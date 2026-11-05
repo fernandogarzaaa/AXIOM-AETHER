@@ -78,3 +78,22 @@ jobs:
         env:
           RUST_LOG: info
           AXIOM_DEVICE: cpu
+
+      # The on-disk corpus (bench/repair/, docs/BENCH-REPAIR.md) exercises the
+      # real `axiom solve` CLI from a fresh checkout of each fixture: no-op
+      # baseline must fail, the repair must land, a failed attempt must leave
+      # the tree byte-identical. Same binary as above, so no extra build.
+      - name: Run on-disk repair corpus (scripts/bench_repair.sh --check)
+        run: scripts/bench_repair.sh --check
+        env:
+          AXIOM_DEVICE: cpu
+          AXIOM_EVAL_REQUIRE_ALL: "1"
+
+      - name: Upload repair-corpus table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-corpus-${{ github.sha }}
+          path: bench/results/repair-*.md
+          if-no-files-found: warn
+          retention-days: 90

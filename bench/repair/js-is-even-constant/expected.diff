@@ -1,0 +1,8 @@
+--- a/parity.js
++++ b/parity.js
+@@ -1,4 +1,4 @@
+ function isEven(n) {
+-  return n % 2 === 1;
++  return n % 2 === 0;
+ }
+ module.exports = isEven;
