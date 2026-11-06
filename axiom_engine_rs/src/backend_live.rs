@@ -109,6 +109,10 @@ enum RouterMode {
     OpenAi,
     /// OpenDrop preset: OpenAI-compatible at the local default base.
     OpenDrop,
+    /// A logged-in vendor CLI driven as a subprocess (`claude -p`), local
+    /// fallback. Experimental: the backend behind it only exists with
+    /// `--features experimental`; without the feature selecting it is an error.
+    Cli,
 }
 
 fn router_mode_from(backend: &str) -> Option<RouterMode> {
@@ -116,8 +120,70 @@ fn router_mode_from(backend: &str) -> Option<RouterMode> {
         "router" => Some(RouterMode::Router),
         "openai" => Some(RouterMode::OpenAi),
         "opendrop" => Some(RouterMode::OpenDrop),
+        "cli" => Some(RouterMode::Cli),
         _ => None,
     }
+}
+
+/// Error text for `AXIOM_BACKEND=cli` in a build without the feature. One
+/// place so the server and the repair CLIs say the same thing.
+#[cfg(not(feature = "experimental"))]
+const CLI_BACKEND_NOT_COMPILED: &str = "AXIOM_BACKEND=cli selects the experimental CLI backend, \
+     which is not compiled into this binary; rebuild with `--features experimental` \
+     (docs/EXPERIMENTAL.md) or use the proxy pass-through path instead \
+     (docs/CLI-INTEGRATION.md)";
+
+/// Build the CLI backend from the environment, or explain why not. `Ok(None)`
+/// only when `AXIOM_BACKEND` is not `cli`.
+#[cfg(feature = "experimental")]
+fn cli_backend_from_env() -> Result<Option<crate::cli_backend::CliBackend>, String> {
+    match crate::cli_backend::CliBackend::from_env() {
+        None => Ok(None),
+        Some(Ok(backend)) => Ok(Some(backend)),
+        Some(Err(e)) => Err(e.to_string()),
+    }
+}
+
+#[cfg(not(feature = "experimental"))]
+fn cli_backend_from_env() -> Result<Option<Box<dyn ChatBackend>>, String> {
+    let selected = std::env::var("AXIOM_BACKEND")
+        .map(|b| b.trim().eq_ignore_ascii_case("cli"))
+        .unwrap_or(false);
+    if selected {
+        Err(CLI_BACKEND_NOT_COMPILED.to_string())
+    } else {
+        Ok(None)
+    }
+}
+
+/// The single-backend brain for Axiom's own model-needing paths (`axiom
+/// solve` LLM repair, the `axiom task` agent loop): whatever `AXIOM_BACKEND`
+/// selects among the modes that yield one concrete backend.
+///
+/// * `claude` — [`ClaudeBackend::from_env`] (needs `ANTHROPIC_API_KEY`;
+///   `Ok(None)` without it, exactly as before).
+/// * `cli` — the experimental subprocess backend. Its version pin and
+///   configuration errors surface as `Err` so callers **refuse to run**
+///   rather than fall back; in a build without the feature it is `Err` too.
+/// * anything else — `Ok(None)` (the deterministic repair phases still run).
+///
+/// Synchronous callers only: the Claude adapter builds a blocking `reqwest`
+/// client (see module docs).
+pub fn repair_backend_from_env() -> Result<Option<Box<dyn ChatBackend>>, String> {
+    #[cfg(feature = "experimental")]
+    {
+        if let Some(cli) = cli_backend_from_env()? {
+            return Ok(Some(Box::new(cli)));
+        }
+    }
+    #[cfg(not(feature = "experimental"))]
+    {
+        if let Some(cli) = cli_backend_from_env()? {
+            return Ok(Some(cli));
+        }
+    }
+    Ok(ClaudeBackend::from_env()
+        .map(|backend| Box::new(ClaudeChatBackend { backend }) as Box<dyn ChatBackend>))
 }
 
 /// Resolve the OpenAI-compatible base URL for a given mode.
@@ -130,7 +196,9 @@ fn openai_base_url_for(mode: RouterMode) -> String {
     }
     match mode {
         RouterMode::OpenDrop => OPENDROP_ROUTER_BASE_URL.to_string(),
-        RouterMode::Router | RouterMode::OpenAi => "https://api.openai.com/v1".to_string(),
+        RouterMode::Router | RouterMode::OpenAi | RouterMode::Cli => {
+            "https://api.openai.com/v1".to_string()
+        }
     }
 }
 
@@ -159,14 +227,42 @@ fn claude_from_key() -> Option<ClaudeBackend> {
 /// * `openai` / `opendrop` register a single OpenAI-compatible provider plus the
 ///   local pipeline as fallback, with a policy that routes every task to it.
 ///
-/// Returns `None` for any other backend so callers fall back to their default
-/// single-backend path.
+/// * `cli` (experimental) registers the subprocess CLI backend as
+///   [`Provider::Cli`] with every task pinned to it, plus the local pipeline
+///   as fallback. A CLI outside its version pin, a bad `AXIOM_CLI_*` value, or
+///   a build without `--features experimental` is `Err` — the server must
+///   refuse to start rather than silently serve from the wrong brain.
+///
+/// Returns `Ok(None)` for any other backend so callers fall back to their
+/// default single-backend path.
 ///
 /// **Must be called off the Tokio runtime** (see module docs): it constructs
 /// blocking `reqwest` clients.
-pub fn router_from_env(pipeline: Arc<RwLock<InferencePipeline>>) -> Option<Router> {
+pub fn router_from_env(pipeline: Arc<RwLock<InferencePipeline>>) -> Result<Option<Router>, String> {
     let backend = std::env::var("AXIOM_BACKEND").unwrap_or_default();
-    let mode = router_mode_from(&backend)?;
+    let Some(mode) = router_mode_from(&backend) else {
+        return Ok(None);
+    };
+    if mode == RouterMode::Cli {
+        let policy = RoutePolicy {
+            code_repair: Provider::Cli,
+            reasoning: Provider::Cli,
+            general: Provider::Cli,
+            failover: vec![Provider::Cli, Provider::Local],
+            consensus: false,
+        };
+        let Some(cli) = cli_backend_from_env()? else {
+            // Unreachable in practice (`mode == Cli` implies AXIOM_BACKEND=cli),
+            // but never guess a backend.
+            return Err("AXIOM_BACKEND=cli selected but no CLI backend was built".into());
+        };
+        #[cfg(feature = "experimental")]
+        let cli: Box<dyn ChatBackend> = Box::new(cli);
+        let router = Router::new(policy)
+            .with(Provider::Cli, cli)
+            .with(Provider::Local, Box::new(LocalPipelineBackend { pipeline }));
+        return Ok(Some(router));
+    }
 
     let consensus = std::env::var("AXIOM_ROUTER_CONSENSUS")
         .ok()
@@ -208,8 +304,9 @@ pub fn router_from_env(pipeline: Arc<RwLock<InferencePipeline>>) -> Option<Route
                 );
             }
 
-            Some(router)
+            Ok(Some(router))
         }
+        RouterMode::Cli => unreachable!("handled above"),
         RouterMode::OpenAi | RouterMode::OpenDrop => {
             // Route every task to the single OpenAI-compatible provider, with
             // the local pipeline as deterministic last-resort fallback.
@@ -236,7 +333,7 @@ pub fn router_from_env(pipeline: Arc<RwLock<InferencePipeline>>) -> Option<Route
                     }),
                 )
                 .with(Provider::Local, Box::new(LocalPipelineBackend { pipeline }));
-            Some(router)
+            Ok(Some(router))
         }
     }
 }
@@ -250,8 +347,19 @@ mod tests {
         assert_eq!(router_mode_from("router"), Some(RouterMode::Router));
         assert_eq!(router_mode_from("OpenAI"), Some(RouterMode::OpenAi));
         assert_eq!(router_mode_from("opendrop"), Some(RouterMode::OpenDrop));
+        assert_eq!(router_mode_from("cli"), Some(RouterMode::Cli));
+        assert_eq!(router_mode_from("CLI"), Some(RouterMode::Cli));
         assert_eq!(router_mode_from("bootstrap"), None);
         assert_eq!(router_mode_from("claude"), None);
+    }
+
+    #[test]
+    fn repair_backend_is_none_when_no_backend_selected() {
+        // Only meaningful when the process env does not select a backend;
+        // assert without mutating process-global state (parallel-safe).
+        if std::env::var("AXIOM_BACKEND").is_err() {
+            assert!(repair_backend_from_env().unwrap().is_none());
+        }
     }
 
     #[test]

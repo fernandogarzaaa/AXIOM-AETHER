@@ -70,7 +70,10 @@ unset. When you add a variable, add it here.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `AXIOM_BACKEND` | local | `anthropic`, `openai`, `opendrop`, `router`, … (see `docs/BACKENDS.md`). |
+| `AXIOM_BACKEND` | local | `claude`, `openai`, `opendrop`, `router`, `cli` (experimental build only), … (see `docs/BACKENDS.md`). |
+| `AXIOM_CLI_COMMAND` | `claude` | Program the experimental `cli` backend spawns (`-p --output-format json`, prompt on stdin). Bare name resolved on `PATH` or an absolute path; its `--version` must parse as `2.x (Claude Code)` or the backend refuses to run. |
+| `AXIOM_CLI_TIMEOUT_SECS` | `120` | Wall-clock bound per `cli`-backend completion; the subprocess is killed past it. Must be a positive integer. |
+| `AXIOM_CLI_MODEL` | unset | Optional `--model` passed to the CLI by the `cli` backend. |
 | `AXIOM_CLAUDE_MODEL` / `AXIOM_CLAUDE_SYSTEM` | `DEFAULT_CLAUDE_MODEL` in `claude_backend.rs` / unset | Model id and default system prompt for the Claude backend. |
 | `AXIOM_ROUTER_CONSENSUS` | off | Router asks two providers and fuses answers via `BetaBelief`. |
 | `AXIOM_OLLAMA_URL` / `AXIOM_OLLAMA_MODELS` | `DEFAULT_OLLAMA_URL` / built-in candidate list (`swarm_router.rs`) | Local Ollama endpoint and model candidates. |

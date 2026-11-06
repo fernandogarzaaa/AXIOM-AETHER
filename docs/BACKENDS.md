@@ -13,8 +13,9 @@ trained model — the brain is pluggable and optional.
 | `bootstrap` (default) | Axiom's tiny local TTT model | free, offline | auto-trained by `axiom init`; weak at generation, fine for the cognition loops |
 | `opendrop` | Local OpenDrop server | free, local | auto-targets a local OpenDrop server at `http://127.0.0.1:11434` — just `opendrop run <model>` |
 | `openai` | Any OpenAI-compatible endpoint | depends | cloud OpenAI **or** a local server (OpenDrop, Ollama, vLLM) |
-| `anthropic` | Claude (Anthropic API) | metered | needs `ANTHROPIC_API_KEY` |
+| `claude` | Claude (Anthropic API) | metered | needs `ANTHROPIC_API_KEY` (the value the code checks is `claude`; older docs said `anthropic`) |
 | `router` | **GPT + Claude + local together** | metered | routes by task (code→Claude, else→GPT), with failover; opt-in consensus |
+| `cli` | **A logged-in vendor CLI as a subprocess** (`claude -p`) | whatever the CLI's login bills | **experimental** (`--features experimental`); no key needed; see [CLI backend](#cli-backend-experimental-no-keys-fallback) and the vendor-terms caveat |
 
 `openai`, `opendrop`, and `router` all build the same internal multi-provider
 router (with the local TTT pipeline as a deterministic last-resort fallback);
@@ -59,6 +60,38 @@ Any value other than `0`, `false`, or `off` enables consensus. Off by default.
 > consensus) is live as `AXIOM_BACKEND=router` (see below) and also grounds
 > ChimeraLang `inquire`.
 
+### CLI backend (experimental, no-keys fallback)
+
+```bash
+cargo build --release --features experimental --manifest-path axiom_engine_rs/Cargo.toml
+export AXIOM_BACKEND=cli
+export AXIOM_CLI_COMMAND=claude        # default; bare name on PATH or absolute path
+export AXIOM_CLI_TIMEOUT_SECS=120      # default; per-call wall-clock bound
+export AXIOM_CLI_MODEL=haiku           # optional --model
+axiom solve ... / axiom task ... / axiom --mode server
+```
+
+Axiom's model-needing paths (`axiom solve` LLM repair, `axiom task`, and server
+generation behind the router — every task pinned to `Provider::Cli`, local
+pipeline as last-resort fallback) spawn
+`claude -p --output-format json --tools "" --no-session-persistence
+--strict-mcp-config --mcp-config '{"mcpServers":{}}'` with the prompt on stdin.
+Guarantees (unit-tested with a fake CLI in `src/cli_backend.rs`): the CLI's
+`--version` must parse as `2.x (Claude Code)` or the backend refuses to run
+(the server exits; the repair paths skip LLM repair with a logged reason); only
+the `type=result / subtype=success / is_error=false / result:string` shape is
+accepted, anything else is an error rather than a guessed completion; every
+call is killed past the timeout; no shell, no prompt in argv, no prompt/output
+logging; `max_tokens` is advisory (the CLI has no output cap).
+
+This is a fallback for machines without an API key, **not a cost lever** —
+nothing is compressed on this path and the CLI bills whichever account it is
+logged into. Anthropic's current guidance says products that drive Claude
+programmatically should use API-key authentication; read
+[`CLI-INTEGRATION.md` § Vendor terms](CLI-INTEGRATION.md#vendor-terms-checked-2026-11-06)
+before using it with a subscription login. For cost savings use the proxy
+pass-through path on that page instead.
+
 ## Local models via OpenDrop (zero per-token cost)
 
 [OpenDrop](https://github.com/fernandogarzaaa/OpenDrop) serves any open-weight
@@ -99,6 +132,13 @@ subscription app call axiom's tools (see [`MCP-CLIENTS.md`](MCP-CLIENTS.md)).
 This works with Claude Desktop / Claude Code over stdio **and** with the ChatGPT
 connector over the remote HTTP transport (`AXIOM_MCP_HTTP=1`), which now also
 exposes the standard `search`/`fetch` tools — see [`MCP-CLIENTS.md`](MCP-CLIENTS.md).
+
+The other direction — the vendor's **own CLI** (Claude Code, Codex CLI, …)
+keeping its login and sending its traffic *through* the Axiom proxy via a base
+URL override — is documented in [`CLI-INTEGRATION.md`](CLI-INTEGRATION.md),
+together with each vendor's current terms on using subscription credentials
+that way. Where those terms restrict or do not clearly permit it, the compliant
+route is an API key.
 
 ## Is a trained model required?
 

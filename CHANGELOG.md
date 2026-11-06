@@ -65,6 +65,22 @@ releases are described on the GitHub Releases page.
   pillars that did not run.
 
 ### Added
+- **Hybrid CLI integration** (`docs/CLI-INTEGRATION.md`): vendor CLIs keep
+  their own login and point their base URL at the proxy, which relays their
+  `Authorization` / `x-api-key` / `anthropic-version` / `anthropic-beta` /
+  `OpenAI-Organization` / `OpenAI-Project` headers upstream untouched and holds
+  no key (`tests/cli_passthrough_proxy.rs`; `/v1/chat/completions` now relays
+  the two OpenAI scoping headers like `/v1/responses` already did).
+  `scripts/start_axiom_for_cli.sh` launches the loopback proxy, waits for
+  `/readyz` and prints the per-CLI exports. Experimental `AXIOM_BACKEND=cli`
+  (`--features experimental`, `src/cli_backend.rs`) drives a logged-in
+  `claude -p --output-format json` subprocess for `axiom solve` / `axiom task`
+  / server generation behind the backend router: version-pinned, fail-closed
+  on unrecognised output, bounded timeout, prompt on stdin, never logged.
+  `backend_live::router_from_env` now returns `Result` so a rejected backend
+  configuration stops the server instead of silently falling back. Measured
+  run: `bench/cvm/CLI-PROXY-RESULTS-2026-11-06.md` (pass-through correctness,
+  not a savings number — see the file).
 - **General deterministic repair** (`mutation_repair.rs`, Phase 2.1 of
   `axiom solve`): a bounded (`AXIOM_REPAIR_MAX_CANDIDATES`, default 64),
   trace-ranked set of single-edit mutations — comparison operators,

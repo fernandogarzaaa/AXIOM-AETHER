@@ -31,6 +31,26 @@ async fn create_completion(
     }))
 }
 
+/// Client headers relayed verbatim to the Chat Completions upstream alongside
+/// `Authorization`. OpenAI's SDKs and the vendor CLIs that speak this shape
+/// scope a key to an organization / project with these two headers; dropping
+/// them would make a key that is valid for the client fail upstream. Narrow
+/// allowlist on purpose: `/v1/responses` has its own, wider one
+/// (`relayable_response_headers`) for the Codex transport.
+fn relayable_chat_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    const ALLOW: &[&str] = &["openai-organization", "openai-project"];
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str().to_ascii_lowercase();
+            if !ALLOW.contains(&name.as_str()) {
+                return None;
+            }
+            value.to_str().ok().map(|v| (name, v.to_string()))
+        })
+        .collect()
+}
+
 /// `POST /v1/chat/completions` — chat completion (stateless or session-aware).
 ///
 /// When `stream: true` is set in the request body, the response is an SSE
@@ -55,7 +75,7 @@ async fn create_chat_completion(
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
-            extra_headers: Vec::new(),
+            extra_headers: relayable_chat_headers(&headers),
         };
         match compressed_openai_chat_path(&state, &body, session_override.as_deref(), &client_auth)
             .await
