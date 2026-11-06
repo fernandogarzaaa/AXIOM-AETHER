@@ -105,9 +105,10 @@ types, which is breaking under semver for 0.x, so it is a new minor version.
   in `axiom_mesh_core` (66% of classes with an operator, 0% without), 0
   rollback violations: `bench/results/SEEDED-HELDOUT-2026-11-06.md`.
 - **Callee-focused repair planning for in-file tests.** The mutation planner
-  never edits inside `#[cfg(test)]`; when the failure blames an assertion
-  there, it ranks the bodies of the functions that test calls ahead of the
-  rest of the file.
+  never edits a `#[cfg(test)]`-gated item (only that item: production code
+  after a test-only `use` or helper stays repairable); when the failure
+  blames an assertion inside one, it ranks the bodies of the functions that
+  test calls ahead of the rest of the file.
 - **Hybrid CLI integration** (`docs/CLI-INTEGRATION.md`): vendor CLIs keep
   their own login and point their base URL at the proxy, which relays their
   `Authorization` / `x-api-key` / `anthropic-version` / `anthropic-beta` /

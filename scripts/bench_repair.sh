@@ -117,13 +117,17 @@ for dir in "$CORPUS"/*/; do
   region_file="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])).get("test_region") or {}; print(m.get("file",""))' "$meta")"
   region_from="$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1])).get("test_region") or {}; print(m.get("from_line",0))' "$meta")"
 
-  # 2. Autonomous solve, no file named. Solver state (heal memory and the
-  #    verified-patch store derived from it, ~/.axiom) is isolated per fixture:
+  # 2. Autonomous solve, no file named. Solver state is isolated per fixture:
   #    fixtures in one corpus often share a verify command, and a patch learned
   #    on one would otherwise be replayed on the next and score as a repair.
+  #    AXIOM_HEAL_MEMORY moves both the heal memory and the verified-patch
+  #    store (PatchMemory::default_path lives next to it). HOME is left alone
+  #    on purpose: rustup, cargo, npm and pip locate their toolchains and caches
+  #    through it, and an emptied HOME makes the verifier fail on a missing
+  #    toolchain instead of on the test.
   state="$(mktemp -d "${TMPDIR:-/tmp}/axiom_bench_repair_${name}_state_XXXXXX")"
   start="$(date +%s.%N)"
-  log="$( cd "$work" && HOME="$state" AXIOM_HEAL_MEMORY="$state/heal_memory.json" "$BIN" solve --max-rounds 2 -- "${VERIFY[@]}" 2>&1 )"
+  log="$( cd "$work" && AXIOM_HEAL_MEMORY="$state/heal_memory.json" "$BIN" solve --max-rounds 2 -- "${VERIFY[@]}" 2>&1 )"
   end="$(date +%s.%N)"
   secs="$(python3 -c "print(f'{$end-$start:.1f}')")"
   how="$(printf '%s\n' "$log" | grep -oE 'mutation repair verified green \([^)]*\)|source repair solved it \(patched=[a-z]+\)|environment heal solved it|fleet patch [0-9a-f]+ verified green locally|LLM-proposed patch verified green' | head -1)"
