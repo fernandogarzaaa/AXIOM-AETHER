@@ -31,3 +31,6 @@ bench/cvm/pss-eval-logs-*/
 C*WINDOWSTEMP*
 bin/
 *.egg-info/
+
+# Loopback proxy state written by scripts/start_axiom_for_cli.sh (pid + log)
+.axiom-cli-proxy/
