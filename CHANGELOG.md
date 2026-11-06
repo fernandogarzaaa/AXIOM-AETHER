@@ -5,6 +5,25 @@ releases are described on the GitHub Releases page.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-06
+
+Headline: the deterministic repair loop now repairs **19 of 40 seeded faults in
+maintainer-written Rust that it was never shown** (19 of 29 in the fault
+classes it has an operator for, 0 of 11 in the classes it has none for), with
+zero rollback violations; the authored gate is 32/32. A JSON-aware digest
+removes ~89% of the tokens of MCP tool results that previously were never
+digested. Two repair-loop bugs that made those numbers impossible are fixed.
+
+**Crate versions:** `axiom_engine` 0.6.0 depends on `axiom_mesh_core` **0.2.0**
+(was 0.1.0). The mesh crate's public API moved to `rand` 0.9 and `ndarray` 0.17
+types, which is breaking under semver for 0.x, so it is a new minor version.
+
+**Deprecations (removed in the next minor):** `crate::hamiltonian` and
+`crate::q_manifold` (use `patch_ranker` / `branch_weights`); the
+`/v1/hypervisor/quantum_coherent_state` route (use
+`/v1/hypervisor/patch_ranker_state`); the `AXIOM_SANDBOX_*` env names and
+`crate::sandbox` (use `AXIOM_COMPILE_VERIFY_*` / `compile_verify`).
+
 ### Security
 - The CVM L2 page store is bounded across sessions: the in-memory index by
   `AXIOM_CVM_MAX_INDEX_BYTES` (256 MiB, least-recently-used sessions drop
