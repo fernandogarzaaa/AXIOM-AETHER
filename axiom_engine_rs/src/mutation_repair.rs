@@ -617,8 +617,8 @@ fn fn_name(line: &str) -> Option<String> {
 fn body_end(lines: &[&str], start: usize, limit: usize) -> usize {
     let mut depth = 0i32;
     let mut opened = false;
-    for i in start..limit {
-        let l = split_eol(lines[i]).0;
+    for (i, raw) in lines.iter().enumerate().take(limit).skip(start) {
+        let l = split_eol(raw).0;
         let mask = code_mask(l, Lang::Rust);
         for (k, b) in l.bytes().enumerate() {
             if !mask[k] {
