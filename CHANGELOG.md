@@ -94,6 +94,20 @@ types, which is breaking under semver for 0.x, so it is a new minor version.
   pillars that did not run.
 
 ### Added
+- **Held-out repair benchmark.** `scripts/seed_faults.py` seeds random
+  single-token faults into maintainer-written code, keeps only those the
+  project's own tests catch, and deliberately includes fault classes the
+  engine has no operator for. `scripts/import_quixbugs.py` converts QuixBugs'
+  40 Python bugs (MIT) with the answer key removed. `scripts/bench_repair.sh`
+  isolates solver state per fixture, pins in-file test regions as the oracle,
+  and reports verifier-written test artifacts (`proptest-regressions/`, …)
+  separately from rollback violations. First measurement: 19/40 seeded faults
+  in `axiom_mesh_core` (66% of classes with an operator, 0% without), 0
+  rollback violations: `bench/results/SEEDED-HELDOUT-2026-11-06.md`.
+- **Callee-focused repair planning for in-file tests.** The mutation planner
+  never edits inside `#[cfg(test)]`; when the failure blames an assertion
+  there, it ranks the bodies of the functions that test calls ahead of the
+  rest of the file.
 - **Hybrid CLI integration** (`docs/CLI-INTEGRATION.md`): vendor CLIs keep
   their own login and point their base URL at the proxy, which relays their
   `Authorization` / `x-api-key` / `anthropic-version` / `anthropic-beta` /

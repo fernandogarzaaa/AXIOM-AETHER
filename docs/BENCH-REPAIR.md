@@ -106,7 +106,19 @@ its toolchain and `.unchanged(&[...])` pinning its oracle.
 
 Keep these deterministic and offline — they stay in CI as the regression gate.
 
-### Phase 2 — a real held-out corpus (LLM path)
+### Phase 2 — a real held-out corpus
+
+**First held-out measurement (2026-11-06): 19/40 seeded faults repaired, 0
+rollback violations.** That is 19 of 29 (66%) in the fault classes the engine
+has an operator for, and 0 of 11 in the ones it has none for. The faults are
+random single-token faults in `axiom_mesh_core` code that predates the repair
+layer, kept only when the crate's own tests catch them. The engine runs with
+no LLM. Method, per-class table and caveats:
+[`bench/results/SEEDED-HELDOUT-2026-11-06.md`](../bench/results/SEEDED-HELDOUT-2026-11-06.md).
+Seeded faults are not developer bugs. The developer-bug corpus below is still
+the next step: QuixBugs is importable today (`scripts/import_quixbugs.py`) but
+has not been run.
+
 
 Wire `axiom task` (the goal-directed, LLM-backed path) against an external,
 versioned bug set so the fixtures are genuinely out-of-distribution:

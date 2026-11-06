@@ -76,7 +76,8 @@ it. Update **both** on every release.
 
 | Metric | Value | Config | Measured | Release |
 |---|---|---|---|---|
-| Autonomous repair | **32/32 = 100%** | 14 localization + 18 real-interpreter fixtures, CPU, no LLM, ~15 s wall clock | 2026-11-05 | (post-0.5.0) |
+| Autonomous repair | **32/32 = 100%** | 14 localization + 18 real-interpreter fixtures, CPU, no LLM, ~15 s wall clock | 2026-11-06 | v0.6.0 |
+| Autonomous repair, **held-out** | **19/40 = 47.5%** (19/29 = 66% in classes with an operator, 0/11 without); 0 rollback violations | 40 seeded single-token faults in `axiom_mesh_core`, `scripts/seed_faults.py --seed 2026 --balance`, no LLM ([write-up](../bench/results/SEEDED-HELDOUT-2026-11-06.md)) | 2026-11-06 | v0.6.0 |
 | Autonomous repair | 14/14 = 100% | built-in fixtures, CPU, no LLM | 2026-10-29 | v0.5.0 |
 | Autonomous repair | 9/9 = 100% | built-in fixtures, CPU, no LLM | 2026-08-28 | (pre-v0.4.2) |
 | Compression | **86.7% savings, 2229/2229 = 100% round-trip** | `AXIOM_PRODUCTION_BPE=1`, 121-file tree | 2026-08-09 | v0.4.x |
