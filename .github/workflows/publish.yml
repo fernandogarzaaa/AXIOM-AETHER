@@ -89,7 +89,19 @@ jobs:
         working-directory: axiom_engine_rs
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
+        # Idempotent like the mesh_core step: a re-run after a partial release
+        # (e.g. a wheel job failed after this crate went out) must not fail
+        # here, or the PyPI job that needs it is skipped again.
+        run: |
+          set +e
+          OUTPUT=$(cargo publish --locked 2>&1)
+          EXIT=$?
+          echo "$OUTPUT"
+          if [ $EXIT -ne 0 ] && echo "$OUTPUT" | grep -q "already exists"; then
+            echo "axiom_engine already published, continuing"
+            exit 0
+          fi
+          exit $EXIT
 
   wheels:
     name: Build wheel (${{ matrix.target }})
@@ -103,7 +115,9 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             maturin-target: x86_64
-          - os: macos-14
+          # macos-14 images were retired ("configuration 'macos-14-arm64-us-default'
+          # is not supported", 2026-11-06); macos-15 is the arm64 replacement.
+          - os: macos-15
             target: aarch64-apple-darwin
             maturin-target: aarch64
           - os: windows-2022
@@ -149,3 +163,6 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          # Re-runs upload only what is missing instead of failing on wheels
+          # an earlier attempt already published.
+          skip-existing: true
