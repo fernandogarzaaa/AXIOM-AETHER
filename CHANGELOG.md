@@ -7,7 +7,8 @@ releases are described on the GitHub Releases page.
 
 Headline: held-out seeded-fault repair goes from 19/40 to **39/40** on the
 original corpus and from 20/40 to **38/40** on a fresh seed (15/17 on its
-faults outside the tuning set), with 0 rollback violations
+faults outside the tuning set), with 0 rollback violations; 33/40 and 32/40
+are verified correct against a strengthened test suite (0.6.0: 16/40)
 ([write-up](bench/results/SEEDED-HELDOUT-v2-2026-11-06.md)).
 
 ### Added
@@ -24,6 +25,14 @@ faults outside the tuning set), with 0 rollback violations
   of the functions the failing test calls, then what those call, and only
   then the rest of the file. Identifier swaps (up to 15 per line) are tried
   off the blamed lines only after every other edit.
+- `axiom_mesh_core`: seven tests for gaps that wrong-but-accepted repairs
+  exposed (`StateSmoother` alpha range, feature-hash stability, explicit soft
+  routing, bandit gating on either knob, dimension checks on every entry
+  point, batch capacity above two).
+- `scripts/reverify_accepted_patches.py`: re-run the repairs a benchmark
+  accepted against a stronger test suite, to separate equivalent edits from
+  ones the original tests could not reject. The planner diagnostic can now
+  emit candidates by label (`AXIOM_PLAN_DIAG_EMIT`).
 - `AXIOM_REPAIR_VERBOSE=1` makes `axiom solve` print each mutation candidate
   as it is tried (`candidate 3/64: swap-args:L296 …`).
 - `tests/mutation_plan_diag.rs` (ignored): offline planner diagnostic that

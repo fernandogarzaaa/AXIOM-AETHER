@@ -243,6 +243,32 @@ impl IdcController {
 mod tests {
     use super::*;
 
+    #[test]
+    #[should_panic(expected = "alpha must be in (0.0, 1.0]")]
+    fn smoother_rejects_alpha_above_one() {
+        let _ = StateSmoother::new(1.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "alpha must be in (0.0, 1.0]")]
+    fn smoother_rejects_non_positive_alpha() {
+        let _ = StateSmoother::new(0.0);
+    }
+
+    #[test]
+    fn feature_hashing_is_stable() {
+        // Persisted state vectors depend on the exact slot and sign each
+        // label hashes to; pin two labels whose sign bit (bit 32 of the
+        // FNV-1a hash) differs from the hash's top bit.
+        let mut state = Array1::zeros(16);
+        hash_feature(&mut state, "probe", 1.0);
+        hash_feature(&mut state, "term:cargo", 1.0);
+        let mut expected = Array1::<f32>::zeros(16);
+        expected[1] = 1.0;
+        expected[5] = -1.0;
+        assert_eq!(state, expected);
+    }
+
     fn passing_tests() -> SensorReading {
         SensorReading::TestLog {
             passed: 10,

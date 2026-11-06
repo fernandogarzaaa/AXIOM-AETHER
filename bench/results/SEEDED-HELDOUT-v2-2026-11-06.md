@@ -7,6 +7,13 @@
 faults whose site and class do not occur in the seed-2026 set, the change is
 **6 → 15 of 17**. Deterministic, CPU-only, no LLM, no network.
 
+**Correct, not just test-passing: 33/40 and 32/40** (0.6.0: 16/40 and 16/40),
+5 → 14 of the 17 fresh faults. Every accepted edit that is not the seeded
+reversal was re-run against a strengthened `axiom_mesh_core` test suite (seven
+tests added for this audit). The equivalent ones still pass; the wrong ones
+are each rejected by the new test written for that gap. See
+[Correct vs test-passing](#correct-vs-test-passing).
+
 Raw tables:
 [seed 2026](repair-seeded-mesh-core-2026-v2-2026-11-06.md) ·
 [seed 7](repair-seeded-mesh-core-seed7-2026-11-06.md) ·
@@ -92,16 +99,52 @@ ranks past the budget (ranks 82–85). The end-to-end count can exceed the
 diagnostic count because the engine can find an accepted fix that is not the
 reversal (see below).
 
+## Correct vs test-passing
+
+A repair counts in the headline when the crate's own 41 tests accept it, which
+is the "plausible patch" of the repair literature. 10 of the 39 (seed 2026)
+and 10 of the 38 (seed 7) accepted edits are not the seeded reversal, so each
+was checked against a stronger oracle:
+
+1. Re-create the exact accepted edit. The planner diagnostic writes every
+   candidate with the logged label. A label can name two spans, for example
+   when a line holds two `!=`. The one that passes the fixture's original
+   tests is the one the benchmark kept.
+2. Splice its code in front of the pristine crate's `#[cfg(test)]` region,
+   after seven tests were added to `axiom_mesh_core` for the gaps the wrong
+   edits exposed. Then re-run the tests
+   (`scripts/reverify_accepted_patches.py`).
+
+| accepted edit (seeded fault → edit) | verdict | caught by |
+|---|---|---|
+| `0..=n` in `sample_gumbel` → its only caller passes `len() - 1` (`len` asserted ≥ 1) | equivalent | — |
+| `0..=len` → `0..=len - 1` (`len` ≥ 1 on that path) | equivalent | — |
+| `!(g != 0)` → `!(g == 0)`; `!(len != dim)` → `!(len == dim)` | equivalent (De Morgan) | — |
+| `!(x)` / `!(!x)` → drop the outer `!` | equivalent (redundant parentheses) | — |
+| `a > 0 \|\| a <= 1` → `a > 0 \|\| a >= 1` | **wrong**: accepts `alpha = 1.5` | `smoother_rejects_alpha_above_one` |
+| `(h >> 64) & 1` → `(h >> 63) & 1` | **wrong**: changes every hashed sign | `feature_hashing_is_stable` |
+| default `hard: false` → negate `if self.config.hard` | **wrong**: inverts an explicit `hard` setting | `hard_routing_is_the_default_and_soft_routing_keeps_adhesion` |
+| `g != 0 && e != 0` → `g != 0 && e == 0`; `!(g != 0 \|\| e != 0)` → `!(g == 0 \|\| e != 0)` | **wrong**: bandit terms gated on the wrong knob | `bandit_terms_apply_when_either_knob_is_set` |
+| `len == dim` → `len - 1 == dim` | **wrong**: lets most mismatched payloads through | `every_entry_point_rejects_a_payload_of_the_wrong_dimension` |
+| `slots > cap` → `slots += 2` | **wrong**: right only for capacity ≤ 2 | `batch_dispatch_fills_a_capacity_above_two_exactly` |
+
+| | 0.6.0, seed 2026 | now, seed 2026 | 0.6.0, seed 7 | now, seed 7 |
+|---|---|---|---|---|
+| accepted by the original 41 tests | 19 | 39 | 20 | 38 |
+| exact reversal | 14 | 29 | 13 | 28 |
+| equivalent edit | 2 | 4 | 3 | 4 |
+| **correct** | **16** | **33** | **16** | **32** |
+| wrong, accepted only because a test was missing | 3 | 6 | 4 | 6 |
+
+The audit agrees exactly with a reading of each diff: all 13 edits judged
+equivalent pass the stronger suite, and each of the 19 judged wrong fails it.
+The wider search space doubles the correct repairs, and it also finds more
+edits that only a weak test lets through (3–4 → 6). For a user that is the
+standing caveat of test-driven repair: a green suite certifies only what the
+suite checks. The seven new tests now ship with `axiom_mesh_core`.
+
 ## What the numbers do and do not say
 
-- **"Different fix" is still not automatically a wrong fix.** 10 of the 39
-  (seed 2026) and 10 of the 38 (seed 7) repairs are accepted edits that differ
-  from the seeded reversal. Examples are `insert - 1 after length` where `..=`
-  was seeded, and `drop !` leaving `(a || b)` where `!(a || b)` was seeded. The
-  crate's 41 tests accept them, which means either an equivalent program or a
-  suite too weak to tell them apart. This is the general test-overfitting
-  problem of automated repair, and this benchmark cannot separate the two
-  cases.
 - **The remaining misses are a budget problem, not an operator problem.** All
   three are faults in a function the failing test reaches only indirectly,
   through the rest of the file (tier 4), and the reversal ranks just past 64.
@@ -119,6 +162,11 @@ reversal (see below).
   unit tests, not by a held-out run.
 
 ## Reproduce
+
+The corpora were generated before the seven audit tests were added to
+`axiom_mesh_core`. `seed_faults.py` keeps only faults the crate's tests catch,
+so regenerating on a later commit yields a different corpus. To reproduce
+these exact fixtures, run the generator at commit `a13ddf4`.
 
 ```bash
 python3 scripts/seed_faults.py --crate axiom_mesh_core --out /tmp/seeded  --n 40 --seed 2026 --balance

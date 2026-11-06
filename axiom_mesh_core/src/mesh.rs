@@ -792,6 +792,67 @@ mod tests {
     }
 
     #[test]
+    fn hard_routing_is_the_default_and_soft_routing_keeps_adhesion() {
+        assert!(MeshConfig::default().hard);
+        let mut mesh = mesh3();
+        mesh.config.hard = false;
+        mesh.config.tau = 5.0; // flat enough that no adhesion rounds to 1.0
+        let mut rng = StdRng::seed_from_u64(3);
+        let adhesion = mesh
+            .forward(&array![1.0, 1.0, 1.0], None, &mut rng)
+            .unwrap();
+        let w = adhesion.weights.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            w > 0.0 && w < 1.0,
+            "soft routing must carry the winner's adhesion, not 1.0: {:?}",
+            adhesion.weights
+        );
+    }
+
+    #[test]
+    fn bandit_terms_apply_when_either_knob_is_set() {
+        for (gain, exploration) in [(1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+            let mut mesh = tied_two_node_mesh(gain, exploration);
+            let before = mesh.field(&array![1.0, 0.0], None);
+            for _ in 0..3 {
+                mesh.record_outcome(NodeId(0), 1.0);
+            }
+            let after = mesh.field(&array![1.0, 0.0], None);
+            assert_ne!(
+                before, after,
+                "gain={gain} exploration={exploration}: outcomes must move the field"
+            );
+        }
+    }
+
+    #[test]
+    fn every_entry_point_rejects_a_payload_of_the_wrong_dimension() {
+        let mesh = mesh3();
+        let mut rng = StdRng::seed_from_u64(3);
+        for bad in [array![1.0, 0.0], array![1.0, 0.0, 0.0, 0.0, 0.0]] {
+            assert!(matches!(
+                mesh.forward(&bad, None, &mut rng),
+                Err(MeshError::DimMismatch { .. })
+            ));
+            assert!(matches!(
+                mesh.forward_restricted(&bad, None, &[NodeId(0)], &mut rng),
+                Err(MeshError::DimMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn batch_dispatch_fills_a_capacity_above_two_exactly() {
+        let mesh = tied_two_node_mesh(0.0, 0.0);
+        let payloads = vec![array![1.0, 0.0]; 7];
+        let result = mesh.forward_batch(&payloads, 3, None).unwrap();
+        for (_, ps) in &result.assignments {
+            assert_eq!(ps.len(), 3, "each node serves exactly its capacity");
+        }
+        assert_eq!(result.dropped.len(), 1);
+    }
+
+    #[test]
     fn record_outcome_tracks_a_running_mean() {
         let mut mesh = tied_two_node_mesh(0.0, 0.0);
         mesh.record_outcome(NodeId(0), 1.0);

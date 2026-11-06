@@ -75,4 +75,33 @@ fn print_plan_ranks() {
     println!(
         "\nreversal within budget {budget}: {within}; beyond budget: {beyond}; not generated: {absent}"
     );
+
+    // Optional: write out specific candidates by label, to re-verify an
+    // accepted patch against a stronger oracle. `EMIT/labels.tsv` holds
+    // `<fixture>\t<candidate label>` lines; each match is written to
+    // `EMIT/<fixture>.src`.
+    if let Ok(emit) = std::env::var("AXIOM_PLAN_DIAG_EMIT") {
+        let emit = PathBuf::from(emit);
+        let tsv = std::fs::read_to_string(emit.join("labels.tsv")).expect("labels.tsv");
+        for line in tsv.lines().filter(|l| !l.trim().is_empty()) {
+            let (name, label) = line.split_once('\t').expect("fixture<TAB>label");
+            let dir = corpus.join(name);
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap())
+                    .unwrap();
+            let rel = meta["fault"]["file"].as_str().unwrap();
+            let broken = std::fs::read_to_string(dir.join("broken").join(rel)).unwrap();
+            let plan = axiom_engine::mutation_repair::plan(&broken, Path::new(rel), "", 100_000);
+            // Labels are not unique when a line holds the same operator
+            // twice (`a != 0 || b != 0`): write every match, numbered.
+            let matches: Vec<_> = plan.iter().filter(|c| c.label == label).collect();
+            if matches.is_empty() {
+                println!("NOT FOUND {name}: {label}");
+            }
+            for (k, c) in matches.iter().enumerate() {
+                std::fs::write(emit.join(format!("{name}.{k}.src")), &c.source).unwrap();
+                println!("emitted {name}.{k}: {label}");
+            }
+        }
+    }
 }
