@@ -103,6 +103,8 @@ pub fn solve(
                 max_restarts: opts.max_restarts,
                 heal_memory_path: opts.heal_memory_path.clone(),
                 anchor: opts.anchor.clone(),
+                // The command is a verifier: bound it like every other run.
+                timeout: Some(verify_timeout()),
                 ..SupervisorOptions::default()
             },
         )?;
@@ -140,7 +142,12 @@ pub fn solve(
                 .clone()
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
-            let cands = crate::fault_locate::repair_targets(&trace, &root);
+            let mut cands = crate::fault_locate::repair_targets(&trace, &root);
+            if cands.is_empty() {
+                // Nothing in the output names a file (e.g. the run was killed
+                // on a timeout before printing): use what the command names.
+                cands = crate::fault_locate::targets_from_command(args, &root);
+            }
             if let Some(first) = cands.first() {
                 println!(
                     "[axiom-solve] round {round}: localized {} candidate file(s); first: {}",
@@ -211,18 +218,22 @@ fn attempt_source_repair(
         .enable_all()
         .build()
         .map_err(|e| candle_core::Error::Msg(format!("solve runtime: {e}")))?;
-    let poly = rt
-        .block_on(engine.run_with_feedback(run_req, |_diag| async { Ok(()) }))
-        .map_err(|e| candle_core::Error::Msg(format!("poly-jit: {e}")))?;
-    if poly.passed {
-        report.source_patched = poly.patched;
-        report.solved = true;
-        report.final_exit = Some(0);
-        println!(
-            "[axiom-solve] round {round}: source repair solved it (patched={})",
-            poly.patched
-        );
-        return Ok(true);
+    // A Poly-JIT error (most often its verify run timing out on a fault that
+    // loops forever) means this phase did not fix it, not that the solve
+    // failed: fall through to the later phases.
+    match rt.block_on(engine.run_with_feedback(run_req, |_diag| async { Ok(()) })) {
+        Ok(poly) if poly.passed => {
+            report.source_patched = poly.patched;
+            report.solved = true;
+            report.final_exit = Some(0);
+            println!(
+                "[axiom-solve] round {round}: source repair solved it (patched={})",
+                poly.patched
+            );
+            return Ok(true);
+        }
+        Ok(_) => {}
+        Err(e) => println!("[axiom-solve] round {round}: poly-jit phase skipped ({e})"),
     }
     // Failed repair → restore the artifact byte-for-byte.
     if let Some(b) = backup {

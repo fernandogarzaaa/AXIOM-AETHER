@@ -494,6 +494,12 @@ pub struct SupervisorOptions {
     /// one checkout (or on another machine, via swarm immunity) applies in
     /// another. `None` → the current process working directory.
     pub anchor: Option<PathBuf>,
+    /// Kill an attempt that runs longer than this and count it as a failed
+    /// run. `None` (the default, used by `axiom run`) waits indefinitely,
+    /// since a supervised program may be a server. `axiom solve` sets it: its
+    /// command is a verifier, and a fault that loops forever must not hang
+    /// the loop.
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl SupervisorOptions {
@@ -604,6 +610,64 @@ pub fn predict_failure(
 /// EMA-merge into a master vibe, heals are remembered for prophylactic
 /// immunity, and novel healed failures can be written into the recall memory
 /// store so the program's lived failure history reaches the reasoning layer.
+/// `Command::output`, but killed after `timeout` (when set). A killed run
+/// keeps whatever it printed, gains a `[timed out after …]` line on stderr,
+/// and reports a non-success status.
+fn output_bounded(
+    cmd: &mut Command,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let Some(limit) = timeout else {
+        return cmd.output();
+    };
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_end(&mut b);
+        }
+        b
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut b);
+        }
+        b
+    });
+    let deadline = Instant::now() + limit;
+    let (status, timed_out) = loop {
+        if let Some(st) = child.try_wait()? {
+            break (st, false);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break (child.wait()?, true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = out_h.join().unwrap_or_default();
+    let mut stderr = err_h.join().unwrap_or_default();
+    if timed_out {
+        stderr.extend_from_slice(
+            format!("\n[timed out after {:.0}s]\n", limit.as_secs_f32()).as_bytes(),
+        );
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 pub fn run_supervised(
     pipeline: &InferencePipeline,
     command: &str,
@@ -670,11 +734,10 @@ pub fn run_supervised(
     for attempt in 1..=max_restarts + 1 {
         report.attempts = attempt;
         let started = Instant::now();
-        let output = match Command::new(command)
-            .args(args)
-            .current_dir(&anchor)
-            .output()
-        {
+        let output = match output_bounded(
+            Command::new(command).args(args).current_dir(&anchor),
+            opts.timeout,
+        ) {
             Ok(o) => o,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 // The program itself isn't executable. Try the exec-bit heal on
@@ -1042,6 +1105,32 @@ fn commit_to_vibe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_run_kills_a_hung_command_and_keeps_its_output() {
+        let t0 = Instant::now();
+        let out = output_bounded(
+            Command::new("sh").args(["-c", "echo started; while :; do :; done"]),
+            Some(std::time::Duration::from_millis(500)),
+        )
+        .unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "killed promptly"
+        );
+        assert!(!out.status.success(), "a killed run is a failed run");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("started"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("timed out"));
+        // Within the limit, it is plain `output()`.
+        let out = output_bounded(
+            Command::new("sh").args(["-c", "echo ok; exit 3"]),
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    }
 
     #[test]
     fn extracts_python_quoted_path() {

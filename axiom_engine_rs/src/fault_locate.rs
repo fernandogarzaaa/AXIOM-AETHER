@@ -607,7 +607,66 @@ pub fn repair_targets(trace: &str, root: &Path) -> Vec<PathBuf> {
     }
     for p in &direct {
         if is_test_path(p) {
-            for hop in import_targets(p, root) {
+            for hop in code_under_test_first(p, import_targets(p, root)) {
+                if !out.contains(&hop) {
+                    out.push(hop);
+                }
+            }
+        }
+    }
+    for p in &direct {
+        if is_test_path(p) && !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+/// A test's imports, reordered so modules outside the test's own directory
+/// come first: what a test imports from beside itself is usually a helper
+/// (a data loader, a fixture), while the code under test lives elsewhere.
+/// Stable within each group.
+fn code_under_test_first(test: &Path, hops: Vec<PathBuf>) -> Vec<PathBuf> {
+    let test_dir = test.parent().map(Path::to_path_buf);
+    let (beside, elsewhere): (Vec<PathBuf>, Vec<PathBuf>) = hops
+        .into_iter()
+        .partition(|h| h.parent().map(Path::to_path_buf) == test_dir);
+    elsewhere.into_iter().chain(beside).collect()
+}
+
+/// Fallback when the verifier's output blames no file at all (it was killed on
+/// a timeout before printing, or crashed silently): the files the verify
+/// command itself names. A test file contributes the modules it imports first,
+/// then itself, as in [`repair_targets`]; pytest node ids
+/// (`tests/test_x.py::test_case`) are reduced to their path. Only files that
+/// exist under `root` count.
+pub fn targets_from_command(args: &[String], root: &Path) -> Vec<PathBuf> {
+    let mut direct: Vec<PathBuf> = Vec::new();
+    for a in args {
+        let path_part = a.split("::").next().unwrap_or(a);
+        if path_part.is_empty() || path_part.starts_with('-') {
+            continue;
+        }
+        let p = Path::new(path_part);
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        };
+        if full.is_file() {
+            if let Some(c) = contained_path(&full, root) {
+                if !direct.contains(&c) {
+                    direct.push(c);
+                }
+            }
+        }
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in &direct {
+        if !is_test_path(p) {
+            out.push(p.clone());
+        } else {
+            for hop in code_under_test_first(p, import_targets(p, root)) {
                 if !out.contains(&hop) {
                     out.push(hop);
                 }
@@ -625,6 +684,55 @@ pub fn repair_targets(trace: &str, root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_line_test_file_hops_to_the_module_under_test() {
+        let root = std::env::temp_dir().join(format!("axiom_fl_cmd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("python_programs")).unwrap();
+        std::fs::create_dir_all(root.join("python_testcases")).unwrap();
+        std::fs::write(
+            root.join("python_programs/bitcount.py"),
+            "def bitcount(n):\n    return n\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("python_testcases/load_testdata.py"),
+            "def load():\n    return []\n",
+        )
+        .unwrap();
+        // The helper beside the test is imported first, as in QuixBugs.
+        std::fs::write(
+            root.join("python_testcases/test_bitcount.py"),
+            "from load_testdata import load\nfrom python_programs.bitcount import bitcount\n\ndef test_one():\n    assert bitcount(1) == 1\n",
+        )
+        .unwrap();
+        let args: Vec<String> = [
+            "-m",
+            "pytest",
+            "-q",
+            "python_testcases/test_bitcount.py::test_one",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let t = targets_from_command(&args, &root);
+        assert_eq!(
+            t.first()
+                .map(|p| p.ends_with("python_programs/bitcount.py")),
+            Some(true),
+            "{t:?}"
+        );
+        assert!(
+            t.last()
+                .unwrap()
+                .ends_with("python_testcases/test_bitcount.py"),
+            "{t:?}"
+        );
+        // Flags and missing paths are ignored.
+        assert!(targets_from_command(&["-q".into(), "nope.py".into()], &root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn parses_rust_compiler_and_panic_frames() {
