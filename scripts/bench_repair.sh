@@ -22,7 +22,10 @@
 # Env: AXIOM_BIN (default: axiom_engine_rs/target/release/axiom, built if absent),
 #      AXIOM_REPAIR_CORPUS (default: bench/repair), AXIOM_BENCH_KEEP=1 (keep each
 #      scratch tree and print its path, for post-hoc inspection), AXIOM_BENCH_LABEL
-#      (suffix for the results file). CPU-only, no network, no API key.
+#      (suffix for the results file), AXIOM_BENCH_VERIFY_TIMEOUT_SECS (default 300: the
+#      runner's own baseline and post-solve verify runs; a fault that loops forever
+#      is a failure, not a hang; the solver's per-candidate limit is
+#      AXIOM_SOLVE_VERIFY_TIMEOUT_SECS). CPU-only, no network, no API key.
 #
 # meta.json may also carry "test_region": {"file": ..., "from_line": N} for
 # fixtures whose tests live in the same file as the code (Rust #[cfg(test)]):
@@ -38,6 +41,17 @@ DATE="$(date +%Y-%m-%d)"
 CHECK=0
 [ "${1:-}" = "--check" ] && CHECK=1
 export AXIOM_DEVICE=cpu
+
+# The runner's own verify runs, bounded: an infinite loop in the faulty code (a
+# legitimate failure mode, e.g. QuixBugs bitcount) must count as a failing run.
+VERIFY_TIMEOUT="${AXIOM_BENCH_VERIFY_TIMEOUT_SECS:-300}"
+verify_bounded() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --kill-after=5 "$VERIFY_TIMEOUT" "$@"
+  else
+    "$@"
+  fi
+}
 
 say() { printf '\033[1m%s\033[0m\n' "$*" >&2; }
 
@@ -104,7 +118,7 @@ for dir in "$CORPUS"/*/; do
   cp -R "$dir/broken/." "$work/"
 
   # 1. No-op baseline.
-  if ( cd "$work" && "${VERIFY[@]}" >/dev/null 2>&1 ); then
+  if ( cd "$work" && verify_bounded "${VERIFY[@]}" >/dev/null 2>&1 ); then
     rows+=("| $name | $lang | NOT BROKEN | verify passes on the untouched tree | — |")
     notbroken=$((notbroken+1)); rm -rf "$work"; continue
   fi
@@ -133,7 +147,7 @@ for dir in "$CORPUS"/*/; do
   how="$(printf '%s\n' "$log" | grep -oE 'mutation repair verified green \([^)]*\)|source repair solved it \(patched=[a-z]+\)|environment heal solved it|fleet patch [0-9a-f]+ verified green locally|LLM-proposed patch verified green' | head -1)"
 
   # 3. Re-verify, then refuse a pass that edited the oracle.
-  if ( cd "$work" && "${VERIFY[@]}" >/dev/null 2>&1 ); then
+  if ( cd "$work" && verify_bounded "${VERIFY[@]}" >/dev/null 2>&1 ); then
     touched=()
     for p in ${PINNED[@]+"${PINNED[@]}"}; do
       cmp -s "$dir/broken/$p" "$work/$p" || touched+=("$p")
