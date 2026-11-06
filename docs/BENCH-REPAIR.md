@@ -108,6 +108,13 @@ Keep these deterministic and offline — they stay in CI as the regression gate.
 
 ### Phase 2 — a real held-out corpus
 
+**Second pass (2026-11-06, unreleased): 39/40 on seed 2026 and 38/40 on a
+fresh seed 7, 0 rollback violations.** That is 15/17 on the seed-7 faults
+outside the tuning set, against 6/17 for the 0.6.0 binary. New operators for
+the four classes that were at 0, call-graph candidate ordering, and three
+repair-loop bugs the benchmark exposed:
+[`bench/results/SEEDED-HELDOUT-v2-2026-11-06.md`](../bench/results/SEEDED-HELDOUT-v2-2026-11-06.md).
+
 **First held-out measurement (2026-11-06): 19/40 seeded faults repaired, 0
 rollback violations.** That is 19 of 29 (66%) in the fault classes the engine
 has an operator for, and 0 of 11 in the ones it has none for. The faults are

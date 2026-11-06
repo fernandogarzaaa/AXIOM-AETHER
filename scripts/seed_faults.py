@@ -274,7 +274,16 @@ def run_verify(cwd: Path, verify: list[str]) -> bool:
 
 
 def copy_crate(src: Path, dst: Path) -> None:
-    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("target", ".git", "*.orig"))
+    # `shutil.copy`, not the default `copy2`: the copy must get fresh mtimes.
+    # With the original (older) mtimes, cargo sees sources older than the test
+    # binary a previous fixture left in the shared CARGO_TARGET_DIR and reruns
+    # that stale binary instead of rebuilding.
+    shutil.copytree(
+        src,
+        dst,
+        ignore=shutil.ignore_patterns("target", ".git", "*.orig", "proptest-regressions"),
+        copy_function=shutil.copy,
+    )
 
 
 def main() -> int:

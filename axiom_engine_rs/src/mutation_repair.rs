@@ -6,9 +6,10 @@
 //! language-aware successor. Given the failing verifier's output and the file
 //! blamed by [`crate::fault_locate`], it enumerates a **bounded, ranked set of
 //! single-edit source mutations** of the kinds that account for a large share of
-//! real one-line bugs — comparison-operator and off-by-one slips, inverted
-//! booleans, `and`/`or` mix-ups, arithmetic-operator slips, swapped call
-//! arguments, missing `return`s, shell `test` operators — and hands them to the
+//! real one-line bugs — comparison-operator and off-by-one slips, inverted or
+//! dropped negations, `and`/`or` mix-ups, arithmetic-operator slips, swapped
+//! call arguments, swapped variables, `min`/`max`-style paired calls,
+//! `break`/`continue`, missing `return`s, shell `test` operators — and hands them to the
 //! verifier-gated, reversible apply loop in [`crate::solve`]. A candidate is kept
 //! only if the real verifier goes green; everything else is rolled back
 //! byte-for-byte. No model, no network: the intelligence is the verifier, and
@@ -16,8 +17,12 @@
 //!
 //! Three rules keep it honest:
 //!
-//! 1. **Focus.** Lines the failure trace blames are mutated first; the rest of
-//!    the file follows, class-major, so the budget goes where the evidence is.
+//! 1. **Focus.** Lines the failure trace blames are mutated first; then the
+//!    rest of the function that raised, the bodies of the functions the
+//!    failing test calls, what those call, and finally the rest of the file —
+//!    each tier class-major, so the budget goes where the evidence is.
+//!    Identifier swaps (up to 15 per line) are tried off the blamed lines only
+//!    after everything else.
 //!    The trace also reorders the mutation classes: an `IndexError` tries
 //!    off-by-one fixes first, an `expected 6 got 5` likewise, a `NoneType` /
 //!    `undefined` result tries a missing `return` first.
@@ -32,6 +37,9 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+
+/// Tier for identifier swaps off the blamed lines: after every other edit.
+const LAST_TIER: u8 = 5;
 
 /// Default cap on candidates per file (one verifier run each).
 pub const DEFAULT_MAX_CANDIDATES: usize = 64;
@@ -48,7 +56,8 @@ pub enum MutationClass {
     /// Integer literal ±1, drop/flip a trailing `± 1`, `len(x)` → `len(x) - 1`,
     /// `range(n)` → `range(n + 1)`, Rust `..` ↔ `..=`.
     OffByOne,
-    /// `true` ↔ `false`, drop a `not`/`!`, negate a returned expression.
+    /// `true` ↔ `false`, drop a `not`/`!` (or unwrap `!( … )`), negate a
+    /// returned expression, an `if`/`while` condition, or a closure body.
     Boolean,
     /// `and` ↔ `or`, `&&` ↔ `||`.
     Logic,
@@ -68,10 +77,17 @@ pub enum MutationClass {
     /// source file whose name is closest. Needs the trace's "module not found"
     /// name and the directory listing, so it is planned per file, not per line.
     ImportPath,
+    /// Swap a call or keyword for its paired opposite: `min` ↔ `max`,
+    /// `floor` ↔ `ceil`, `first` ↔ `last`, `starts_with` ↔ `ends_with`,
+    /// `any` ↔ `all`, `break` ↔ `continue`.
+    ApiSwap,
+    /// Exchange every occurrence of two identifiers on one line (`a - b` with
+    /// `b - a`, a swapped `(row, col)`): the "wrong variable" bug.
+    IdentSwap,
 }
 
 impl MutationClass {
-    pub const ALL: [MutationClass; 9] = [
+    pub const ALL: [MutationClass; 11] = [
         MutationClass::Comparison,
         MutationClass::OffByOne,
         MutationClass::Boolean,
@@ -80,6 +96,8 @@ impl MutationClass {
         MutationClass::SwapArgs,
         MutationClass::MissingReturn,
         MutationClass::ShellTest,
+        MutationClass::ApiSwap,
+        MutationClass::IdentSwap,
         MutationClass::ImportPath,
     ];
 
@@ -94,6 +112,8 @@ impl MutationClass {
             MutationClass::MissingReturn => "missing-return",
             MutationClass::ShellTest => "shell-test",
             MutationClass::ImportPath => "import-path",
+            MutationClass::ApiSwap => "api-swap",
+            MutationClass::IdentSwap => "ident-swap",
         }
     }
 }
@@ -388,17 +408,34 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
             hinted_in_oracle.push(i);
         }
     }
+    // The rest of the function that raised (an in-scope blamed line is
+    // usually the symptom: an index that went out of bounds a few lines after
+    // the bound was computed). Nearest lines first, earlier lines before later.
+    let enclosing: Vec<usize> = enclosing_fn_lines(&lines, lang, &hinted)
+        .into_iter()
+        .filter(|i| in_scope(*i) && !hinted.contains(i))
+        .collect();
     // Functions the failing test exercises, by name: their bodies are the
     // most likely home of the fault when the trace only blames the assertion.
-    let focus: Vec<usize> = callee_focus_lines(&lines, lang, &oracle, &hinted_in_oracle)
+    // Direct callees first, then what those call.
+    let (direct, indirect) = callee_focus_lines(&lines, lang, &oracle, &hinted_in_oracle);
+    let taken = |i: &usize| hinted.contains(i) || enclosing.contains(i);
+    let focus: Vec<usize> = direct.into_iter().filter(|i| !taken(i)).collect();
+    let focus2: Vec<usize> = indirect
         .into_iter()
-        .filter(|i| !hinted.contains(i))
+        .filter(|i| !taken(i) && !focus.contains(i))
         .collect();
     // Remaining lines: by distance to the nearest hint/focus line if any, else
     // file order.
-    let anchors: Vec<usize> = hinted.iter().chain(focus.iter()).copied().collect();
+    let anchors: Vec<usize> = hinted
+        .iter()
+        .chain(enclosing.iter())
+        .chain(focus.iter())
+        .chain(focus2.iter())
+        .copied()
+        .collect();
     let mut rest: Vec<usize> = (0..n)
-        .filter(|i| in_scope(*i) && !hinted.contains(i) && !focus.contains(i))
+        .filter(|i| in_scope(*i) && !anchors.contains(i))
         .collect();
     if !anchors.is_empty() {
         rest.sort_by_key(|i| {
@@ -440,6 +477,15 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
                 // Tier 0 (blamed lines): line order, every class. Tiers 1+
                 // (callee focus, then the rest of the file): class-major so
                 // the trace-derived class order decides what is tried first.
+                // Identifier swaps are the most prolific class (up to 15 per
+                // line), so off the blamed lines they wait until every other
+                // edit has been tried. A swapped variable usually breaks the
+                // build, and the compiler then blames the line itself.
+                let tier = if *class == MutationClass::IdentSwap && tier > 0 {
+                    LAST_TIER
+                } else {
+                    tier
+                };
                 let key = if tier == 0 {
                     (0, pos, cr, *seq)
                 } else {
@@ -461,11 +507,17 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
     for (pos, li) in hinted.iter().enumerate() {
         visit(*li, pos, 0, &mut keyed, &mut seq);
     }
-    for (pos, li) in focus.iter().enumerate() {
+    for (pos, li) in enclosing.iter().enumerate() {
         visit(*li, pos, 1, &mut keyed, &mut seq);
     }
-    for (pos, li) in rest.iter().enumerate() {
+    for (pos, li) in focus.iter().enumerate() {
         visit(*li, pos, 2, &mut keyed, &mut seq);
+    }
+    for (pos, li) in focus2.iter().enumerate() {
+        visit(*li, pos, 3, &mut keyed, &mut seq);
+    }
+    for (pos, li) in rest.iter().enumerate() {
+        visit(*li, pos, 4, &mut keyed, &mut seq);
     }
 
     // Import-path repairs are planned per file (they need the trace's missing
@@ -595,9 +647,9 @@ fn callee_focus_lines(
     lang: Lang,
     oracle: &[(usize, usize)],
     hinted_in_oracle: &[usize],
-) -> Vec<usize> {
+) -> (Vec<usize>, Vec<usize>) {
     if lang != Lang::Rust || oracle.is_empty() || hinted_in_oracle.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let n = lines.len();
     let content = |i: usize| split_eol(lines[i]).0;
@@ -620,7 +672,7 @@ fn callee_focus_lines(
         defs.push((name, i, end));
     }
     if defs.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // Called names, in order of appearance across the blamed tests. Each scan
@@ -647,15 +699,91 @@ fn callee_focus_lines(
         }
     }
 
-    let mut out: Vec<usize> = Vec::new();
-    for name in &called {
-        for (def, s, e) in &defs {
-            if def == name {
-                for i in *s..=*e {
-                    if !out.contains(&i) {
-                        out.push(i);
+    let bodies_of = |names: &[String], skip: &[usize]| -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        for name in names {
+            for (def, s, e) in &defs {
+                if def == name {
+                    for i in *s..=*e {
+                        if !out.contains(&i) && !skip.contains(&i) {
+                            out.push(i);
+                        }
                     }
                 }
+            }
+        }
+        out
+    };
+    let direct = bodies_of(&called, &[]);
+    // One hop further: what the direct callees call (a fault in a helper
+    // shows up as a wrong result from the function the test calls).
+    let mut called2: Vec<String> = Vec::new();
+    for &i in &direct {
+        for name in called_identifiers(content(i)) {
+            if !called.contains(&name) && !called2.contains(&name) {
+                called2.push(name);
+            }
+        }
+    }
+    let indirect = bodies_of(&called2, &direct);
+    (direct, indirect)
+}
+
+/// Lines of the function enclosing each blamed line (Rust brace bodies,
+/// Python indentation bodies), ordered by distance to the blamed line with
+/// earlier lines first (the faulty computation usually precedes the panic).
+fn enclosing_fn_lines(lines: &[&str], lang: Lang, hinted: &[usize]) -> Vec<usize> {
+    let n = lines.len();
+    let content = |i: usize| split_eol(lines[i]).0;
+    let indent = |i: usize| content(i).len() - content(i).trim_start().len();
+    let mut out: Vec<usize> = Vec::new();
+    for &h in hinted {
+        let range = match lang {
+            Lang::Rust => {
+                let is_fn = |i: usize| {
+                    fn_name(content(i).trim_start()).is_some()
+                        && (content(i).trim_start().starts_with("fn ")
+                            || content(i).contains(" fn ")
+                            || content(i).trim_start().starts_with("pub fn "))
+                };
+                let mut s = h;
+                while s > 0 && !is_fn(s) {
+                    s -= 1;
+                }
+                if !is_fn(s) {
+                    continue;
+                }
+                let e = body_end(lines, s, n);
+                if e < h {
+                    continue; // the hint is not inside that body
+                }
+                (s, e)
+            }
+            Lang::Python => {
+                let mut s = h;
+                while s > 0 && !content(s).trim_start().starts_with("def ") {
+                    s -= 1;
+                }
+                if !content(s).trim_start().starts_with("def ") || s == h {
+                    continue;
+                }
+                let base = indent(s);
+                let mut e = s + 1;
+                while e < n && (content(e).trim().is_empty() || indent(e) > base) {
+                    e += 1;
+                }
+                if e <= h {
+                    continue;
+                }
+                (s, e - 1)
+            }
+            _ => continue,
+        };
+        let mut body: Vec<usize> = (range.0..=range.1).filter(|i| *i != h).collect();
+        body.sort_by_key(|i| if *i < h { 2 * (h - i) } else { 2 * (i - h) + 1 });
+        for i in body {
+            if !out.contains(&i) {
+                out.push(i);
             }
         }
     }
@@ -767,6 +895,8 @@ pub fn line_mutations(
         MutationClass::ShellTest => shell_test(line, lang, &mask),
         // Planned per file in `plan` (needs the trace and the directory).
         MutationClass::ImportPath => Vec::new(),
+        MutationClass::ApiSwap => api_swap(line, lang, &mask),
+        MutationClass::IdentSwap => ident_swap(line, lang, &mask),
     }
 }
 
@@ -1425,6 +1555,11 @@ fn boolean(line: &str, lang: Lang, mask: &[bool]) -> Vec<(String, String)> {
             }
         }
     }
+    if lang.c_like() {
+        out.extend(unwrap_negated_group(line, mask));
+    }
+    out.extend(negate_condition(line, lang, mask));
+    out.extend(negate_closure_body(line, lang, mask));
     out
 }
 
@@ -1802,6 +1937,358 @@ fn shell_test(line: &str, lang: Lang, mask: &[bool]) -> Vec<(String, String)> {
     out
 }
 
+/// Paired opposites: a call to one is a classic single-token slip for the other.
+/// `call` pairs must be followed by `(` (a call, not a variable that happens to
+/// be named `max`); keyword pairs stand alone.
+const API_PAIRS_CALL: &[(&str, &str)] = &[
+    ("min", "max"),
+    ("max", "min"),
+    ("floor", "ceil"),
+    ("ceil", "floor"),
+    ("first", "last"),
+    ("last", "first"),
+    ("starts_with", "ends_with"),
+    ("ends_with", "starts_with"),
+    ("startswith", "endswith"),
+    ("endswith", "startswith"),
+    ("startsWith", "endsWith"),
+    ("endsWith", "startsWith"),
+    ("any", "all"),
+    ("all", "any"),
+    ("min_by_key", "max_by_key"),
+    ("max_by_key", "min_by_key"),
+];
+
+fn api_swap(line: &str, lang: Lang, mask: &[bool]) -> Vec<(String, String)> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    for (from, to) in API_PAIRS_CALL {
+        for (s, e) in word_spans(line, mask, from) {
+            if next_non_space(b, e).map(|k| b[k]) != Some(b'(') {
+                continue;
+            }
+            out.push((format!("{from} -> {to}"), replace_span(line, s, e, to)));
+        }
+    }
+    if lang != Lang::Shell {
+        for (from, to) in [("break", "continue"), ("continue", "break")] {
+            for (s, e) in word_spans(line, mask, from) {
+                out.push((format!("{from} -> {to}"), replace_span(line, s, e, to)));
+            }
+        }
+    }
+    out
+}
+
+/// Words that are never a variable worth swapping.
+const NOT_SWAPPABLE: &[&str] = &[
+    "as",
+    "async",
+    "await",
+    "break",
+    "const",
+    "continue",
+    "crate",
+    "def",
+    "del",
+    "dyn",
+    "elif",
+    "else",
+    "enum",
+    "extern",
+    "false",
+    "fn",
+    "for",
+    "from",
+    "func",
+    "function",
+    "if",
+    "impl",
+    "import",
+    "in",
+    "is",
+    "lambda",
+    "let",
+    "loop",
+    "match",
+    "mod",
+    "move",
+    "mut",
+    "new",
+    "nil",
+    "not",
+    "null",
+    "or",
+    "and",
+    "pub",
+    "ref",
+    "return",
+    "self",
+    "static",
+    "struct",
+    "super",
+    "this",
+    "trait",
+    "true",
+    "type",
+    "typeof",
+    "undefined",
+    "unsafe",
+    "use",
+    "var",
+    "where",
+    "while",
+    "with",
+    "yield",
+    "None",
+    "True",
+    "False",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "usize",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "isize",
+    "f32",
+    "f64",
+    "bool",
+    "char",
+    "str",
+    "int",
+    "float",
+    "string",
+];
+
+/// At most this many distinct identifiers per line take part in swaps, so a
+/// long line costs at most `C(6, 2) = 15` candidates.
+const MAX_SWAP_IDENTS: usize = 6;
+
+fn ident_swap(line: &str, lang: Lang, mask: &[bool]) -> Vec<(String, String)> {
+    if lang == Lang::Shell {
+        return Vec::new();
+    }
+    let b = line.as_bytes();
+    let n = b.len();
+    // (start, end) spans of every code identifier, and the distinct names in
+    // first-seen order.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if mask[i]
+            && (b[i].is_ascii_alphabetic() || b[i] == b'_')
+            && (i == 0 || !is_ident(b[i - 1]))
+        {
+            let mut e = i;
+            while e < n && is_ident(b[e]) && mask[e] {
+                e += 1;
+            }
+            let w = &line[i..e];
+            let after_path = i >= 2 && &b[i - 2..i] == b"::";
+            let macro_call = e < n && b[e] == b'!';
+            let upper = b[i].is_ascii_uppercase();
+            if !after_path && !macro_call && !upper && !NOT_SWAPPABLE.contains(&w) {
+                spans.push((i, e));
+                if !names.contains(&w) {
+                    names.push(w);
+                }
+            }
+            i = e;
+        } else {
+            i += 1;
+        }
+    }
+    names.truncate(MAX_SWAP_IDENTS);
+    let mut out = Vec::new();
+    for x in 0..names.len() {
+        for y in x + 1..names.len() {
+            let (a, c) = (names[x], names[y]);
+            let mut s = String::with_capacity(line.len());
+            let mut last = 0;
+            for (st, en) in &spans {
+                let w = &line[*st..*en];
+                let rep = if w == a {
+                    c
+                } else if w == c {
+                    a
+                } else {
+                    continue;
+                };
+                s.push_str(&line[last..*st]);
+                s.push_str(rep);
+                last = *en;
+            }
+            s.push_str(&line[last..]);
+            out.push((format!("swap `{a}` <-> `{c}`"), s));
+        }
+    }
+    out
+}
+
+/// Is `expr` a single postfix operand (`a`, `a.b(c)`, `xs[i]`, `f(x, y)`) that
+/// can take a prefix `!` / `not ` without parentheses?
+fn is_simple_operand(expr: &str, lang: Lang) -> bool {
+    let b = expr.as_bytes();
+    if b.is_empty() || !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
+        return false;
+    }
+    let mask = code_mask(expr, lang);
+    let mut depth = 0i32;
+    for (k, c) in b.iter().enumerate() {
+        if !mask[k] {
+            continue;
+        }
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ if depth == 0 && !(is_ident(*c) || *c == b'.' || *c == b':' || *c == b'?') => {
+                return false
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn negated(expr: &str, lang: Lang) -> String {
+    let simple = is_simple_operand(expr, lang);
+    match (lang.word_logic(), simple) {
+        (true, true) => format!("not {expr}"),
+        (true, false) => format!("not ({expr})"),
+        (false, true) => format!("!{expr}"),
+        (false, false) => format!("!({expr})"),
+    }
+}
+
+/// Negate a whole `if` / `while` condition (the dropped `!`): `if x {` →
+/// `if !x {`, `if a || b {` → `if !(a || b) {`, `if (x) {` → `if (!x) {`,
+/// `if x:` → `if not x:`. Conditions that already start with a negation are
+/// left to the `drop !` operator; `if let` / `while let` are not conditions.
+fn negate_condition(line: &str, lang: Lang, mask: &[bool]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if lang == Lang::Shell {
+        return out;
+    }
+    let t_end = line.trim_end().len();
+    for kw in ["if", "while", "elif"] {
+        for (_, e) in word_spans(line, mask, kw) {
+            let Some(cs) = next_non_space(line.as_bytes(), e) else {
+                continue;
+            };
+            // Condition runs to the block opener at the end of the line.
+            let opener = if lang.word_logic() { ':' } else { '{' };
+            let body = line[cs..t_end].trim_end();
+            let Some(cond) = body.strip_suffix(opener) else {
+                continue;
+            };
+            let cond = cond.trim_end();
+            if cond.is_empty()
+                || cond.starts_with("let ")
+                || cond.starts_with('!')
+                || cond.starts_with("not ")
+                || !mask[cs..cs + cond.len()].iter().any(|m| *m)
+            {
+                continue;
+            }
+            let ce = cs + cond.len();
+            // `if (cond) {` (C, JS, Java): negate inside the parentheses.
+            let bb = line.as_bytes();
+            let new_cond = if bb[cs] == b'(' && matching_paren(bb, mask, cs) == Some(ce - 1) {
+                let inner = &line[cs + 1..ce - 1];
+                if inner.starts_with('!') {
+                    continue;
+                }
+                format!("({})", negated(inner, lang))
+            } else {
+                negated(cond, lang)
+            };
+            out.push((
+                format!("negate `{kw}` condition"),
+                replace_span(line, cs, ce, &new_cond),
+            ));
+        }
+    }
+    out
+}
+
+/// Negate the body of a one-expression closure passed as the last argument:
+/// `.filter(|&p| claimed[p])` → `.filter(|&p| !claimed[p])`,
+/// `.filter(x => x.ok)` → `.filter(x => !x.ok)`.
+fn negate_closure_body(line: &str, lang: Lang, mask: &[bool]) -> Vec<(String, String)> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let push = |body_s: usize, close: usize, out: &mut Vec<(String, String)>| {
+        let body = line[body_s..close].trim();
+        if body.is_empty() || body.starts_with('!') || body.starts_with('{') {
+            return;
+        }
+        let s = body_s + (line[body_s..close].len() - line[body_s..close].trim_start().len());
+        let e = s + body.len();
+        out.push((
+            "negate closure body".to_string(),
+            replace_span(line, s, e, &negated(body, lang)),
+        ));
+    };
+    for open in 0..b.len() {
+        if b[open] != b'(' || !mask[open] {
+            continue;
+        }
+        let Some(close) = matching_paren(b, mask, open) else {
+            continue;
+        };
+        let Some(first) = next_non_space(b, open + 1) else {
+            continue;
+        };
+        if lang == Lang::Rust && b[first] == b'|' {
+            // `|args| body` — the second `|` ends the parameter list.
+            if let Some(rel) = line[first + 1..close].find('|') {
+                push(first + 1 + rel + 1, close, &mut out);
+            }
+        } else if lang == Lang::JavaScript {
+            if let Some(rel) = line[open + 1..close].find("=>") {
+                push(open + 1 + rel + 2, close, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// `!(a || b)` → `a || b` when the parenthesised group is the whole condition
+/// (keeps the code warning-free, unlike leaving `(a || b)` behind).
+fn unwrap_negated_group(line: &str, mask: &[bool]) -> Vec<(String, String)> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    for (s, e, op) in op_spans(line, mask) {
+        if op != "!" || e >= b.len() || b[e] != b'(' || (s > 0 && is_ident(b[s - 1])) {
+            continue;
+        }
+        let Some(close) = matching_paren(b, mask, e) else {
+            continue;
+        };
+        let before = prev_non_space(b, s).map(|k| b[k]);
+        let after = next_non_space(b, close + 1).map(|k| b[k]);
+        let opens_condition = before.is_none_or(|c| is_ident(c) || c == b'(' || c == b'=');
+        let ends_condition = matches!(
+            after,
+            None | Some(b'{') | Some(b')') | Some(b';') | Some(b',')
+        );
+        if opens_condition && ends_condition {
+            let inner = &line[e + 1..close];
+            out.push((
+                "unwrap `!( )`".to_string(),
+                format!("{}{}{}", &line[..s], inner, &line[close + 1..]),
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1915,6 +2402,171 @@ mod tests {
         assert!(m.contains(&"if (a || b) {".to_string()));
         let m = muts("ignored = 'a or b'", Lang::Python, MutationClass::Logic);
         assert!(m.is_empty(), "{m:?}");
+    }
+
+    #[test]
+    fn negation_is_added_to_conditions_and_closure_bodies() {
+        let has = |m: &[String], s: &str| m.iter().any(|l| l == s);
+        // A dropped `!` on an `if` condition: simple operand, no parentheses.
+        let m = muts(
+            "            if eligible_idx.contains(&i) {",
+            Lang::Rust,
+            MutationClass::Boolean,
+        );
+        assert!(
+            has(&m, "            if !eligible_idx.contains(&i) {"),
+            "{m:?}"
+        );
+        // A compound condition is wrapped.
+        let m = muts("if a != 0 || b {", Lang::Rust, MutationClass::Boolean);
+        assert!(has(&m, "if !(a != 0 || b) {"), "{m:?}");
+        // C-style parenthesised condition: negate inside the parentheses.
+        let m = muts("while (ok) {", Lang::JavaScript, MutationClass::Boolean);
+        assert!(has(&m, "while (!ok) {"), "{m:?}");
+        // Python uses `not`.
+        let m = muts("    if xs:", Lang::Python, MutationClass::Boolean);
+        assert!(has(&m, "    if not xs:"), "{m:?}");
+        // `if let` is a pattern match, not a condition.
+        let m = muts("if let Some(x) = y {", Lang::Rust, MutationClass::Boolean);
+        assert!(!m.iter().any(|l| l.contains("if !")), "{m:?}");
+        // Closure bodies.
+        let m = muts(
+            "            .filter(|&p| payload_claimed[p])",
+            Lang::Rust,
+            MutationClass::Boolean,
+        );
+        assert!(
+            has(&m, "            .filter(|&p| !payload_claimed[p])"),
+            "{m:?}"
+        );
+        let m = muts(
+            "xs.filter(x => x.ok)",
+            Lang::JavaScript,
+            MutationClass::Boolean,
+        );
+        assert!(has(&m, "xs.filter(x => !x.ok)"), "{m:?}");
+    }
+
+    #[test]
+    fn negated_group_unwraps_without_leaving_parentheses() {
+        let m = muts(
+            "        if !(self.gain != 0.0 || self.explore != 0.0) {",
+            Lang::Rust,
+            MutationClass::Boolean,
+        );
+        assert!(
+            m.contains(&"        if self.gain != 0.0 || self.explore != 0.0 {".to_string()),
+            "{m:?}"
+        );
+        // A `!( )` that is one operand of a larger expression keeps its scope
+        // (only the plain `drop !` applies there).
+        let m = muts("if !(a) && b {", Lang::Rust, MutationClass::Boolean);
+        assert!(
+            !m.contains(&"if a && b {".to_string()) || m.contains(&"if (a) && b {".to_string())
+        );
+        assert!(!m.iter().any(|l| l == "if a) && b {"), "{m:?}");
+    }
+
+    #[test]
+    fn api_swap_flips_paired_calls_and_loop_control() {
+        let m = muts(
+            "    let fan_out = self.fan_out.min(self.nodes.len()).max(1);",
+            Lang::Rust,
+            MutationClass::ApiSwap,
+        );
+        assert!(
+            m.contains(&"    let fan_out = self.fan_out.max(self.nodes.len()).max(1);".to_string())
+        );
+        assert!(
+            m.contains(&"    let fan_out = self.fan_out.min(self.nodes.len()).min(1);".to_string())
+        );
+        let m = muts("x = math.floor(y)", Lang::Python, MutationClass::ApiSwap);
+        assert_eq!(m, vec!["x = math.ceil(y)".to_string()]);
+        let m = muts("                break;", Lang::Rust, MutationClass::ApiSwap);
+        assert_eq!(m, vec!["                continue;".to_string()]);
+        // A variable named `max` is not a call.
+        let m = muts("let max = 3;", Lang::Rust, MutationClass::ApiSwap);
+        assert!(m.is_empty(), "{m:?}");
+        // Strings are untouched.
+        let m = muts(r#"log("min(a)")"#, Lang::JavaScript, MutationClass::ApiSwap);
+        assert!(m.is_empty(), "{m:?}");
+    }
+
+    #[test]
+    fn ident_swap_exchanges_every_occurrence_of_a_pair() {
+        let m = muts(
+            "        let tau = self.effective_tau(residual);",
+            Lang::Rust,
+            MutationClass::IdentSwap,
+        );
+        assert!(
+            m.contains(&"        let residual = self.effective_tau(tau);".to_string()),
+            "{m:?}"
+        );
+        // Both occurrences of each name move together.
+        let m = muts("d = b - a + b", Lang::Python, MutationClass::IdentSwap);
+        assert!(m.contains(&"d = a - b + a".to_string()), "{m:?}");
+        assert!(m.contains(&"b = d - a + d".to_string()), "{m:?}");
+        assert_eq!(m.len(), 3, "C(3, 2) pairs: {m:?}");
+        // Keywords, `Type::path` segments, macros and capitalised names stay.
+        let m = muts("let x = Foo::new(y);", Lang::Rust, MutationClass::IdentSwap);
+        assert_eq!(m, vec!["let y = Foo::new(x);".to_string()]);
+        let m = muts(
+            "println!(\"{a}\", b);",
+            Lang::Rust,
+            MutationClass::IdentSwap,
+        );
+        assert!(m.is_empty(), "{m:?}");
+        // At most C(6, 2) candidates per line.
+        let m = muts(
+            "f(a, b, c, d, e, g, h, i, j)",
+            Lang::Python,
+            MutationClass::IdentSwap,
+        );
+        assert!(m.len() <= 15, "{}", m.len());
+    }
+
+    #[test]
+    fn ident_swaps_off_the_blamed_line_come_after_every_other_class() {
+        let src = "fn f(a: i32, b: i32) -> i32 {\n    let d = a - b;\n    d + 1\n}\n";
+        let plan = plan(src, &PathBuf::from("lib.rs"), "", 1_000);
+        let first_swap = plan
+            .iter()
+            .position(|c| c.class == MutationClass::IdentSwap)
+            .expect("an ident swap is planned");
+        assert!(
+            plan[first_swap..]
+                .iter()
+                .all(|c| c.class == MutationClass::IdentSwap),
+            "{:?}",
+            plan.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+        // On a blamed line it is tried with that line's other edits.
+        let plan = plan_with(src, "error[E0425]: --> lib.rs:2:13");
+        let pos = plan
+            .iter()
+            .position(|c| c.class == MutationClass::IdentSwap && c.line == 2)
+            .unwrap();
+        assert!(pos < 10, "{pos}");
+    }
+
+    fn plan_with(src: &str, trace: &str) -> Vec<Candidate> {
+        plan(src, &PathBuf::from("lib.rs"), trace, 1_000)
+    }
+
+    #[test]
+    fn enclosing_function_of_an_in_scope_panic_comes_before_the_rest() {
+        // The panic is at line 4 (the index); the faulty bound is line 3.
+        let src = "fn other(x: usize) -> usize {\n    x + 1\n}\nfn get(xs: &[u8]) -> u8 {\n    let i = xs.len();\n    xs[i]\n}\n";
+        let trace = "thread 'tests::t' panicked at src/lib.rs:6:5:\nindex out of bounds: the len is 3 but the index is 3";
+        let plan = plan(src, &PathBuf::from("src/lib.rs"), trace, 1_000);
+        let fix = "fn other(x: usize) -> usize {\n    x + 1\n}\nfn get(xs: &[u8]) -> u8 {\n    let i = xs.len() - 1;\n    xs[i]\n}\n";
+        let pos = plan
+            .iter()
+            .position(|c| c.source == fix)
+            .expect("fix planned");
+        let first_other = plan.iter().position(|c| c.line <= 3).unwrap_or(usize::MAX);
+        assert!(pos < first_other, "fix at {pos}, other fn at {first_other}");
     }
 
     #[test]
@@ -2203,7 +2855,11 @@ mod tests {
             .iter()
             .position(|c| (10..=12).contains(&c.line))
             .unwrap_or(p.len());
-        let last_focus = p.iter().rposition(|c| (1..=8).contains(&c.line)).unwrap();
+        // (Identifier swaps off the blamed line deliberately come last.)
+        let last_focus = p
+            .iter()
+            .rposition(|c| (1..=8).contains(&c.line) && c.class != MutationClass::IdentSwap)
+            .unwrap();
         assert!(
             last_focus < first_unrelated,
             "focus lines must precede unrelated ones: {:?}",
