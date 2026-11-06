@@ -5,6 +5,37 @@ releases are described on the GitHub Releases page.
 
 ## [Unreleased]
 
+### Added
+
+- **Mutation repair: four fault classes it could not repair before.**
+  `api-swap` swaps a call for its paired opposite (`min`↔`max`,
+  `floor`↔`ceil`, `first`↔`last`, `starts_with`↔`ends_with`, `any`↔`all`)
+  and swaps `break`↔`continue`. `ident-swap` exchanges every occurrence of two identifiers on
+  a line (the "wrong variable" bug). The boolean class now also adds a dropped
+  negation to an `if`/`while` condition or a one-expression closure body, and
+  unwraps `!( … )` without leaving redundant parentheses behind.
+- **Mutation repair: candidate ordering.** After the lines the trace blames,
+  the planner now tries the rest of the function that raised, then the bodies
+  of the functions the failing test calls, then what those call, and only
+  then the rest of the file. Identifier swaps (up to 15 per line) are tried
+  off the blamed lines only after every other edit.
+- `tests/mutation_plan_diag.rs` (ignored): offline planner diagnostic that
+  reports, for each fixture of a seeded corpus, where the reversal of the
+  seeded fault ranks in the plan. Iterates in seconds without a verifier.
+
+### Fixed
+
+- **Debug builds of every model-loading subcommand panicked at start-up**
+  (`Cannot drop a runtime in a context where blocking is not allowed`). The
+  pipeline's context streamer built a `reqwest::blocking` client inside the
+  CLI's async runtime; reqwest's debug-only guard panics on that. The client
+  is now built lazily, only when a context API URL is configured. Release
+  binaries were not affected.
+- `scripts/seed_faults.py` copied the crate with its original mtimes, so a
+  test binary a previous fixture left in the shared `CARGO_TARGET_DIR` looked
+  up to date and the pristine-crate check ran the wrong code. Copies now get
+  fresh mtimes, and `proptest-regressions/` is no longer copied.
+
 ## [0.6.0] - 2026-11-06
 
 Headline: the deterministic repair loop now repairs **19 of 40 seeded faults in

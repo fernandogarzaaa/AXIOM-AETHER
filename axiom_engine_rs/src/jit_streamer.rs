@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -9,7 +10,11 @@ use sha2::{Digest, Sha256};
 pub struct JitContextStreamer {
     vocab_size: u32,
     max_context_tokens: usize,
-    client: Client,
+    /// Built on first use (only when `api_url` is set). Constructing a
+    /// `reqwest::blocking` client spins up and drops a private runtime, which
+    /// panics in debug builds when done inside an async context — and every
+    /// CLI subcommand builds its pipeline inside one.
+    client: OnceLock<Client>,
     api_url: Option<String>,
     api_key: Option<String>,
 }
@@ -21,14 +26,10 @@ impl JitContextStreamer {
         api_url: Option<String>,
         api_key: Option<String>,
     ) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(6))
-            .build()
-            .unwrap_or_else(|_| Client::new());
         Self {
             vocab_size: vocab_size.max(1),
             max_context_tokens: max_context_tokens.max(1),
-            client,
+            client: OnceLock::new(),
             api_url,
             api_key,
         }
@@ -99,7 +100,13 @@ impl JitContextStreamer {
             format!("{base_url}?q={encoded}")
         };
 
-        let mut request = self.client.get(target).header(
+        let client = self.client.get_or_init(|| {
+            Client::builder()
+                .timeout(Duration::from_secs(6))
+                .build()
+                .unwrap_or_else(|_| Client::new())
+        });
+        let mut request = client.get(target).header(
             "accept",
             "application/json,text/markdown;q=0.9,text/plain;q=0.9",
         );
