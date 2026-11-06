@@ -248,7 +248,12 @@ fn attempt_source_repair(
     // assertion line. Each candidate is one verifier run under the same
     // reversible policy as the LLM path: kept only if the command goes green,
     // otherwise rolled back byte-for-byte. No model, no network.
-    {
+    //
+    // Never on a test file: a blind single-token edit of the oracle can only
+    // weaken it (swapping two names in a test's setup made a QuixBugs test
+    // pass without touching the buggy program). Phase 3 may still edit a test
+    // it judges to be wrong.
+    if !crate::fault_locate::is_test_path(src) {
         let working_dir = opts.anchor.as_deref();
         let (_still_failing, trace) = run_verify_capture(command, args, working_dir);
         if let Ok(original) = std::fs::read_to_string(src) {
