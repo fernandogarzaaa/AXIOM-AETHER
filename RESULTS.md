@@ -1,14 +1,16 @@
 # AxiomBench Results
 
 <!-- axiombench:table:begin -->
-Generated (unix): 1783089448
+Generated (unix): 1793962968
 
 | Pillar | Headline | n | Read as |
 |---|---|---|---|
 | cognition | 3/3 symbol exact-recovery | **3** | smoke check, not a rate |
-| trust | 100% supported coverage; neural contradiction catch-rate 10% -> 100% (threshold 0.750) | 240 calibration claims | calibrated result |
-| fleet | node B pre-immunized in 0.17 ms; signed DWE applied in 0.10 ms (pass) | 2 nodes | pass/fail, not a benchmark |
+| trust | 100% supported coverage, neural contradiction catch-rate 10% -> 100% (threshold 0.750) | 240 calibration claims | calibrated result |
+| fleet | node B pre-immunized in 0.02 ms; signed DWE applied in 0.01 ms (pass) | 2 nodes | pass/fail, not a benchmark |
 | cost | 75.1% byte reduction | **3 replayed records from 3 sessions** | indicative only |
+
+Rows carried over from the previous table (pillar not run this invocation): cost.
 <!-- axiombench:table:end -->
 
 ## How to read these
