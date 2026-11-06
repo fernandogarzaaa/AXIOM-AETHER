@@ -1,7 +1,7 @@
 use crate::{
-    agentic, agentic_eval, bench, bootstrap, claude_backend, cli, config, daemon, fault_locate,
-    hardware, heal_memory, inference, lsp, mcp_stdio, meta_train, patch_memory, prime, provenance,
-    self_heal, server, skeleton, solve, train, tui, verify_suggest, vibe_memory,
+    agentic, agentic_eval, bench, bootstrap, cli, config, daemon, fault_locate, hardware,
+    heal_memory, inference, lsp, mcp_stdio, meta_train, patch_memory, prime, provenance, self_heal,
+    server, skeleton, solve, train, tui, verify_suggest, vibe_memory,
 };
 // Experimental: compiled only with `--features experimental` (docs/EXPERIMENTAL.md).
 #[cfg(feature = "experimental")]
@@ -522,7 +522,7 @@ async fn run_main() -> Result<()> {
 /// applies atomically and keeps only if the verifier passes — the model never
 /// gets to write anything that isn't independently verified.
 struct LlmTaskProposer<'a> {
-    backend: &'a claude_backend::ClaudeBackend,
+    backend: &'a dyn crate::backend_router::ChatBackend,
     program: &'a str,
     args: &'a [String],
     targets: Vec<PathBuf>,
@@ -559,7 +559,7 @@ impl agentic::Proposer for LlmTaskProposer<'_> {
             fail = ctx.last_failure,
             files = files_blob,
         );
-        let text = self.backend.generate(&prompt, 8192).ok()?;
+        let text = self.backend.complete(&prompt, 8192).ok()?;
         let edits = parse_multifile_response(&text, &self.targets);
         if edits.is_empty() {
             None
@@ -985,13 +985,23 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 return Ok(());
             }
 
-            let backend = claude_backend::ClaudeBackend::from_env().ok_or_else(|| {
-                candle_core::Error::Msg(
-                    "axiom task needs an LLM backend — set ANTHROPIC_API_KEY (or AXIOM_* \
-                     equivalent). For deterministic repair without a model, use `axiom solve`."
-                        .into(),
-                )
-            })?;
+            let backend = match crate::backend_live::repair_backend_from_env() {
+                Ok(Some(backend)) => backend,
+                Ok(None) => {
+                    return Err(candle_core::Error::Msg(
+                        "axiom task needs an LLM backend — set AXIOM_BACKEND=claude with \
+                         ANTHROPIC_API_KEY, or (experimental build) AXIOM_BACKEND=cli to drive \
+                         a logged-in `claude` CLI; see docs/BACKENDS.md. For deterministic \
+                         repair without a model, use `axiom solve`."
+                            .into(),
+                    ))
+                }
+                Err(e) => {
+                    return Err(candle_core::Error::Msg(format!(
+                        "axiom task: LLM backend configuration rejected: {e}"
+                    )))
+                }
+            };
 
             // Decide which files the agent may edit: caller-named, else localized
             // from the verifier's own failure output. EITHER way every target
@@ -1042,7 +1052,7 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 goal.clone()
             };
             let mut proposer = LlmTaskProposer {
-                backend: &backend,
+                backend: backend.as_ref(),
                 program: &program,
                 args: &args,
                 targets: targets.clone(),

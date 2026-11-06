@@ -17,6 +17,8 @@ pub mod cache_stack;
 pub mod chimera;
 pub mod claude_backend;
 pub mod cli;
+#[cfg(feature = "experimental")]
+pub mod cli_backend;
 pub mod cluster;
 pub mod compile_verify;
 pub mod config;
