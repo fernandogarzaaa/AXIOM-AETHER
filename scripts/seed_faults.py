@@ -297,7 +297,10 @@ def main() -> int:
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     target_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "axiom_seeded_target"
-    verify_sh = args.verify or f'CARGO_TARGET_DIR="{target_dir}" cargo test --release --lib -q'
+    # Debug profile on purpose: it builds incrementally, so each of the up to
+    # 64 repair candidates costs ~1-2 s to verify instead of a full release
+    # recompile (~10 s+), which makes a 40-fixture run ~1 h instead of ~8 h.
+    verify_sh = args.verify or f'CARGO_TARGET_DIR="{target_dir}" cargo test --lib -q'
     verify = ["sh", "-c", verify_sh]
 
     # Confirm the pristine crate is green with this verifier.
