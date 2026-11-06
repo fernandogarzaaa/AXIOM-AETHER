@@ -1,19 +1,26 @@
-//! Bounded quantum-state manifold simulator for Q-TTT.
+//! Branch weights: a bounded probability distribution over candidate patches.
 //!
-//! This is a classical, deterministic tensor-network simulator. Complex
-//! amplitudes are represented as paired real-valued dimensions with shape
-//! `[2, branches, bond_dim]` to stay compatible with Candle CPU/CUDA tensors.
+//! [`BranchWeights::encode`] gives each candidate an initial weight from its
+//! prior cost plus a hashed feature vector of its text (shape
+//! `[2, branches, feature_dim]`, two real components per entry, as a Candle
+//! tensor); [`reweight_by_energy`] multiplies the weights by `exp(-dt * energy)`
+//! and renormalises; [`BranchWeights::select`] puts all the weight on one
+//! branch. Deterministic and CPU-only. Formerly `q_manifold` ("quantum-state
+//! manifold", "amplitudes", "collapse"): the arithmetic is a softmax-style
+//! reweighting and nothing more, and the names now say so. JSON field names
+//! in [`BranchWeightTelemetry`] are unchanged so existing dashboards keep
+//! working.
 
 use candle_core::{Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const COMPLEX_COMPONENTS: usize = 2;
-pub const MAX_MPS_BRANCHES: usize = 8;
-pub const MAX_MPS_BOND_DIM: usize = 8;
+pub const MAX_BRANCHES: usize = 8;
+pub const MAX_FEATURE_DIM: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ManifoldVariation {
+pub struct BranchCandidate {
     pub label: String,
     pub structural_text: String,
     #[serde(default)]
@@ -21,7 +28,7 @@ pub struct ManifoldVariation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuantumManifoldTelemetry {
+pub struct BranchWeightTelemetry {
     pub active: bool,
     pub branches: usize,
     pub bond_dimension: usize,
@@ -33,7 +40,7 @@ pub struct QuantumManifoldTelemetry {
     pub iterations: usize,
 }
 
-impl Default for QuantumManifoldTelemetry {
+impl Default for BranchWeightTelemetry {
     fn default() -> Self {
         Self {
             active: false,
@@ -50,7 +57,7 @@ impl Default for QuantumManifoldTelemetry {
 }
 
 #[derive(Debug, Clone)]
-pub struct QuantumStateManifold {
+pub struct BranchWeights {
     pub branches: Vec<String>,
     pub bond_dimension: usize,
     pub amplitudes: Vec<[f32; COMPLEX_COMPONENTS]>,
@@ -58,15 +65,15 @@ pub struct QuantumStateManifold {
     pub tensor: Tensor,
 }
 
-impl QuantumStateManifold {
+impl BranchWeights {
     pub fn encode(
         context: &str,
-        variations: &[ManifoldVariation],
+        variations: &[BranchCandidate],
         requested_bond_dim: usize,
         device: &Device,
     ) -> Result<Self> {
-        let branch_count = variations.len().clamp(1, MAX_MPS_BRANCHES);
-        let bond_dimension = requested_bond_dim.clamp(1, MAX_MPS_BOND_DIM);
+        let branch_count = variations.len().clamp(1, MAX_BRANCHES);
+        let bond_dimension = requested_bond_dim.clamp(1, MAX_FEATURE_DIM);
         let mut raw = Vec::with_capacity(branch_count);
         let mut feature_norms = Vec::with_capacity(branch_count);
         let mut branches = Vec::with_capacity(branch_count);
@@ -121,8 +128,8 @@ impl QuantumStateManifold {
         entropy_bits(&self.probabilities())
     }
 
-    pub fn telemetry(&self) -> QuantumManifoldTelemetry {
-        QuantumManifoldTelemetry {
+    pub fn telemetry(&self) -> BranchWeightTelemetry {
+        BranchWeightTelemetry {
             active: !self.branches.is_empty(),
             branches: self.branches.len(),
             bond_dimension: self.bond_dimension,
@@ -135,12 +142,12 @@ impl QuantumStateManifold {
         }
     }
 
-    pub fn collapse(
+    pub fn select(
         &mut self,
         branch: usize,
         ground_energy: f32,
         iterations: usize,
-    ) -> QuantumManifoldTelemetry {
+    ) -> BranchWeightTelemetry {
         let branch = branch.min(self.amplitudes.len().saturating_sub(1));
         for (idx, amp) in self.amplitudes.iter_mut().enumerate() {
             if idx == branch {
@@ -149,7 +156,7 @@ impl QuantumStateManifold {
                 *amp = [0.0, 0.0];
             }
         }
-        QuantumManifoldTelemetry {
+        BranchWeightTelemetry {
             active: true,
             branches: self.branches.len(),
             bond_dimension: self.bond_dimension,
@@ -163,7 +170,7 @@ impl QuantumStateManifold {
     }
 }
 
-pub fn evolve_probabilities(mut probabilities: Vec<f32>, energies: &[f32], dt: f32) -> Vec<f32> {
+pub fn reweight_by_energy(mut probabilities: Vec<f32>, energies: &[f32], dt: f32) -> Vec<f32> {
     if probabilities.len() != energies.len() || probabilities.is_empty() {
         return Vec::new();
     }
@@ -208,7 +215,7 @@ pub fn normalize_probabilities(mut probabilities: Vec<f32>) -> Vec<f32> {
     probabilities
 }
 
-fn hashed_features(context: &str, variation: &ManifoldVariation, dim: usize) -> Vec<f32> {
+fn hashed_features(context: &str, variation: &BranchCandidate, dim: usize) -> Vec<f32> {
     (0..dim)
         .map(|idx| {
             let value = stable_unit(
@@ -241,28 +248,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifold_encodes_paired_real_imag_tensor() {
+    fn branch_weights_encode_paired_components_tensor() {
         let variations = vec![
-            ManifoldVariation {
+            BranchCandidate {
                 label: "a".into(),
                 structural_text: "exit 1".into(),
                 prior_cost: 1.0,
             },
-            ManifoldVariation {
+            BranchCandidate {
                 label: "b".into(),
                 structural_text: "exit 0".into(),
                 prior_cost: 0.1,
             },
         ];
-        let manifold = QuantumStateManifold::encode("fault", &variations, 4, &Device::Cpu).unwrap();
-        assert_eq!(manifold.tensor.dims(), &[2, 2, 4]);
-        assert!((manifold.probabilities().iter().sum::<f32>() - 1.0).abs() < 1e-5);
-        assert!(manifold.entropy_bits() > 0.0);
+        let weights = BranchWeights::encode("fault", &variations, 4, &Device::Cpu).unwrap();
+        assert_eq!(weights.tensor.dims(), &[2, 2, 4]);
+        assert!((weights.probabilities().iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        assert!(weights.entropy_bits() > 0.0);
     }
 
     #[test]
     fn probability_evolution_prefers_lower_energy() {
-        let evolved = evolve_probabilities(vec![0.5, 0.5], &[4.0, 0.2], 0.4);
+        let evolved = reweight_by_energy(vec![0.5, 0.5], &[4.0, 0.2], 0.4);
         assert!(evolved[1] > evolved[0]);
     }
 }

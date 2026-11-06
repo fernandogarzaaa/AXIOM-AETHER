@@ -5,6 +5,25 @@ releases are described on the GitHub Releases page.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-06
+
+Headline: the deterministic repair loop now repairs **19 of 40 seeded faults in
+maintainer-written Rust that it was never shown** (19 of 29 in the fault
+classes it has an operator for, 0 of 11 in the classes it has none for), with
+zero rollback violations; the authored gate is 32/32. A JSON-aware digest
+removes ~89% of the tokens of MCP tool results that previously were never
+digested. Two repair-loop bugs that made those numbers impossible are fixed.
+
+**Crate versions:** `axiom_engine` 0.6.0 depends on `axiom_mesh_core` **0.2.0**
+(was 0.1.0). The mesh crate's public API moved to `rand` 0.9 and `ndarray` 0.17
+types, which is breaking under semver for 0.x, so it is a new minor version.
+
+**Deprecations (removed in the next minor):** `crate::hamiltonian` and
+`crate::q_manifold` (use `patch_ranker` / `branch_weights`); the
+`/v1/hypervisor/quantum_coherent_state` route (use
+`/v1/hypervisor/patch_ranker_state`); the `AXIOM_SANDBOX_*` env names and
+`crate::sandbox` (use `AXIOM_COMPILE_VERIFY_*` / `compile_verify`).
+
 ### Security
 - The CVM L2 page store is bounded across sessions: the in-memory index by
   `AXIOM_CVM_MAX_INDEX_BYTES` (256 MiB, least-recently-used sessions drop
@@ -32,6 +51,16 @@ releases are described on the GitHub Releases page.
 - API key and MCP token comparisons are constant-time.
 
 ### Fixed
+- **Repair candidates are no longer run from stale `cargo`/`make` builds.**
+  The stale-`.pyc` fix below first set each candidate's mtime into the past;
+  timestamp-based build tools rebuild only when a source is newer than its
+  output, so every Rust candidate was verified against the old binary and
+  rejected, correct fixes included (reproduced on a seeded `>=`/`>` fault:
+  fails with a past mtime, passes with the current one). `mark_fresh` now
+  stamps `max(now, previous stamp + 1 s, base + 1 s)` in whole seconds,
+  process-wide and monotonic, and rollback writes in both `solve` and
+  `agentic::Transaction` get the same stamp. Bursts of writes run ahead of the
+  wall clock by at most the number of writes (bounded by the candidate cap).
 - Candidate writes in the repair loops (`solve` single-file path and
   `agentic::Transaction`) now give the file a modification time distinct from
   the original and from every earlier candidate (`agentic::mark_fresh`).
@@ -65,6 +94,21 @@ releases are described on the GitHub Releases page.
   pillars that did not run.
 
 ### Added
+- **Held-out repair benchmark.** `scripts/seed_faults.py` seeds random
+  single-token faults into maintainer-written code, keeps only those the
+  project's own tests catch, and deliberately includes fault classes the
+  engine has no operator for. `scripts/import_quixbugs.py` converts QuixBugs'
+  40 Python bugs (MIT) with the answer key removed. `scripts/bench_repair.sh`
+  isolates solver state per fixture, pins in-file test regions as the oracle,
+  and reports verifier-written test artifacts (`proptest-regressions/`, …)
+  separately from rollback violations. First measurement: 19/40 seeded faults
+  in `axiom_mesh_core` (66% of classes with an operator, 0% without), 0
+  rollback violations: `bench/results/SEEDED-HELDOUT-2026-11-06.md`.
+- **Callee-focused repair planning for in-file tests.** The mutation planner
+  never edits a `#[cfg(test)]`-gated item (only that item: production code
+  after a test-only `use` or helper stays repairable); when the failure
+  blames an assertion inside one, it ranks the bodies of the functions that
+  test calls ahead of the rest of the file.
 - **Hybrid CLI integration** (`docs/CLI-INTEGRATION.md`): vendor CLIs keep
   their own login and point their base URL at the proxy, which relays their
   `Authorization` / `x-api-key` / `anthropic-version` / `anthropic-beta` /
@@ -81,6 +125,22 @@ releases are described on the GitHub Releases page.
   configuration stops the server instead of silently falling back. Measured
   run: `bench/cvm/CLI-PROXY-RESULTS-2026-11-06.md` (pass-through correctness,
   not a savings number — see the file).
+- **Structure-preserving JSON digest** (`json_digest.rs`) and a JSON-aware
+  admission estimate for the CVM tool-result digest. Every MCP server answers
+  in JSON, and minified JSON has few whitespace tokens: a 37 KB GitHub
+  `list_workflow_runs` response is ~9.3k model tokens but 2.7k whitespace
+  tokens, so under the whitespace-only estimate none of the five real MCP
+  responses recorded from a Claude Code session (2.1k–9.3k tokens each) ever
+  crossed the 4000-token threshold — they reached upstream verbatim and then
+  sat in the cached transcript for the rest of the session. Admission now
+  estimates text that parses as a JSON object or array by
+  `max(whitespace, chars/4)` (code and prose are unchanged), and the digest
+  keeps what an agent reasons about — top-level scalars, array lengths, the
+  union of item keys with types and a value histogram for enum-like fields,
+  a sample of items, truncated-string markers — instead of the prose
+  head+tail excerpt that kept part of item 1 and the end of item N. Still
+  recoverable verbatim through the same `axiom_expand` stub. Measured on the
+  five responses in `bench/cvm/JSON-DIGEST-2026-11-05.md`.
 - **General deterministic repair** (`mutation_repair.rs`, Phase 2.1 of
   `axiom solve`): a bounded (`AXIOM_REPAIR_MAX_CANDIDATES`, default 64),
   trace-ranked set of single-edit mutations — comparison operators,
@@ -133,6 +193,22 @@ releases are described on the GitHub Releases page.
   images and GitHub Actions.
 
 ### Changed
+- **Physics-flavoured module names renamed to what they do.** `hamiltonian.rs`
+  is `patch_ranker.rs` (`VariationalHamiltonian` → `PatchRanker`,
+  `HamiltonianFault` → `FaultContext`, `HamiltonianOptimization` →
+  `RankedPatches` with `selected_patch` / `selected_label` /
+  `energies_tensor`, `QuantumRuntimeStatus` → `PatchRankerStatus`,
+  `optimize_fault` → `rank`); `q_manifold.rs` is `branch_weights.rs`
+  (`QuantumStateManifold` → `BranchWeights`, `ManifoldVariation` →
+  `BranchCandidate`, `QuantumManifoldTelemetry` → `BranchWeightTelemetry`,
+  `evolve_probabilities` → `reweight_by_energy`, `collapse` → `select`). The
+  arithmetic is unchanged: a deterministic score per candidate and an
+  exponential reweighting, which is what the names now say. `crate::hamiltonian`
+  and `crate::q_manifold` remain as deprecated re-exports for one release.
+  New route `GET /v1/hypervisor/patch_ranker_state` (`{"ranker": …}`);
+  `/v1/hypervisor/quantum_coherent_state` stays for one release with its old
+  `{"quantum": …}` body, and `PolyJitStatus` keeps the `quantum` JSON key so
+  `/v1/hypervisor/jit_status` consumers are unaffected.
 - Dependency majors brought current together, since they cross crate
   boundaries and could not land one PR at a time: `ndarray` 0.17 and `rand`
   0.9 in both `axiom_engine_rs` and `axiom_mesh_core` (the engine passes

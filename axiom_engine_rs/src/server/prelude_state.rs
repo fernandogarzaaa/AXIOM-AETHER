@@ -44,7 +44,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 use uuid::Uuid;
 
 use crate::anthropic_forwarder::{
-    build_compressed_payload, partition_messages, whitespace_token_count, AnthropicForwarder,
+    build_compressed_payload, partition_messages, AnthropicForwarder,
     ClientAuth, ForwarderError,
 };
 use crate::backend_router::{Router as BackendRouter, TaskKind};
@@ -61,7 +61,7 @@ use crate::digest::Digestor;
 use crate::dwe::{
     extract_delta_fragment, record_applied_fragment, record_rejected_fragment, DweBus, DweTelemetry,
 };
-use crate::hamiltonian::QuantumRuntimeStatus;
+use crate::patch_ranker::PatchRankerStatus;
 use crate::inference::InferencePipeline;
 use crate::metrics;
 use crate::openai_forwarder::{OpenAiClientAuth, OpenAiForwarder, OpenAiForwarderError};
@@ -1609,8 +1609,14 @@ struct HypervisorJitStatusResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct HypervisorQuantumStateResponse {
-    quantum: QuantumRuntimeStatus,
+struct HypervisorRankerStateResponse {
+    ranker: PatchRankerStatus,
+}
+
+/// Legacy shape of `/v1/hypervisor/quantum_coherent_state` (deprecated route).
+#[derive(Debug, Serialize)]
+struct HypervisorLegacyQuantumStateResponse {
+    quantum: PatchRankerStatus,
 }
 
 #[derive(Debug, Serialize)]

@@ -25,7 +25,7 @@
 //!     `evolve NAME until stable { max_iter }`, `emit NAME`.
 //!   * Certificates over a run (SHA-256 + optional HMAC via `crate::provenance`).
 //!
-//! Deferred (tracked for follow-up PRs): `gate` quantum-consensus branches,
+//! Deferred (tracked for follow-up PRs): `gate` consensus branches,
 //! `fn`/`match`/`goal`/`reason`, the type checker's capability enforcement, the
 //! PyTorch/LLVM compiler backends, RAG, and symbol emergence. The module is
 //! structured (lexer → parser → {vm, cir}) so these slot in incrementally.

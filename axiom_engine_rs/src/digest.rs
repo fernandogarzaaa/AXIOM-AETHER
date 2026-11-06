@@ -41,6 +41,14 @@ const WRAPPER_MARKER: &str = "axiom-cvm-s3-digest-marker";
 
 impl Digestor for SkeletonDigestor {
     fn digest(&self, text: &str, budget_tokens: usize) -> String {
+        // JSON (MCP tool output, API responses): a structure-preserving digest
+        // -- shape, counts, every top-level scalar, a sample of items -- instead
+        // of the prose head+tail excerpt, which kept part of item 1 and the end
+        // of item N and lost everything in between. See `json_digest`.
+        if let Some(value) = crate::json_digest::parse_structured(text) {
+            let out = crate::json_digest::digest(&value, budget_tokens);
+            return truncate_to_token_budget(&out, budget_tokens);
+        }
         // PageRank-ranked skeletonization: orders symbols by structural
         // importance and keeps the highest-ranked ones within budget,
         // instead of the old arbitrary word-truncation. Falls back to the
@@ -220,6 +228,27 @@ pub async fn haiku_digest(
         .and_then(Value::as_str)
         .ok_or_else(|| HaikuDigestError::Network("no text content in Haiku response".into()))?;
     Ok(truncate_to_token_budget(text, budget_tokens))
+}
+
+/// Token estimate used for digest admission. The crate's convention is
+/// whitespace tokens, which is a fair proxy for code and prose but undercounts
+/// minified JSON by 5-10x (a 37 KB GitHub API response is ~9k model tokens and
+/// ~2.7k whitespace tokens; a 6.8 KB pull-request listing is ~1.7k vs 289), so
+/// such tool results sailed under the threshold verbatim and then sat in the
+/// cached transcript for the rest of the session. For text that parses as a
+/// JSON object or array this returns the larger of the whitespace count and
+/// `chars / 4`; everything else keeps the whitespace count, so admission of
+/// code and prose is unchanged.
+pub fn admission_token_estimate(text: &str) -> usize {
+    let ws = crate::anthropic_forwarder::whitespace_token_count(text);
+    let t = text.trim_start();
+    if (t.starts_with('{') || t.starts_with('['))
+        && crate::json_digest::parse_structured(text).is_some()
+    {
+        ws.max(text.len().div_ceil(4))
+    } else {
+        ws
+    }
 }
 
 /// Default token threshold (`AXIOM_CVM_DIGEST_THRESHOLD_TOKENS`) above

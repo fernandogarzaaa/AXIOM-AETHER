@@ -80,7 +80,8 @@ regenerates them on every push and fails if the repair gate regresses.
 
 | Metric | Value | Config | Measured |
 |---|---|---|---|
-| **Autonomous repair** — `axiom eval-agentic` | 32/32 = 100% | 14 localization fixtures + 18 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, ~15 s | 2026-11-05 |
+| **Autonomous repair** — `axiom eval-agentic` | 32/32 = 100% | 14 localization fixtures + 18 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, ~15 s | 2026-11-06 |
+| **Autonomous repair, held-out** — `scripts/bench_repair.sh` | 19/40 = 47.5% (66% of the fault classes it has an operator for, 0% of the rest), 0 rollback violations | 40 random single-token faults seeded into `axiom_mesh_core`, which the engine was never shown; no LLM ([write-up](bench/results/SEEDED-HELDOUT-2026-11-06.md)) | 2026-11-06 |
 | **Compression** — `axiom bench axiom_engine_rs/src` | 86.7% savings, 2229/2229 = 100% round-trip | `AXIOM_PRODUCTION_BPE=1` | 2026-08-09 |
 | **Compression** — same, legacy tokenizer | 82.4% savings, 2181/2181 = 100% round-trip | `AXIOM_PRODUCTION_BPE=0` | 2026-08-09 |
 | **Cost, real traffic** — `/metrics` delta | 65.1% / 41.4% quota savings | two live Claude Code sessions | 2026-07-17 |
@@ -118,7 +119,7 @@ notes and the construction blueprint live at
 |---|---|---|
 | `AXIOM_CACHE_SAFE` | **1** | Never mutates message content at or before a client `cache_control` breakpoint. |
 | `AXIOM_CVM_DIGEST` | **`skeleton`** | Replaces heavy `tool_result` blocks in the newest turn with a code-aware digest + a recoverable stub (`axiom_expand`/`POST /v1/expand` returns the original verbatim). Set `off` to disable, `haiku` to summarize with a real Claude Haiku call (bills your account). |
-| `AXIOM_CVM_DIGEST_THRESHOLD_TOKENS` | **4000** | Minimum token estimate before a `tool_result` block is digested. |
+| `AXIOM_CVM_DIGEST_THRESHOLD_TOKENS` | **4000** | Minimum token estimate before a `tool_result` block is digested. Code and prose are counted in whitespace tokens; text that parses as JSON (MCP tool output, API responses) is counted as `max(whitespace, chars/4)`, because minified JSON has 5–10× fewer whitespace tokens than model tokens and used to pass under the threshold verbatim. JSON gets a structure-preserving digest (count, keys, value histogram, sample) rather than a prose excerpt. |
 | `AXIOM_CVM_MAX_INDEX_BYTES` / `AXIOM_CVM_MAX_TOTAL_BYTES` | **256 MiB** / **2 GiB** | Cross-session bounds on the L2 page store: in-memory index budget (least-recently-used sessions drop from memory, reload from disk) and total on-disk size (least-recently-used session files are deleted, logged). Each session is additionally capped at 64 MiB. |
 | `AXIOM_PREFIX_DEDUP` | **0** | Lossless dedup of byte-identical repeated blocks in the system prefix. Off by default: measured 0% real gain on this machine's actual rule files (see below) — shipped but not proven valuable yet. |
 | `AXIOM_KEEPALIVE` | **0** | Actuarial cache-refresh pings to survive the 5-minute cache TTL between turns. Off by default forever unless you opt in — it replays your own API credentials on a timer; read `axiom_engine_rs/src/keepalive.rs` before enabling. |
@@ -375,7 +376,7 @@ POST   /v1/hypervisor/jit_run               # VFS hypervisor — also needs AXIO
 GET    /v1/hypervisor/jit_status            # VFS hypervisor
 POST   /v1/hypervisor/list                  # VFS hypervisor
 POST   /v1/hypervisor/stat                  # VFS hypervisor
-GET    /v1/hypervisor/quantum_coherent_state # VFS hypervisor
+GET    /v1/hypervisor/patch_ranker_state   # patch-ranker telemetry (deprecated alias: /v1/hypervisor/quantum_coherent_state)
 ```
 
 This list is maintained by hand against the `.route(...)` registrations in
@@ -770,7 +771,7 @@ the map a new contributor needs; the longer version with evidence is in
 | Graph memory | Directed, weighted edges between memory records; recall seeds a bounded spreading activation from its direct hits and appends graph-only neighbours after them | `graph_memory.rs`, `memory_recall.rs` |
 | Hypervisor | The Poly JIT + Neural VFS surface (`/v1/hypervisor/*`). **Not** a real hypervisor: no VM or OS isolation. The name is kept for API stability. | `server/routes_hypervisor.rs`, `vfs.rs`, `poly_jit.rs` |
 | Compile verifier (formerly "sandbox") | A `cargo check`-only verifier run in an isolated temp directory. **Not** a process or OS security boundary: no seccomp, no container, only a wall-clock timeout. | `compile_verify.rs` (`AXIOM_COMPILE_VERIFY*`; the `AXIOM_SANDBOX_*` names are deprecated aliases) |
-| Q-TTT / Hamiltonian / quantum manifold | A classical, deterministic tensor-network simulator using physics-inspired optimisation terminology; not quantum computing | `hamiltonian.rs`, `q_manifold.rs` |
+| Patch ranker / branch weights (formerly "Q-TTT", `hamiltonian.rs`, `q_manifold.rs`) | Scores Poly-JIT repair candidates with cheap deterministic signals and picks one via an exponential reweighting over candidates. Classical, CPU-only; the old physics vocabulary described exactly this arithmetic. Old module paths remain as deprecated aliases for one release; JSON keys (`quantum`) are unchanged. | `patch_ranker.rs`, `branch_weights.rs` |
 | Axiom Mesh (`axiom_mesh_rs`) | A standalone multi-agent orchestration research workspace; only `axiom_mesh_core` is a dependency of the engine | `axiom_mesh_rs/`, `axiom_mesh_core/` |
 | ChimeraLang | A cognition-language DSL, compiled only with `--features experimental` | `chimera.rs` |
 

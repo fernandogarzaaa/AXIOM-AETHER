@@ -520,11 +520,17 @@ where
             return true;
         }
         // Rejected: roll back byte-for-byte, feed this attempt's trace forward.
+        let candidate_mtime = std::fs::metadata(source_path)
+            .and_then(|m| m.modified())
+            .ok();
         if let Err(e) = std::fs::write(source_path, &original) {
             eprintln!(
                 "[axiom-solve] WARNING: failed to restore original after rejected patch: {e}"
             );
         }
+        // Newer than the rejected candidate's build output, or the next
+        // candidate's verify could be served the stale artifact.
+        crate::agentic::mark_fresh(source_path, candidate_mtime);
         if !trace.trim().is_empty() {
             failure = trace;
         }

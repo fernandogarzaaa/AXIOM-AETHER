@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::hamiltonian::{HamiltonianFault, QuantumRuntimeStatus, VariationalHamiltonian};
+use crate::patch_ranker::{FaultContext, PatchRanker, PatchRankerStatus};
 
 pub const MAX_POLY_JIT_STEPS: usize = 3;
 
@@ -22,8 +22,8 @@ pub const MAX_POLY_JIT_STEPS: usize = 3;
 pub struct PolyJitEngine {
     timeout: Duration,
     status: Arc<Mutex<PolyJitStatus>>,
-    quantum_status: Arc<Mutex<QuantumRuntimeStatus>>,
-    optimizer: VariationalHamiltonian,
+    ranker_status: Arc<Mutex<PatchRankerStatus>>,
+    optimizer: PatchRanker,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +66,11 @@ pub struct PolyJitStatus {
     pub last_session_id: Option<String>,
     pub last_status: Option<String>,
     pub last_error: Option<String>,
-    pub quantum: QuantumRuntimeStatus,
+    /// Patch-ranker telemetry. The JSON key stays `quantum` (its historical
+    /// name) so `/v1/hypervisor/jit_status` consumers keep working; it will
+    /// become `ranker` at the next breaking release.
+    #[serde(rename = "quantum")]
+    pub ranker: PatchRankerStatus,
 }
 
 #[derive(Debug)]
@@ -101,19 +105,19 @@ impl PolyJitEngine {
         Self {
             timeout,
             status: Arc::new(Mutex::new(PolyJitStatus::default())),
-            quantum_status: Arc::new(Mutex::new(QuantumRuntimeStatus::default())),
-            optimizer: VariationalHamiltonian::default(),
+            ranker_status: Arc::new(Mutex::new(PatchRankerStatus::default())),
+            optimizer: PatchRanker::default(),
         }
     }
 
     pub fn status(&self) -> PolyJitStatus {
         let mut status = self.status.lock().map(|s| s.clone()).unwrap_or_default();
-        status.quantum = self.quantum_status();
+        status.ranker = self.ranker_status();
         status
     }
 
-    pub fn quantum_status(&self) -> QuantumRuntimeStatus {
-        self.quantum_status
+    pub fn ranker_status(&self) -> PatchRankerStatus {
+        self.ranker_status
             .lock()
             .map(|s| s.clone())
             .unwrap_or_default()
@@ -181,7 +185,7 @@ impl PolyJitEngine {
             if let Some(source_path) = request.source_path.as_deref() {
                 let patched = source_excerpt
                     .as_deref()
-                    .and_then(|source| self.quantum_patch(&diagnostic, source))
+                    .and_then(|source| self.ranked_patch(&diagnostic, source))
                     .or_else(|| synthesize_patch(source_excerpt.as_deref().unwrap_or("")));
                 if let Some(patched) = patched {
                     tokio::fs::write(source_path, patched)
@@ -233,25 +237,25 @@ impl PolyJitEngine {
         }
     }
 
-    fn quantum_patch(&self, diagnostic: &PolyJitDiagnostic, source: &str) -> Option<String> {
+    fn ranked_patch(&self, diagnostic: &PolyJitDiagnostic, source: &str) -> Option<String> {
         if source.trim().is_empty() {
             return None;
         }
-        let fault = HamiltonianFault {
+        let fault = FaultContext {
             stdout: diagnostic.stdout.clone(),
             stderr: diagnostic.stderr.clone(),
             status_code: diagnostic.status_code,
             source: source.to_string(),
         };
-        let optimization = self.optimizer.optimize_fault(&fault).ok()?;
-        if let Ok(mut status) = self.quantum_status.lock() {
+        let optimization = self.optimizer.rank(&fault).ok()?;
+        if let Ok(mut status) = self.ranker_status.lock() {
             status.total_optimizations += 1;
-            if optimization.collapsed_patch.is_some() {
+            if optimization.selected_patch.is_some() {
                 status.total_collapses += 1;
             }
             status.last_state = optimization.telemetry;
         }
-        optimization.collapsed_patch
+        optimization.selected_patch
     }
 }
 

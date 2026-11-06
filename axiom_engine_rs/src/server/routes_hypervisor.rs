@@ -275,12 +275,24 @@ async fn hypervisor_jit_status(State(state): State<AppState>) -> Json<Hypervisor
     })
 }
 
-/// `GET /v1/hypervisor/quantum_coherent_state` — report Q-TTT manifold state.
-async fn hypervisor_quantum_coherent_state(
+/// `GET /v1/hypervisor/patch_ranker_state` — telemetry of the patch ranker
+/// that scores Poly-JIT repair candidates (`crate::patch_ranker`).
+async fn hypervisor_patch_ranker_state(
     State(state): State<AppState>,
-) -> Json<HypervisorQuantumStateResponse> {
-    Json(HypervisorQuantumStateResponse {
-        quantum: state.poly_jit.quantum_status(),
+) -> Json<HypervisorRankerStateResponse> {
+    Json(HypervisorRankerStateResponse {
+        ranker: state.poly_jit.ranker_status(),
+    })
+}
+
+/// `GET /v1/hypervisor/quantum_coherent_state` — **deprecated** alias of
+/// `/v1/hypervisor/patch_ranker_state`, kept for one release with its original
+/// `{"quantum": …}` body so existing clients do not break.
+async fn hypervisor_quantum_coherent_state_legacy(
+    State(state): State<AppState>,
+) -> Json<HypervisorLegacyQuantumStateResponse> {
+    Json(HypervisorLegacyQuantumStateResponse {
+        quantum: state.poly_jit.ranker_status(),
     })
 }
 

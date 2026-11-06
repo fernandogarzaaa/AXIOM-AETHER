@@ -11,6 +11,7 @@ pub mod belief;
 pub mod bench;
 pub mod bincode_compat;
 pub mod bootstrap;
+pub mod branch_weights;
 pub mod cache_safety;
 pub mod cache_stack;
 #[cfg(feature = "experimental")]
@@ -42,12 +43,12 @@ pub mod fuzzy_dedup;
 pub mod gpu_embed;
 pub mod graph_memory;
 pub mod hallucination;
-pub mod hamiltonian;
 pub mod hardware;
 pub mod heal_memory;
 pub mod hindsight;
 pub mod inference;
 pub mod jit_streamer;
+pub mod json_digest;
 pub mod keepalive;
 pub mod kernel;
 pub mod local_trivial;
@@ -65,13 +66,13 @@ pub mod mutation_repair;
 pub mod openai_forwarder;
 pub mod pairs;
 pub mod patch_memory;
+pub mod patch_ranker;
 pub mod poly_jit;
 #[cfg(feature = "experimental")]
 pub mod predictive_tools;
 pub mod prefix_diet;
 pub mod prime;
 pub mod provenance;
-pub mod q_manifold;
 pub mod quantization;
 pub mod rebase;
 pub mod responses_compressor;
@@ -110,6 +111,24 @@ pub mod verify_suggest;
 pub mod vfs;
 pub mod vibe_memory;
 pub mod weight_merge;
+
+/// Deprecated name for [`patch_ranker`]; kept for one release.
+#[deprecated(
+    since = "0.6.0",
+    note = "renamed to `patch_ranker`; it scores candidate patches, there is no Hamiltonian"
+)]
+pub mod hamiltonian {
+    pub use crate::patch_ranker::*;
+}
+
+/// Deprecated name for [`branch_weights`]; kept for one release.
+#[deprecated(
+    since = "0.6.0",
+    note = "renamed to `branch_weights`; it is a probability over candidates, not a quantum manifold"
+)]
+pub mod q_manifold {
+    pub use crate::branch_weights::*;
+}
 
 /// Deprecated name for [`compile_verify`]; kept for one release.
 #[deprecated(

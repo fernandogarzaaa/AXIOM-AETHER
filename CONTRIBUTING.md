@@ -160,7 +160,7 @@ ones, grouped by pillar:
 `chimera.rs` · `dwe.rs` · `cluster.rs` · `swarm_route.rs` · `swarm_router.rs` ·
 `mesh_router.rs` · `daemon.rs` · `vfs.rs` · `state_predictor.rs` ·
 `trajectory_sampler.rs` · `predictive_tools.rs` · `alignment_loop.rs` ·
-`q_manifold.rs` · `hamiltonian.rs`
+`branch_weights.rs` · `patch_ranker.rs` (formerly `q_manifold.rs` · `hamiltonian.rs`)
 
 ---
 

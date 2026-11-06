@@ -364,19 +364,45 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
     }
     let n = lines.len();
 
+    // In-file test region (Rust `#[cfg(test)]`): the oracle. Nothing at or
+    // below it is ever mutated, and a blamed line inside it (the assertion
+    // that panicked) is not a repair site but a pointer to the functions the
+    // test calls — see `callee_focus_lines`.
+    let oracle = oracle_ranges(&lines, lang);
+    let in_scope = |i: usize| !in_ranges(&oracle, i);
+
     // Blamed lines (1-based → 0-based), in the order the trace ranks them.
     let mut hinted: Vec<usize> = Vec::new();
+    let mut hinted_in_oracle: Vec<usize> = Vec::new();
     for l in crate::fault_locate::line_hints_for(trace, path) {
         let idx = l as usize;
-        if idx >= 1 && idx <= n && !hinted.contains(&(idx - 1)) {
-            hinted.push(idx - 1);
+        if idx == 0 || idx > n {
+            continue;
+        }
+        let i = idx - 1;
+        if in_scope(i) {
+            if !hinted.contains(&i) {
+                hinted.push(i);
+            }
+        } else if !hinted_in_oracle.contains(&i) {
+            hinted_in_oracle.push(i);
         }
     }
-    // Remaining lines: by distance to the nearest hint if any, else file order.
-    let mut rest: Vec<usize> = (0..n).filter(|i| !hinted.contains(i)).collect();
-    if !hinted.is_empty() {
+    // Functions the failing test exercises, by name: their bodies are the
+    // most likely home of the fault when the trace only blames the assertion.
+    let focus: Vec<usize> = callee_focus_lines(&lines, lang, &oracle, &hinted_in_oracle)
+        .into_iter()
+        .filter(|i| !hinted.contains(i))
+        .collect();
+    // Remaining lines: by distance to the nearest hint/focus line if any, else
+    // file order.
+    let anchors: Vec<usize> = hinted.iter().chain(focus.iter()).copied().collect();
+    let mut rest: Vec<usize> = (0..n)
+        .filter(|i| in_scope(*i) && !hinted.contains(i) && !focus.contains(i))
+        .collect();
+    if !anchors.is_empty() {
         rest.sort_by_key(|i| {
-            hinted
+            anchors
                 .iter()
                 .map(|h| h.abs_diff(*i))
                 .min()
@@ -411,10 +437,13 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
                     src.push_str(l);
                 }
                 let cr = class_rank(*class);
+                // Tier 0 (blamed lines): line order, every class. Tiers 1+
+                // (callee focus, then the rest of the file): class-major so
+                // the trace-derived class order decides what is tried first.
                 let key = if tier == 0 {
                     (0, pos, cr, *seq)
                 } else {
-                    (1, cr, pos, *seq)
+                    (tier, cr, pos, *seq)
                 };
                 *seq += 1;
                 keyed.push((
@@ -432,8 +461,11 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
     for (pos, li) in hinted.iter().enumerate() {
         visit(*li, pos, 0, &mut keyed, &mut seq);
     }
-    for (pos, li) in rest.iter().enumerate() {
+    for (pos, li) in focus.iter().enumerate() {
         visit(*li, pos, 1, &mut keyed, &mut seq);
+    }
+    for (pos, li) in rest.iter().enumerate() {
+        visit(*li, pos, 2, &mut keyed, &mut seq);
     }
 
     // Import-path repairs are planned per file (they need the trace's missing
@@ -477,6 +509,223 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
         if out.len() >= max.max(1) {
             break;
         }
+    }
+    out
+}
+
+/// Inclusive line ranges of every `#[cfg(test)]`-gated item: the oracle.
+/// Each range runs from the attribute line through the end of the item it
+/// gates — the matching `}` for a block item (`mod tests { … }`, a test-only
+/// `fn`), or the first line ending in `;` for a one-line item (a test-only
+/// `use`). Only the gated item is excluded: production code *after* a
+/// test-only helper or import stays repairable. Rust only; other languages
+/// keep tests in separate files.
+fn oracle_ranges(lines: &[&str], lang: Lang) -> Vec<(usize, usize)> {
+    if lang != Lang::Rust {
+        return Vec::new();
+    }
+    let n = lines.len();
+    let content = |i: usize| split_eol(lines[i]).0;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if content(i).trim() != "#[cfg(test)]" {
+            i += 1;
+            continue;
+        }
+        // The gated item starts at the next non-blank, non-attribute line.
+        let mut item = i + 1;
+        while item < n && {
+            let t = content(item).trim();
+            t.is_empty() || (t.starts_with("#[") && t.ends_with(']'))
+        } {
+            item += 1;
+        }
+        if item >= n {
+            out.push((i, n - 1));
+            break;
+        }
+        // A block item opens `{` before any `;`; a one-line item hits `;`.
+        let mut end = item;
+        let mut is_block = false;
+        'scan: for (j, raw) in lines.iter().enumerate().skip(item) {
+            let l = split_eol(raw).0;
+            let mask = code_mask(l, Lang::Rust);
+            for (k, b) in l.bytes().enumerate() {
+                if !mask[k] {
+                    continue;
+                }
+                match b {
+                    b'{' => {
+                        is_block = true;
+                        end = j;
+                        break 'scan;
+                    }
+                    b';' => {
+                        end = j;
+                        break 'scan;
+                    }
+                    _ => {}
+                }
+            }
+            end = j;
+        }
+        if is_block {
+            end = body_end(lines, end, n);
+        }
+        out.push((i, end));
+        i = end + 1;
+    }
+    out
+}
+
+fn in_ranges(ranges: &[(usize, usize)], i: usize) -> bool {
+    ranges.iter().any(|(s, e)| *s <= i && i <= *e)
+}
+
+/// Lines of the non-test functions that the failing test calls, in the order
+/// the test calls them. The blamed lines are assertions inside an oracle range
+/// (`hinted_in_oracle`); each is widened to its enclosing test function, the
+/// identifiers that function calls are collected, and every `fn <name>`
+/// defined outside the oracle ranges with one of those names contributes its
+/// body. Cheap, static, deterministic: the call-graph half of spectrum-based
+/// fault localization without running the tests one by one.
+fn callee_focus_lines(
+    lines: &[&str],
+    lang: Lang,
+    oracle: &[(usize, usize)],
+    hinted_in_oracle: &[usize],
+) -> Vec<usize> {
+    if lang != Lang::Rust || oracle.is_empty() || hinted_in_oracle.is_empty() {
+        return Vec::new();
+    }
+    let n = lines.len();
+    let content = |i: usize| split_eol(lines[i]).0;
+    let is_fn_line = |i: usize| {
+        let t = content(i).trim_start();
+        t.starts_with("fn ") || t.starts_with("pub fn ") || t.contains(" fn ")
+    };
+    let is_test_attr = |i: usize| content(i).trim() == "#[test]";
+
+    // Definitions outside the oracle: name -> (first line, last line).
+    let mut defs: Vec<(String, usize, usize)> = Vec::new();
+    for i in 0..n {
+        if in_ranges(oracle, i) || !is_fn_line(i) {
+            continue;
+        }
+        let Some(name) = fn_name(content(i)) else {
+            continue;
+        };
+        let end = body_end(lines, i, n);
+        defs.push((name, i, end));
+    }
+    if defs.is_empty() {
+        return Vec::new();
+    }
+
+    // Called names, in order of appearance across the blamed tests. Each scan
+    // stays inside the oracle range that holds the blamed line.
+    let mut called: Vec<String> = Vec::new();
+    for &h in hinted_in_oracle {
+        let Some(&(rs, re)) = oracle.iter().find(|(s, e)| *s <= h && h <= *e) else {
+            continue;
+        };
+        let mut start = h;
+        while start > rs && !is_fn_line(start) {
+            start -= 1;
+        }
+        let mut end = h + 1;
+        while end <= re && !is_test_attr(end) && !(end > start && is_fn_line(end)) {
+            end += 1;
+        }
+        for i in start..end.min(n) {
+            for name in called_identifiers(content(i)) {
+                if !called.contains(&name) {
+                    called.push(name);
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<usize> = Vec::new();
+    for name in &called {
+        for (def, s, e) in &defs {
+            if def == name {
+                for i in *s..=*e {
+                    if !out.contains(&i) {
+                        out.push(i);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `fn name(` / `fn name<` → `name`.
+fn fn_name(line: &str) -> Option<String> {
+    let idx = line.find("fn ")?;
+    let rest = &line[idx + 3..];
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Last line of the block that opens on `start` (brace depth returns to zero),
+/// bounded by `limit`.
+fn body_end(lines: &[&str], start: usize, limit: usize) -> usize {
+    let mut depth = 0i32;
+    let mut opened = false;
+    for (i, raw) in lines.iter().enumerate().take(limit).skip(start) {
+        let l = split_eol(raw).0;
+        let mask = code_mask(l, Lang::Rust);
+        for (k, b) in l.bytes().enumerate() {
+            if !mask[k] {
+                continue;
+            }
+            match b {
+                b'{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if opened && depth <= 0 {
+            return i;
+        }
+    }
+    limit.saturating_sub(1)
+}
+
+/// Identifiers immediately followed by `(` on a code line, macros (`name!(`)
+/// excluded, in order of appearance.
+fn called_identifiers(line: &str) -> Vec<String> {
+    let b = line.as_bytes();
+    let mask = code_mask(line, Lang::Rust);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if mask[i] && (b[i].is_ascii_alphabetic() || b[i] == b'_') {
+            let s = i;
+            while i < b.len() && is_ident(b[i]) {
+                i += 1;
+            }
+            let mut j = i;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            let macro_call = j < b.len() && b[j] == b'!';
+            let turbofish = j + 1 < b.len() && b[j] == b':' && b[j + 1] == b':';
+            if !macro_call && !turbofish && j < b.len() && b[j] == b'(' {
+                out.push(line[s..i].to_string());
+            }
+            continue;
+        }
+        i += 1;
     }
     out
 }
@@ -1911,6 +2160,134 @@ mod tests {
             p[0].source
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_test_region_is_oracle_and_focus_follows_the_failing_tests_callees() {
+        let src = "\
+pub fn clamp_add(a: i32, b: i32) -> i32 {
+    let s = a + b;
+    if s > 100 {
+        100
+    } else {
+        s
+    }
+}
+
+pub fn unrelated(x: i32) -> i32 {
+    x * 3
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn adds_and_clamps() {
+        let r = super::clamp_add(60, 50);
+        assert_eq!(r, 100);
+    }
+}
+";
+        let path = PathBuf::from("src/lib.rs");
+        // The panic blames the assertion (line 19), which is in the test region.
+        let trace = "thread 'tests::adds_and_clamps' panicked at src/lib.rs:19:9:\nassertion `left == right` failed\n  left: 110\n right: 100";
+        let p = plan(src, &path, trace, 64);
+        assert!(!p.is_empty());
+        // Nothing in the test region is ever a candidate.
+        assert!(
+            p.iter().all(|c| c.line < 14),
+            "{:?}",
+            p.iter().map(|c| c.line).collect::<Vec<_>>()
+        );
+        // The focus (clamp_add's body, lines 1-8) comes before `unrelated`.
+        let first_unrelated = p
+            .iter()
+            .position(|c| (10..=12).contains(&c.line))
+            .unwrap_or(p.len());
+        let last_focus = p.iter().rposition(|c| (1..=8).contains(&c.line)).unwrap();
+        assert!(
+            last_focus < first_unrelated,
+            "focus lines must precede unrelated ones: {:?}",
+            p.iter()
+                .map(|c| (c.line, c.label.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            p.iter().any(|c| c.source.contains("if s >= 100")),
+            "expected the comparison flip among candidates"
+        );
+
+        // Helpers.
+        assert_eq!(
+            fn_name("    pub fn clamp_add(a: i32) -> i32 {"),
+            Some("clamp_add".into())
+        );
+        assert_eq!(
+            called_identifiers(
+                "        let r = super::clamp_add(60, 50); assert_eq!(r, 1); foo::<T>(x)"
+            ),
+            vec!["clamp_add".to_string()]
+        );
+        let lines: Vec<&str> = src.split_inclusive('\n').collect();
+        assert_eq!(oracle_ranges(&lines, Lang::Rust), vec![(13, 20)]);
+        assert!(oracle_ranges(&lines, Lang::Python).is_empty());
+        assert_eq!(body_end(&lines, 0, 13), 7);
+    }
+
+    #[test]
+    fn oracle_excludes_only_the_cfg_test_item_not_the_rest_of_the_file() {
+        // The layout Codex flagged in cvm_store.rs: a test-only import and a
+        // test-only helper method precede production code. Everything after
+        // them must stay repairable.
+        let src = "\
+#[cfg(test)]
+use std::collections::HashMap;
+
+pub struct Store {
+    n: usize,
+}
+
+impl Store {
+    #[cfg(test)]
+    pub(crate) fn len_for_test(&self) -> usize {
+        self.n
+    }
+}
+
+pub fn evicted_bytes(a: usize, b: usize) -> usize {
+    a - b
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sums() {
+        assert_eq!(super::evicted_bytes(2, 3), 5);
+    }
+}
+";
+        let lines: Vec<&str> = src.split_inclusive('\n').collect();
+        let ranges = oracle_ranges(&lines, Lang::Rust);
+        assert_eq!(ranges, vec![(0, 1), (8, 11), (18, 24)], "{ranges:?}");
+        let trace = "thread 'tests::sums' panicked at src/lib.rs:23:9:\nassertion `left == right` failed\n  left: 18446744073709551615";
+        let p = plan(src, &PathBuf::from("src/lib.rs"), trace, 64);
+        assert!(
+            p.iter().any(|c| c.source.contains("    a + b\n")),
+            "production code after the test-only items must be repairable: {:?}",
+            p.iter().map(|c| c.label.clone()).collect::<Vec<_>>()
+        );
+        for c in &p {
+            assert!(
+                !in_ranges(&ranges, c.line - 1),
+                "edited an oracle line: {}",
+                c.label
+            );
+        }
+        // The fix is reached through callee focus, ahead of unrelated lines.
+        assert_eq!(
+            p[0].line, 16,
+            "first candidate should be inside evicted_bytes: {}",
+            p[0].label
+        );
     }
 
     #[test]
