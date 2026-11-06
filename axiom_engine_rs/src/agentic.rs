@@ -30,9 +30,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::provenance::sha256_hex;
 
-/// Process-wide counter behind [`mark_fresh`]: every candidate write gets its
-/// own backward offset, so no two writes in one process share an mtime.
-static FRESHNESS_TICK: AtomicU64 = AtomicU64::new(0);
+/// Last whole-second stamp handed out by [`mark_fresh`] (Unix seconds), so
+/// every write in this process gets a strictly later second than the one
+/// before it.
+static LAST_FRESH_STAMP: AtomicU64 = AtomicU64::new(0);
 
 /// Give `path` a modification time no other candidate write in this process has
 /// used, so mtime-keyed build caches never serve a stale artifact for it.
@@ -46,19 +47,49 @@ static FRESHNESS_TICK: AtomicU64 = AtomicU64::new(0);
 /// fix is rolled back as rejected. Observed on `py-swapped-args` (swapping two
 /// arguments never changes the size).
 ///
-/// The fix sets the mtime to `base - (1 + n) s` where `n` is a process-wide
-/// counter: distinct from the original, distinct from every earlier candidate,
-/// and never in the future (a future-dated source trips clock-skew warnings in
-/// other tools). Best-effort: a filesystem that refuses `set_modified` leaves
-/// the file as written.
+/// The stamp must also never move **backwards**. Cargo, make, ninja and most
+/// build tools rebuild only when a source is *newer* than its build output; an
+/// earlier version of this function set the mtime into the past (to avoid
+/// future-dated files) and every Rust candidate was then run from the stale
+/// binary and rejected, correct fixes included (seeded-fault benchmark,
+/// 2026-11-06: the authored fix for a `>=`/`>` fault failed with a past mtime
+/// and passed with the current one).
+///
+/// So the stamp is the larger of *now* and *one whole second after the
+/// previous stamp* (and after `base`, the file's mtime before the write),
+/// in whole seconds. That gives:
+/// * Python: a different second from whatever the `.pyc` recorded;
+/// * cargo/make: newer than any build output produced so far;
+/// * monotonic within the process, so candidate N+1 is never "older" than N.
+///
+/// When writes come faster than one per second the stamps run ahead of the
+/// wall clock by at most the number of writes in the burst (bounded by the
+/// candidate cap, 64 by default); `make` may print a clock-skew notice, and
+/// nothing else is affected. Best-effort: a filesystem that refuses
+/// `set_modified` leaves the file as written.
 pub fn mark_fresh(path: &Path, base: Option<SystemTime>) {
-    let tick = FRESHNESS_TICK.fetch_add(1, Ordering::Relaxed);
-    let base = base.unwrap_or_else(SystemTime::now);
-    let Some(stamp) = base.checked_sub(Duration::from_secs(1 + tick)) else {
-        return;
+    let secs = |t: SystemTime| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    let now = secs(SystemTime::now());
+    let floor = base.map(|b| secs(b) + 1).unwrap_or(0);
+    let mut prev = LAST_FRESH_STAMP.load(Ordering::Relaxed);
+    let stamp = loop {
+        let next = now.max(prev + 1).max(floor);
+        match LAST_FRESH_STAMP.compare_exchange_weak(
+            prev,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break next,
+            Err(actual) => prev = actual,
+        }
     };
     if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
-        let _ = f.set_modified(stamp);
+        let _ = f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(stamp));
     }
 }
 
@@ -176,7 +207,11 @@ impl Transaction {
         for (path, original) in &self.snapshot {
             match original {
                 Some(bytes) => {
+                    let before = std::fs::metadata(path).and_then(|m| m.modified()).ok();
                     let _ = std::fs::write(path, bytes);
+                    // The restored bytes must look newer than the rejected
+                    // candidate's build output, or the next verify runs it.
+                    mark_fresh(path, before);
                 }
                 None => {
                     let _ = std::fs::remove_file(path);
@@ -397,22 +432,57 @@ mod tests {
     }
 
     #[test]
-    fn mark_fresh_gives_every_write_a_distinct_past_mtime() {
+    fn mark_fresh_is_monotonic_never_in_the_past_and_distinct_per_write() {
         let dir = tmp("fresh");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("m.py");
         std::fs::write(&f, "a").unwrap();
         let original = std::fs::metadata(&f).unwrap().modified().unwrap();
-        let mut seen = Vec::new();
+        let start = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut seen: Vec<u64> = Vec::new();
         for _ in 0..3 {
             std::fs::write(&f, "b").unwrap(); // same size as the original
-            mark_fresh(&f, Some(original));
-            let m = std::fs::metadata(&f).unwrap().modified().unwrap();
-            assert_ne!(m, original, "must differ from the original mtime");
-            assert!(m < original, "never future-dated");
-            assert!(!seen.contains(&m), "distinct across writes");
+            let before = std::fs::metadata(&f).unwrap().modified().ok();
+            mark_fresh(&f, before);
+            let m = std::fs::metadata(&f)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert!(m >= start, "never earlier than the wall clock at start");
+            assert!(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(m) > original,
+                "newer than the original, so timestamp-based builds rebuild"
+            );
+            assert!(
+                seen.iter().all(|p| *p < m),
+                "strictly increasing: {seen:?} then {m}"
+            );
             seen.push(m);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollback_restores_bytes_with_a_newer_mtime_than_the_candidate() {
+        let dir = tmp("rbfresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("lib.rs");
+        std::fs::write(&f, "fn a() {}").unwrap();
+        let mut tx = Transaction::apply(&EditSet::new().with(f.clone(), "fn b() {}")).unwrap();
+        let cand = std::fs::metadata(&f).unwrap().modified().unwrap();
+        tx.rollback();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "fn a() {}");
+        let restored = std::fs::metadata(&f).unwrap().modified().unwrap();
+        assert!(
+            restored > cand,
+            "restored file must look newer than the candidate"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
