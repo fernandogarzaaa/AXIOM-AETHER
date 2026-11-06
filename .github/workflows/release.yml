@@ -10,6 +10,11 @@ on:
         description: "Release tag to create/publish (e.g. v0.1.1). The release + tag are created at the selected ref."
         required: true
         type: string
+      skip_checkpoint:
+        description: "Skip training/publishing the production checkpoint (binaries-only re-run of an existing release)."
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,7 +73,9 @@ jobs:
             target: x86_64-pc-windows-msvc
             suffix: windows-x86_64
             ext: zip
-          - os: macos-14
+          # macos-14 images were retired ("configuration 'macos-14-arm64-us-default'
+          # is not supported", 2026-11-06); macos-15 is the arm64 replacement.
+          - os: macos-15
             target: aarch64-apple-darwin
             suffix: macos-arm64
             ext: tar.gz
@@ -154,6 +161,7 @@ jobs:
   checkpoint:
     name: Train & publish production checkpoint
     needs: test
+    if: ${{ !inputs.skip_checkpoint }}
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
