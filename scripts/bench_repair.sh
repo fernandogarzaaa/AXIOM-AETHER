@@ -70,7 +70,7 @@ if [ ! -x "$BIN" ]; then
   ( cd "$CRATE" && cargo build --release --locked --bin axiom ) || { echo "build failed" >&2; exit 1; }
 fi
 
-pass=0; fail=0; skip=0; notbroken=0; dirty=0
+pass=0; fail=0; skip=0; notbroken=0; dirty=0; artifact_runs=0
 rows=()
 for dir in "$CORPUS"/*/; do
   dir="${dir%/}"
@@ -146,8 +146,38 @@ for dir in "$CORPUS"/*/; do
       rows+=("| $name | $lang | PASS | ${how:-?} | ${secs}s, $authored, pinned ${#PINNED[@]} file(s) intact |"); pass=$((pass+1))
     fi
   else
-    # 4. Rollback correctness against the post-baseline snapshot.
-    if diff -rq "$snap" "$work" >/dev/null 2>&1; then rb="tree intact"; else rb="TREE MODIFIED: $(diff -rq "$snap" "$work" 2>/dev/null | head -3 | tr '\n' ' ')"; dirty=$((dirty+1)); fi
+    # 4. Rollback correctness against the post-baseline snapshot. Every
+    #    changed path is classified: test-framework artifacts that the
+    #    *verifier* writes when a candidate breaks a test (proptest's failing
+    #    seeds, bytecode/test caches, build dirs) are counted separately from
+    #    any other change, which is a real rollback violation.
+    mapfile -t changed < <(diff -rq "$snap" "$work" 2>/dev/null | python3 -c '
+import re, sys
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    m = re.match(r"Files (\S+) and (\S+) differ$", line)
+    if m:
+        print(m.group(2)); continue
+    m = re.match(r"Only in (\S+): (.+)$", line)
+    if m:
+        print(m.group(1).rstrip("/") + "/" + m.group(2))
+' | sed "s#^$work/##; s#^$snap/##")
+    artifacts=(); violations=()
+    for c in ${changed[@]+"${changed[@]}"}; do
+      case "$c" in
+        proptest-regressions|proptest-regressions/*|*/proptest-regressions|*/proptest-regressions/*|__pycache__|*/__pycache__|*/__pycache__/*|.pytest_cache|.pytest_cache/*|target|target/*|node_modules|node_modules/*)
+          artifacts+=("$c") ;;
+        *) violations+=("$c") ;;
+      esac
+    done
+    if [ "${#violations[@]}" -gt 0 ]; then
+      rb="TREE MODIFIED: ${violations[*]:0:3}"; dirty=$((dirty+1))
+    else
+      rb="tree intact"
+    fi
+    if [ "${#artifacts[@]}" -gt 0 ]; then
+      rb="$rb; verifier artifacts: ${artifacts[*]:0:2}"; artifact_runs=$((artifact_runs+1))
+    fi
     rows+=("| $name | $lang | FAIL | ${how:-no repair found} | ${secs}s, $rb |"); fail=$((fail+1))
   fi
   if [ "${AXIOM_BENCH_KEEP:-0}" = 1 ]; then say "kept $work"; else rm -rf "$work"; fi
@@ -166,6 +196,10 @@ TABLE="$OUTDIR/repair${AXIOM_BENCH_LABEL:+-$AXIOM_BENCH_LABEL}-$DATE.md"
   printf '%s\n' ${rows[@]+"${rows[@]}"}
   echo
   echo "**pass: $pass · fail: $fail · skipped: $skip · not broken: $notbroken · rollback violations: $dirty**"
+  if [ "$artifact_runs" -gt 0 ]; then
+    echo
+    echo "_$artifact_runs failed fixture(s) left test-framework artifacts that the verifier wrote while a candidate was failing (e.g. \`proptest-regressions/\`). These are not solver edits and are not counted as rollback violations; they are what running the same tests by hand on a broken candidate would leave._"
+  fi
 } | tee "$TABLE"
 say "wrote $TABLE"
 
