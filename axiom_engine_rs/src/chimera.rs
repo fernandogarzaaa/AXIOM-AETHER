@@ -958,6 +958,7 @@ fn provider_for_agent(agent: &str) -> Option<crate::backend_router::Provider> {
         "claude" | "anthropic" => Some(Provider::Anthropic),
         "gpt" | "openai" | "chatgpt" => Some(Provider::OpenAi),
         "local" | "opendrop" | "bootstrap" => Some(Provider::Local),
+        "cli" => Some(Provider::Cli),
         _ => None,
     }
 }

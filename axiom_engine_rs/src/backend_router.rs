@@ -31,6 +31,11 @@ pub enum Provider {
     Anthropic,
     /// A local model (bootstrap TTT or OpenDrop) used as a last-resort fallback.
     Local,
+    /// A vendor CLI driven as a subprocess (`AXIOM_BACKEND=cli`, e.g.
+    /// `claude -p`). The backend behind this label is experimental
+    /// (`crate::cli_backend`, `--features experimental`); the label itself is
+    /// unconditional so routing policy code needs no feature gates.
+    Cli,
 }
 
 /// Coarse task class used for routing.

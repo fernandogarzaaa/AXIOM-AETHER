@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use candle_core::Result as CResult;
 
-use crate::claude_backend::ClaudeBackend;
+use crate::backend_router::ChatBackend;
 use crate::inference::InferencePipeline;
 use crate::poly_jit::{PolyJitEngine, PolyJitRunRequest};
 use crate::self_heal::{run_supervised, SupervisorOptions};
@@ -316,7 +316,20 @@ fn attempt_source_repair(
     // for a patch — but keep it ONLY if the verify command then goes green. The
     // model never gets to "fix" anything that isn't independently verified; a
     // rejected patch is rolled back byte-for-byte.
-    if let Some(backend) = ClaudeBackend::from_env() {
+    //
+    // The backend is whatever `AXIOM_BACKEND` selects for the repair paths:
+    // `claude` (API key) or, in an experimental build, `cli` (a logged-in
+    // vendor CLI driven as a subprocess). A configuration error (e.g. a CLI
+    // outside its version pin) disables LLM repair for this run rather than
+    // guessing — the deterministic phases above have already had their turn.
+    let backend = match crate::backend_live::repair_backend_from_env() {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("[axiom-solve] LLM repair unavailable: {e}");
+            None
+        }
+    };
+    if let Some(backend) = backend {
         let working_dir = opts.anchor.as_deref();
         // Feed the model the REAL compile/test failure trace. The supervisor's
         // diagnostics only hold non-correctable *environment* diagnoses and are
@@ -329,7 +342,14 @@ fn attempt_source_repair(
         } else {
             trace
         };
-        let solved = llm_repair_round(&backend, command, args, working_dir, src, &failure_output);
+        let solved = llm_repair_round(
+            backend.as_ref(),
+            command,
+            args,
+            working_dir,
+            src,
+            &failure_output,
+        );
         if solved {
             report.llm_patched = true;
             report.solved = true;
@@ -389,7 +409,7 @@ fn fault_hint_from(failure: &str, source_path: &Path) -> String {
 /// iff some attempt made the verify command pass. Thin wrapper over
 /// [`apply_verified_patch_iterative`] (the unit-tested core).
 fn llm_repair_round(
-    backend: &ClaudeBackend,
+    backend: &dyn ChatBackend,
     command: &str,
     args: &[String],
     working_dir: Option<&Path>,
@@ -420,7 +440,7 @@ fn llm_repair_round(
                 args = args.join(" "),
                 path = source_path.display(),
             );
-            match backend.generate(&prompt, 8192) {
+            match backend.complete(&prompt, 8192) {
                 Ok(text) => {
                     let candidate = strip_code_fences(&text);
                     // Guard against a truncated full-file rewrite (response hit

@@ -189,15 +189,20 @@ pub async fn run_server(
     // constructs `reqwest::blocking` clients, which panic if created inside the
     // Tokio runtime.
     let pipeline_for_router = state.pipeline.clone();
+    //
+    // `AXIOM_BACKEND=cli` (experimental) also lands here: the vendor CLI is one
+    // more router provider. Its version pin / configuration errors are fatal
+    // on purpose — an unsupported CLI must refuse to serve, not fall back.
     let router = tokio::task::spawn_blocking(move || {
         crate::backend_live::router_from_env(pipeline_for_router)
     })
     .await
-    .expect("router_from_env build task panicked");
+    .expect("router_from_env build task panicked")
+    .map_err(|e| format!("AXIOM_BACKEND configuration rejected: {e}"))?;
     if router.is_some() {
         println!(
             "[+] AXIOM_BACKEND router mode — generation routed across configured providers \
-             (GPT/Claude/local), with failover"
+             (GPT/Claude/CLI/local), with failover"
         );
     }
     let state = state.with_router(router);

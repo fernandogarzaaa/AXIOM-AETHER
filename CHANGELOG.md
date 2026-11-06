@@ -32,6 +32,16 @@ releases are described on the GitHub Releases page.
 - API key and MCP token comparisons are constant-time.
 
 ### Fixed
+- **Repair candidates are no longer run from stale `cargo`/`make` builds.**
+  The stale-`.pyc` fix below first set each candidate's mtime into the past;
+  timestamp-based build tools rebuild only when a source is newer than its
+  output, so every Rust candidate was verified against the old binary and
+  rejected, correct fixes included (reproduced on a seeded `>=`/`>` fault:
+  fails with a past mtime, passes with the current one). `mark_fresh` now
+  stamps `max(now, previous stamp + 1 s, base + 1 s)` in whole seconds,
+  process-wide and monotonic, and rollback writes in both `solve` and
+  `agentic::Transaction` get the same stamp. Bursts of writes run ahead of the
+  wall clock by at most the number of writes (bounded by the candidate cap).
 - Candidate writes in the repair loops (`solve` single-file path and
   `agentic::Transaction`) now give the file a modification time distinct from
   the original and from every earlier candidate (`agentic::mark_fresh`).
@@ -65,6 +75,22 @@ releases are described on the GitHub Releases page.
   pillars that did not run.
 
 ### Added
+- **Hybrid CLI integration** (`docs/CLI-INTEGRATION.md`): vendor CLIs keep
+  their own login and point their base URL at the proxy, which relays their
+  `Authorization` / `x-api-key` / `anthropic-version` / `anthropic-beta` /
+  `OpenAI-Organization` / `OpenAI-Project` headers upstream untouched and holds
+  no key (`tests/cli_passthrough_proxy.rs`; `/v1/chat/completions` now relays
+  the two OpenAI scoping headers like `/v1/responses` already did).
+  `scripts/start_axiom_for_cli.sh` launches the loopback proxy, waits for
+  `/readyz` and prints the per-CLI exports. Experimental `AXIOM_BACKEND=cli`
+  (`--features experimental`, `src/cli_backend.rs`) drives a logged-in
+  `claude -p --output-format json` subprocess for `axiom solve` / `axiom task`
+  / server generation behind the backend router: version-pinned, fail-closed
+  on unrecognised output, bounded timeout, prompt on stdin, never logged.
+  `backend_live::router_from_env` now returns `Result` so a rejected backend
+  configuration stops the server instead of silently falling back. Measured
+  run: `bench/cvm/CLI-PROXY-RESULTS-2026-11-06.md` (pass-through correctness,
+  not a savings number — see the file).
 - **Structure-preserving JSON digest** (`json_digest.rs`) and a JSON-aware
   admission estimate for the CVM tool-result digest. Every MCP server answers
   in JSON, and minified JSON has few whitespace tokens: a 37 KB GitHub

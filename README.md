@@ -258,6 +258,14 @@ point axiom at a bigger brain when you want one:
 - **Your ChatGPT/Claude subscription** — drive axiom's tools from the app via MCP
   (zero API cost); works from Claude over stdio and from the ChatGPT connector
   over remote HTTP (`AXIOM_MCP_HTTP=1`).
+- **Your vendor CLI through the proxy** — Claude Code, Codex CLI, Aider, Cline,
+  Continue or OpenCode keep their own login and point their base URL at
+  `./scripts/start_axiom_for_cli.sh`'s loopback proxy; Axiom relays their
+  credentials untouched and holds no key. Exact variables, routes, a measured
+  run, and each vendor's current terms on subscription use (read them first):
+  [`docs/CLI-INTEGRATION.md`](docs/CLI-INTEGRATION.md). The experimental
+  `AXIOM_BACKEND=cli` (`--features experimental`) drives a logged-in `claude -p`
+  as a no-keys fallback for the repair paths.
 
 See [`docs/AGENT-SETUP.md`](docs/AGENT-SETUP.md) (**set up Axiom with your
 Codex/Claude agent** — copy-paste prompts + troubleshooting),
