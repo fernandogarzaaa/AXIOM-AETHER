@@ -1,5 +1,8 @@
 # Held-out repair rate on seeded faults — 2026-11-06
 
+> **Superseded** by the [second pass](SEEDED-HELDOUT-v2-2026-11-06.md) (39/40 and 38/40 on a
+> fresh seed); this page is the 0.6.0 measurement and stays as the baseline.
+
 **Result: 19 of 40 seeded faults repaired (47.5%), 0 rollback violations.**
 19 of 29 (66%) in fault classes the engine has a mutation operator for; 0 of 11
 in the classes it has none for. 14 of the 19 repairs are the exact reversal of

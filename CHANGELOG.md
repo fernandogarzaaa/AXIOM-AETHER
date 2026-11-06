@@ -5,6 +5,11 @@ releases are described on the GitHub Releases page.
 
 ## [Unreleased]
 
+Headline: held-out seeded-fault repair goes from 19/40 to **39/40** on the
+original corpus and from 20/40 to **38/40** on a fresh seed (15/17 on its
+faults outside the tuning set), with 0 rollback violations
+([write-up](bench/results/SEEDED-HELDOUT-v2-2026-11-06.md)).
+
 ### Added
 
 - **Mutation repair: four fault classes it could not repair before.**

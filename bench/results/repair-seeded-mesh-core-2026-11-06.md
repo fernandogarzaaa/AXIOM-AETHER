@@ -1,6 +1,6 @@
 # Repair corpus — 2026-11-06
 
-Corpus: `/tmp/claude-0/-home-user-AXIOM-AETHER/3625c33e-e5a7-566a-8b5d-bee72903a15e/scratchpad/seeded_dbg` · runner: `scripts/bench_repair.sh` · deterministic, no LLM · candidate cap: `AXIOM_REPAIR_MAX_CANDIDATES=64`.
+Corpus: `/tmp/seeded` · runner: `scripts/bench_repair.sh` · deterministic, no LLM · candidate cap: `AXIOM_REPAIR_MAX_CANDIDATES=64`.
 
 | Fixture | Lang | Result | How | Notes |
 |---|---|---|---|---|

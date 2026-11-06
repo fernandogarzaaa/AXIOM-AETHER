@@ -81,7 +81,7 @@ regenerates them on every push and fails if the repair gate regresses.
 | Metric | Value | Config | Measured |
 |---|---|---|---|
 | **Autonomous repair** — `axiom eval-agentic` | 32/32 = 100% | 14 localization fixtures + 18 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, ~15 s | 2026-11-06 |
-| **Autonomous repair, held-out** — `scripts/bench_repair.sh` | 19/40 = 47.5% (66% of the fault classes it has an operator for, 0% of the rest), 0 rollback violations | 40 random single-token faults seeded into `axiom_mesh_core`, which the engine was never shown; no LLM ([write-up](bench/results/SEEDED-HELDOUT-2026-11-06.md)) | 2026-11-06 |
+| **Autonomous repair, held-out** — `scripts/bench_repair.sh` | 38/40 = 95% on a fresh seed (15/17 on faults outside the tuning set; 0.6.0: 20/40, 6/17); 39/40 on the tuning seed; 0 rollback violations | random single-token faults seeded into `axiom_mesh_core`, which the engine was never shown; no LLM ([write-up](bench/results/SEEDED-HELDOUT-v2-2026-11-06.md)) | 2026-11-06 |
 | **Compression** — `axiom bench axiom_engine_rs/src` | 86.7% savings, 2229/2229 = 100% round-trip | `AXIOM_PRODUCTION_BPE=1` | 2026-08-09 |
 | **Compression** — same, legacy tokenizer | 82.4% savings, 2181/2181 = 100% round-trip | `AXIOM_PRODUCTION_BPE=0` | 2026-08-09 |
 | **Cost, real traffic** — `/metrics` delta | 65.1% / 41.4% quota savings | two live Claude Code sessions | 2026-07-17 |
