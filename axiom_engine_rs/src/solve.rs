@@ -249,8 +249,10 @@ fn attempt_source_repair(
             );
             if !plan.is_empty() {
                 let budget = plan.len();
-                let mut queue = plan.into_iter();
+                let mut queue = plan.into_iter().enumerate();
                 let mut applied: Option<String> = None;
+                // AXIOM_REPAIR_VERBOSE=1 lists every candidate as it is tried.
+                let verbose = std::env::var("AXIOM_REPAIR_VERBOSE").is_ok_and(|v| v == "1");
                 let solved = apply_verified_patch_iterative(
                     command,
                     args,
@@ -259,7 +261,10 @@ fn attempt_source_repair(
                     budget,
                     &trace,
                     |_failure, _original| {
-                        let c = queue.next()?;
+                        let (i, c) = queue.next()?;
+                        if verbose {
+                            println!("[axiom-solve]   candidate {}/{budget}: {}", i + 1, c.label);
+                        }
                         applied = Some(c.label);
                         Some(c.source)
                     },
@@ -608,6 +613,30 @@ pub fn run_verify(command: &str, args: &[String], working_dir: Option<&Path>) ->
 /// `(success, combined stdout+stderr trace)` capped to the last ~4000 chars.
 /// stdout/stderr are drained on threads so a chatty verifier can't deadlock on a
 /// full pipe; on timeout the child is killed and `success` is false.
+/// Characters of verifier output kept from the start and from the end.
+const TRACE_HEAD_CHARS: usize = 2000;
+const TRACE_TAIL_CHARS: usize = 4000;
+
+/// Bound a verifier's output to what the repair loop keeps: the first
+/// [`TRACE_HEAD_CHARS`] and the last [`TRACE_TAIL_CHARS`] characters, with an
+/// elision marker between. The head matters as much as the tail: a test
+/// runner prints the first failure (and, with `RUST_BACKTRACE=1`, its frames
+/// citing the faulty line) near the top, and a long backtrace or a run of
+/// property-test failures can push every `file:line` citation out of a
+/// tail-only window. Char-boundary safe.
+pub fn bound_trace(trace: &str) -> String {
+    let n = trace.chars().count();
+    if n <= TRACE_HEAD_CHARS + TRACE_TAIL_CHARS {
+        return trace.to_string();
+    }
+    let head: String = trace.chars().take(TRACE_HEAD_CHARS).collect();
+    let tail: String = trace.chars().skip(n - TRACE_TAIL_CHARS).collect();
+    format!(
+        "{head}\n[… {} chars elided …]\n{tail}",
+        n - TRACE_HEAD_CHARS - TRACE_TAIL_CHARS
+    )
+}
+
 pub fn run_verify_capture(
     command: &str,
     args: &[String],
@@ -665,15 +694,7 @@ pub fn run_verify_capture(
 
     let mut trace = out_h.join().unwrap_or_default();
     trace.push_str(&err_h.join().unwrap_or_default());
-    // Keep the tail (failures usually surface there); char-boundary safe.
-    let trace: String = {
-        let chars: Vec<char> = trace.chars().collect();
-        if chars.len() > 4000 {
-            chars[chars.len() - 4000..].iter().collect()
-        } else {
-            trace
-        }
-    };
+    let trace = bound_trace(&trace);
 
     match status {
         Some(st) => (st.success(), trace),
@@ -848,6 +869,23 @@ mod tests {
             &["-c".into(), "exit 1".into()],
             None
         ));
+    }
+
+    #[test]
+    fn bound_trace_keeps_head_and_tail_of_long_output() {
+        let short = "panicked at src/lib.rs:3:5";
+        assert_eq!(bound_trace(short), short);
+        let first = "thread 't' panicked at src/x.rs:1:1\n   at ./src/mesh.rs:296:51\n";
+        let noise = "   frame at /rustc/abc/library/core/src/panicking.rs:80:14\n".repeat(400);
+        let last = "error: test failed, to rerun pass `--lib`";
+        let b = bound_trace(&format!("{first}{noise}{last}"));
+        assert!(b.contains("src/mesh.rs:296:51"), "head kept");
+        assert!(b.ends_with(last), "tail kept");
+        assert!(b.contains("chars elided"));
+        assert!(b.chars().count() < TRACE_HEAD_CHARS + TRACE_TAIL_CHARS + 64);
+        // Multi-byte characters never split.
+        let wide = "é".repeat(10_000);
+        assert!(bound_trace(&wide).starts_with('é'));
     }
 
     #[test]

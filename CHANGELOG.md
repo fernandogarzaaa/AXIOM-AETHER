@@ -19,12 +19,20 @@ releases are described on the GitHub Releases page.
   of the functions the failing test calls, then what those call, and only
   then the rest of the file. Identifier swaps (up to 15 per line) are tried
   off the blamed lines only after every other edit.
+- `AXIOM_REPAIR_VERBOSE=1` makes `axiom solve` print each mutation candidate
+  as it is tried (`candidate 3/64: swap-args:L296 …`).
 - `tests/mutation_plan_diag.rs` (ignored): offline planner diagnostic that
   reports, for each fixture of a seeded corpus, where the reversal of the
   seeded fault ranks in the plan. Iterates in seconds without a verifier.
 
 ### Fixed
 
+- **Fault localization lost its evidence on long test output.** The solve
+  loop kept only the last 4000 characters of the verifier's output. With
+  `RUST_BACKTRACE=1`, or a run of failing property tests, that tail held no
+  `file:line` citing the faulty code, so the mutation budget went to the wrong
+  lines. The kept window is now the first 2000 and the last 4000
+  characters (`solve::bound_trace`).
 - **Debug builds of every model-loading subcommand panicked at start-up**
   (`Cannot drop a runtime in a context where blocking is not allowed`). The
   pipeline's context streamer built a `reqwest::blocking` client inside the

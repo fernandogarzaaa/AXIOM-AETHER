@@ -45,7 +45,10 @@ fn print_plan_ranks() {
         let broken_path = dir.join("broken").join(rel);
         let broken = std::fs::read_to_string(&broken_path).unwrap();
         let pristine = std::fs::read_to_string(pristine_root.join(rel)).unwrap();
-        let trace = std::fs::read_to_string(traces.join(format!("{name}.txt"))).unwrap_or_default();
+        // Bounded exactly as the solve loop bounds a verifier's output.
+        let trace = axiom_engine::solve::bound_trace(
+            &std::fs::read_to_string(traces.join(format!("{name}.txt"))).unwrap_or_default(),
+        );
         let plan = axiom_engine::mutation_repair::plan(&broken, Path::new(rel), &trace, 100_000);
         let rank = plan.iter().position(|c| c.source == pristine);
         let hints = axiom_engine::fault_locate::line_hints_for(&trace, Path::new(rel));
