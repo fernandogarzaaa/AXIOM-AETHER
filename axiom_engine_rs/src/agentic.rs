@@ -55,11 +55,17 @@ static LAST_FRESH_STAMP: AtomicU64 = AtomicU64::new(0);
 /// 2026-11-06: the authored fix for a `>=`/`>` fault failed with a past mtime
 /// and passed with the current one).
 ///
-/// So the stamp is the larger of *now* and *one whole second after the
-/// previous stamp* (and after `base`, the file's mtime before the write),
-/// in whole seconds. That gives:
+/// *Now* is rounded **up** to the next whole second. Rounded down, a
+/// candidate written in the same wall-clock second as the previous build
+/// started got a stamp no newer than that build, and cargo reran the stale
+/// binary: a seeded fault whose fix was the very first candidate passed when
+/// run by hand and failed in the benchmark, depending on sub-second timing.
+///
+/// So the stamp is the largest of *now* (rounded up), *one whole second after
+/// the previous stamp*, and one second after `base` (the file's mtime before
+/// the write), in whole seconds. That gives:
 /// * Python: a different second from whatever the `.pyc` recorded;
-/// * cargo/make: newer than any build output produced so far;
+/// * cargo/make: strictly newer than any build that started before the write;
 /// * monotonic within the process, so candidate N+1 is never "older" than N.
 ///
 /// When writes come faster than one per second the stamps run ahead of the
@@ -73,7 +79,10 @@ pub fn mark_fresh(path: &Path, base: Option<SystemTime>) {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     };
-    let now = secs(SystemTime::now());
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() + u64::from(d.subsec_nanos() > 0))
+        .unwrap_or(0);
     let floor = base.map(|b| secs(b) + 1).unwrap_or(0);
     let mut prev = LAST_FRESH_STAMP.load(Ordering::Relaxed);
     let stamp = loop {
@@ -432,6 +441,29 @@ mod tests {
     }
 
     #[test]
+    fn mark_fresh_beats_a_build_that_started_this_second() {
+        // A long-unchanged source (old mtime) whose build started a moment
+        // before the candidate is written: the candidate must look newer
+        // than that build, or cargo reruns the stale binary.
+        let dir = tmp("fresh_build");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("lib.rs");
+        std::fs::write(&f, "a").unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let build_started = SystemTime::now();
+        std::fs::write(&f, "b").unwrap();
+        mark_fresh(&f, Some(old));
+        assert!(std::fs::metadata(&f).unwrap().modified().unwrap() > build_started);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn mark_fresh_is_monotonic_never_in_the_past_and_distinct_per_write() {
         let dir = tmp("fresh");
         std::fs::create_dir_all(&dir).unwrap();
@@ -446,7 +478,13 @@ mod tests {
         for _ in 0..3 {
             std::fs::write(&f, "b").unwrap(); // same size as the original
             let before = std::fs::metadata(&f).unwrap().modified().ok();
+            // Anything that started before the write (a build) must look older.
+            let build_started = SystemTime::now();
             mark_fresh(&f, before);
+            assert!(
+                std::fs::metadata(&f).unwrap().modified().unwrap() > build_started,
+                "strictly newer than a build that started just before the write"
+            );
             let m = std::fs::metadata(&f)
                 .unwrap()
                 .modified()

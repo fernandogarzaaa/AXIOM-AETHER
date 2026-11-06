@@ -27,6 +27,12 @@ releases are described on the GitHub Releases page.
 
 ### Fixed
 
+- **A correct first repair candidate could be rejected, depending on timing.**
+  `agentic::mark_fresh` rounded *now* down to the whole second, so a
+  candidate written in the same second the previous build started looked no
+  newer than that build and cargo reran the stale binary. It now rounds up.
+  Seen as a seeded fault whose fix was candidate 1: solved by hand, failed in
+  the benchmark run.
 - **Fault localization lost its evidence on long test output.** The solve
   loop kept only the last 4000 characters of the verifier's output. With
   `RUST_BACKTRACE=1`, or a run of failing property tests, that tail held no
