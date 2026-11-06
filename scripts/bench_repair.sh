@@ -40,6 +40,20 @@ CHECK=0
 export AXIOM_DEVICE=cpu
 
 say() { printf '\033[1m%s\033[0m\n' "$*" >&2; }
+
+# Paths a *verifier* writes while running tests (proptest's failing-seed
+# records, bytecode/test caches, build output). Never solver edits; excluded
+# from the authored-fix comparison and reported separately from rollback
+# violations.
+is_verifier_artifact() {
+  case "$1" in
+    proptest-regressions|proptest-regressions/*|*/proptest-regressions|*/proptest-regressions/*) return 0 ;;
+    __pycache__|__pycache__/*|*/__pycache__|*/__pycache__/*|*.pyc) return 0 ;;
+    .pytest_cache|.pytest_cache/*|*/.pytest_cache|*/.pytest_cache/*) return 0 ;;
+    target|target/*|node_modules|node_modules/*) return 0 ;;
+  esac
+  return 1
+}
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Files the solver must never have changed for a pass to count: meta.json
@@ -132,11 +146,14 @@ for dir in "$CORPUS"/*/; do
       if [ -f "$dir/expected.diff" ] && have patch; then
         ref="$(mktemp -d)"; cp -R "$dir/broken/." "$ref/"
         if ( cd "$ref" && patch -s -p1 < "$dir/expected.diff" >/dev/null 2>&1 ); then
-          # Compare only the fixture's own files: anything the verifier
-          # generated (present in the post-baseline snapshot) is ignored.
+          # Compare only the fixture's own source files: test-framework
+          # artifacts the verifier rewrites (proptest seed records, caches,
+          # build dirs) would otherwise mislabel an exact reversal of the
+          # fault as a "different fix".
           same=1
           while IFS= read -r -d '' f; do
             rel="${f#"$dir/broken/"}"
+            if is_verifier_artifact "$rel"; then continue; fi
             cmp -s "$ref/$rel" "$work/$rel" || { same=0; break; }
           done < <(find "$dir/broken" -type f -print0)
           if [ "$same" = 1 ]; then authored="authored fix"; else authored="different fix"; fi
@@ -164,11 +181,7 @@ for line in sys.stdin:
 ' | sed "s#^$work/##; s#^$snap/##")
     artifacts=(); violations=()
     for c in ${changed[@]+"${changed[@]}"}; do
-      case "$c" in
-        proptest-regressions|proptest-regressions/*|*/proptest-regressions|*/proptest-regressions/*|__pycache__|*/__pycache__|*/__pycache__/*|.pytest_cache|.pytest_cache/*|target|target/*|node_modules|node_modules/*)
-          artifacts+=("$c") ;;
-        *) violations+=("$c") ;;
-      esac
+      if is_verifier_artifact "$c"; then artifacts+=("$c"); else violations+=("$c"); fi
     done
     if [ "${#violations[@]}" -gt 0 ]; then
       rb="TREE MODIFIED: ${violations[*]:0:3}"; dirty=$((dirty+1))
