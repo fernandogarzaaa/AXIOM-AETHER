@@ -9,6 +9,15 @@ Developer bugs: on QuixBugs (40 Python programs with one human-written bug
 each) the deterministic engine repairs **9/40, all correct**, with 0 rollback
 violations ([write-up](bench/results/QUIXBUGS-2026-11-07.md)).
 
+### Added (developer-bug run)
+
+- Mutation repair: bitwise slips (`^=`/`&=`/`|=`, spaced `^`/`&`/`|`) in the
+  arithmetic class, and a late `arg-shift` class: ±1 on a bare argument or
+  index, a swapped two-element subscript, swapped operands of a lone `+`.
+  QuixBugs goes to 14/40, all correct. That is in-sample (the families were
+  chosen from its failures); held out it is 9/40. The seeded corpora are
+  unchanged at 39/40 and 38/40.
+
 ### Fixed (developer-bug run)
 
 - **`axiom solve` hung forever on a fault that loops forever.** The
