@@ -5,6 +5,27 @@ releases are described on the GitHub Releases page.
 
 ## [Unreleased]
 
+Developer bugs: on QuixBugs (40 Python programs with one human-written bug
+each) the deterministic engine repairs **9/40, all correct**, with 0 rollback
+violations ([write-up](bench/results/QUIXBUGS-2026-11-07.md)).
+
+### Fixed (developer-bug run)
+
+- **`axiom solve` hung forever on a fault that loops forever.** The
+  supervisor's first run of the verify command had no time limit.
+  `SupervisorOptions::timeout` now bounds it (`None` for `axiom run`); `solve`
+  passes its verify timeout.
+- **A Poly-JIT verify timeout aborted the whole solve.** It now means "this
+  phase did not fix it", and the solve moves on to mutation repair.
+- **A test killed on a timeout left nothing to localize.**
+  `fault_locate::targets_from_command` falls back to the files the verify
+  command names (pytest node ids reduced to paths). When the localizer follows
+  a test's imports, helpers beside the test now rank after the code under test.
+- **Mutation repair could go green by editing a test.** Seen as a swapped name
+  in a QuixBugs test's graph setup. Phase 2.1 now never edits a test file.
+- `scripts/bench_repair.sh` bounds its own baseline and post-solve verify runs
+  (`AXIOM_BENCH_VERIFY_TIMEOUT_SECS`, default 300).
+
 Headline: held-out seeded-fault repair goes from 19/40 to **39/40** on the
 original corpus and from 20/40 to **38/40** on a fresh seed (15/17 on its
 faults outside the tuning set), with 0 rollback violations; 33/40 and 32/40
