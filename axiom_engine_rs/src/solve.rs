@@ -103,6 +103,8 @@ pub fn solve(
                 max_restarts: opts.max_restarts,
                 heal_memory_path: opts.heal_memory_path.clone(),
                 anchor: opts.anchor.clone(),
+                // The command is a verifier: bound it like every other run.
+                timeout: Some(verify_timeout()),
                 ..SupervisorOptions::default()
             },
         )?;
@@ -140,7 +142,12 @@ pub fn solve(
                 .clone()
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
-            let cands = crate::fault_locate::repair_targets(&trace, &root);
+            let mut cands = crate::fault_locate::repair_targets(&trace, &root);
+            if cands.is_empty() {
+                // Nothing in the output names a file (e.g. the run was killed
+                // on a timeout before printing): use what the command names.
+                cands = crate::fault_locate::targets_from_command(args, &root);
+            }
             if let Some(first) = cands.first() {
                 println!(
                     "[axiom-solve] round {round}: localized {} candidate file(s); first: {}",
@@ -211,18 +218,22 @@ fn attempt_source_repair(
         .enable_all()
         .build()
         .map_err(|e| candle_core::Error::Msg(format!("solve runtime: {e}")))?;
-    let poly = rt
-        .block_on(engine.run_with_feedback(run_req, |_diag| async { Ok(()) }))
-        .map_err(|e| candle_core::Error::Msg(format!("poly-jit: {e}")))?;
-    if poly.passed {
-        report.source_patched = poly.patched;
-        report.solved = true;
-        report.final_exit = Some(0);
-        println!(
-            "[axiom-solve] round {round}: source repair solved it (patched={})",
-            poly.patched
-        );
-        return Ok(true);
+    // A Poly-JIT error (most often its verify run timing out on a fault that
+    // loops forever) means this phase did not fix it, not that the solve
+    // failed: fall through to the later phases.
+    match rt.block_on(engine.run_with_feedback(run_req, |_diag| async { Ok(()) })) {
+        Ok(poly) if poly.passed => {
+            report.source_patched = poly.patched;
+            report.solved = true;
+            report.final_exit = Some(0);
+            println!(
+                "[axiom-solve] round {round}: source repair solved it (patched={})",
+                poly.patched
+            );
+            return Ok(true);
+        }
+        Ok(_) => {}
+        Err(e) => println!("[axiom-solve] round {round}: poly-jit phase skipped ({e})"),
     }
     // Failed repair → restore the artifact byte-for-byte.
     if let Some(b) = backup {
@@ -237,7 +248,12 @@ fn attempt_source_repair(
     // assertion line. Each candidate is one verifier run under the same
     // reversible policy as the LLM path: kept only if the command goes green,
     // otherwise rolled back byte-for-byte. No model, no network.
-    {
+    //
+    // Never on a test file: a blind single-token edit of the oracle can only
+    // weaken it (swapping two names in a test's setup made a QuixBugs test
+    // pass without touching the buggy program). Phase 3 may still edit a test
+    // it judges to be wrong.
+    if !crate::fault_locate::is_test_path(src) {
         let working_dir = opts.anchor.as_deref();
         let (_still_failing, trace) = run_verify_capture(command, args, working_dir);
         if let Ok(original) = std::fs::read_to_string(src) {
@@ -642,64 +658,20 @@ pub fn run_verify_capture(
     args: &[String],
     working_dir: Option<&Path>,
 ) -> (bool, String) {
-    use std::io::Read;
-    use std::process::Stdio;
-    use std::time::Instant;
-
     let mut cmd = std::process::Command::new(command);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args);
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return (false, format!("failed to spawn verify command: {e}")),
-    };
-
-    // Drain both pipes concurrently to avoid a full-buffer deadlock.
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let out_h = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(ref mut o) = stdout {
-            let _ = o.read_to_string(&mut s);
+    // Bounded, and the verifier's whole process group is killed on timeout,
+    // so a runaway test (or a subprocess it started) cannot hang the loop.
+    match crate::proc_bound::output_bounded(&mut cmd, Some(verify_timeout())) {
+        Ok(out) => {
+            let mut trace = String::from_utf8_lossy(&out.stdout).into_owned();
+            trace.push_str(&String::from_utf8_lossy(&out.stderr));
+            (out.status.success(), bound_trace(&trace))
         }
-        s
-    });
-    let err_h = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(ref mut e) = stderr {
-            let _ = e.read_to_string(&mut s);
-        }
-        s
-    });
-
-    let deadline = Instant::now() + verify_timeout();
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
-                    break None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => break None,
-        }
-    };
-
-    let mut trace = out_h.join().unwrap_or_default();
-    trace.push_str(&err_h.join().unwrap_or_default());
-    let trace = bound_trace(&trace);
-
-    match status {
-        Some(st) => (st.success(), trace),
-        None if timed_out => (false, format!("{trace}\n[verify timed out]")),
-        None => (false, trace),
+        Err(e) => (false, format!("failed to spawn verify command: {e}")),
     }
 }
 

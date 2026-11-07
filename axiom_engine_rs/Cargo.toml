@@ -204,3 +204,7 @@ proptest = "1"
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+# kill(2) on a verifier's process group (proc_bound); already in the lock graph.
+libc = "0.2"

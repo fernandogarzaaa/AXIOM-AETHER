@@ -191,6 +191,7 @@ dependencies = [
  "hf-hub",
  "http-body-util",
  "indicatif 0.17.11",
+ "libc",
  "model2vec-rs",
  "ndarray 0.17.2",
  "proptest",

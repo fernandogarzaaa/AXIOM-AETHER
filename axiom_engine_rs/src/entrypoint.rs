@@ -1198,7 +1198,8 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 vibe_path,
                 heal_memory_path,
                 remember_into,
-                anchor: None, // default: the current working directory
+                anchor: None,  // default: the current working directory
+                timeout: None, // a supervised program may be a server
             };
 
             // Anticipatory pre-flight: predict from learned immunity, no model

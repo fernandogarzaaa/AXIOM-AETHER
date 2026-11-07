@@ -122,9 +122,14 @@ random single-token faults in `axiom_mesh_core` code that predates the repair
 layer, kept only when the crate's own tests catch them. The engine runs with
 no LLM. Method, per-class table and caveats:
 [`bench/results/SEEDED-HELDOUT-2026-11-06.md`](../bench/results/SEEDED-HELDOUT-2026-11-06.md).
-Seeded faults are not developer bugs. The developer-bug corpus below is still
-the next step: QuixBugs is importable today (`scripts/import_quixbugs.py`) but
-has not been run.
+Seeded faults are not developer bugs.
+
+**Developer bugs (2026-11-07): QuixBugs, 9/40 repaired, all 9 correct, 0
+rollback violations.** These are 40 Python programs with one human-written bug
+each, with no operator tuned on them. The 31 misses are mostly fixes outside a
+single-token mutator: missing statements, added conditions, wrapped calls and
+one-sided renames. The write-up sorts them by fix shape:
+[`bench/results/QUIXBUGS-2026-11-07.md`](../bench/results/QUIXBUGS-2026-11-07.md).
 
 
 Wire `axiom task` (the goal-directed, LLM-backed path) against an external,

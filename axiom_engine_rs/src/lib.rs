@@ -72,6 +72,7 @@ pub mod poly_jit;
 pub mod predictive_tools;
 pub mod prefix_diet;
 pub mod prime;
+pub mod proc_bound;
 pub mod provenance;
 pub mod quantization;
 pub mod rebase;

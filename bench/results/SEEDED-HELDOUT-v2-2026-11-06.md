@@ -154,8 +154,9 @@ suite checks. The seven new tests now ship with `axiom_mesh_core`.
   multi-line or semantic. Identifier swaps in particular are seeded as
   "exchange the first two names on a line", and the operator undoes exactly
   that family. A developer's wrong variable is often a one-sided substitution,
-  which `ident-swap` does not cover. QuixBugs (`scripts/import_quixbugs.py`) is
-  still the prepared developer-bug measurement, still not run here.
+  which `ident-swap` does not cover. On developer bugs (QuixBugs, 40 Python
+  programs) the same engine repairs 9/40, all correct:
+  [`QUIXBUGS-2026-11-07.md`](QUIXBUGS-2026-11-07.md).
 - **One crate, one language.** Both corpora come from `axiom_mesh_core`, and
   every operator and tier change is exercised here only on Rust. The Python
   `def`-body tier and the Python/JS forms of the new operators are covered by

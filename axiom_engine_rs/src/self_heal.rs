@@ -494,6 +494,12 @@ pub struct SupervisorOptions {
     /// one checkout (or on another machine, via swarm immunity) applies in
     /// another. `None` → the current process working directory.
     pub anchor: Option<PathBuf>,
+    /// Kill an attempt that runs longer than this and count it as a failed
+    /// run. `None` (the default, used by `axiom run`) waits indefinitely,
+    /// since a supervised program may be a server. `axiom solve` sets it: its
+    /// command is a verifier, and a fault that loops forever must not hang
+    /// the loop.
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl SupervisorOptions {
@@ -670,11 +676,10 @@ pub fn run_supervised(
     for attempt in 1..=max_restarts + 1 {
         report.attempts = attempt;
         let started = Instant::now();
-        let output = match Command::new(command)
-            .args(args)
-            .current_dir(&anchor)
-            .output()
-        {
+        let output = match crate::proc_bound::output_bounded(
+            Command::new(command).args(args).current_dir(&anchor),
+            opts.timeout,
+        ) {
             Ok(o) => o,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 // The program itself isn't executable. Try the exec-bit heal on

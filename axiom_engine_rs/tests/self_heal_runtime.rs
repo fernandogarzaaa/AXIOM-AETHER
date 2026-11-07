@@ -66,6 +66,7 @@ fn supervise_full(
             heal_memory_path: heal_memory,
             remember_into: None,
             anchor: None,
+            timeout: None,
         },
     )
 }

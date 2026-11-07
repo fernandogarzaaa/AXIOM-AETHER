@@ -215,14 +215,32 @@ impl PolyJitEngine {
     ) -> Result<ProcessOutput, PolyJitError> {
         let command_string = format!("{} {}", request.command, request.args.join(" "));
         let mut command = Command::new(&request.command);
-        command.args(&request.args);
+        command
+            .args(&request.args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // Dropping the future on timeout must not leave the verifier
+            // running: kill the child on drop, and its process group below.
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
         if let Some(dir) = request.working_dir.as_deref() {
             command.current_dir(dir);
         }
-        let output = timeout(self.timeout, command.output())
-            .await
-            .map_err(|_| PolyJitError::Timeout(command_string.clone()))?
+        let child = command
+            .spawn()
             .map_err(|e| PolyJitError::Io(format!("process start failed: {e}")))?;
+        let pid = child.id();
+        let output = match timeout(self.timeout, child.wait_with_output()).await {
+            Ok(r) => r.map_err(|e| PolyJitError::Io(format!("process wait failed: {e}")))?,
+            Err(_) => {
+                if let Some(pid) = pid {
+                    crate::proc_bound::kill_group(pid);
+                }
+                return Err(PolyJitError::Timeout(command_string.clone()));
+            }
+        };
         Ok(ProcessOutput {
             command: command_string,
             status_code: output.status.code(),
