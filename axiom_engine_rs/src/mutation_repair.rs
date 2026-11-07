@@ -84,10 +84,15 @@ pub enum MutationClass {
     /// Exchange every occurrence of two identifiers on one line (`a - b` with
     /// `b - a`, a swapped `(row, col)`): the "wrong variable" bug.
     IdentSwap,
+    /// Argument- and operand-level slips: `± 1` on a bare identifier argument
+    /// or index (`f(mid, hi)` → `f(mid + 1, hi)`), a two-element subscript
+    /// swapped (`d[j, k]` → `d[k, j]`), and the operands of a lone `+`
+    /// swapped (`s = s + c` → `s = c + s`). Prolific, so tried late.
+    ArgShift,
 }
 
 impl MutationClass {
-    pub const ALL: [MutationClass; 11] = [
+    pub const ALL: [MutationClass; 12] = [
         MutationClass::Comparison,
         MutationClass::OffByOne,
         MutationClass::Boolean,
@@ -97,6 +102,7 @@ impl MutationClass {
         MutationClass::MissingReturn,
         MutationClass::ShellTest,
         MutationClass::ApiSwap,
+        MutationClass::ArgShift,
         MutationClass::IdentSwap,
         MutationClass::ImportPath,
     ];
@@ -114,6 +120,7 @@ impl MutationClass {
             MutationClass::ImportPath => "import-path",
             MutationClass::ApiSwap => "api-swap",
             MutationClass::IdentSwap => "ident-swap",
+            MutationClass::ArgShift => "arg-shift",
         }
     }
 }
@@ -481,7 +488,9 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
                 // line), so off the blamed lines they wait until every other
                 // edit has been tried. A swapped variable usually breaks the
                 // build, and the compiler then blames the line itself.
-                let tier = if *class == MutationClass::IdentSwap && tier > 0 {
+                let tier = if matches!(*class, MutationClass::IdentSwap | MutationClass::ArgShift)
+                    && tier > 0
+                {
                     LAST_TIER
                 } else {
                     tier
@@ -889,8 +898,18 @@ pub fn line_mutations(
         MutationClass::OffByOne => off_by_one(line, lang, &mask),
         MutationClass::Boolean => boolean(line, lang, &mask),
         MutationClass::Logic => logic(line, lang, &mask),
-        MutationClass::Arithmetic => arithmetic(line, lang, &mask),
+        MutationClass::Arithmetic => {
+            let mut v = arithmetic(line, lang, &mask);
+            v.extend(bitwise(line, lang, &mask));
+            v
+        }
         MutationClass::SwapArgs => swap_args(line, &mask),
+        MutationClass::ArgShift => {
+            let mut v = shift_argument(line, lang, &mask);
+            v.extend(swap_subscript(line, &mask));
+            v.extend(swap_sum_operands(line, lang, &mask));
+            v
+        }
         MutationClass::MissingReturn => missing_return(line, lang, &mask, next_line),
         MutationClass::ShellTest => shell_test(line, lang, &mask),
         // Planned per file in `plan` (needs the trace and the directory).
@@ -1937,6 +1956,222 @@ fn shell_test(line: &str, lang: Lang, mask: &[bool]) -> Vec<(String, String)> {
     out
 }
 
+/// At most this many identifiers per line get a `± 1` shift.
+const MAX_SHIFTED_ARGS: usize = 4;
+
+/// `f(mid, end)` → `f(mid + 1, end)`, `range(0, r)` → `range(0, r + 1)`,
+/// `dp[i, j]` → `dp[i, j - 1]`: ± 1 on a bare identifier that is a whole
+/// call argument or subscript element (the developer off-by-one that is not on
+/// a literal or a length).
+fn shift_argument(line: &str, lang: Lang, mask: &[bool]) -> Vec<(String, String)> {
+    let b = line.as_bytes();
+    let n = b.len();
+    let mut out = Vec::new();
+    if lang == Lang::Shell {
+        return out;
+    }
+    let mut shifted = 0;
+    let mut i = 0;
+    while i < n && shifted < MAX_SHIFTED_ARGS {
+        if !(mask[i]
+            && (b[i].is_ascii_alphabetic() || b[i] == b'_')
+            && (i == 0 || !is_ident(b[i - 1])))
+        {
+            i += 1;
+            continue;
+        }
+        let mut e = i;
+        while e < n && is_ident(b[e]) {
+            e += 1;
+        }
+        let word = &line[i..e];
+        let before = prev_non_space(b, i).map(|k| b[k]);
+        let after = next_non_space(b, e).map(|k| b[k]);
+        let is_arg = matches!(before, Some(b'(') | Some(b',') | Some(b'['))
+            && matches!(after, Some(b')') | Some(b',') | Some(b']'))
+            && !(i > 0 && b[i - 1] == b'.');
+        if is_arg
+            && !NOT_SWAPPABLE.contains(&word)
+            && !word.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+        {
+            for (op, label) in [(" + 1", "+ 1"), (" - 1", "- 1")] {
+                out.push((
+                    format!("`{word}` -> `{word} {label}`"),
+                    format!("{}{word}{op}{}", &line[..i], &line[e..]),
+                ));
+            }
+            shifted += 1;
+        }
+        i = e;
+    }
+    out
+}
+
+/// Bitwise operator slips: `^=` / `&=` / `|=` among themselves, and a spaced
+/// binary `a ^ b` / `a & b` / `a | b` (spaces on both sides, so a Rust borrow
+/// `&x` or closure `|x|` is not one).
+fn bitwise(line: &str, lang: Lang, mask: &[bool]) -> Vec<(String, String)> {
+    let b = line.as_bytes();
+    let n = b.len();
+    let mut out = Vec::new();
+    if lang == Lang::Shell {
+        return out;
+    }
+    let mut i = 0;
+    while i < n {
+        if !mask[i] || !matches!(b[i], b'^' | b'&' | b'|') {
+            i += 1;
+            continue;
+        }
+        let c = b[i];
+        let doubled = (i + 1 < n && b[i + 1] == c) || (i > 0 && b[i - 1] == c);
+        if doubled {
+            i += 1;
+            continue;
+        }
+        let compound = i + 1 < n && b[i + 1] == b'=' && !(i + 2 < n && b[i + 2] == b'=');
+        let spaced = i > 0 && b[i - 1] == b' ' && i + 1 < n && b[i + 1] == b' ';
+        if compound || spaced {
+            let from = c as char;
+            for to in ['&', '|', '^'] {
+                if to as u8 == c {
+                    continue;
+                }
+                let new_line = replace_span(line, i, i + 1, &to.to_string());
+                out.push((
+                    if compound {
+                        format!("{from}= -> {to}=")
+                    } else {
+                        format!("{from} -> {to}")
+                    },
+                    new_line,
+                ));
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Swap the two elements of a two-element subscript: `d[j, k]` → `d[k, j]`.
+fn swap_subscript(line: &str, mask: &[bool]) -> Vec<(String, String)> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    for open in 0..b.len() {
+        if b[open] != b'['
+            || !mask[open]
+            || open == 0
+            || !(is_ident(b[open - 1]) || b[open - 1] == b']' || b[open - 1] == b')')
+        {
+            continue;
+        }
+        let Some(close) = matching_paren(b, mask, open) else {
+            continue;
+        };
+        let mut depth = 0i32;
+        let mut commas = Vec::new();
+        for k in open + 1..close {
+            if !mask[k] {
+                continue;
+            }
+            match b[k] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b',' if depth == 0 => commas.push(k),
+                _ => {}
+            }
+        }
+        if commas.len() != 1 {
+            continue;
+        }
+        let (x, y) = (
+            line[open + 1..commas[0]].trim(),
+            line[commas[0] + 1..close].trim(),
+        );
+        if x.is_empty() || y.is_empty() || x == y {
+            continue;
+        }
+        out.push((
+            format!("swap subscript `{x}` <-> `{y}`"),
+            format!("{}[{y}, {x}]{}", &line[..open], &line[close + 1..]),
+        ));
+    }
+    out
+}
+
+/// `result = result + c` → `result = c + result`: swap the operands of a
+/// single top-level `+` on the right of an assignment or `return`
+/// (concatenation is not commutative).
+fn swap_sum_operands(line: &str, lang: Lang, mask: &[bool]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if lang == Lang::Shell {
+        return out;
+    }
+    let b = line.as_bytes();
+    let indent = line.len() - line.trim_start().len();
+    let t = &line[indent..];
+    // Start of the right-hand side.
+    let rhs_start = if let Some(r) = t.strip_prefix("return ") {
+        indent + (t.len() - r.len())
+    } else {
+        let mut eq = None;
+        for k in indent..b.len() {
+            if mask[k]
+                && b[k] == b'='
+                && !matches!(b.get(k + 1), Some(b'='))
+                && !matches!(
+                    b.get(k.wrapping_sub(1)),
+                    Some(b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/')
+                )
+            {
+                eq = Some(k + 1);
+                break;
+            }
+        }
+        match eq {
+            Some(k) => k,
+            None => return out,
+        }
+    };
+    let end = line.trim_end().trim_end_matches(';').len();
+    if rhs_start >= end {
+        return out;
+    }
+    let mut depth = 0i32;
+    let mut plus = Vec::new();
+    for k in rhs_start..end {
+        if !mask[k] {
+            continue;
+        }
+        match b[k] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'+' if depth == 0 && b.get(k + 1) != Some(&b'=') && is_binary_position(b, k) => {
+                plus.push(k)
+            }
+            b'-' | b'*' | b'/' | b'%' | b'<' | b'>' | b'&' | b'|' if depth == 0 => return out,
+            _ => {}
+        }
+    }
+    if plus.len() != 1 {
+        return out;
+    }
+    let (a, c) = (
+        line[rhs_start..plus[0]].trim(),
+        line[plus[0] + 1..end].trim(),
+    );
+    if a.is_empty() || c.is_empty() || a == c {
+        return out;
+    }
+    let lead = &line[..rhs_start];
+    let sep = if lead.ends_with(' ') { "" } else { " " };
+    out.push((
+        format!("swap operands `{a}` + `{c}`"),
+        format!("{lead}{sep}{c} + {a}{}", &line[end..]),
+    ));
+    out
+}
+
 /// Paired opposites: a call to one is a classic single-token slip for the other.
 /// `call` pairs must be followed by `(` (a call, not a variable that happens to
 /// be named `max`); keyword pairs stand alone.
@@ -2468,6 +2703,90 @@ mod tests {
     }
 
     #[test]
+    fn variable_argument_and_index_shift_by_one() {
+        let has = |m: &[String], x: &str| m.iter().any(|l| l == x);
+        let m = muts(
+            "    return search(mid, hi)",
+            Lang::Python,
+            MutationClass::ArgShift,
+        );
+        assert!(has(&m, "    return search(mid + 1, hi)"), "{m:?}");
+        assert!(has(&m, "    return search(mid, hi - 1)"), "{m:?}");
+        let m = muts(
+            "for c in range(0, r):",
+            Lang::Python,
+            MutationClass::ArgShift,
+        );
+        assert!(has(&m, "for c in range(0, r + 1):"), "{m:?}");
+        let m = muts(
+            "t[i, j] = t[i - 1, j] + 1",
+            Lang::Python,
+            MutationClass::ArgShift,
+        );
+        assert!(has(&m, "t[i, j] = t[i - 1, j - 1] + 1"), "{m:?}");
+        // Attribute access and keywords are not bare arguments.
+        let m = muts("f(self.x, None)", Lang::Python, MutationClass::ArgShift);
+        assert!(
+            !m.iter().any(|l| l.contains("x + 1") || l.contains("None")),
+            "{m:?}"
+        );
+    }
+
+    #[test]
+    fn bitwise_operators_swap_but_logic_and_borrows_do_not() {
+        let m = muts(
+            "        n ^= n - 1",
+            Lang::Python,
+            MutationClass::Arithmetic,
+        );
+        assert!(m.contains(&"        n &= n - 1".to_string()), "{m:?}");
+        let m = muts("mask = a | b", Lang::Python, MutationClass::Arithmetic);
+        assert!(m.contains(&"mask = a & b".to_string()), "{m:?}");
+        let m = muts("if a && b || c {", Lang::Rust, MutationClass::Arithmetic);
+        assert!(
+            !m.iter().any(|l| l.contains('^')),
+            "logic operators untouched: {m:?}"
+        );
+        let m = muts(
+            "let r = f(&x, |y| y);",
+            Lang::Rust,
+            MutationClass::Arithmetic,
+        );
+        assert!(
+            !m.iter().any(|l| l.contains('^')),
+            "borrow and closure untouched: {m:?}"
+        );
+    }
+
+    #[test]
+    fn subscript_elements_and_sum_operands_swap() {
+        let m = muts(
+            "d = w[i, k] + w[j, k]",
+            Lang::Python,
+            MutationClass::ArgShift,
+        );
+        assert!(m.contains(&"d = w[i, k] + w[k, j]".to_string()), "{m:?}");
+        let m = muts(
+            "        out = out + digits[i]",
+            Lang::Python,
+            MutationClass::ArgShift,
+        );
+        assert!(
+            m.contains(&"        out = digits[i] + out".to_string()),
+            "{m:?}"
+        );
+        let m = muts(
+            "    return head + rest;",
+            Lang::JavaScript,
+            MutationClass::ArgShift,
+        );
+        assert!(m.contains(&"    return rest + head;".to_string()), "{m:?}");
+        // Mixed operators: precedence would change, so no swap.
+        let m = muts("x = a + b * c", Lang::Python, MutationClass::ArgShift);
+        assert!(!m.iter().any(|l| l.starts_with("x = b")), "{m:?}");
+    }
+
+    #[test]
     fn api_swap_flips_paired_calls_and_loop_control() {
         let m = muts(
             "    let fan_out = self.fan_out.min(self.nodes.len()).max(1);",
@@ -2855,10 +3174,13 @@ mod tests {
             .iter()
             .position(|c| (10..=12).contains(&c.line))
             .unwrap_or(p.len());
-        // (Identifier swaps off the blamed line deliberately come last.)
+        // (Identifier swaps and arg-shifts off the blamed line deliberately come last.)
         let last_focus = p
             .iter()
-            .rposition(|c| (1..=8).contains(&c.line) && c.class != MutationClass::IdentSwap)
+            .rposition(|c| {
+                (1..=8).contains(&c.line)
+                    && !matches!(c.class, MutationClass::IdentSwap | MutationClass::ArgShift)
+            })
             .unwrap();
         assert!(
             last_focus < first_unrelated,
