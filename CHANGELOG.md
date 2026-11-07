@@ -21,6 +21,13 @@ violations ([write-up](bench/results/QUIXBUGS-2026-11-07.md)).
   `fault_locate::targets_from_command` falls back to the files the verify
   command names (pytest node ids reduced to paths). When the localizer follows
   a test's imports, helpers beside the test now rank after the code under test.
+- **A timed-out verifier was not fully killed.** Only the direct child was
+  killed, so a subprocess holding its pipes still blocked the read, and
+  Poly-JIT's timeout left its verifier running. 15 orphaned QuixBugs
+  verifiers were found hours later. Verifiers now run in their own process
+  group, which is `SIGKILL`ed on timeout, with a bounded 2 s drain
+  (`proc_bound`, shared by the supervisor, `run_verify_capture` and
+  Poly-JIT).
 - **Mutation repair could go green by editing a test.** Seen as a swapped name
   in a QuixBugs test's graph setup. Phase 2.1 now never edits a test file.
 - `scripts/bench_repair.sh` bounds its own baseline and post-solve verify runs
