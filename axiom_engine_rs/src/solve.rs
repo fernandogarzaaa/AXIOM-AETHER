@@ -658,64 +658,20 @@ pub fn run_verify_capture(
     args: &[String],
     working_dir: Option<&Path>,
 ) -> (bool, String) {
-    use std::io::Read;
-    use std::process::Stdio;
-    use std::time::Instant;
-
     let mut cmd = std::process::Command::new(command);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args);
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return (false, format!("failed to spawn verify command: {e}")),
-    };
-
-    // Drain both pipes concurrently to avoid a full-buffer deadlock.
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let out_h = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(ref mut o) = stdout {
-            let _ = o.read_to_string(&mut s);
+    // Bounded, and the verifier's whole process group is killed on timeout,
+    // so a runaway test (or a subprocess it started) cannot hang the loop.
+    match crate::proc_bound::output_bounded(&mut cmd, Some(verify_timeout())) {
+        Ok(out) => {
+            let mut trace = String::from_utf8_lossy(&out.stdout).into_owned();
+            trace.push_str(&String::from_utf8_lossy(&out.stderr));
+            (out.status.success(), bound_trace(&trace))
         }
-        s
-    });
-    let err_h = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(ref mut e) = stderr {
-            let _ = e.read_to_string(&mut s);
-        }
-        s
-    });
-
-    let deadline = Instant::now() + verify_timeout();
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
-                    break None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => break None,
-        }
-    };
-
-    let mut trace = out_h.join().unwrap_or_default();
-    trace.push_str(&err_h.join().unwrap_or_default());
-    let trace = bound_trace(&trace);
-
-    match status {
-        Some(st) => (st.success(), trace),
-        None if timed_out => (false, format!("{trace}\n[verify timed out]")),
-        None => (false, trace),
+        Err(e) => (false, format!("failed to spawn verify command: {e}")),
     }
 }
 
