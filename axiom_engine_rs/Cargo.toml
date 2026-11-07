@@ -186,7 +186,7 @@ crossterm = "0.28"
 # (`cargo install`, the pip wheel, Docker, release binaries) carry no
 # dependency on an external model. Enable with `--features fuzzy-embed`.
 # See docs/EXPERIMENTAL.md.
-model2vec-rs = { version = "0.3", optional = true }
+model2vec-rs = { version = "0.4", optional = true }
 anyhow = { version = "1", optional = true }
 # GPU-first fuzzy-dedup backend (src/gpu_embed.rs): a larger, pretrained
 # contextual encoder (BAAI/bge-base-en-v1.5) used purely as a similarity

@@ -193,7 +193,7 @@ dependencies = [
  "indicatif 0.17.11",
  "libc",
  "model2vec-rs",
- "ndarray 0.17.2",
+ "ndarray",
  "proptest",
  "rand 0.9.4",
  "ratatui",
@@ -223,7 +223,7 @@ dependencies = [
 name = "axiom_mesh_core"
 version = "0.2.0"
 dependencies = [
- "ndarray 0.17.2",
+ "ndarray",
  "rand 0.9.4",
  "serde",
  "thiserror 2.0.18",
@@ -2600,18 +2600,19 @@ dependencies = [
 
 [[package]]
 name = "model2vec-rs"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ca11a52a52721b3305bd03ee42d66d8026f54f00235b81746662f2b25a743f1"
+checksum = "51020c65a18a206a4158aa354db49de672da7b1feab5b8213896bd54d03acb17"
 dependencies = [
  "anyhow",
  "half",
  "hf-hub",
- "ndarray 0.15.6",
  "safetensors 0.5.3",
  "serde",
  "serde_json",
  "tokenizers 0.21.4",
+ "unicode-normalization",
+ "unicode_categories",
  "ureq",
 ]
 
@@ -2652,19 +2653,6 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "tempfile",
-]
-
-[[package]]
-name = "ndarray"
-version = "0.15.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb12d4e967ec485a5f71c6311fe28158e9d6f4bc4a447b474184d0f91a8fa32"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "rawpointer",
 ]
 
 [[package]]
@@ -5058,6 +5046,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-normalization-alignments"
