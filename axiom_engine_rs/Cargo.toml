@@ -144,7 +144,7 @@ required-features = ["live-eval"]
 
 [dependencies]
 candle-core = "0.10.2"
-candle-nn = "0.10.2"
+candle-nn = "0.11.1"
 tokio = { version = "1.35", features = ["full"] }
 sha2 = "0.10.8"
 rand = "0.9"
