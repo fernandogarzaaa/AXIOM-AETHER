@@ -5,9 +5,40 @@ releases are described on the GitHub Releases page.
 
 ## [Unreleased]
 
-Developer bugs: on QuixBugs (40 Python programs with one human-written bug
-each) the deterministic engine repairs **9/40, all correct**, with 0 rollback
-violations ([write-up](bench/results/QUIXBUGS-2026-11-07.md)).
+## [0.7.0] - 2026-11-08
+
+Headline: the deterministic repair engine (no LLM) now repairs **39/40**
+seeded faults on the original held-out corpus and **38/40** on a fresh one,
+up from 19/40 and 20/40 in 0.6.0. Against a strengthened test suite, 33/40 and
+32/40 are verified correct (0.6.0: 16/40). On **real developer bugs**
+(QuixBugs, 40 Python programs) it repairs **9/40 held out, all correct**
+(14/40 in-sample after operators chosen from its failures). `axiom solve` no
+longer hangs, aborts or leaks processes on a test that loops forever, and
+never repairs by editing a test file.
+
+**Crate versions:** `axiom_engine` 0.7.0 depends on `axiom_mesh_core`
+**0.3.0** (public API moved to `rand` 0.10). **Minimum Rust:** `axiom_engine`
+1.94 (was 1.90, set by `candle` 0.11); `axiom_mesh_core` stays at 1.90.
+
+### Removed
+
+Removed as announced in 0.6.0:
+
+- `crate::hamiltonian` and `crate::q_manifold`. Use `crate::patch_ranker`
+  and `crate::branch_weights`.
+- The `/v1/hypervisor/quantum_coherent_state` route; it now returns 404. Use
+  `/v1/hypervisor/patch_ranker_state`. The `quantum` JSON key in
+  `/v1/hypervisor/jit_status` is unchanged.
+- `crate::sandbox`, the `SandboxController` / `SandboxDiagnostic` /
+  `SandboxRunReport` / `SandboxError` type aliases, and the
+  `AXIOM_SANDBOX_*` environment names, which are now ignored. Use
+  `crate::compile_verify` and `AXIOM_COMPILE_VERIFY*`.
+
+### Developer bugs (QuixBugs)
+
+On QuixBugs (40 Python programs with one human-written bug each) the
+deterministic engine repairs **9/40, all correct**, with 0 rollback violations
+([write-up](bench/results/QUIXBUGS-2026-11-07.md)).
 
 ### Dependencies
 
@@ -65,7 +96,9 @@ violations ([write-up](bench/results/QUIXBUGS-2026-11-07.md)).
 - `scripts/bench_repair.sh` bounds its own baseline and post-solve verify runs
   (`AXIOM_BENCH_VERIFY_TIMEOUT_SECS`, default 300).
 
-Headline: held-out seeded-fault repair goes from 19/40 to **39/40** on the
+### Held-out seeded faults
+
+Held-out seeded-fault repair goes from 19/40 to **39/40** on the
 original corpus and from 20/40 to **38/40** on a fresh seed (15/17 on its
 faults outside the tuning set), with 0 rollback violations; 33/40 and 32/40
 are verified correct against a strengthened test suite (0.6.0: 16/40)

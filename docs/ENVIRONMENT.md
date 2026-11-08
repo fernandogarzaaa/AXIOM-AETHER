@@ -90,7 +90,7 @@ unset. When you add a variable, add it here.
 | `AXIOM_JSON_DIGEST_FIXTURES` | unset | Test-only: directory of `*.json` tool results for the `json_digest` measurement helper (`cargo test --lib -- --ignored --nocapture print_measurement_table`). |
 | `AXIOM_REPAIR_MAX_CANDIDATES` | `64` | Cap on deterministic mutation-repair candidates per blamed file in `axiom solve` (one verifier run each; `mutation_repair.rs`). |
 | `AXIOM_EVAL_REQUIRE_ALL` | unset | `1`/`true`: `axiom eval-agentic` fails if any fixture was skipped for a missing toolchain (same as `--require-all`). |
-| `AXIOM_COMPILE_VERIFY_ROOT` / `AXIOM_COMPILE_VERIFY_MAX_STEPS` / `AXIOM_COMPILE_VERIFY` / `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS` | see `compile_verify.rs` | Staging-directory controls for the `cargo check` compile verifier (`AXIOM_COMPILE_VERIFY=0\|false\|off` disables it; **not** an OS sandbox, see `docs/SECURITY-AUDIT.md` §3). **Deprecated aliases:** `AXIOM_SANDBOX_ROOT` / `AXIOM_SANDBOX_MAX_STEPS` / `AXIOM_SANDBOX_VERIFY` / `AXIOM_SANDBOX_TIMEOUT_SECS` are still accepted for one release (the new name wins when both are set; using only an old name prints one stderr warning per process). |
+| `AXIOM_COMPILE_VERIFY_ROOT` / `AXIOM_COMPILE_VERIFY_MAX_STEPS` / `AXIOM_COMPILE_VERIFY` / `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS` | see `compile_verify.rs` | Staging-directory controls for the `cargo check` compile verifier (`AXIOM_COMPILE_VERIFY=0\|false\|off` disables it; **not** an OS sandbox, see `docs/SECURITY-AUDIT.md` §3). The old `AXIOM_SANDBOX_*` names (deprecated in 0.6.0) were removed in 0.7.0 and are now ignored. |
 | `AXIOM_EPISTEMIC_*` | see `docs/EPISTEMIC_DRIFT.md` | Epistemic validation thresholds. |
 
 ## Fleet / swarm (experimental)

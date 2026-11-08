@@ -117,11 +117,6 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/hypervisor/patch_ranker_state",
             get(hypervisor_patch_ranker_state),
         )
-        // Deprecated alias (one release): same telemetry, legacy `quantum` key.
-        .route(
-            "/v1/hypervisor/quantum_coherent_state",
-            get(hypervisor_quantum_coherent_state_legacy),
-        )
         .route("/v1/swarm/matrix_state", get(swarm_matrix_state))
         .route("/v1/expand", post(expand_symbol_handler))
         .route(

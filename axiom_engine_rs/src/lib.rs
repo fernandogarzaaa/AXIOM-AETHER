@@ -112,30 +112,3 @@ pub mod verify_suggest;
 pub mod vfs;
 pub mod vibe_memory;
 pub mod weight_merge;
-
-/// Deprecated name for [`patch_ranker`]; kept for one release.
-#[deprecated(
-    since = "0.6.0",
-    note = "renamed to `patch_ranker`; it scores candidate patches, there is no Hamiltonian"
-)]
-pub mod hamiltonian {
-    pub use crate::patch_ranker::*;
-}
-
-/// Deprecated name for [`branch_weights`]; kept for one release.
-#[deprecated(
-    since = "0.6.0",
-    note = "renamed to `branch_weights`; it is a probability over candidates, not a quantum manifold"
-)]
-pub mod q_manifold {
-    pub use crate::branch_weights::*;
-}
-
-/// Deprecated name for [`compile_verify`]; kept for one release.
-#[deprecated(
-    since = "0.6.0",
-    note = "renamed to `compile_verify`; it is a cargo-check verifier, not a sandbox"
-)]
-pub mod sandbox {
-    pub use crate::compile_verify::*;
-}
