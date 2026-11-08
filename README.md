@@ -80,11 +80,11 @@ regenerates them on every push and fails if the repair gate regresses.
 
 | Metric | Value | Config | Measured |
 |---|---|---|---|
-| **Autonomous repair** — `axiom eval-agentic` | 32/32 = 100% | 14 localization fixtures + 18 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, ~15 s | 2026-11-06 |
+| **Autonomous repair** — `axiom eval-agentic` | 32/32 = 100% | 14 localization fixtures + 18 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, ~15 s | 2026-11-08 |
 | **Autonomous repair, held-out** — `scripts/bench_repair.sh` | 38/40 = 95% on a fresh seed (15/17 on faults outside the tuning set; 0.6.0: 20/40, 6/17); 39/40 on the tuning seed; 32/40 and 33/40 verified correct against a strengthened suite (0.6.0: 16/40); 0 rollback violations | random single-token faults seeded into `axiom_mesh_core`, which the engine was never shown; no LLM ([write-up](bench/results/SEEDED-HELDOUT-v2-2026-11-06.md)) | 2026-11-06 |
 | **Autonomous repair, developer bugs** — QuixBugs via `scripts/bench_repair.sh` | 9/40 = 22.5% held out, all 9 verified correct against the reference fixes (14/40 in-sample after three operator families chosen from its failures); 0 rollback violations, 0 test edits | 40 Python programs with one human-written bug each (QuixBugs @ 4257f44); no operator tuned on them; no LLM ([write-up](bench/results/QUIXBUGS-2026-11-07.md)) | 2026-11-07 |
 | **Compression** — `axiom bench axiom_engine_rs/src` | 86.7% savings, 2229/2229 = 100% round-trip | `AXIOM_PRODUCTION_BPE=1` | 2026-08-09 |
-| **Compression** — same, legacy tokenizer | 82.4% savings, 2181/2181 = 100% round-trip | `AXIOM_PRODUCTION_BPE=0` | 2026-08-09 |
+| **Compression** — same, legacy tokenizer | 84.5% savings, 3085/3085 = 100% round-trip | `AXIOM_PRODUCTION_BPE=0` | 2026-11-08 |
 | **Cost, real traffic** — `/metrics` delta | 65.1% / 41.4% quota savings | two live Claude Code sessions | 2026-07-17 |
 | **Trust gate** — `axiombench` | 100% supported coverage; contradiction catch-rate 10% → 100% (τ=0.75) | 240 calibration claims | AxiomBench |
 
@@ -377,7 +377,7 @@ POST   /v1/hypervisor/jit_run               # VFS hypervisor — also needs AXIO
 GET    /v1/hypervisor/jit_status            # VFS hypervisor
 POST   /v1/hypervisor/list                  # VFS hypervisor
 POST   /v1/hypervisor/stat                  # VFS hypervisor
-GET    /v1/hypervisor/patch_ranker_state   # patch-ranker telemetry (deprecated alias: /v1/hypervisor/quantum_coherent_state)
+GET    /v1/hypervisor/patch_ranker_state   # patch-ranker telemetry (the old /v1/hypervisor/quantum_coherent_state alias was removed in 0.7.0)
 ```
 
 This list is maintained by hand against the `.route(...)` registrations in
@@ -771,8 +771,8 @@ the map a new contributor needs; the longer version with evidence is in
 | PSS | Prolonged-Session Stack: the five levers for 100+ turn sessions | `prefix_diet.rs`, `tool_defer.rs`, `cache_stack.rs`, `keepalive.rs`, `local_trivial.rs` |
 | Graph memory | Directed, weighted edges between memory records; recall seeds a bounded spreading activation from its direct hits and appends graph-only neighbours after them | `graph_memory.rs`, `memory_recall.rs` |
 | Hypervisor | The Poly JIT + Neural VFS surface (`/v1/hypervisor/*`). **Not** a real hypervisor: no VM or OS isolation. The name is kept for API stability. | `server/routes_hypervisor.rs`, `vfs.rs`, `poly_jit.rs` |
-| Compile verifier (formerly "sandbox") | A `cargo check`-only verifier run in an isolated temp directory. **Not** a process or OS security boundary: no seccomp, no container, only a wall-clock timeout. | `compile_verify.rs` (`AXIOM_COMPILE_VERIFY*`; the `AXIOM_SANDBOX_*` names are deprecated aliases) |
-| Patch ranker / branch weights (formerly "Q-TTT", `hamiltonian.rs`, `q_manifold.rs`) | Scores Poly-JIT repair candidates with cheap deterministic signals and picks one via an exponential reweighting over candidates. Classical, CPU-only; the old physics vocabulary described exactly this arithmetic. Old module paths remain as deprecated aliases for one release; JSON keys (`quantum`) are unchanged. | `patch_ranker.rs`, `branch_weights.rs` |
+| Compile verifier (formerly "sandbox") | A `cargo check`-only verifier run in an isolated temp directory. **Not** a process or OS security boundary: no seccomp, no container, only a wall-clock timeout. | `compile_verify.rs` (`AXIOM_COMPILE_VERIFY*`; the old `AXIOM_SANDBOX_*` names were removed in 0.7.0) |
+| Patch ranker / branch weights (formerly "Q-TTT", `hamiltonian.rs`, `q_manifold.rs`) | Scores Poly-JIT repair candidates with cheap deterministic signals and picks one via an exponential reweighting over candidates. Classical, CPU-only; the old physics vocabulary described exactly this arithmetic. The old module paths were removed in 0.7.0; the `quantum` JSON key in `/v1/hypervisor/jit_status` is unchanged. | `patch_ranker.rs`, `branch_weights.rs` |
 | Axiom Mesh (`axiom_mesh_rs`) | A standalone multi-agent orchestration research workspace; only `axiom_mesh_core` is a dependency of the engine | `axiom_mesh_rs/`, `axiom_mesh_core/` |
 | ChimeraLang | A cognition-language DSL, compiled only with `--features experimental` | `chimera.rs` |
 

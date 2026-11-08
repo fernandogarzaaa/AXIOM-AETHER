@@ -13,15 +13,12 @@
 //! `tokio::process::Command`, captures diagnostics, and lets the server feed
 //! those diagnostics back into Axiom's TTT feedback path.
 //!
-//! Environment variables (canonical names; the `AXIOM_SANDBOX_*` equivalents
-//! are deprecated aliases and the new name wins when both are set):
+//! Environment variables (the `AXIOM_SANDBOX_*` aliases were removed in 0.7.0):
 //! `AXIOM_COMPILE_VERIFY`, `AXIOM_COMPILE_VERIFY_ROOT`,
 //! `AXIOM_COMPILE_VERIFY_MAX_STEPS`, `AXIOM_COMPILE_VERIFY_TIMEOUT_SECS`.
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -93,18 +90,9 @@ impl std::fmt::Display for CompileVerifyError {
 
 impl std::error::Error for CompileVerifyError {}
 
-#[deprecated(since = "0.6.0", note = "renamed to `CompileVerifier`")]
-pub type SandboxController = CompileVerifier;
-#[deprecated(since = "0.6.0", note = "renamed to `CompileDiagnostic`")]
-pub type SandboxDiagnostic = CompileDiagnostic;
-#[deprecated(since = "0.6.0", note = "renamed to `CompileRunReport`")]
-pub type SandboxRunReport = CompileRunReport;
-#[deprecated(since = "0.6.0", note = "renamed to `CompileVerifyError`")]
-pub type SandboxError = CompileVerifyError;
-
 impl CompileVerifier {
     pub fn from_env() -> Option<Self> {
-        let verify = env_with_alias("AXIOM_COMPILE_VERIFY", "AXIOM_SANDBOX_VERIFY");
+        let verify = std::env::var("AXIOM_COMPILE_VERIFY").ok();
         if verify
             .as_deref()
             .map(|v| matches!(v, "0" | "false" | "FALSE" | "off" | "OFF"))
@@ -112,21 +100,21 @@ impl CompileVerifier {
         {
             return None;
         }
-        let root = env_with_alias("AXIOM_COMPILE_VERIFY_ROOT", "AXIOM_SANDBOX_ROOT")
+        let root = std::env::var("AXIOM_COMPILE_VERIFY_ROOT")
+            .ok()
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("axiom-compile-verify"));
-        let max_steps = env_with_alias("AXIOM_COMPILE_VERIFY_MAX_STEPS", "AXIOM_SANDBOX_MAX_STEPS")
+        let max_steps = std::env::var("AXIOM_COMPILE_VERIFY_MAX_STEPS")
+            .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_OPTIMIZATION_STEPS)
             .min(DEFAULT_MAX_OPTIMIZATION_STEPS);
-        let timeout_secs = env_with_alias(
-            "AXIOM_COMPILE_VERIFY_TIMEOUT_SECS",
-            "AXIOM_SANDBOX_TIMEOUT_SECS",
-        )
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = std::env::var("AXIOM_COMPILE_VERIFY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
         Some(Self::new(
             root,
             max_steps,
@@ -257,43 +245,6 @@ impl CompileVerifier {
     }
 }
 
-/// Pure resolver for a canonical env var with a deprecated alias. The new name
-/// wins when both are set; the flag is true only when the deprecated value is
-/// the one actually used.
-fn resolve_env(new: Option<&str>, old: Option<&str>) -> (Option<String>, bool) {
-    match (new, old) {
-        (Some(n), _) => (Some(n.to_string()), false),
-        (None, Some(o)) => (Some(o.to_string()), true),
-        (None, None) => (None, false),
-    }
-}
-
-/// Read `new_name`, falling back to the deprecated `old_name`. Warns once per
-/// process per deprecated name actually used.
-fn env_with_alias(new_name: &str, old_name: &'static str) -> Option<String> {
-    let new = std::env::var(new_name).ok();
-    let old = std::env::var(old_name).ok();
-    let (value, used_deprecated) = resolve_env(new.as_deref(), old.as_deref());
-    if used_deprecated {
-        warn_deprecated_once(new_name, old_name);
-    }
-    value
-}
-
-fn warn_deprecated_once(new_name: &str, old_name: &'static str) {
-    static WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
-    let first = warned
-        .lock()
-        .map(|mut set| set.insert(old_name))
-        .unwrap_or(false);
-    if first {
-        eprintln!(
-            "[compile-verify] WARN: {old_name} is deprecated; use {new_name} (the alias will be removed in a future release)"
-        );
-    }
-}
-
 enum CheckOutcome {
     Pass,
     Fail(CompileDiagnostic),
@@ -388,24 +339,5 @@ mod tests {
         assert_eq!(report.attempts, 1);
         assert_eq!(seen.len(), 1);
         assert!(seen[0].stderr.contains("error") || seen[0].stdout.contains("\"reason\""));
-    }
-
-    #[test]
-    fn resolve_env_new_wins_over_old() {
-        assert_eq!(
-            resolve_env(Some("a"), Some("b")),
-            (Some("a".to_string()), false)
-        );
-        assert_eq!(resolve_env(Some("a"), None), (Some("a".to_string()), false));
-    }
-
-    #[test]
-    fn resolve_env_old_only_flags_deprecated() {
-        assert_eq!(resolve_env(None, Some("b")), (Some("b".to_string()), true));
-    }
-
-    #[test]
-    fn resolve_env_neither_is_none() {
-        assert_eq!(resolve_env(None, None), (None, false));
     }
 }

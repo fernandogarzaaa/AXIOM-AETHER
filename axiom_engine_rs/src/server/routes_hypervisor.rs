@@ -285,17 +285,6 @@ async fn hypervisor_patch_ranker_state(
     })
 }
 
-/// `GET /v1/hypervisor/quantum_coherent_state` — **deprecated** alias of
-/// `/v1/hypervisor/patch_ranker_state`, kept for one release with its original
-/// `{"quantum": …}` body so existing clients do not break.
-async fn hypervisor_quantum_coherent_state_legacy(
-    State(state): State<AppState>,
-) -> Json<HypervisorLegacyQuantumStateResponse> {
-    Json(HypervisorLegacyQuantumStateResponse {
-        quantum: state.poly_jit.ranker_status(),
-    })
-}
-
 /// `GET /v1/swarm/matrix_state` — report localized model/DWE/SR-TTT state.
 async fn swarm_matrix_state(State(state): State<AppState>) -> Json<SwarmMatrixStateResponse> {
     let dwe = state.dwe_bus.telemetry();

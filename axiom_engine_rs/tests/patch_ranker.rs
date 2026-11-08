@@ -64,8 +64,8 @@ async fn patch_ranker_state_endpoint_reports_default_inactive_state() {
 }
 
 #[tokio::test]
-async fn legacy_quantum_coherent_state_route_still_serves_the_old_shape() {
-    // Deprecated alias: same telemetry, historical `quantum` key, one release.
+async fn legacy_quantum_coherent_state_route_is_removed() {
+    // Deprecated in 0.6.0, removed in 0.7.0 as announced: use patch_ranker_state.
     let state = test_state().await;
     let app = create_router(state);
     let req = Request::builder()
@@ -74,11 +74,7 @@ async fn legacy_quantum_coherent_state_route_still_serves_the_old_shape() {
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(response["quantum"]["total_optimizations"], 0);
-    assert_eq!(response["quantum"]["last_state"]["active"], false);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

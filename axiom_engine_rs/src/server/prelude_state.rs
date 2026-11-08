@@ -1613,12 +1613,6 @@ struct HypervisorRankerStateResponse {
     ranker: PatchRankerStatus,
 }
 
-/// Legacy shape of `/v1/hypervisor/quantum_coherent_state` (deprecated route).
-#[derive(Debug, Serialize)]
-struct HypervisorLegacyQuantumStateResponse {
-    quantum: PatchRankerStatus,
-}
-
 #[derive(Debug, Serialize)]
 struct SwarmMatrixStateResponse {
     matrix: SwarmMatrixState,
