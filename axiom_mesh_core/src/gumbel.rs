@@ -11,7 +11,7 @@
 //! for telemetry and for future gradient-based topology learning.
 
 use ndarray::Array1;
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 /// Numerically-stable softmax over a 1-D logit vector.
 pub fn softmax(logits: &Array1<f32>) -> Array1<f32> {

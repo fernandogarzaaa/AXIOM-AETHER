@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use crate::mesh_core::mesh::{KineticNeuralMesh, MeshConfig};
 use crate::mesh_core::node::{NodeId, NodeKind, WorkerNode};
 use ndarray::Array1;
-use rand::{rngs::StdRng, SeedableRng};
+use rand::rngs::StdRng;
 
 /// Constant payload/dim: see the module docs on why there's no real
 /// per-request embedding here.
@@ -82,7 +82,7 @@ impl MeshModelSelector {
         }
         Self {
             mesh: Mutex::new(mesh),
-            rng: Mutex::new(StdRng::from_os_rng()),
+            rng: Mutex::new(rand::make_rng::<StdRng>()),
             nodes,
         }
     }

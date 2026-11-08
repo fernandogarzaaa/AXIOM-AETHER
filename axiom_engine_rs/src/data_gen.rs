@@ -1,5 +1,5 @@
 use candle_core::{Device, Result, Tensor};
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::config::DEFAULT_EOS_TOKEN;
 
