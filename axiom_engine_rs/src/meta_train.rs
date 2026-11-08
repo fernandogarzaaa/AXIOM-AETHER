@@ -235,7 +235,7 @@ impl RepoFileDataset {
     }
 
     fn rng_u64(&mut self) -> u64 {
-        use rand::RngCore;
+        use rand::Rng;
         self.rng.next_u64()
     }
 }

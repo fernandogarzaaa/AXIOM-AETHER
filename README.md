@@ -231,7 +231,7 @@ iwr https://raw.githubusercontent.com/fernandogarzaaa/AXIOM-AETHER/main/scripts/
 
 ### Build from source
 
-Needs Rust ≥ 1.90 and a C toolchain (`cc` is required to link; on
+Needs Rust ≥ 1.94 (`axiom_mesh_core` alone: ≥ 1.90) and a C toolchain (`cc` is required to link; on
 Debian/Ubuntu: `sudo apt-get install -y build-essential pkg-config libssl-dev`).
 The release build compiles ~400 crates (candle, tokenizers, axum, tree-sitter);
 expect several minutes on a fast machine. On small boxes (≤ 8 GB RAM) build with

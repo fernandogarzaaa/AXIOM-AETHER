@@ -11,7 +11,7 @@
 //! for telemetry and for future gradient-based topology learning.
 
 use ndarray::Array1;
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 /// Numerically-stable softmax over a 1-D logit vector.
 pub fn softmax(logits: &Array1<f32>) -> Array1<f32> {
@@ -25,7 +25,7 @@ pub fn softmax(logits: &Array1<f32>) -> Array1<f32> {
 fn sample_gumbel(n: usize, rng: &mut impl Rng) -> Array1<f32> {
     Array1::from_iter((0..n).map(|_| {
         // Clamp away from 0 and 1 so both logs stay finite.
-        let u: f32 = rng.gen_range(1e-7..1.0 - 1e-7);
+        let u: f32 = rng.random_range(1e-7..1.0 - 1e-7);
         -(-u.ln()).ln()
     }))
 }
