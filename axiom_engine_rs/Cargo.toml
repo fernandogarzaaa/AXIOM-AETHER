@@ -156,8 +156,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1"
-tokenizers = "0.22"
-scraper = "0.27"
+tokenizers = "0.23"
+scraper = "0.29"
 tree-sitter = "0.26.9"
 tree-sitter-rust = "0.24.2"
 urlencoding = "2.1"
@@ -186,7 +186,7 @@ crossterm = "0.28"
 # (`cargo install`, the pip wheel, Docker, release binaries) carry no
 # dependency on an external model. Enable with `--features fuzzy-embed`.
 # See docs/EXPERIMENTAL.md.
-model2vec-rs = { version = "0.3", optional = true }
+model2vec-rs = { version = "0.4", optional = true }
 anyhow = { version = "1", optional = true }
 # GPU-first fuzzy-dedup backend (src/gpu_embed.rs): a larger, pretrained
 # contextual encoder (BAAI/bge-base-en-v1.5) used purely as a similarity
