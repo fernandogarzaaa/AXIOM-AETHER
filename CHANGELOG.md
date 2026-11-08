@@ -18,6 +18,10 @@ violations ([write-up](bench/results/QUIXBUGS-2026-11-07.md)).
 - **`axiom_mesh_core` 0.2.0 → 0.3.0.** Its public routing functions take
   `&mut impl rand::Rng`, which is a different trait in `rand` 0.10, so
   callers must use `rand` 0.10 as well.
+- **Minimum Rust version for `axiom_engine`: 1.90 → 1.94.** `candle-core`
+  0.11 does not compile on 1.93 or older: its `__cpuid_count` call outside
+  `unsafe` is rejected there, and 1.94 is the first release that builds it.
+  `axiom_mesh_core` still builds on 1.90 and keeps that minimum.
 - `candle-core` / `candle-nn` / `candle-transformers` 0.10 → 0.11, moved
   together. Moving `candle-nn` alone left two `candle-core` versions in the
   graph. `safetensors` 0.7 → 0.8 to match `candle-core` 0.11, which also drops

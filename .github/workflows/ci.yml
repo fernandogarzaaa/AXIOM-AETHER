@@ -233,11 +233,12 @@ jobs:
 
   # Verify the crate builds and its unit tests pass on the Minimum Supported
   # Rust Version declared in axiom_engine_rs/Cargo.toml (rust-version =
-  # "1.90"). Pins the exact toolchain (not stable) and uses --locked so the
-  # committed lockfile is proven MSRV-compatible. Scoped to the engine crate,
-  # which is the only workspace that declares a rust-version.
+  # "1.94", set by candle-core 0.11, which does not compile on 1.93 or older).
+  # Pins the exact toolchain (not stable) and uses --locked so the committed
+  # lockfile is proven MSRV-compatible. Scoped to the engine crate;
+  # axiom_mesh_core declares its own, lower rust-version (1.90).
   msrv:
-    name: MSRV (Rust 1.90)
+    name: MSRV (Rust 1.94)
     # The protocol gate is cheap and its failure invalidates everything below.
     needs: protocol
     runs-on: ubuntu-22.04
@@ -247,10 +248,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.90 toolchain
+      - name: Install Rust 1.94 toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.90
+          toolchain: 1.94
 
       - name: Cache Cargo (MSRV)
         uses: actions/cache@v6
@@ -261,8 +262,8 @@ jobs:
             axiom_engine_rs/target
           # Separate key from the stable-toolchain jobs: a shared target dir
           # across toolchains would cause needless rebuilds at best.
-          key: ci-msrv-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
-          restore-keys: ci-msrv-${{ runner.os }}-
+          key: ci-msrv-1.94-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+          restore-keys: ci-msrv-1.94-${{ runner.os }}-
 
       - name: Install Linux build dependencies
         run: |

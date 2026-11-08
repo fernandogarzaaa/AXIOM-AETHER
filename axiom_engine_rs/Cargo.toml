@@ -2,7 +2,7 @@
 name = "axiom_engine"
 version = "0.6.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.94"
 description = "Axiom-TTT Inference Engine â€“ Rust implementation using candle"
 license = "MIT"
 repository = "https://github.com/fernandogarzaaa/AXIOM-AETHER"
