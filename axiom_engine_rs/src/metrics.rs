@@ -8,11 +8,16 @@ pub static GAUGE_ACTIVE_SESSIONS: AtomicU64 = AtomicU64::new(0);
 pub static GAUGE_QUANTIZED_SESSIONS: AtomicU64 = AtomicU64::new(0);
 pub static HISTOGRAM_PREFILL_LATENCY: LazyLock<Mutex<Histogram>> =
     LazyLock::new(|| Mutex::new(Histogram::new(&HISTOGRAM_BUCKETS)));
+/// First-token latency buckets. The prefill buckets top out at 1.0 s, but
+/// a local Ollama first token often takes several seconds (cold model
+/// load), so reusing them would collapse every observation into `+Inf`
+/// and leave p50/p95 unanswerable.
+const FIRST_TOKEN_BUCKETS: [f64; 10] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0];
 /// Time from dispatching a streamed local (Ollama) request to the first
 /// token arriving. Phase 3 item 1's only metrics addition; item 5 owns the
 /// rest of the observability surface.
 pub static HISTOGRAM_FIRST_TOKEN_LATENCY: LazyLock<Mutex<Histogram>> =
-    LazyLock::new(|| Mutex::new(Histogram::new(&HISTOGRAM_BUCKETS)));
+    LazyLock::new(|| Mutex::new(Histogram::new(&FIRST_TOKEN_BUCKETS)));
 
 const HISTOGRAM_BUCKETS: [f64; 9] = [0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0];
 
@@ -173,7 +178,7 @@ pub fn render_metrics() -> String {
         .lock()
         .map(|guard| guard.snapshot())
         .unwrap_or(HistogramSnapshot {
-            buckets: HISTOGRAM_BUCKETS
+            buckets: FIRST_TOKEN_BUCKETS
                 .iter()
                 .copied()
                 .map(|bucket| (bucket, 0))
@@ -344,6 +349,34 @@ mod tests {
         assert!(
             count >= 1,
             "at least one first-token observation must be recorded"
+        );
+    }
+
+    #[test]
+    fn test_first_token_buckets_resolve_multi_second_latency() {
+        // A 3 s first token must land in the 5 s bucket but not the
+        // 2.5 s bucket: with the old prefill buckets (max finite 1.0 s)
+        // it collapsed into +Inf and p50/p95 were unanswerable. The
+        // histogram is process-global, so compare the two buckets
+        // instead of asserting absolute counts: any other observation
+        // increments both buckets or neither, never only the 2.5 s one.
+        // Bucket labels render via `{}` on f64, so 5.0 prints as "5".
+        observe_first_token_latency(3.0);
+        let rendered = render_metrics();
+        let bucket_count = |le: &str| -> u64 {
+            rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with("axiom_first_token_latency_seconds_bucket")
+                        && line.contains(&format!("le=\"{le}\""))
+                })
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|value| value.parse().ok())
+                .expect("first-token bucket line must be rendered")
+        };
+        assert!(
+            bucket_count("5") > bucket_count("2.5"),
+            "a 3 s observation must resolve between the 2.5 s and 5 s buckets"
         );
     }
 

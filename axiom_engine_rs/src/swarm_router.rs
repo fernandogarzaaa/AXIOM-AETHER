@@ -192,12 +192,18 @@ impl SwarmRouter {
         let stream_model = model.clone();
         tokio::spawn(async move {
             let started = Instant::now();
-            let completed =
+            let outcome =
                 run_stream_dispatch(&client, &base_url, &stream_model, num_ctx, messages, tx).await;
-            if let Some(selector) = &mesh_selector {
+            // A cancellation says nothing about the model: the client
+            // went away, so recording it as a failure would train the
+            // selector away from healthy models. Completed and Failed
+            // both feed the selector unchanged.
+            if let (Some(selector), false) =
+                (&mesh_selector, matches!(outcome, StreamOutcome::Cancelled))
+            {
                 selector.record_outcome(
                     &stream_model,
-                    completed,
+                    matches!(outcome, StreamOutcome::Completed),
                     started.elapsed().as_millis() as u64,
                 );
             }
@@ -287,19 +293,32 @@ impl SwarmRouter {
     }
 }
 
+/// Outcome of one streamed dispatch, for mesh-selector learning.
+/// `Completed` and `Failed` feed `record_outcome`; `Cancelled` must not:
+/// a client disconnect (dropped receiver, failed send, or `tx.closed()`
+/// winning the race) says nothing about the model, and recording it as a
+/// failure would train the selector away from healthy models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 /// Producer half of [`SwarmStream`]: streams one Ollama `/api/chat`
 /// response, sending each content delta through the bounded channel as it
-/// arrives. Returns `true` only when the upstream stream ended with a
-/// `done` line. The channel is the backpressure mechanism: `send` blocks
+/// arrives. Returns [`StreamOutcome::Completed`] only when the upstream
+/// stream ended with a `done` line. The channel is the backpressure mechanism: `send` blocks
 /// while it is full, so a slow consumer stalls this task instead of letting
 /// it accumulate the whole generation. A dropped receiver (client
-/// disconnect) makes `send` fail, and this task then returns, dropping the
-/// response and aborting the upstream request. The disconnect is also
-/// observed while waiting for upstream data: the dispatch and every body
-/// read race against `tx.closed()`, so an abandoned request does not keep
-/// consuming inference resources for up to the request timeout. A stream
-/// that ends without a `done` line is an upstream error, not a clean stop:
-/// the SSE layer must not bless a truncated answer with `[DONE]`.
+/// disconnect) makes `send` fail, and this task then returns
+/// [`StreamOutcome::Cancelled`], dropping the response and aborting the
+/// upstream request. The disconnect is also observed while waiting for
+/// upstream data: the dispatch and every body read race against
+/// `tx.closed()`, so an abandoned request does not keep consuming
+/// inference resources for up to the request timeout. A stream that ends
+/// without a `done` line is an upstream error, not a clean stop: the SSE
+/// layer must not bless a truncated answer with `[DONE]`.
 async fn run_stream_dispatch(
     client: &Client,
     base_url: &str,
@@ -307,7 +326,7 @@ async fn run_stream_dispatch(
     num_ctx: u64,
     messages: Vec<Value>,
     tx: tokio::sync::mpsc::Sender<Result<String, SwarmRouteError>>,
-) -> bool {
+) -> StreamOutcome {
     let request = json!({
         "model": model,
         "stream": true,
@@ -330,11 +349,11 @@ async fn run_stream_dispatch(
                 Ok(response) => response,
                 Err(e) => {
                     let _ = tx.send(Err(SwarmRouteError::Upstream(e.to_string()))).await;
-                    return false;
+                    return StreamOutcome::Failed;
                 }
             }
         }
-        _ = tx.closed() => return false,
+        _ = tx.closed() => return StreamOutcome::Cancelled,
     };
     let status = response.status();
     if !status.is_success() {
@@ -346,7 +365,7 @@ async fn run_stream_dispatch(
                 body
             ))))
             .await;
-        return false;
+        return StreamOutcome::Failed;
     }
     let mut byte_stream = response.bytes_stream();
     let mut assembler = OllamaLineAssembler::new();
@@ -362,13 +381,20 @@ async fn run_stream_dispatch(
                             "body read failed: {e}"
                         ))))
                         .await;
-                    return false;
+                    return StreamOutcome::Failed;
                 }
                 None => break,
             },
-            _ = tx.closed() => return false,
+            _ = tx.closed() => return StreamOutcome::Cancelled,
         };
-        for line in assembler.push(&chunk) {
+        let lines = match assembler.push(&chunk) {
+            Ok(lines) => lines,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return StreamOutcome::Failed;
+            }
+        };
+        for line in lines {
             match parse_ollama_stream_line(&line) {
                 Ok(parsed) => {
                     if !parsed.delta.is_empty() {
@@ -379,7 +405,7 @@ async fn run_stream_dispatch(
                             first_token = false;
                         }
                         if tx.send(Ok(parsed.delta)).await.is_err() {
-                            return false;
+                            return StreamOutcome::Cancelled;
                         }
                     }
                     if parsed.done {
@@ -389,7 +415,7 @@ async fn run_stream_dispatch(
                 }
                 Err(e) => {
                     let _ = tx.send(Err(e)).await;
-                    return false;
+                    return StreamOutcome::Failed;
                 }
             }
         }
@@ -406,7 +432,7 @@ async fn run_stream_dispatch(
                     crate::metrics::observe_first_token_latency(started.elapsed().as_secs_f64());
                 }
                 if tx.send(Ok(parsed.delta)).await.is_err() {
-                    return false;
+                    return StreamOutcome::Cancelled;
                 }
             }
             done = parsed.done;
@@ -418,10 +444,15 @@ async fn run_stream_dispatch(
                 "ollama stream ended without a done line".to_string(),
             )))
             .await;
-        return false;
+        return StreamOutcome::Failed;
     }
-    true
+    StreamOutcome::Completed
 }
+
+/// Maximum bytes one unterminated NDJSON line may occupy. Without a cap
+/// a missing newline lets the buffer grow until the 30-minute request
+/// timeout ends the stream.
+const MAX_NDJSON_LINE_BYTES: usize = 1 << 20;
 
 /// Assembles newline-delimited records from raw byte chunks. Decoding
 /// happens per complete line, never per network chunk: a multibyte UTF-8
@@ -430,22 +461,52 @@ async fn run_stream_dispatch(
 /// sequence never contains `0x0A`).
 struct OllamaLineAssembler {
     buf: Vec<u8>,
+    /// Offset up to which `buf` has already been scanned for a newline.
+    /// Each push only scans the bytes appended since the last scan, so a
+    /// long unterminated line costs linear time instead of a full rescan
+    /// per push. Reset to 0 whenever a line is drained, since the drain
+    /// shifts the unscanned tail to the front.
+    scan_offset: usize,
 }
 
 impl OllamaLineAssembler {
     fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            scan_offset: 0,
+        }
     }
 
     /// Feed raw bytes; returns each complete line, without the newline.
-    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+    /// Fails with `SwarmRouteError::Upstream` when the unterminated tail
+    /// passes `MAX_NDJSON_LINE_BYTES`: an upstream that never sends a
+    /// newline must not grow the buffer unbounded.
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, SwarmRouteError> {
         self.buf.extend_from_slice(bytes);
         let mut lines = Vec::new();
-        while let Some(newline) = self.buf.iter().position(|b| *b == b'\n') {
-            let line_bytes: Vec<u8> = self.buf.drain(..=newline).collect();
-            lines.push(String::from_utf8_lossy(&line_bytes).trim().to_string());
+        loop {
+            match self.buf[self.scan_offset..]
+                .iter()
+                .position(|b| *b == b'\n')
+            {
+                Some(relative) => {
+                    let newline = self.scan_offset + relative;
+                    let line_bytes: Vec<u8> = self.buf.drain(..=newline).collect();
+                    lines.push(String::from_utf8_lossy(&line_bytes).trim().to_string());
+                    self.scan_offset = 0;
+                }
+                None => {
+                    self.scan_offset = self.buf.len();
+                    break;
+                }
+            }
         }
-        lines
+        if self.buf.len() > MAX_NDJSON_LINE_BYTES {
+            return Err(SwarmRouteError::Upstream(
+                "ollama stream line exceeded maximum length".to_string(),
+            ));
+        }
+        Ok(lines)
     }
 
     /// Remaining bytes with no newline terminator (a truncated final line).
@@ -612,12 +673,12 @@ mod tests {
         // first half on its own would corrupt it into replacement chars.
         let crab = line.find('🦀').unwrap();
         let split = crab + 2;
-        let first = assembler.push(&bytes[..split]);
+        let first = assembler.push(&bytes[..split]).unwrap();
         assert!(
             first.is_empty(),
             "no complete line before the newline arrives"
         );
-        let rest = assembler.push(&bytes[split..]);
+        let rest = assembler.push(&bytes[split..]).unwrap();
         assert_eq!(rest.len(), 1);
         assert!(
             rest[0].contains('🦀'),
@@ -630,11 +691,46 @@ mod tests {
     #[test]
     fn line_assembler_returns_each_complete_line_in_order() {
         let mut assembler = OllamaLineAssembler::new();
-        let lines = assembler.push(b"{\"a\":1}\n{\"b\":2}\n{\"c\":3");
+        let lines = assembler.push(b"{\"a\":1}\n{\"b\":2}\n{\"c\":3").unwrap();
         assert_eq!(lines, vec!["{\"a\":1}", "{\"b\":2}"]);
         assert_eq!(assembler.remainder(), "{\"c\":3");
-        let lines = assembler.push(b"}\n");
+        let lines = assembler.push(b"}\n").unwrap();
         assert_eq!(lines, vec!["{\"c\":3}"]);
+        assert_eq!(assembler.remainder(), "");
+    }
+
+    #[test]
+    fn line_assembler_rejects_unterminated_line_past_cap() {
+        let mut assembler = OllamaLineAssembler::new();
+        // Exactly at the cap is still accepted; one byte more fails.
+        let at_cap = vec![b'x'; MAX_NDJSON_LINE_BYTES];
+        assert!(assembler.push(&at_cap).unwrap().is_empty());
+        assert!(assembler.push(b"x").is_err());
+
+        // The cap also trips when the line grows across many small
+        // pushes, not just one big one.
+        let mut assembler = OllamaLineAssembler::new();
+        for _ in 0..=MAX_NDJSON_LINE_BYTES / 1024 {
+            if assembler.push(&[b'y'; 1024]).is_err() {
+                return;
+            }
+        }
+        panic!("assembler accepted more than the cap across small pushes");
+    }
+
+    #[test]
+    fn line_assembler_completes_long_line_fed_in_small_chunks() {
+        // A 512 KiB line fed 1 KiB at a time exercises the scan offset:
+        // each push must only scan its new bytes and still deliver the
+        // line intact once the newline arrives.
+        let mut assembler = OllamaLineAssembler::new();
+        let chunk = [b'z'; 1024];
+        for _ in 0..512 {
+            assert!(assembler.push(&chunk).unwrap().is_empty());
+        }
+        let lines = assembler.push(b"\n").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), 512 * 1024);
         assert_eq!(assembler.remainder(), "");
     }
 
