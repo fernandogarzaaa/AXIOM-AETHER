@@ -22,12 +22,17 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use uuid::Uuid;
 
 pub const DEFAULT_MAX_OPTIMIZATION_STEPS: usize = 3;
 const DEFAULT_TIMEOUT_SECS: u64 = 20;
+
+/// How long to keep reading output after cargo exits or was killed, when a
+/// descendant holds the pipes open. Mirrors proc_bound's drain grace.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct CompileVerifier {
@@ -184,7 +189,27 @@ impl CompileVerifier {
             sanitize_session_id(session_id),
             Uuid::new_v4()
         ));
-        create_rust_workspace(&workspace, code).await?;
+        let result = self
+            .verify_in_workspace(&workspace, session_id, code, feedback)
+            .await;
+        // Cleanup runs on EVERY exit: pass, fail, timeout, feedback error.
+        // A `?` inside the loop must not leave the temp workspace behind.
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        result
+    }
+
+    async fn verify_in_workspace<F, Fut>(
+        &self,
+        workspace: &Path,
+        session_id: &str,
+        code: &str,
+        feedback: &mut F,
+    ) -> Result<CompileRunReport, CompileVerifyError>
+    where
+        F: FnMut(CompileDiagnostic) -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        create_rust_workspace(workspace, code).await?;
 
         let mut report = CompileRunReport {
             session_id: session_id.to_string(),
@@ -195,7 +220,7 @@ impl CompileVerifier {
         };
         for step in 1..=self.max_steps {
             report.attempts = step;
-            match self.run_cargo_check(&workspace, session_id, step).await? {
+            match self.run_cargo_check(workspace, session_id, step).await? {
                 CheckOutcome::Pass => {
                     report.passed = true;
                     break;
@@ -208,7 +233,6 @@ impl CompileVerifier {
                 }
             }
         }
-        let _ = tokio::fs::remove_dir_all(&workspace).await;
         Ok(report)
     }
 
@@ -219,18 +243,94 @@ impl CompileVerifier {
         step: usize,
     ) -> Result<CheckOutcome, CompileVerifyError> {
         let command = "cargo check --message-format=json".to_string();
-        let output = timeout(
-            self.timeout,
-            Command::new("cargo")
-                .args(["check", "--message-format=json"])
-                .current_dir(workspace)
-                .output(),
-        )
-        .await
-        .map_err(|_| CompileVerifyError::Timeout(command.clone()))?
-        .map_err(|e| CompileVerifyError::Io(format!("cargo check failed to start: {e}")))?;
+        let mut cmd = Command::new("cargo");
+        cmd.args(["check", "--message-format=json"])
+            .current_dir(workspace)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // Dropping the future on timeout must not leave cargo running:
+            // kill the child on drop, and its process group below.
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| CompileVerifyError::Io(format!("cargo check failed to start: {e}")))?;
+        let pid = child.id();
+        // Readers are separate tasks so `child.wait()` stays the timeout
+        // boundary: `wait_with_output` consumes the child, so a timeout
+        // could never reap it. Output is read unboundedly here, as before;
+        // capping it is a follow-up once the shared capped reader lands.
+        let stdout_task = child.stdout.take().map(|mut out| {
+            tokio::spawn(async move {
+                let mut b = Vec::new();
+                let _ = out.read_to_end(&mut b).await;
+                b
+            })
+        });
+        let stderr_task = child.stderr.take().map(|mut err| {
+            tokio::spawn(async move {
+                let mut b = Vec::new();
+                let _ = err.read_to_end(&mut b).await;
+                b
+            })
+        });
+        // If this run is cancelled (future dropped) or returns early on a
+        // wait error, the reader tasks must be aborted, not detached.
+        let _reader_guard = AbortReadersOnDrop {
+            stdout: stdout_task.as_ref().map(|t| t.abort_handle()),
+            stderr: stderr_task.as_ref().map(|t| t.abort_handle()),
+        };
+        let status = match timeout(self.timeout, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(e)) => {
+                if let Some(task) = stdout_task {
+                    task.abort();
+                }
+                if let Some(task) = stderr_task {
+                    task.abort();
+                }
+                return Err(CompileVerifyError::Io(format!("process wait failed: {e}")));
+            }
+            Err(_) => {
+                // `wait` returns only when the child exits, so a plain
+                // timeout leaves cargo (and the rustc it spawned) running.
+                // Kill the whole group, reap the child so no zombie is left,
+                // then report the timeout. The direct kill is not redundant:
+                // on Windows `kill_group` is a no-op, so without it this
+                // path would wait on the still-running cargo indefinitely.
+                // This matches `proc_bound::output_bounded`, which kills the
+                // group and then the direct child on timeout.
+                if let Some(pid) = pid {
+                    crate::proc_bound::kill_group(pid);
+                }
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                if let Some(task) = stdout_task {
+                    task.abort();
+                }
+                if let Some(task) = stderr_task {
+                    task.abort();
+                }
+                return Err(CompileVerifyError::Timeout(command.clone()));
+            }
+        };
+        // A descendant holding the pipes keeps the readers alive; give them
+        // a short grace, then kill the group so the pipes close and the
+        // readers finish instead of hanging the caller.
+        let mut stdout_task = stdout_task;
+        let mut stderr_task = stderr_task;
+        let stdout = match &mut stdout_task {
+            Some(task) => drain_reader(task, pid).await,
+            None => Vec::new(),
+        };
+        let stderr = match &mut stderr_task {
+            Some(task) => drain_reader(task, pid).await,
+            None => Vec::new(),
+        };
 
-        if output.status.success() {
+        if status.success() {
             return Ok(CheckOutcome::Pass);
         }
         Ok(CheckOutcome::Fail(CompileDiagnostic {
@@ -238,13 +338,14 @@ impl CompileVerifier {
             step,
             command,
             workspace: workspace.display().to_string(),
-            status_code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            status_code: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).to_string(),
+            stderr: String::from_utf8_lossy(&stderr).to_string(),
         }))
     }
 }
 
+#[derive(Debug)]
 enum CheckOutcome {
     Pass,
     Fail(CompileDiagnostic),
@@ -309,6 +410,55 @@ async fn create_rust_workspace(path: &Path, code: &str) -> Result<(), CompileVer
     Ok(())
 }
 
+/// Await a bounded reader task, giving a descendant that holds the pipes
+/// one drain grace; if it still has not finished, kill the group and take
+/// whatever the reader collected once the pipes close.
+async fn drain_reader(task: &mut tokio::task::JoinHandle<Vec<u8>>, pid: Option<u32>) -> Vec<u8> {
+    match timeout(DRAIN_GRACE, &mut *task).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            if let Some(pid) = pid {
+                crate::proc_bound::kill_group(pid);
+            }
+            match timeout(DRAIN_GRACE, &mut *task).await {
+                Ok(Ok(bytes)) => bytes,
+                _ => {
+                    // The reader is still stuck on a pipe held open by a
+                    // descendant that escaped the process group (or a
+                    // platform where kill_group is a no-op). Dropping the
+                    // handle would detach the task, leaking it and its
+                    // pipe forever; abort it instead.
+                    task.abort();
+                    Vec::new()
+                }
+            }
+        }
+    }
+}
+
+/// Aborts the bounded reader tasks when the enclosing run ends before they
+/// finish. Dropping a `JoinHandle` only detaches its task, so a run that
+/// is cancelled (its future dropped) or returns early on a wait error
+/// would otherwise leak readers holding pipes open behind an escaped
+/// descendant. Aborting a task that already finished is a no-op, so the
+/// normal path is unaffected.
+struct AbortReadersOnDrop {
+    stdout: Option<tokio::task::AbortHandle>,
+    stderr: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for AbortReadersOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.stdout.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.stderr.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +489,327 @@ mod tests {
         assert_eq!(report.attempts, 1);
         assert_eq!(seen.len(), 1);
         assert!(seen[0].stderr.contains("error") || seen[0].stdout.contains("\"reason\""));
+    }
+
+    /// A 1 ms timeout cannot let a real `cargo check` finish, so the timeout
+    /// path always runs: the error must be Timeout, the workspace must be
+    /// gone, and no cargo or rustc process from this run may survive.
+    #[tokio::test]
+    async fn timeout_removes_workspace_and_leaves_no_subprocess() {
+        let root =
+            std::env::temp_dir().join(format!("axiom-compile-verify-test-{}", Uuid::new_v4()));
+        // Snapshot first: other tests in this binary run in parallel and may
+        // have their own cargo processes; only NEW ones count as leaks.
+        let leaked_before = leaked_processes_under(&root);
+        let zombies_before = zombie_children_named(&["cargo", "rustc"]);
+        let verifier = CompileVerifier::new(root.clone(), 1, Duration::from_millis(1));
+        let err = verifier
+            .verify_rust_code_with_feedback("s1", "pub fn ok() {}", &mut |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CompileVerifyError::Timeout(_)),
+            "expected Timeout, got {err}"
+        );
+        assert!(
+            std::fs::read_dir(&root).unwrap().next().is_none(),
+            "workspace left behind under {}",
+            root.display()
+        );
+        // SIGKILL is delivered before the call returns; give the kernel a
+        // moment, then assert nothing from this run is still alive.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leaked = leaked_processes_under(&root);
+        let leaked: Vec<u32> = leaked
+            .into_iter()
+            .filter(|p| !leaked_before.contains(p))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "processes still alive under {}: {leaked:?}",
+            root.display()
+        );
+        let zombies = zombie_children_named(&["cargo", "rustc"]);
+        let zombies: Vec<u32> = zombies
+            .into_iter()
+            .filter(|p| !zombies_before.contains(p))
+            .collect();
+        assert!(
+            zombies.is_empty(),
+            "zombie cargo/rustc children: {zombies:?}"
+        );
+    }
+
+    /// A build script that sleeps puts a descendant in cargo's process
+    /// group while the check runs. A timeout must kill the whole group,
+    /// not just cargo: kill_on_drop alone leaves the sleeping build
+    /// script alive under the workspace.
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_group() {
+        let root =
+            std::env::temp_dir().join(format!("axiom-compile-verify-test-{}", Uuid::new_v4()));
+        let workspace = root.join("group-kill");
+        create_rust_workspace(&workspace, "pub fn ok() {}")
+            .await
+            .unwrap();
+        std::fs::write(
+            workspace.join("build.rs"),
+            "fn main() { std::thread::sleep(std::time::Duration::from_secs(10)); }",
+        )
+        .unwrap();
+        let leaked_before = leaked_processes_under(&root);
+        // 1 s: cargo has started the sleeping build script, but the script
+        // needs 10 s, so the timeout must fire while it is still running.
+        // The call must return promptly: without the group kill, the wait
+        // for cargo waits out the script's whole 10 s sleep instead.
+        let t0 = std::time::Instant::now();
+        let verifier = CompileVerifier::new(root.clone(), 1, Duration::from_secs(1));
+        let err = verifier
+            .run_cargo_check(&workspace, "s1", 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CompileVerifyError::Timeout(_)),
+            "expected Timeout, got {err}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "timeout returned in {:?}, the group was not killed",
+            t0.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leaked = leaked_processes_under(&root);
+        let leaked: Vec<u32> = leaked
+            .into_iter()
+            .filter(|p| !leaked_before.contains(p))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "processes still alive under {}: {leaked:?}",
+            root.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The timeout path must kill the direct child, not only its group.
+    /// On Linux the group kill already reaches cargo, so this test cannot
+    /// distinguish the two kills here: it pins the timeout path returning
+    /// promptly with no cargo or rustc left behind. The direct kill is the
+    /// Windows path, where `kill_group` is a no-op and without it the wait
+    /// would hang indefinitely; actual Windows behavior cannot be verified
+    /// in this sandbox.
+    #[tokio::test]
+    async fn timeout_kills_the_direct_child_and_returns_promptly() {
+        let root =
+            std::env::temp_dir().join(format!("axiom-compile-verify-test-{}", Uuid::new_v4()));
+        let workspace = root.join("direct-kill");
+        create_rust_workspace(&workspace, "pub fn ok() {}")
+            .await
+            .unwrap();
+        std::fs::write(
+            workspace.join("build.rs"),
+            "fn main() { std::thread::sleep(std::time::Duration::from_secs(30)); }",
+        )
+        .unwrap();
+        let leaked_before = leaked_processes_under(&root);
+        let zombies_before = zombie_children_named(&["cargo", "rustc"]);
+        // 500 ms: cargo has started the sleeping build script, which needs
+        // 30 s, so the timeout must fire while it is still running.
+        let t0 = std::time::Instant::now();
+        let verifier = CompileVerifier::new(root.clone(), 1, Duration::from_millis(500));
+        let err = verifier
+            .run_cargo_check(&workspace, "s1", 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CompileVerifyError::Timeout(_)),
+            "expected Timeout, got {err}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "timeout returned in {:?}, the direct child was not killed",
+            t0.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leaked = leaked_processes_under(&root);
+        let leaked: Vec<u32> = leaked
+            .into_iter()
+            .filter(|p| !leaked_before.contains(p))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "processes still alive under {}: {leaked:?}",
+            root.display()
+        );
+        let zombies = zombie_children_named(&["cargo", "rustc"]);
+        let zombies: Vec<u32> = zombies
+            .into_iter()
+            .filter(|p| !zombies_before.contains(p))
+            .collect();
+        assert!(
+            zombies.is_empty(),
+            "zombie cargo/rustc children: {zombies:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A reader that never finishes (a pipe held open by a descendant
+    /// that escaped the process group, where kill_group cannot reach it)
+    /// must be aborted on the final drain timeout, not detached. Dropping
+    /// the handle would leak the task, its pipe, and its retained output
+    /// forever; repeated runs would accumulate them.
+    #[tokio::test]
+    async fn drain_reader_aborts_a_stuck_reader_on_final_timeout() {
+        let mut task = tokio::spawn(async { std::future::pending::<Vec<u8>>().await });
+        let t0 = std::time::Instant::now();
+        let out = drain_reader(&mut task, None).await;
+        assert!(out.is_empty(), "a stuck reader returns no output");
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "drain returned in {:?}",
+            t0.elapsed()
+        );
+        // Awaiting the task must yield Cancelled promptly: with the old
+        // code the task was detached and still pending, so this times out.
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+        assert!(
+            joined.is_ok(),
+            "reader task was detached, not aborted: still pending after drain"
+        );
+        assert!(
+            joined.unwrap().unwrap_err().is_cancelled(),
+            "reader task must be cancelled"
+        );
+    }
+
+    /// Dropping the reader guard must abort pending readers: the mechanism
+    /// that cleans up when the enclosing run is cancelled or returns early
+    /// on a wait error.
+    #[tokio::test]
+    async fn abort_readers_on_drop_aborts_pending_tasks() {
+        let mut task = tokio::spawn(async { std::future::pending::<Vec<u8>>().await });
+        let guard = AbortReadersOnDrop {
+            stdout: Some(task.abort_handle()),
+            stderr: None,
+        };
+        drop(guard);
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+        assert!(joined.is_ok(), "guard must abort the task, not detach it");
+        assert!(
+            joined.unwrap().unwrap_err().is_cancelled(),
+            "reader task must be cancelled"
+        );
+    }
+
+    /// A feedback error is an error path too: the workspace must still go.
+    #[tokio::test]
+    async fn feedback_error_still_removes_workspace() {
+        let root =
+            std::env::temp_dir().join(format!("axiom-compile-verify-test-{}", Uuid::new_v4()));
+        let verifier = CompileVerifier::new(root.clone(), 1, Duration::from_secs(30));
+        let err = verifier
+            .verify_rust_code_with_feedback("s1", "pub fn broken( {", &mut |_| async {
+                Err("boom".to_string())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CompileVerifyError::Feedback(_)),
+            "expected Feedback, got {err}"
+        );
+        assert!(
+            std::fs::read_dir(&root).unwrap().next().is_none(),
+            "workspace left behind under {}",
+            root.display()
+        );
+    }
+
+    /// PIDs of live (non-zombie) processes whose working directory or
+    /// command line is under `root`: a cargo/rustc that survived its
+    /// timeout would still sit in the deleted workspace.
+    #[cfg(unix)]
+    fn leaked_processes_under(root: &Path) -> Vec<u32> {
+        let root = root.to_string_lossy().into_owned();
+        let mut leaked = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return leaked;
+        };
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if pid == std::process::id() {
+                continue;
+            }
+            if proc_state(pid).as_deref() == Some("Z") {
+                continue;
+            }
+            let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default();
+            if cwd.starts_with(&root) || cmdline.contains(&root) {
+                leaked.push(pid);
+            }
+        }
+        leaked
+    }
+
+    /// Zombie children of this process with the given command names: a
+    /// timed-out cargo that was killed but never reaped would linger here.
+    #[cfg(unix)]
+    fn zombie_children_named(names: &[&str]) -> Vec<u32> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if proc_state(pid).as_deref() != Some("Z") {
+                continue;
+            }
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            // stat is `pid (comm) state ppid ...`: comm is parenthesised.
+            let Some(open) = stat.find('(') else { continue };
+            let Some(close) = stat.rfind(')') else {
+                continue;
+            };
+            let comm = &stat[open + 1..close];
+            let after = &stat[close + 2..];
+            let mut fields = after.split_whitespace();
+            let state = fields.next().unwrap_or("");
+            let ppid: u32 = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            if state == "Z" && ppid == std::process::id() && names.contains(&comm) {
+                found.push(pid);
+            }
+        }
+        found
+    }
+
+    /// The single-letter state from /proc/<pid>/stat, or None if unreadable.
+    #[cfg(unix)]
+    fn proc_state(pid: u32) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let close = stat.rfind(')')?;
+        stat[close + 2..]
+            .split_whitespace()
+            .next()
+            .map(str::to_string)
+    }
+
+    #[cfg(not(unix))]
+    fn leaked_processes_under(_root: &Path) -> Vec<u32> {
+        Vec::new()
+    }
+
+    #[cfg(not(unix))]
+    fn zombie_children_named(_names: &[&str]) -> Vec<u32> {
+        Vec::new()
     }
 }
