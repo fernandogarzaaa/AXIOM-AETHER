@@ -6,6 +6,9 @@ replicaCount: 3
 image:
   repository: ghcr.io/fernandogarzaaa/axiom-aether
   tag: latest
+  # Pinned digest for the tag above, resolved 2026-11-09 from GHCR
+  # (multi-arch manifest list). The chart renders repo:tag@digest when set.
+  digest: "sha256:844f485adf925e515070a1680630eaefe4423a54ea8cbc971b045e6acb5d8afe"
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -108,6 +111,8 @@ gossip:
   schedule: "*/5 * * * *"        # every 5 minutes
   # Image needs curl + jq. Override if you mirror images internally.
   image: dwdraju/alpine-curl-jq:latest
+  # Pinned digest for the image above, resolved 2026-11-09 from Docker Hub.
+  digest: "sha256:eb00b3d4864c03814885a1c15ed1f5b2b569ca102ad4d02c27d582affb4fd6b1"
   backoffLimit: 1
   restartPolicy: Never
 
@@ -147,6 +152,8 @@ podDisruptionBudget:
 tests:
   enabled: true
   image: curlimages/curl:8.11.1
+  # Pinned digest for the image above, resolved 2026-11-09 from Docker Hub.
+  digest: "sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69"
 
 # Probe timings — startupProbe covers model load + checkpoint download.
 probes:

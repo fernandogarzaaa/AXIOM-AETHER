@@ -18,7 +18,7 @@ spec:
     runAsUser: 10001
   containers:
     - name: connection-test
-      image: {{ .Values.tests.image | quote }}
+      image: "{{ .Values.tests.image }}{{ with .Values.tests.digest }}@{{ . }}{{ end }}"
       {{- if or .Values.secrets.apiKey .Values.secrets.existingSecret }}
       env:
         - name: AXIOM_API_KEY
