@@ -162,6 +162,75 @@ async fn hypervisor_stat(
     })))
 }
 
+/// Restores a backed-up source file unless the repair passed.
+///
+/// The guard is armed on creation. Call [`SourceRestoreGuard::restore`] after
+/// the run to restore explicitly on the async path; dropping an armed guard
+/// restores synchronously as a last resort, so an error return (or panic)
+/// after a candidate patch was written never leaves the patch behind.
+/// Without the guard, the `?` on `run_with_feedback` returned before the
+/// restore branch, and a timeout after a patch write left the patch in place
+/// (audit P1-2).
+struct SourceRestoreGuard {
+    path: Option<String>,
+    backup: Option<String>,
+    armed: bool,
+    restored: bool,
+}
+
+impl SourceRestoreGuard {
+    fn new(path: Option<String>, backup: Option<String>) -> Self {
+        let armed = path.is_some() && backup.is_some();
+        Self {
+            path,
+            backup,
+            armed,
+            restored: false,
+        }
+    }
+
+    /// Restore the backed-up bytes now (async). Disarms the guard on success
+    /// and records the restore. A no-op when no backup exists or the guard
+    /// was already disarmed.
+    async fn restore(&mut self) -> std::io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        if let (Some(p), Some(b)) = (self.path.as_deref(), self.backup.as_deref()) {
+            tokio::fs::write(p, b).await?;
+        }
+        self.restored = true;
+        self.armed = false;
+        Ok(())
+    }
+
+    /// Keep the current file: the repair passed, so the patch stays.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn restored(&self) -> bool {
+        self.restored
+    }
+
+    fn path(&self) -> &str {
+        self.path.as_deref().unwrap_or("")
+    }
+}
+
+impl Drop for SourceRestoreGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let (Some(p), Some(b)) = (self.path.as_deref(), self.backup.as_deref()) {
+            if let Err(e) = std::fs::write(p, b) {
+                eprintln!("[poly-jit] failed to restore source_path '{p}': {e}");
+            }
+        }
+    }
+}
+
 /// `POST /v1/hypervisor/jit_run` — drive the Poly JIT closed loop: run a
 /// command; on failure feed the fault trace into the session's W̃ (TTT) and
 /// apply a bounded, deterministic source patch (Q-TTT-ranked candidates), then
@@ -206,6 +275,11 @@ async fn hypervisor_jit_run(
         None => None,
     };
 
+    // The guard owns restoration from here on: it restores on EVERY
+    // unsuccessful exit (run error, failing report, panic), not just when
+    // the run returns a failing report.
+    let mut guard = SourceRestoreGuard::new(source_path.clone(), backup);
+
     let run_req = PolyJitRunRequest {
         session_id: session_id.clone(),
         command: req.command,
@@ -215,7 +289,7 @@ async fn hypervisor_jit_run(
     };
 
     let cache_path = compression_cache_path();
-    let report = state
+    let run = state
         .poly_jit
         .run_with_feedback(run_req, |diag| {
             // Feed each fault trace into the session's fast-weights (TTT).
@@ -246,24 +320,41 @@ async fn hypervisor_jit_run(
                 Ok(())
             }
         })
-        .await
-        .map_err(|e| ApiError::Internal(format!("poly-jit run failed: {e}")))?;
+        .await;
 
-    // SAFETY: restore the original source if the repair did not pass.
-    let mut source_restored = false;
-    if !report.passed {
-        if let (Some(p), Some(b)) = (source_path.as_deref(), backup.as_ref()) {
-            tokio::fs::write(p, b).await.map_err(|e| {
+    // Decide the file's fate BEFORE propagating any error, so no `?` below
+    // can skip restoration.
+    let report = match run {
+        Ok(report) => {
+            if report.passed {
+                guard.disarm();
+            } else if let Err(e) = guard.restore().await {
+                let p = guard.path();
                 eprintln!("[poly-jit] failed to restore source_path '{p}': {e}");
-                ApiError::Internal(format!("failed to restore source_path '{p}': {e}"))
-            })?;
-            source_restored = true;
+                return Err(ApiError::Internal(format!(
+                    "failed to restore source_path '{p}': {e}"
+                )));
+            }
+            report
         }
-    }
+        Err(e) => {
+            // The run errored after possibly writing a candidate patch:
+            // restore first, then report the run error. A restore failure
+            // is chained onto the run error instead of replacing it.
+            if let Err(re) = guard.restore().await {
+                let p = guard.path();
+                eprintln!("[poly-jit] failed to restore source_path '{p}': {re}");
+                return Err(ApiError::Internal(format!(
+                    "poly-jit run failed: {e}; failed to restore source_path '{p}': {re}"
+                )));
+            }
+            return Err(ApiError::Internal(format!("poly-jit run failed: {e}")));
+        }
+    };
 
     Ok(Json(HypervisorJitRunResponse {
         report,
-        source_restored,
+        source_restored: guard.restored(),
         jit: state.poly_jit.status(),
     }))
 }

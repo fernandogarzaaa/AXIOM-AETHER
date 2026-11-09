@@ -1362,4 +1362,212 @@ mod tests {
         );
         safe_drop(pipeline_arc).await;
     }
+
+    /// Build a JIT-enabled state whose Poly-JIT engine times out fast, so
+    /// timeout tests run in seconds instead of the 20 s default.
+    async fn make_jit_test_state(timeout_secs: u64) -> AppState {
+        let mut state = make_test_state().await.with_jit_exec_enabled(true);
+        state.poly_jit = std::sync::Arc::new(crate::poly_jit::PolyJitEngine::new(
+            std::time::Duration::from_secs(timeout_secs),
+        ));
+        state
+    }
+
+    fn jit_tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("axiom_srv_jit_{tag}_{}", std::process::id()))
+    }
+
+    async fn post_jit_run(
+        app: axum::Router,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/hypervisor/jit_run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // Error responses from this API are plain text (ApiError), not
+        // JSON: parse leniently and let the caller assert on the status.
+        // Success responses carry the JSON report.
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn hypervisor_jit_run_restores_source_when_run_times_out_after_patch() {
+        // Repro for audit P1-2: the run writes a candidate patch on step 1,
+        // then times out on step 2. The old handler returned the run error
+        // before its restore branch, leaving the patch in place.
+        let dir = jit_tmp("timeout");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("src.txt");
+        let original = "AXIOM_POLYJIT_FIXTURE_FAIL\n";
+        std::fs::write(&source, original).unwrap();
+        let script = dir.join("run.sh");
+        let counter = dir.join("ran_once");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ -f \"{}\" ]; then sleep 300; else touch \"{}\"; exit 1; fi\n",
+                counter.display(),
+                counter.display()
+            ),
+        )
+        .unwrap();
+
+        let state = make_jit_test_state(2).await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let body = serde_json::json!({
+            "command": "sh",
+            "args": [script.to_string_lossy(), counter.to_string_lossy()],
+            "source_path": source.to_string_lossy(),
+            "session_id": "jit-timeout-test",
+        });
+        let (status, _) = post_jit_run(app, body).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            original,
+            "a timed-out run must not leave the candidate patch behind"
+        );
+        safe_drop(pipeline_arc).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn hypervisor_jit_run_restores_source_when_report_fails() {
+        // The pre-existing restore path: every step fails, the report says
+        // passed=false, the source must come back byte-for-byte.
+        let dir = jit_tmp("fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("src.txt");
+        let original = "AXIOM_POLYJIT_FIXTURE_FAIL\n";
+        std::fs::write(&source, original).unwrap();
+        let script = dir.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+
+        let state = make_jit_test_state(5).await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let body = serde_json::json!({
+            "command": "sh",
+            "args": [script.to_string_lossy()],
+            "source_path": source.to_string_lossy(),
+            "session_id": "jit-fail-test",
+        });
+        let (status, value) = post_jit_run(app, body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["source_restored"], true);
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+        safe_drop(pipeline_arc).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn hypervisor_jit_run_keeps_patch_when_report_passes() {
+        // First run fails, the patch is written, the second run passes:
+        // the passing patch stays and source_restored is false.
+        let dir = jit_tmp("pass");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("src.txt");
+        std::fs::write(&source, "AXIOM_POLYJIT_FIXTURE_FAIL\n").unwrap();
+        let script = dir.join("run.sh");
+        let counter = dir.join("ran_once");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ -f \"{}\" ]; then exit 0; else touch \"{}\"; exit 1; fi\n",
+                counter.display(),
+                counter.display()
+            ),
+        )
+        .unwrap();
+
+        let state = make_jit_test_state(5).await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let body = serde_json::json!({
+            "command": "sh",
+            "args": [script.to_string_lossy(), counter.to_string_lossy()],
+            "source_path": source.to_string_lossy(),
+            "session_id": "jit-pass-test",
+        });
+        let (status, value) = post_jit_run(app, body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["source_restored"], false);
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            "AXIOM_POLYJIT_FIXTURE_PASS\n",
+            "the passing patch stays"
+        );
+        safe_drop(pipeline_arc).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn source_restore_guard_restores_on_drop_when_armed() {
+        let dir = jit_tmp("guard_drop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("src.txt");
+        std::fs::write(&f, "patched").unwrap();
+        {
+            let _guard = SourceRestoreGuard::new(
+                Some(f.to_string_lossy().into_owned()),
+                Some("original".to_string()),
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "original");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn source_restore_guard_keeps_file_when_disarmed() {
+        let dir = jit_tmp("guard_disarm");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("src.txt");
+        std::fs::write(&f, "patched").unwrap();
+        {
+            let mut guard = SourceRestoreGuard::new(
+                Some(f.to_string_lossy().into_owned()),
+                Some("original".to_string()),
+            );
+            guard.disarm();
+        }
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "patched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn source_restore_guard_explicit_restore_disarms() {
+        let dir = jit_tmp("guard_restore");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("src.txt");
+        std::fs::write(&f, "patched").unwrap();
+        let mut guard = SourceRestoreGuard::new(
+            Some(f.to_string_lossy().into_owned()),
+            Some("original".to_string()),
+        );
+        guard.restore().await.unwrap();
+        assert!(guard.restored());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "original");
+        drop(guard);
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "original",
+            "an explicit restore must not run twice on drop"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
