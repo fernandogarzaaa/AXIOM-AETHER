@@ -196,6 +196,56 @@ pub struct Candidate {
     pub source: String,
 }
 
+/// One planned edit, without the materialized source: `plan` ranks and
+/// bounds these first and only builds the full mutated file for the
+/// survivors, so planning memory stays flat in the file size instead of
+/// quadratic (Codex P2 on #247: a 28 KB file with 2,000 lines peaked at
+/// ~222 MB RSS with `max = 1` because every mutation was stored as a full
+/// source copy before the limit was applied).
+struct PlannedEdit {
+    key: (u8, usize, usize, usize),
+    class: MutationClass,
+    /// 1-based line that was edited.
+    line: usize,
+    label: String,
+    new_line: String,
+}
+
+/// Sort planned edits by key, drop duplicates (same line + same replacement
+/// is the same mutated file), and keep at most `max`. Pure, so the ranking
+/// is unit-testable without building sources.
+fn rank_edits(mut edits: Vec<PlannedEdit>, max: usize) -> Vec<PlannedEdit> {
+    edits.sort_by_key(|e| e.key);
+    let mut seen: HashSet<(usize, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for e in edits {
+        if !seen.insert((e.line, e.new_line.clone())) {
+            continue;
+        }
+        out.push(e);
+        if out.len() >= max.max(1) {
+            break;
+        }
+    }
+    out
+}
+
+/// Build the full mutated file for one planned edit: the original source
+/// with line `li` (0-based) replaced by `new_line`.
+fn materialize(source: &str, lines: &[&str], li: usize, new_line: &str) -> String {
+    let (_, eol) = split_eol(lines[li]);
+    let mut src = String::with_capacity(source.len() + 16);
+    for l in &lines[..li] {
+        src.push_str(l);
+    }
+    src.push_str(new_line);
+    src.push_str(eol);
+    for l in &lines[li + 1..] {
+        src.push_str(l);
+    }
+    src
+}
+
 /// Candidate cap from `AXIOM_REPAIR_MAX_CANDIDATES`, else [`DEFAULT_MAX_CANDIDATES`].
 pub fn max_candidates() -> usize {
     std::env::var("AXIOM_REPAIR_MAX_CANDIDATES")
@@ -496,10 +546,10 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
     }
 
     // (tier, a, b, seq) sort key — see the module docs.
-    let mut keyed: Vec<((u8, usize, usize, usize), Candidate)> = Vec::new();
+    let mut edits: Vec<PlannedEdit> = Vec::new();
     let mut seq = 0usize;
-    let visit = |li: usize, pos: usize, tier: u8, keyed: &mut Vec<_>, seq: &mut usize| {
-        let (content, eol) = split_eol(lines[li]);
+    let visit = |li: usize, pos: usize, tier: u8, edits: &mut Vec<PlannedEdit>, seq: &mut usize| {
+        let (content, _) = split_eol(lines[li]);
         if content.trim().is_empty()
             || is_comment_only(content, lang)
             || is_oracle_line(content)
@@ -515,15 +565,6 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
             for (what, new_line) in line_mutations(content, lang, *class, next) {
                 if new_line == content {
                     continue;
-                }
-                let mut src = String::with_capacity(source.len() + 16);
-                for l in &lines[..li] {
-                    src.push_str(l);
-                }
-                src.push_str(&new_line);
-                src.push_str(eol);
-                for l in &lines[li + 1..] {
-                    src.push_str(l);
                 }
                 let cr = class_rank(*class);
                 // Tier 0 (blamed lines): line order, every class. Tiers 1+
@@ -546,75 +587,65 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
                     (tier, cr, pos, *seq)
                 };
                 *seq += 1;
-                keyed.push((
+                edits.push(PlannedEdit {
                     key,
-                    Candidate {
-                        label: format!("{}:L{} {}", class.name(), li + 1, what),
-                        class: *class,
-                        line: li + 1,
-                        source: src,
-                    },
-                ));
+                    class: *class,
+                    line: li + 1,
+                    label: format!("{}:L{} {}", class.name(), li + 1, what),
+                    new_line,
+                });
             }
         }
     };
     for (pos, li) in hinted.iter().enumerate() {
-        visit(*li, pos, 0, &mut keyed, &mut seq);
+        visit(*li, pos, 0, &mut edits, &mut seq);
     }
     for (pos, li) in enclosing.iter().enumerate() {
-        visit(*li, pos, 1, &mut keyed, &mut seq);
+        visit(*li, pos, 1, &mut edits, &mut seq);
     }
     for (pos, li) in focus.iter().enumerate() {
-        visit(*li, pos, 2, &mut keyed, &mut seq);
+        visit(*li, pos, 2, &mut edits, &mut seq);
     }
     for (pos, li) in focus2.iter().enumerate() {
-        visit(*li, pos, 3, &mut keyed, &mut seq);
+        visit(*li, pos, 3, &mut edits, &mut seq);
     }
     for (pos, li) in rest.iter().enumerate() {
-        visit(*li, pos, 4, &mut keyed, &mut seq);
+        visit(*li, pos, 4, &mut edits, &mut seq);
     }
 
     // Import-path repairs are planned per file (they need the trace's missing
     // name and the directory listing); rank them as tier 0 when the trace
     // names a missing module, since nothing else can fix that failure.
     for (li, what, new_line) in import_path_candidates(source, path, trace) {
-        let (content, eol) = split_eol(lines[li]);
+        let (content, _) = split_eol(lines[li]);
         if new_line == content {
             continue;
         }
-        let mut src = String::with_capacity(source.len() + 16);
-        for l in &lines[..li] {
-            src.push_str(l);
-        }
-        src.push_str(&new_line);
-        src.push_str(eol);
-        for l in &lines[li + 1..] {
-            src.push_str(l);
-        }
         let cr = class_rank(MutationClass::ImportPath);
-        keyed.push((
-            (0, 0, cr, seq),
-            Candidate {
-                label: format!("{}:L{} {}", MutationClass::ImportPath.name(), li + 1, what),
-                class: MutationClass::ImportPath,
-                line: li + 1,
-                source: src,
-            },
-        ));
+        edits.push(PlannedEdit {
+            key: (0, 0, cr, seq),
+            class: MutationClass::ImportPath,
+            line: li + 1,
+            label: format!("{}:L{} {}", MutationClass::ImportPath.name(), li + 1, what),
+            new_line,
+        });
         seq += 1;
     }
 
-    keyed.sort_by_key(|(k, _)| *k);
-    let mut seen: HashSet<&str> = HashSet::new();
+    // Rank and bound the descriptors first; only the survivors get a full
+    // mutated source built.
     let mut out = Vec::new();
-    for (_, c) in &keyed {
-        if c.source == source || !seen.insert(c.source.as_str()) {
+    for e in rank_edits(edits, max) {
+        let src = materialize(source, &lines, e.line - 1, &e.new_line);
+        if src == source {
             continue;
         }
-        out.push(c.clone());
-        if out.len() >= max.max(1) {
-            break;
-        }
+        out.push(Candidate {
+            label: e.label,
+            class: e.class,
+            line: e.line,
+            source: src,
+        });
     }
     out
 }
@@ -3145,6 +3176,45 @@ mod tests {
             "{:?}",
             p.iter().map(|c| &c.label).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn rank_edits_sorts_dedups_and_bounds() {
+        // Codex P2 on #247: the candidate limit did not bound planning
+        // memory, because every mutation was stored as a full source copy
+        // before `max` was applied. Ranking runs on lightweight descriptors
+        // first; only the survivors are materialized.
+        let edit = |key: (u8, usize, usize, usize), line: usize, new_line: &str| PlannedEdit {
+            key,
+            class: MutationClass::Arithmetic,
+            line,
+            label: format!("Arithmetic:L{line} {new_line}"),
+            new_line: new_line.to_string(),
+        };
+        let ranked = rank_edits(
+            vec![
+                edit((1, 0, 0, 2), 5, "x = x - 2"),
+                edit((0, 0, 0, 0), 1, "x = x - 2"),
+                edit((0, 0, 0, 1), 1, "x = x - 2"),
+                edit((0, 1, 0, 3), 2, "x = x * 2"),
+            ],
+            2,
+        );
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].line, 1);
+        assert_eq!(ranked[0].new_line, "x = x - 2");
+        assert_eq!(ranked[1].line, 2);
+    }
+
+    #[test]
+    fn plan_on_a_2000_line_file_returns_one_candidate_with_max_1() {
+        // Codex P2 on #247: a 28 KB file with 2,000 `x = x + 2` lines peaked
+        // at ~222 MB RSS with `max = 1`. The bound must hold on the result;
+        // the memory win is measured separately (see PR body), not asserted
+        // here, because in-process RSS is noisy under parallel test threads.
+        let src = "x = x + 2\n".repeat(2000);
+        let p = plan(&src, &PathBuf::from("calc.py"), "calc.py:1: NameError", 1);
+        assert_eq!(p.len(), 1);
     }
 
     #[test]
