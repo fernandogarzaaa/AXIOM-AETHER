@@ -62,6 +62,12 @@ secrets:
   # trusting. STRONGLY recommended when gossip is enabled. Generate with
   # `openssl rand -hex 32`.
   fleetKey: ""
+  # Data-plane API key — when set, the server requires `X-Axiom-Key` on every
+  # data-plane route (/v1/*) and the gossip CronJob + `helm test` pod present
+  # it. Generate with `openssl rand -hex 32`. Leave empty to keep the open
+  # local-first default (the server guard is a passthrough when unset).
+  # When set, app pods receive it via the Secret envFrom in deployment.yaml.
+  apiKey: ""
   anthropicApiKey: ""
   contextApiKey: ""
   # If you already manage these in an existing Secret, set existingSecret to

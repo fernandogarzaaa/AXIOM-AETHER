@@ -339,3 +339,37 @@ jobs:
 
       - name: Pytest
         run: python -m pytest tests/ -q
+
+  # Helm chart gate (audit Finding 6, P1): the gossip CronJob and `helm test`
+  # pod must present X-Axiom-Key on data-plane probes when secrets.apiKey is
+  # set, and keep working with no header when it is unset. `helm template`
+  # renders are asserted by deploy/helm/axiom/tests/test_helm_auth.py.
+  helm:
+    name: Helm chart (lint + auth renders)
+    # The protocol gate is cheap and its failure invalidates everything below.
+    needs: protocol
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.22.1
+
+      - name: Install PyYAML (render assertions)
+        run: python -m pip install --quiet pyyaml
+
+      - name: Helm lint
+        run: helm lint deploy/helm/axiom
+
+      - name: Helm auth renders (apiKey set / unset / existingSecret)
+        run: python3 deploy/helm/axiom/tests/test_helm_auth.py

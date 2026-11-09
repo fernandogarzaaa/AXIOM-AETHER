@@ -19,14 +19,33 @@ spec:
   containers:
     - name: connection-test
       image: {{ .Values.tests.image | quote }}
+      {{- if or .Values.secrets.apiKey .Values.secrets.existingSecret }}
+      env:
+        - name: AXIOM_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "axiom.secretName" . }}
+              key: AXIOM_API_KEY
+              optional: true
+      {{- end }}
       command: ["/bin/sh", "-c"]
       args:
         - |
           set -eu
           base="http://{{ include "axiom.fullname" . }}:{{ .Values.service.port }}"
+          # curl with the data-plane key when configured. /readyz is a public
+          # ops endpoint and stays unauthenticated; /v1/models is guarded and
+          # requires X-Axiom-Key when AXIOM_API_KEY is set on the server.
+          curl_auth() {
+            if [ -n "${AXIOM_API_KEY:-}" ]; then
+              curl -H "X-Axiom-Key: $AXIOM_API_KEY" "$@"
+            else
+              curl "$@"
+            fi
+          }
           echo "[test] GET $base/readyz"
           curl -fsS --max-time 10 "$base/readyz" | grep -q '"status":"ready"'
           echo "[test] GET $base/v1/models"
-          curl -fsS --max-time 10 "$base/v1/models" | grep -q '"object"'
+          curl_auth -fsS --max-time 10 "$base/v1/models" | grep -q '"object"'
           echo "[test] OK"
 {{- end }}
