@@ -234,7 +234,6 @@ impl SwarmRouter {
         let mesh_selector = self.mesh_selector.clone();
         let stream_model = model.clone();
         tokio::spawn(async move {
-            let task_started = Instant::now();
             let outcome = run_stream_dispatch(response, started, tx).await;
             // A cancellation says nothing about the model: the client
             // went away, so recording it as a failure would train the
@@ -243,10 +242,15 @@ impl SwarmRouter {
             if let (Some(selector), false) =
                 (&mesh_selector, matches!(outcome, StreamOutcome::Cancelled))
             {
+                // Latency runs from dispatch, not from the spawned task:
+                // a model that spends time loading before returning
+                // headers must not earn a fast-model reward for the short
+                // response that follows. This matches the first-token
+                // timer, which already starts before dispatch.
                 selector.record_outcome(
                     &stream_model,
                     matches!(outcome, StreamOutcome::Completed),
-                    task_started.elapsed().as_millis() as u64,
+                    dispatch_started.elapsed().as_millis() as u64,
                 );
             }
         });
