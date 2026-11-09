@@ -193,14 +193,33 @@ impl SwarmRouter {
         }
         let model = self.select_model_for_dispatch().await?;
         let messages = translate_messages(payload);
-        let (response, started) = start_stream_request(
+        let dispatch_started = Instant::now();
+        let (response, started) = match start_stream_request(
             &self.client,
             &self.config.base_url,
             &model,
             self.config.num_ctx,
             messages,
         )
-        .await?;
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A startup failure never reaches the producer task, so
+                // record it here: without this the selector never learns
+                // the model is failing and keeps preferring it. Only
+                // startup failures record; a client disconnect still
+                // records nothing (see the Cancelled exclusion below).
+                if let Some(selector) = &self.mesh_selector {
+                    selector.record_outcome(
+                        &model,
+                        false,
+                        dispatch_started.elapsed().as_millis() as u64,
+                    );
+                }
+                return Err(e);
+            }
+        };
         let (tx, rx) = tokio::sync::mpsc::channel(SWARM_STREAM_CHANNEL_CAPACITY);
         let mesh_selector = self.mesh_selector.clone();
         let stream_model = model.clone();
