@@ -41,6 +41,62 @@ fn cleanup_responses_run_subsessions(
     }
 }
 
+/// Cancellation guard for the fingerprint fan-out in
+/// `compressed_responses_payload`.
+///
+/// Dropping the payload future (client disconnect / task abort) drops the
+/// `JoinSet` without running any error branch, so the transient sub-sessions
+/// stayed registered. The guard runs the SAME cleanup the error branches use
+/// (no second mechanism), and also flips a shared flag the fingerprint tasks
+/// observe: a `spawn_blocking` closure already running when the future is
+/// dropped keeps running after the abort, so it must not create a sub-session
+/// after this guard cleaned up, and must drop its own sub-session if
+/// cancellation landed while it was adapting.
+struct ResponsesRunCleanupGuard {
+    state: AppState,
+    session_id: String,
+    run_count: usize,
+    is_transient: bool,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ResponsesRunCleanupGuard {
+    fn new(
+        state: &AppState,
+        session_id: &str,
+        run_count: usize,
+        is_transient: bool,
+    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Self {
+                state: state.clone(),
+                session_id: session_id.to_string(),
+                run_count,
+                is_transient,
+                cancelled: cancelled.clone(),
+            },
+            cancelled,
+        )
+    }
+}
+
+impl Drop for ResponsesRunCleanupGuard {
+    fn drop(&mut self) {
+        // Flag first: a detached blocking closure checks this before creating
+        // its sub-session and before returning, so nothing it does after this
+        // point can recreate a session this drop removes.
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        cleanup_responses_run_subsessions(
+            &self.state,
+            &self.session_id,
+            self.run_count,
+            self.is_transient,
+        );
+    }
+}
+
 async fn compressed_responses_payload(
     state: &AppState,
     body: &Value,
@@ -69,6 +125,15 @@ async fn compressed_responses_payload(
         .unwrap_or_else(|| format!("responses-{}", Uuid::new_v4()));
     let is_transient_session = session_override.is_none();
 
+    // Guard lives until this function returns or its future is dropped, so
+    // cancellation reaches the same cleanup the error branches use.
+    let (_cleanup_guard, cancelled) = ResponsesRunCleanupGuard::new(
+        state,
+        &session_id,
+        plan.runs.len(),
+        is_transient_session,
+    );
+
     // One fingerprint per contiguous run, each adapted in its own sub-session
     // so a run's recall vector reflects only that run's context. Runs are
     // independent, so fan them out with a small cap and restore plan order
@@ -82,12 +147,20 @@ async fn compressed_responses_payload(
             let ordinal = next_run;
             let run = &plan.runs[ordinal];
             let state = state.clone();
+            let cancelled = cancelled.clone();
             let run_session = format!("{session_id}#r{ordinal}");
             let context = run.context.clone();
             let query = plan.query.clone();
             tasks.spawn(async move {
-                let fingerprint =
-                    responses_run_fingerprint(&state, &run_session, &context, &query).await?;
+                let fingerprint = responses_run_fingerprint(
+                    &state,
+                    &run_session,
+                    &context,
+                    &query,
+                    cancelled,
+                    is_transient_session,
+                )
+                .await?;
                 Ok::<_, ApiError>((ordinal, fingerprint))
             });
             next_run += 1;
@@ -177,6 +250,8 @@ async fn responses_run_fingerprint(
     session_id: &str,
     context: &str,
     query: &str,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    is_transient: bool,
 ) -> Result<String, ApiError> {
     let pipeline_arc = state.pipeline.clone();
     let store = state.ttt_sessions.clone();
@@ -186,6 +261,14 @@ async fn responses_run_fingerprint(
     let session_for_task = session_id.to_string();
     let started = Instant::now();
     let fingerprint = spawn_blocking(move || -> Result<_, ApiError> {
+        // Cancellation landed while this blocking closure was queued or
+        // running: do not create a sub-session the cleanup already removed.
+        // Non-transient (client-owned) sessions are never touched here.
+        if is_transient && cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ApiError::Internal(
+                "Responses fingerprint cancelled".into(),
+            ));
+        }
         let pipeline = pipeline_arc
             .read()
             .map_err(|_| ApiError::Internal("pipeline lock poisoned".into()))?;
@@ -194,19 +277,38 @@ async fn responses_run_fingerprint(
             .map_err(|error| ApiError::Internal(format!("session allocation failed: {error}")))?;
         let mut states = session.blocking_lock();
         let context_ids = pipeline.encode_text(&context);
-        adapt_session_blocking(&pipeline, &mut states, &context_ids)
-            .map_err(|error| ApiError::Internal(format!("TTT adapt failed: {error}")))?;
-        let query_ids = pipeline.encode_text(&query);
-        extract_memory_vector_blocking(
-            &pipeline,
-            &mut states,
-            &query_ids,
-            &session_for_task,
-            context_ids.len(),
-            started,
-            top_k,
-        )
-        .map_err(|error| ApiError::Internal(format!("memory extraction failed: {error}")))
+        // Capture the outcome instead of `?`-ing out: the cancellation
+        // self-cleanup below must run on the error paths too, or a failed
+        // adapt/extract after cancellation lands leaks the sub-session
+        // (CodeRabbit review on PR #288).
+        let memory = match adapt_session_blocking(&pipeline, &mut states, &context_ids)
+            .map_err(|error| ApiError::Internal(format!("TTT adapt failed: {error}")))
+        {
+            Ok(()) => {
+                let query_ids = pipeline.encode_text(&query);
+                extract_memory_vector_blocking(
+                    &pipeline,
+                    &mut states,
+                    &query_ids,
+                    &session_for_task,
+                    context_ids.len(),
+                    started,
+                    top_k,
+                )
+                .map_err(|error| {
+                    ApiError::Internal(format!("memory extraction failed: {error}"))
+                })
+            }
+            Err(error) => Err(error),
+        };
+        // Cancellation landed while this closure was adapting: the parent
+        // future is gone, so drop this run's sub-session here instead of
+        // leaving it for a cleanup that already ran. Runs on success and
+        // error alike.
+        if is_transient && cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = store.take_session(&session_for_task);
+        }
+        memory
     })
     .await
     .map_err(|error| ApiError::Internal(format!("blocking task join failed: {error}")))??;
