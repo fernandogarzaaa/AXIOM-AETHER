@@ -338,19 +338,22 @@ pub fn render_metrics() -> String {
         quantized_sessions
     ));
 
-    push_histogram(
+    push_histogram_header(
         &mut body,
         "axiom_prefill_latency_seconds",
         "Time spent inside prefill execution paths.",
-        None,
-        &histogram,
     );
+    push_histogram_samples(&mut body, "axiom_prefill_latency_seconds", None, &histogram);
 
+    push_histogram_header(
+        &mut body,
+        "axiom_stage_latency_seconds",
+        "Time spent in one pipeline stage (compress, route, forward, fingerprint).",
+    );
     for (stage, snapshot) in &stage_histograms {
-        push_histogram(
+        push_histogram_samples(
             &mut body,
             "axiom_stage_latency_seconds",
-            "Time spent in one pipeline stage (compress, route, forward, fingerprint).",
             Some(*stage),
             snapshot,
         );
@@ -419,20 +422,27 @@ pub fn render_metrics() -> String {
     body
 }
 
-/// Render one histogram family. With no stage the output is the bare
+/// Emit one histogram family's `# HELP` / `# TYPE` declarations. The
+/// Prometheus exposition format allows one of each per metric name, so a
+/// labelled family declares them once here and renders one sample block
+/// per label value via `push_histogram_samples`; calling this per stage
+/// would emit duplicate declarations and get the scrape rejected.
+fn push_histogram_header(body: &mut String, metric: &str, help: &str) {
+    body.push_str(&format!("# HELP {metric} {help}\n"));
+    body.push_str(&format!("# TYPE {metric} histogram\n"));
+}
+
+/// Render one histogram's samples. With no stage the output is the bare
 /// `metric_bucket{le="..."}` / `metric_sum` / `metric_count` shape the
 /// prefill series already used; with a stage the same lines carry a
 /// `stage="..."` label (sum and count included, as a labelled family
-/// requires). One helper keeps the six histogram blocks identical.
-fn push_histogram(
+/// requires).
+fn push_histogram_samples(
     body: &mut String,
     metric: &str,
-    help: &str,
     stage: Option<Stage>,
     snapshot: &HistogramSnapshot,
 ) {
-    body.push_str(&format!("# HELP {metric} {help}\n"));
-    body.push_str(&format!("# TYPE {metric} histogram\n"));
     let bucket_label = stage.map_or(String::new(), |s| format!("stage=\"{}\",", s.as_str()));
     let series_label = stage.map_or(String::new(), |s| format!("{{stage=\"{}\"}}", s.as_str()));
     for (bucket, count) in &snapshot.buckets {
@@ -692,6 +702,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_each_metric_family_declares_help_and_type_once() {
+        // Parse the rendered exposition the way a scraper does: every
+        // `# HELP <name>` and `# TYPE <name>` must appear exactly once per
+        // metric family. The stage family renders four labelled sample
+        // blocks but declares its metadata once; a duplicate declaration
+        // gets the whole scrape rejected.
+        for stage in Stage::ALL {
+            observe_stage_latency(stage, 0.001);
+        }
+        observe_prefill_latency(0.01);
+        let rendered = render_metrics();
+        let mut helps: Vec<&str> = Vec::new();
+        let mut types: Vec<&str> = Vec::new();
+        for line in rendered.lines() {
+            if let Some(name) = line.strip_prefix("# HELP ") {
+                helps.push(name.split_whitespace().next().expect("HELP needs a name"));
+            }
+            if let Some(name) = line.strip_prefix("# TYPE ") {
+                types.push(name.split_whitespace().next().expect("TYPE needs a name"));
+            }
+        }
+        for (kind, names) in [("HELP", &helps), ("TYPE", &types)] {
+            let mut seen = std::collections::HashSet::new();
+            for name in names {
+                assert!(
+                    seen.insert(*name),
+                    "duplicate #{kind} declaration for metric family {name}"
+                );
+            }
+        }
+        assert!(
+            helps.contains(&"axiom_stage_latency_seconds"),
+            "stage family must declare HELP once"
+        );
+        assert!(
+            types.contains(&"axiom_stage_latency_seconds"),
+            "stage family must declare TYPE once"
+        );
+        assert_eq!(
+            helps
+                .iter()
+                .filter(|name| **name == "axiom_stage_latency_seconds")
+                .count(),
+            1,
+            "stage family HELP must appear exactly once"
+        );
+        assert_eq!(
+            types
+                .iter()
+                .filter(|name| **name == "axiom_stage_latency_seconds")
+                .count(),
+            1,
+            "stage family TYPE must appear exactly once"
+        );
     }
 
     #[test]
