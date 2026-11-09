@@ -5,8 +5,9 @@
 //!
 //!   * every request answers 200 OK with the mock upstream's text, and every
 //!     upstream payload carries a fingerprint with the raw heavy text
-//!     stripped and a distinct per-session `state_hash` (no wrong answers,
-//!     no cross-tenant bleed under load),
+//!     stripped, a distinct per-session `state_hash`, and a fingerprint
+//!     `session_id` naming exactly the sessions fired (no wrong answers,
+//!     no cross-tenant bleed, no missing/duplicated payload under load),
 //!   * p95 request latency grows at most [`MAX_P95_GROWTH`] over a warm
 //!     sequential baseline,
 //!   * RSS grows at most [`MAX_RSS_GROWTH_RATIO`] plus
@@ -164,6 +165,44 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
     sorted[rank.max(1).min(sorted.len()) - 1]
 }
 
+/// The assistant text of a `/v1/messages` response body.
+///
+/// A substring search for `"ok"` does not verify the answer: the usage
+/// fields `input_tokens` and `output_tokens` contain that substring, so
+/// `text.contains("ok")` passes even when the assistant answer is wrong
+/// or missing (Codex review on PR #292). Parse the JSON and read the
+/// assistant text instead.
+fn assistant_text(body: &[u8]) -> String {
+    let value: Value = serde_json::from_slice(body).expect("response body must be JSON");
+    value["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The `session_id` carried in a payload's `<axiom_context_fingerprint>`
+/// header (`session_id="..."`). The top-level `session_id` field is
+/// stripped from upstream payloads by design, but the fingerprint header
+/// still names the session, so the harness can bind each upstream payload
+/// to the session it came from: the set of fingerprint session ids at a
+/// level must equal exactly the sessions fired at that level. That catches
+/// a missing, duplicated, or foreign payload, which a distinct-hash check
+/// alone would miss. (A pure hash-value swap with correct headers stays
+/// undetectable: the hash is computed by the code under test, so any
+/// "expected" hash would be circular.)
+fn extract_fingerprint_session_id(body: &Value) -> Option<String> {
+    let combined: String = body["messages"]
+        .as_array()?
+        .iter()
+        .filter_map(|m| m.get("content").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .concat();
+    combined.lines().find_map(|line| {
+        let rest = line.strip_prefix("<axiom_context_fingerprint session_id=\"")?;
+        rest.split('"').next().map(str::to_string)
+    })
+}
+
 fn extract_state_hash(body: &Value) -> Option<String> {
     let combined: String = body["messages"]
         .as_array()?
@@ -276,7 +315,12 @@ async fn graded_concurrency_bounds_p95_rss_and_registry() {
     // below and the level-1 RSS are warm, not cold-start numbers.
     let (status, _, bytes) = run_one(&app, "graded-warmup", "warmup").await;
     assert_eq!(status, StatusCode::OK, "warm-up request must be 200");
-    assert!(String::from_utf8_lossy(&bytes).contains("ok"));
+    assert_eq!(
+        assistant_text(&bytes),
+        "ok",
+        "warm-up response must carry the mock upstream answer, got: {}",
+        String::from_utf8_lossy(&bytes)
+    );
     clear_sessions(&app).await;
     let warm_rss = rss_kib();
     println!("[graded-stress] warm_rss={warm_rss:?}KiB");
@@ -287,7 +331,12 @@ async fn graded_concurrency_bounds_p95_rss_and_registry() {
         let (status, latency, bytes) =
             run_one(&app, &format!("graded-base-{i}"), &format!("base{i}")).await;
         assert_eq!(status, StatusCode::OK, "baseline request {i} must be 200");
-        assert!(String::from_utf8_lossy(&bytes).contains("ok"));
+        assert_eq!(
+            assistant_text(&bytes),
+            "ok",
+            "baseline response {i} must carry the mock upstream answer, got: {}",
+            String::from_utf8_lossy(&bytes)
+        );
         baseline_latencies.push(latency);
     }
     baseline_latencies.sort_unstable();
@@ -326,10 +375,11 @@ async fn graded_concurrency_bounds_p95_rss_and_registry() {
                 StatusCode::OK,
                 "level {level}: every request must be 200"
             );
-            let text = String::from_utf8_lossy(&bytes);
-            assert!(
-                text.contains("ok"),
-                "level {level}: response must carry the mock upstream answer, got: {text}"
+            assert_eq!(
+                assistant_text(&bytes),
+                "ok",
+                "level {level}: response must carry the mock upstream answer, got: {}",
+                String::from_utf8_lossy(&bytes)
             );
             latencies.push(latency);
         }
@@ -351,6 +401,7 @@ async fn graded_concurrency_bounds_p95_rss_and_registry() {
             "level {level}: mock must have received exactly one upstream call per session"
         );
         let mut hashes = std::collections::HashSet::new();
+        let mut fingerprint_sessions = std::collections::HashSet::new();
         for body in new_payloads {
             assert!(
                 body.get("session_id").is_none(),
@@ -374,11 +425,21 @@ async fn graded_concurrency_bounds_p95_rss_and_registry() {
             if let Some(h) = extract_state_hash(body) {
                 hashes.insert(h);
             }
+            if let Some(s) = extract_fingerprint_session_id(body) {
+                fingerprint_sessions.insert(s);
+            }
         }
         assert_eq!(
             hashes.len(),
             level,
             "level {level}: each session must produce a distinct state_hash (no cross-tenant bleed)"
+        );
+        let expected_sessions: std::collections::HashSet<String> =
+            (0..level).map(|i| format!("graded-{level}-{i}")).collect();
+        assert_eq!(
+            fingerprint_sessions, expected_sessions,
+            "level {level}: every upstream payload's fingerprint must name exactly \
+             the sessions fired at this level (no missing, duplicated, or foreign payload)"
         );
 
         // ---- Registry: exactly N live sessions, then 0 after clear -----
