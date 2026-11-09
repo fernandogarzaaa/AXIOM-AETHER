@@ -223,14 +223,22 @@ impl SessionData {
 /// its integrity was proven at startup.
 ///
 /// * `Verified` — the checkpoint file exists, its tokenizer is present, and
-///   its SHA-256 matches the pinned `AXIOM_CHECKPOINT_SHA256`.
+///   its SHA-256 matches the pinned `AXIOM_CHECKPOINT_SHA256`; when a
+///   tokenizer hash is also pinned (`AXIOM_TOKENIZER_SHA256`), the tokenizer
+///   file's SHA-256 must match that too. A substituted tokenizer with a valid
+///   checkpoint hash is not verified.
 /// * `Absent` — the checkpoint file does not exist (nothing to serve).
-/// * `Mismatched` — the checkpoint hash differs from the pinned hash, or a
-///   required weight file (the tokenizer) is missing.
+/// * `Mismatched` — the checkpoint hash differs from the pinned hash, a
+///   required weight file (the tokenizer) is missing, the tokenizer hash
+///   differs from its pinned hash, or a tokenizer hash is pinned but no
+///   tokenizer file is configured to check it against.
 /// * `Unverified` — the checkpoint exists but no hash was pinned, so its
 ///   integrity was never proven. This is the state of every fetch done
 ///   without `AXIOM_CHECKPOINT_SHA256` (fetch_base_model in config.rs logs
-///   the computed digest as unverified in that case).
+///   the computed digest as unverified in that case). When no tokenizer hash
+///   is pinned, the tokenizer is checked for presence only, so a checkpoint
+///   whose hash matches is `Verified` even though the tokenizer itself was
+///   never hash-proven; pin `AXIOM_TOKENIZER_SHA256` to close that gap.
 ///
 /// The status is computed once at startup by [`resolve_checkpoint_status`]
 /// and carried on [`AppState`]; `/readyz` consults it, it never re-hashes.
@@ -260,7 +268,7 @@ impl CheckpointStatus {
             CheckpointStatus::Verified => "production checkpoint sha256 verified",
             CheckpointStatus::Absent => "production checkpoint weights are absent",
             CheckpointStatus::Mismatched => {
-                "production checkpoint sha256 mismatch, or a required weight file is missing"
+                "production checkpoint sha256 mismatch, a required weight file is missing, or the tokenizer sha256 mismatch"
             }
             CheckpointStatus::Unverified => {
                 "production checkpoint is unverified: no pinned sha256 is configured"
@@ -271,12 +279,18 @@ impl CheckpointStatus {
 
 /// Resolve the startup checkpoint status from the files on disk. Pure over
 /// the filesystem (no env reads): callers pass the already-resolved paths
-/// and pinned hash. A file that cannot be opened or read counts as
+/// and pinned hashes. A file that cannot be opened or read counts as
 /// `Mismatched` — its integrity cannot be proven, so it must not serve.
+/// `expected_tokenizer_sha256` is `None` (or empty) for presence-only
+/// tokenizer checks, the backward-compatible behavior for smoke deploys;
+/// when pinned, the tokenizer file is hashed with the same streaming
+/// helper and must match, or the status is `Mismatched` even when the
+/// checkpoint hash matches.
 pub fn resolve_checkpoint_status(
     checkpoint_path: &FsPath,
     tokenizer_path: Option<&FsPath>,
     expected_sha256: Option<&str>,
+    expected_tokenizer_sha256: Option<&str>,
 ) -> CheckpointStatus {
     if !checkpoint_path.is_file() {
         return CheckpointStatus::Absent;
@@ -290,7 +304,17 @@ pub fn resolve_checkpoint_status(
         return CheckpointStatus::Unverified;
     };
     match sha256_file(checkpoint_path) {
-        Some(actual) if actual.eq_ignore_ascii_case(expected.trim()) => {
+        Some(actual) if actual.eq_ignore_ascii_case(expected.trim()) => {}
+        _ => return CheckpointStatus::Mismatched,
+    }
+    let Some(expected_tok) = expected_tokenizer_sha256.filter(|s| !s.trim().is_empty()) else {
+        return CheckpointStatus::Verified;
+    };
+    let Some(tokenizer) = tokenizer_path else {
+        return CheckpointStatus::Mismatched;
+    };
+    match sha256_file(tokenizer) {
+        Some(actual) if actual.eq_ignore_ascii_case(expected_tok.trim()) => {
             CheckpointStatus::Verified
         }
         _ => CheckpointStatus::Mismatched,

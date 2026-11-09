@@ -190,12 +190,24 @@ pub async fn run_server(
             .as_deref()
             .map(FsPath::new),
         std::env::var("AXIOM_CHECKPOINT_SHA256").ok().as_deref(),
+        std::env::var("AXIOM_TOKENIZER_SHA256").ok().as_deref(),
     );
     if require_verified_checkpoint {
         match checkpoint_status {
-            CheckpointStatus::Verified => println!(
-                "[+] Production checkpoint verified (sha256 matches AXIOM_CHECKPOINT_SHA256) — /readyz will report ready"
-            ),
+            CheckpointStatus::Verified => {
+                if std::env::var("AXIOM_TOKENIZER_SHA256")
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "[+] Production checkpoint and tokenizer verified (sha256 matches AXIOM_CHECKPOINT_SHA256 and AXIOM_TOKENIZER_SHA256) — /readyz will report ready"
+                    );
+                } else {
+                    println!(
+                        "[+] Production checkpoint verified (sha256 matches AXIOM_CHECKPOINT_SHA256) — /readyz will report ready"
+                    );
+                }
+            }
             other => eprintln!(
                 "[axiom] WARNING: AXIOM_REQUIRE_VERIFIED_CHECKPOINT=1 but the checkpoint is {} ({}) — /readyz will return 503 until a verified checkpoint is present",
                 other.as_str(),

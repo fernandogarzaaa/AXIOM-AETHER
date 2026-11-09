@@ -496,7 +496,7 @@ mod tests {
     fn resolve_checkpoint_status_absent_when_file_missing() {
         let missing = std::path::Path::new("/definitely/not/a/checkpoint.bin");
         assert_eq!(
-            resolve_checkpoint_status(missing, None, None),
+            resolve_checkpoint_status(missing, None, None, None),
             CheckpointStatus::Absent
         );
     }
@@ -507,11 +507,11 @@ mod tests {
         let ckpt = dir.path().join("ckpt.bin");
         std::fs::write(&ckpt, b"weights").unwrap();
         assert_eq!(
-            resolve_checkpoint_status(&ckpt, None, None),
+            resolve_checkpoint_status(&ckpt, None, None, None),
             CheckpointStatus::Unverified
         );
         assert_eq!(
-            resolve_checkpoint_status(&ckpt, None, Some("")),
+            resolve_checkpoint_status(&ckpt, None, Some(""), None),
             CheckpointStatus::Unverified,
             "an empty pinned hash is the same as no pinned hash"
         );
@@ -524,7 +524,7 @@ mod tests {
         std::fs::write(&ckpt, b"weights").unwrap();
         let digest = format!("{:x}", Sha256::digest(b"weights"));
         assert_eq!(
-            resolve_checkpoint_status(&ckpt, None, Some(&digest)),
+            resolve_checkpoint_status(&ckpt, None, Some(&digest), None),
             CheckpointStatus::Verified
         );
     }
@@ -535,7 +535,7 @@ mod tests {
         let ckpt = dir.path().join("ckpt.bin");
         std::fs::write(&ckpt, b"weights").unwrap();
         assert_eq!(
-            resolve_checkpoint_status(&ckpt, None, Some("deadbeef")),
+            resolve_checkpoint_status(&ckpt, None, Some("deadbeef"), None),
             CheckpointStatus::Mismatched
         );
     }
@@ -548,9 +548,79 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(b"weights"));
         let missing_tok = dir.path().join("no-tokenizer.json");
         assert_eq!(
-            resolve_checkpoint_status(&ckpt, Some(&missing_tok), Some(&digest)),
+            resolve_checkpoint_status(&ckpt, Some(&missing_tok), Some(&digest), None),
             CheckpointStatus::Mismatched,
             "a verified checkpoint without its tokenizer is not servable"
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_verified_when_tokenizer_hash_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        std::fs::write(&tok, b"tokenizer-bytes").unwrap();
+        let ckpt_digest = format!("{:x}", Sha256::digest(b"weights"));
+        let tok_digest = format!("{:x}", Sha256::digest(b"tokenizer-bytes"));
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, Some(&tok), Some(&ckpt_digest), Some(&tok_digest)),
+            CheckpointStatus::Verified
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_mismatched_when_tokenizer_hash_mismatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        std::fs::write(&tok, b"substituted-tokenizer").unwrap();
+        let ckpt_digest = format!("{:x}", Sha256::digest(b"weights"));
+        let pinned_tok_digest = format!("{:x}", Sha256::digest(b"tokenizer-bytes"));
+        assert_eq!(
+            resolve_checkpoint_status(
+                &ckpt,
+                Some(&tok),
+                Some(&ckpt_digest),
+                Some(&pinned_tok_digest)
+            ),
+            CheckpointStatus::Mismatched,
+            "a substituted tokenizer must not pass on a valid checkpoint hash alone"
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_presence_only_without_pinned_tokenizer_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        std::fs::write(&tok, b"any-tokenizer").unwrap();
+        let ckpt_digest = format!("{:x}", Sha256::digest(b"weights"));
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, Some(&tok), Some(&ckpt_digest), None),
+            CheckpointStatus::Verified,
+            "no pinned tokenizer hash keeps presence-only behavior"
+        );
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, Some(&tok), Some(&ckpt_digest), Some("")),
+            CheckpointStatus::Verified,
+            "an empty pinned tokenizer hash is the same as no pinned hash"
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_mismatched_when_tokenizer_hash_pinned_but_no_tokenizer_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        let ckpt_digest = format!("{:x}", Sha256::digest(b"weights"));
+        let tok_digest = format!("{:x}", Sha256::digest(b"tokenizer-bytes"));
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, None, Some(&ckpt_digest), Some(&tok_digest)),
+            CheckpointStatus::Mismatched,
+            "a pinned tokenizer hash with no tokenizer file to check proves nothing"
         );
     }
 

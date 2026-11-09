@@ -36,7 +36,10 @@ config:
   productionBpe: "1"     # AXIOM_PRODUCTION_BPE — load the trained checkpoint dims from the sidecar
   # Refuse readiness until the production checkpoint is verified:
   # "1" makes /readyz return 503 unless the checkpoint file exists, its
-  # tokenizer is present, and its SHA-256 matches checkpoint.sha256.
+  # tokenizer is present, and its SHA-256 matches checkpoint.sha256. When
+  # checkpoint.tokenizerSha256 is pinned, the tokenizer file's SHA-256 must
+  # match it too; without a pinned tokenizer hash the tokenizer is checked
+  # for presence only.
   # Default "" (off) preserves the local-first default: the legacy bootstrap
   # model still reports ready. Set to "1" in production alongside a pinned
   # checkpoint.sha256; pinning the hash alone does NOT enable the gate.
