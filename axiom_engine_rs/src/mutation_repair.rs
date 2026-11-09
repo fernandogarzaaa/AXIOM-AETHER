@@ -236,6 +236,46 @@ pub fn is_oracle_line(line: &str) -> bool {
     MARKERS.iter().any(|m| l.contains(m))
 }
 
+/// Lines that continue a multiline oracle expression. Only the opening line
+/// of a multiline assertion carries an oracle marker, so line-local
+/// `is_oracle_line` misses the comparison on a continuation line and `plan`
+/// would mutate it (Codex P1 on #247: `1 == 2` -> `1 != 2`, verifier green
+/// by reversing the assertion). A bracket-depth scan from each oracle line
+/// marks the continuation lines up to and including the line where the
+/// depth returns to zero. Counting is naive (no string/comment awareness);
+/// over-extension only ever skips a mutation, which is the safe direction.
+fn oracle_continuation_lines(lines: &[&str]) -> HashSet<usize> {
+    let depth_of = |s: &str| -> i32 {
+        s.chars().fold(0i32, |d, c| match c {
+            '(' | '[' | '{' => d + 1,
+            ')' | ']' | '}' => d - 1,
+            _ => d,
+        })
+    };
+    let mut out = HashSet::new();
+    for (i, line) in lines.iter().enumerate() {
+        let (content, _) = split_eol(line);
+        if !is_oracle_line(content) {
+            continue;
+        }
+        let mut depth = depth_of(content);
+        if depth <= 0 {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < lines.len() {
+            let (next, _) = split_eol(lines[j]);
+            depth += depth_of(next);
+            out.insert(j);
+            j += 1;
+            if depth <= 0 {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Order the mutation classes by what the failure trace suggests. Pure
 /// heuristics over the verifier's text; the default order is used when nothing
 /// matches. Returned vector always contains every class exactly once.
@@ -390,6 +430,7 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
         return Vec::new();
     }
     let n = lines.len();
+    let oracle_continuations = oracle_continuation_lines(&lines);
 
     // In-file test region (Rust `#[cfg(test)]`): the oracle. Nothing at or
     // below it is ever mutated, and a blamed line inside it (the assertion
@@ -459,7 +500,11 @@ pub fn plan(source: &str, path: &Path, trace: &str, max: usize) -> Vec<Candidate
     let mut seq = 0usize;
     let visit = |li: usize, pos: usize, tier: u8, keyed: &mut Vec<_>, seq: &mut usize| {
         let (content, eol) = split_eol(lines[li]);
-        if content.trim().is_empty() || is_comment_only(content, lang) || is_oracle_line(content) {
+        if content.trim().is_empty()
+            || is_comment_only(content, lang)
+            || is_oracle_line(content)
+            || oracle_continuations.contains(&li)
+        {
             return;
         }
         let next = lines[li + 1..]
@@ -3050,6 +3095,53 @@ mod tests {
         );
         assert!(
             p.iter().all(|c| c.line != 2),
+            "{:?}",
+            p.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn plan_never_mutates_continuation_lines_of_multiline_assertions() {
+        // Codex P1 on #247: only the opening line of a multiline assertion
+        // carries an oracle marker, so the comparison on a continuation line
+        // was mutated (`1 == 2` -> `1 != 2`) and the verifier went green by
+        // reversing the assertion. The whole assertion expression is the
+        // oracle, including its closing line — even when the blamed line is
+        // the continuation itself.
+        let src = "def check():\n    assert (\n        1 == 2\n    )\n";
+        let p = plan(
+            src,
+            &PathBuf::from("test_check.py"),
+            "test_check.py:3: AssertionError",
+            64,
+        );
+        assert!(
+            !p.iter().any(|c| c.source.contains("1 != 2")),
+            "continuation line mutated: {:?}",
+            p.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+        assert!(
+            p.iter().all(|c| c.line != 3 && c.line != 4),
+            "{:?}",
+            p.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+
+        // Same shape in Rust: `assert!` opens the expression, the
+        // comparison lives on the next line.
+        let src = "fn check(a: i32, b: i32) {\n    assert!(\n        a == b\n    );\n}\n";
+        let p = plan(
+            src,
+            &PathBuf::from("lib.rs"),
+            "lib.rs:3: assertion failed",
+            64,
+        );
+        assert!(
+            !p.iter().any(|c| c.source.contains("a != b")),
+            "continuation line mutated: {:?}",
+            p.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+        assert!(
+            p.iter().all(|c| c.line != 3 && c.line != 4),
             "{:?}",
             p.iter().map(|c| &c.label).collect::<Vec<_>>()
         );
