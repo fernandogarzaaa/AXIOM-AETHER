@@ -353,6 +353,123 @@ mod tests {
     }
 
     #[test]
+    fn test_stage_latency_observations_render_per_stage() {
+        // Each pipeline stage must produce its own labelled histogram series
+        // with a sane count after one observation.
+        for stage in Stage::ALL {
+            observe_stage_latency(stage, 0.02);
+        }
+        let rendered = render_metrics();
+        for stage in Stage::ALL {
+            let label = stage.as_str();
+            assert!(
+                rendered.contains(&format!(
+                    "axiom_stage_latency_seconds_bucket{{stage=\"{label}\""
+                )),
+                "missing stage series for {label}"
+            );
+            let count_line = rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with(&format!(
+                        "axiom_stage_latency_seconds_count{{stage=\"{label}\"}}"
+                    ))
+                })
+                .expect("stage count line must be rendered");
+            let count: u64 = count_line
+                .split_whitespace()
+                .nth(1)
+                .expect("count value must exist")
+                .parse()
+                .expect("count must parse");
+            assert!(
+                count >= 1,
+                "stage {label} must record at least one observation"
+            );
+            let sum_line = rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with(&format!(
+                        "axiom_stage_latency_seconds_sum{{stage=\"{label}\"}}"
+                    ))
+                })
+                .expect("stage sum line must be rendered");
+            let sum: f64 = sum_line
+                .split_whitespace()
+                .nth(1)
+                .expect("sum value must exist")
+                .parse()
+                .expect("sum must parse");
+            assert!(
+                sum >= 0.02,
+                "stage {label} sum must cover the 0.02s observation, got {sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_memory_gauges_render() {
+        set_session_memory_bytes(1234);
+        let rss = refresh_process_memory();
+        #[cfg(target_os = "linux")]
+        {
+            let bytes = rss.expect("RSS must be measurable on Linux");
+            assert!(bytes > 0, "measured RSS must be positive, got {bytes}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(rss.is_none(), "RSS is unmeasured off Linux");
+        }
+        let rendered = render_metrics();
+        let rss_line = rendered
+            .lines()
+            .find(|line| line.starts_with("axiom_process_rss_bytes "))
+            .expect("process RSS gauge must be rendered");
+        let rss_value: u64 = rss_line
+            .split_whitespace()
+            .nth(1)
+            .expect("RSS value must exist")
+            .parse()
+            .expect("RSS value must parse");
+        #[cfg(target_os = "linux")]
+        assert!(rss_value > 0, "rendered RSS must be positive on Linux");
+        let memory_line = rendered
+            .lines()
+            .find(|line| line.starts_with("axiom_session_memory_bytes "))
+            .expect("session memory gauge must be rendered");
+        let memory_value: u64 = memory_line
+            .split_whitespace()
+            .nth(1)
+            .expect("session memory value must exist")
+            .parse()
+            .expect("session memory value must parse");
+        assert!(
+            memory_value >= 1234,
+            "session memory gauge must carry the recorded bytes, got {memory_value}"
+        );
+    }
+
+    #[test]
+    fn test_backpressure_stall_counter_renders() {
+        record_backpressure_stall();
+        let rendered = render_metrics();
+        let count_line = rendered
+            .lines()
+            .find(|line| line.starts_with("axiom_stream_backpressure_stalls_total "))
+            .expect("backpressure stall counter must be rendered");
+        let count: u64 = count_line
+            .split_whitespace()
+            .nth(1)
+            .expect("count value must exist")
+            .parse()
+            .expect("count must parse");
+        assert!(
+            count >= 1,
+            "at least one backpressure stall must be recorded"
+        );
+    }
+
+    #[test]
     fn test_first_token_buckets_resolve_multi_second_latency() {
         // A 3 s first token must land in the 5 s bucket but not the
         // 2.5 s bucket: with the old prefill buckets (max finite 1.0 s)
@@ -378,6 +495,33 @@ mod tests {
             bucket_count("5") > bucket_count("2.5"),
             "a 3 s observation must resolve between the 2.5 s and 5 s buckets"
         );
+    }
+
+    #[test]
+    fn test_stage_render_is_bounded_to_four_stages() {
+        // Four stages, each a 9-bucket histogram plus +Inf, sum, count:
+        // exactly 48 stage lines, no more, regardless of observations.
+        for stage in Stage::ALL {
+            observe_stage_latency(stage, 0.001);
+        }
+        let rendered = render_metrics();
+        let stage_lines = rendered
+            .lines()
+            .filter(|line| line.starts_with("axiom_stage_latency_seconds_"))
+            .count();
+        assert_eq!(
+            stage_lines, 48,
+            "rendered {stage_lines} stage lines, bound is 48"
+        );
+        for line in rendered.lines() {
+            if let Some(rest) = line.split("stage=\"").nth(1) {
+                let label = rest.split('"').next().unwrap_or("");
+                assert!(
+                    ["compress", "route", "forward", "fingerprint"].contains(&label),
+                    "unexpected stage label in rendered metrics: {label}"
+                );
+            }
+        }
     }
 
     #[test]

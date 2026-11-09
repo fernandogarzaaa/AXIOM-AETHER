@@ -1365,6 +1365,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_renders_stage_memory_and_stall_series() {
+        // Drive the new observability surface through the real /metrics
+        // route: one observation per stage, one stall, a session-memory
+        // value, and an RSS refresh, then assert every new series is in
+        // the exposition body.
+        for stage in metrics::Stage::ALL {
+            metrics::observe_stage_latency(stage, 0.01);
+        }
+        metrics::record_backpressure_stall();
+        metrics::set_session_memory_bytes(2048);
+        metrics::refresh_process_memory();
+
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+        for stage in metrics::Stage::ALL {
+            assert!(
+                rendered.contains(&format!(
+                    "axiom_stage_latency_seconds_bucket{{stage=\"{}\"",
+                    stage.as_str()
+                )),
+                "missing stage series for {}",
+                stage.as_str()
+            );
+        }
+        assert!(rendered.contains("axiom_process_rss_bytes"));
+        assert!(rendered.contains("axiom_session_memory_bytes"));
+        assert!(rendered.contains("axiom_stream_backpressure_stalls_total"));
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
     async fn ops_endpoints_exempt_from_api_key() {
         // /healthz and /readyz must stay reachable for probes even when the
         // data plane is locked down. /metrics is NOT exempt: it is gated by
