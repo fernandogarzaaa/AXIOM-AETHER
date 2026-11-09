@@ -706,9 +706,14 @@ async fn create_response(
         .and_then(|value| value.to_str().ok());
     // One stable idempotency key for every upstream attempt of this
     // request: the client-supplied `Idempotency-Key` when present,
-    // otherwise derived from the original body + session id. The same
-    // `client_auth` is reused for the first attempt and any retry below,
-    // so a 5xx retry cannot double-execute (see `resolve_idempotency_key`).
+    // otherwise derived from the original body + session id + a nonce
+    // generated once per inbound request. The same `client_auth` is
+    // reused for the first attempt and any retry below, so a 5xx retry
+    // cannot double-execute (see `resolve_idempotency_key`). The nonce
+    // keeps independent identical requests distinct: without it, two
+    // separate requests with the same body and session would share a key
+    // and the upstream would replay the first response for the second.
+    let request_nonce = Uuid::new_v4().to_string();
     let idempotency_key = crate::openai_forwarder::resolve_idempotency_key(
         client_auth
             .extra_headers
@@ -717,6 +722,7 @@ async fn create_response(
             .map(|(_, value)| value.as_str()),
         &body,
         session_override.unwrap_or("anonymous"),
+        &request_nonce,
     );
     client_auth
         .extra_headers

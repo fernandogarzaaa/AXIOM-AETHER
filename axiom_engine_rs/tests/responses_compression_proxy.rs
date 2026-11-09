@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use axiom_engine::config::AxiomConfig;
 use axiom_engine::context_compressor::CompressorConfig;
 use axiom_engine::inference::InferencePipeline;
-use axiom_engine::openai_forwarder::resolve_idempotency_key;
 use axiom_engine::openai_forwarder::OpenAiForwarder;
 use axiom_engine::server::{create_router, AppState};
 use axum::body::Body;
@@ -330,11 +329,13 @@ async fn compressed_5xx_retry_carries_same_idempotency_key() {
         first_key, second_key,
         "retry must reuse the first attempt's key"
     );
-    assert_eq!(
-        *first_key,
-        resolve_idempotency_key(None, &original, "anonymous"),
-        "derived key must come from the original body + session id"
+    assert!(
+        first_key.starts_with("axiom-"),
+        "derived key must carry the axiom- prefix"
     );
+    // The derived key is scoped to this inbound request by a fresh nonce,
+    // so its exact value is not predictable from body + session alone;
+    // the derivation contract itself is pinned by the unit tests.
     task.abort();
     std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
 }
