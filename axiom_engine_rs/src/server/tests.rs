@@ -809,13 +809,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ops_endpoints_exempt_from_api_key() {
-        // /healthz and /metrics must stay reachable for probes/scrapers even
-        // when the data plane is locked down.
+    async fn metrics_requires_api_key_when_configured() {
+        // /metrics is gated by require_api_key: without the key it 401s, with
+        // the key it serves the exposition body.
         let state = make_test_state().await.with_api_key(Some("k3y".into()));
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state);
-        for uri in ["/healthz", "/metrics"] {
+
+        // Missing header → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong key → 401.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .header("x-axiom-key", "wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct key → 200 with the exposition body.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .header("x-axiom-key", "k3y")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("axiom_total_tokens_prefilled"));
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn metrics_open_by_default_when_no_api_key() {
+        // With AXIOM_API_KEY unset the guard is a passthrough, so /metrics
+        // stays open with no header, as before.
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn ops_endpoints_exempt_from_api_key() {
+        // /healthz and /readyz must stay reachable for probes even when the
+        // data plane is locked down. /metrics is NOT exempt: it is gated by
+        // require_api_key (see metrics_requires_api_key_when_configured).
+        let state = make_test_state().await.with_api_key(Some("k3y".into()));
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        for uri in ["/healthz", "/readyz"] {
             let resp = app
                 .clone()
                 .oneshot(

@@ -72,10 +72,12 @@ async fn require_api_key(State(state): State<AppState>, req: axum::extract::Requ
 
 /// Build the axum Router with all API routes attached.
 ///
-/// Routes split into two groups:
-/// * **public** — `/healthz`, `/readyz`, `/metrics` (ops/observability, must stay
-///   reachable for probes and scrapers) and `/mcp` (guarded separately by its own
-///   `AXIOM_MCP_TOKEN`).
+/// Routes split into three groups:
+/// * **public** — `/healthz` and `/readyz` (probes, must stay reachable) and
+///   `/mcp` (guarded separately by its own `AXIOM_MCP_TOKEN`).
+/// * **metrics** — `/metrics`, wrapped in [`require_api_key`]. With
+///   `AXIOM_API_KEY` unset the guard is a passthrough, so scrapers keep
+///   working by default; with a key set, scrapers must present it.
 /// * **guarded** — the data plane, wrapped in [`require_api_key`]. With
 ///   `AXIOM_API_KEY` unset the guard is a passthrough, so behavior is unchanged
 ///   by default.
@@ -83,8 +85,17 @@ pub fn create_router(state: AppState) -> Router {
     let public = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/metrics", get(export_metrics))
         .route("/mcp", get(mcp_http_sse).post(post_mcp));
+
+    // /metrics is not public: session telemetry must not be reachable without
+    // the key once AXIOM_API_KEY is set. Kept on its own router (rather than
+    // folded into the data plane) so /healthz and /readyz stay ungated.
+    let metrics = Router::new()
+        .route("/metrics", get(export_metrics))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ));
 
     let guarded = Router::new()
         .route("/v1/fleet/status", get(fleet_status))
@@ -154,6 +165,7 @@ pub fn create_router(state: AppState) -> Router {
     ));
 
     public
+        .merge(metrics)
         .merge(guarded)
         .layer(CorsLayer::permissive())
         // Codex CLI compresses HTTP request bodies (gzip/zstd); decompress
