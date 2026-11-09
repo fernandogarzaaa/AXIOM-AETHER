@@ -1378,7 +1378,11 @@ mod tests {
             metrics::observe_stage_latency(stage, 0.01);
         }
         metrics::record_backpressure_stall();
-        metrics::set_session_memory_bytes(2048);
+        // Preload zero, not 2048: with a preloaded value above the
+        // expected 64-byte session the assertion below passes even if
+        // the route stops refreshing session memory. Zero makes a
+        // missing refresh fail the assertion in isolation.
+        metrics::set_session_memory_bytes(0);
         metrics::refresh_process_memory();
 
         let state = make_test_state().await;
@@ -1950,6 +1954,12 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_upload_with_overflowing_shape_is_rejected_not_panicking() {
+        // Creating a session refreshes the process-global session-memory
+        // gauge synchronously and spawns an LRU refresh that writes it
+        // again, so this test holds the gauge lock for its whole body:
+        // otherwise its 1024-byte refresh can replace the 1234 bytes
+        // `test_memory_gauges_render` sets before it renders.
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state);

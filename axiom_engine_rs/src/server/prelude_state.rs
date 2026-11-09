@@ -1298,6 +1298,15 @@ async fn enforce_lru_vram_budget_async(
         };
 
         let Some((evict_session_id, baseline_last_used)) = candidate else {
+            // Test-only: serialize this gauge write with the gauge tests.
+            // This task is spawned by `trigger_lru_vram_budget`, so it
+            // runs outside any test's lock hold; without the lock its
+            // refresh can replace the 1234 bytes
+            // `test_memory_gauges_render` sets before it renders.
+            #[cfg(test)]
+            let _gauge_guard = crate::metrics::SESSION_MEMORY_GAUGE_TEST_LOCK
+                .lock()
+                .await;
             refresh_session_metrics_from_sessions(&sessions)
                 .map_err(|e| format!("session metrics refresh failed: {e}"))?;
             return Ok(());
