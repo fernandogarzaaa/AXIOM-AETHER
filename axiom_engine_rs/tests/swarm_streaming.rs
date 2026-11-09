@@ -33,6 +33,17 @@ fn router_for(base_url: &str) -> SwarmRouter {
     })
 }
 
+fn mesh_router_for(base_url: &str) -> SwarmRouter {
+    SwarmRouter::new(SwarmRouterConfig {
+        enabled: true,
+        base_url: base_url.to_string(),
+        model_candidates: vec!["phi4:3.8b".to_string()],
+        num_ctx: 4096,
+        timeout_ms: 5_000,
+        mesh_routing: true,
+    })
+}
+
 fn chat_payload() -> Value {
     json!({"messages": [{"role": "user", "content": "hello"}]})
 }
@@ -79,11 +90,27 @@ impl FakeOllama {
         Self::spawn_with_status(vec![], true, chat_status).await
     }
 
+    /// Like `spawn`, but `/api/chat` waits `header_delay` before
+    /// returning headers, modelling a model that spends time loading
+    /// or processing the prompt before the first token can arrive.
+    async fn spawn_with_header_delay(chunks: Vec<FakeChunk>, header_delay: Duration) -> Self {
+        Self::spawn_full(chunks, true, 200, header_delay).await
+    }
+
     async fn spawn_with(chunks: Vec<FakeChunk>, send_done: bool) -> Self {
         Self::spawn_with_status(chunks, send_done, 200).await
     }
 
     async fn spawn_with_status(chunks: Vec<FakeChunk>, send_done: bool, chat_status: u16) -> Self {
+        Self::spawn_full(chunks, send_done, chat_status, Duration::ZERO).await
+    }
+
+    async fn spawn_full(
+        chunks: Vec<FakeChunk>,
+        send_done: bool,
+        chat_status: u16,
+        header_delay: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let stats = Arc::new(FakeStats::default());
@@ -97,7 +124,8 @@ impl FakeOllama {
                 let chunks = chunks.clone();
                 let stats = serve_stats.clone();
                 tokio::spawn(async move {
-                    handle_connection(socket, chunks, stats, send_done, chat_status).await;
+                    handle_connection(socket, chunks, stats, send_done, chat_status, header_delay)
+                        .await;
                 });
             }
         });
@@ -160,6 +188,7 @@ async fn handle_connection(
     stats: Arc<FakeStats>,
     send_done: bool,
     chat_status: u16,
+    header_delay: Duration,
 ) {
     let Some((method, path, body)) = read_request(&mut socket).await else {
         return;
@@ -197,6 +226,9 @@ async fn handle_connection(
         .unwrap_or(false);
     if stream {
         stats.saw_stream_true.store(true, Ordering::SeqCst);
+        // Model-load / prompt-processing wait: headers arrive only after
+        // this delay, so the dispatch's header wait is `header_delay`.
+        sleep(header_delay).await;
         let head =
             "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n";
         if socket.write_all(head.as_bytes()).await.is_err() {
@@ -509,6 +541,53 @@ async fn first_token_latency_is_recorded() {
     assert!(
         count >= 1,
         "at least one first-token observation must be recorded"
+    );
+}
+
+#[tokio::test]
+async fn streaming_mesh_latency_includes_startup_wait() {
+    // Codex P2: with mesh routing on, a model that spends time loading
+    // before returning headers must not earn a fast-model reward for the
+    // short response that follows. The fake delays headers by 1000 ms,
+    // then completes immediately; the latency the selector records must
+    // cover the header wait, not just the fast body that followed it.
+    const HEADER_DELAY_MS: u64 = 1000;
+    let fake = FakeOllama::spawn_with_header_delay(
+        vec![FakeChunk {
+            content: "hi".to_string(),
+            delay_before: Duration::from_millis(0),
+        }],
+        Duration::from_millis(HEADER_DELAY_MS),
+    )
+    .await;
+    let router = mesh_router_for(&fake.base_url);
+    let mut stream = router
+        .route_chat_stream(&chat_payload())
+        .await
+        .expect("streaming dispatch must succeed");
+    while let Some(item) = timeout(Duration::from_secs(10), stream.receiver.recv())
+        .await
+        .expect("chunks must arrive")
+    {
+        let _ = item.expect("chunk must not be an upstream error");
+    }
+    // The producer task records the outcome after the stream ends, so
+    // poll until the recording lands. A missing recording is itself a
+    // failure, not a hang: the poll is bounded.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let recorded = loop {
+        if let Some(latency) = router.last_recorded_mesh_latency_ms("phi4:3.8b") {
+            break latency;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "mesh selector never recorded the streaming outcome"
+        );
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        recorded >= HEADER_DELAY_MS - 200,
+        "recorded mesh latency must include the {HEADER_DELAY_MS} ms header wait, got {recorded} ms"
     );
 }
 

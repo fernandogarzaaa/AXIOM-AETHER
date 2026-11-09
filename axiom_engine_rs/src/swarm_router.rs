@@ -151,6 +151,16 @@ impl SwarmRouter {
         &self.config
     }
 
+    /// Last mesh latency (ms) recorded for `model` on this router, if
+    /// any. `None` when mesh routing is off or no outcome has been
+    /// recorded yet. Observability hook: see
+    /// `MeshModelSelector::last_recorded_latency_ms`.
+    pub fn last_recorded_mesh_latency_ms(&self, model: &str) -> Option<u64> {
+        self.mesh_selector
+            .as_ref()
+            .and_then(|selector| selector.last_recorded_latency_ms(model))
+    }
+
     pub async fn route_chat_payload(
         &self,
         payload: &Value,

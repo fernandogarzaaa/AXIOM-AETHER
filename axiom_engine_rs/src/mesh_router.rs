@@ -22,6 +22,7 @@
 //! entirely the static priority bias plus learned quality, which is an
 //! honest scope for what this integration can actually justify.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::mesh_core::mesh::{KineticNeuralMesh, MeshConfig};
@@ -38,6 +39,11 @@ pub struct MeshModelSelector {
     rng: Mutex<StdRng>,
     /// Model name -> its NodeId, in the caller's original priority order.
     nodes: Vec<(String, NodeId)>,
+    /// Last latency (ms) recorded per model. The mesh's learned reward is
+    /// internal, so without this there is no way to check what latency a
+    /// dispatch actually fed the selector — this is the observability
+    /// hook the streaming latency test reads back.
+    last_latencies: Mutex<HashMap<String, u64>>,
 }
 
 impl MeshModelSelector {
@@ -84,6 +90,7 @@ impl MeshModelSelector {
             mesh: Mutex::new(mesh),
             rng: Mutex::new(rand::make_rng::<StdRng>()),
             nodes,
+            last_latencies: Mutex::new(HashMap::new()),
         }
     }
 
@@ -137,12 +144,22 @@ impl MeshModelSelector {
         let Some((_, id)) = self.nodes.iter().find(|(name, _)| name == model) else {
             return;
         };
+        self.last_latencies
+            .lock()
+            .unwrap()
+            .insert(model.to_string(), latency_ms);
         let reward = if success {
             200.0 / (latency_ms.max(1) as f32 + 200.0)
         } else {
             -1.0
         };
         self.mesh.lock().unwrap().record_outcome(*id, reward);
+    }
+
+    /// Last latency (ms) recorded for `model`, if any. `None` means no
+    /// outcome has been recorded for it yet.
+    pub fn last_recorded_latency_ms(&self, model: &str) -> Option<u64> {
+        self.last_latencies.lock().unwrap().get(model).copied()
     }
 }
 
