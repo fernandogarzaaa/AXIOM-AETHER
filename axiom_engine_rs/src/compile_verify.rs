@@ -291,10 +291,15 @@ impl CompileVerifier {
                 // `wait` returns only when the child exits, so a plain
                 // timeout leaves cargo (and the rustc it spawned) running.
                 // Kill the whole group, reap the child so no zombie is left,
-                // then report the timeout.
+                // then report the timeout. The direct kill is not redundant:
+                // on Windows `kill_group` is a no-op, so without it this
+                // path would wait on the still-running cargo indefinitely.
+                // This matches `proc_bound::output_bounded`, which kills the
+                // group and then the direct child on timeout.
                 if let Some(pid) = pid {
                     crate::proc_bound::kill_group(pid);
                 }
+                let _ = child.kill().await;
                 let _ = child.wait().await;
                 if let Some(task) = stdout_task {
                     task.abort();
@@ -540,6 +545,68 @@ mod tests {
             leaked.is_empty(),
             "processes still alive under {}: {leaked:?}",
             root.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The timeout path must kill the direct child, not only its group.
+    /// On Linux the group kill already reaches cargo, so this test cannot
+    /// distinguish the two kills here: it pins the timeout path returning
+    /// promptly with no cargo or rustc left behind. The direct kill is the
+    /// Windows path, where `kill_group` is a no-op and without it the wait
+    /// would hang indefinitely; actual Windows behavior cannot be verified
+    /// in this sandbox.
+    #[tokio::test]
+    async fn timeout_kills_the_direct_child_and_returns_promptly() {
+        let root =
+            std::env::temp_dir().join(format!("axiom-compile-verify-test-{}", Uuid::new_v4()));
+        let workspace = root.join("direct-kill");
+        create_rust_workspace(&workspace, "pub fn ok() {}")
+            .await
+            .unwrap();
+        std::fs::write(
+            workspace.join("build.rs"),
+            "fn main() { std::thread::sleep(std::time::Duration::from_secs(30)); }",
+        )
+        .unwrap();
+        let leaked_before = leaked_processes_under(&root);
+        let zombies_before = zombie_children_named(&["cargo", "rustc"]);
+        // 500 ms: cargo has started the sleeping build script, which needs
+        // 30 s, so the timeout must fire while it is still running.
+        let t0 = std::time::Instant::now();
+        let verifier = CompileVerifier::new(root.clone(), 1, Duration::from_millis(500));
+        let err = verifier
+            .run_cargo_check(&workspace, "s1", 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CompileVerifyError::Timeout(_)),
+            "expected Timeout, got {err}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "timeout returned in {:?}, the direct child was not killed",
+            t0.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leaked = leaked_processes_under(&root);
+        let leaked: Vec<u32> = leaked
+            .into_iter()
+            .filter(|p| !leaked_before.contains(p))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "processes still alive under {}: {leaked:?}",
+            root.display()
+        );
+        let zombies = zombie_children_named(&["cargo", "rustc"]);
+        let zombies: Vec<u32> = zombies
+            .into_iter()
+            .filter(|p| !zombies_before.contains(p))
+            .collect();
+        assert!(
+            zombies.is_empty(),
+            "zombie cargo/rustc children: {zombies:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
