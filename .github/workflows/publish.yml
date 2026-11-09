@@ -47,7 +47,7 @@ jobs:
           OUTPUT=$(cargo publish --locked 2>&1)
           EXIT=$?
           echo "$OUTPUT"
-          if [ $EXIT -ne 0 ] && echo "$OUTPUT" | grep -q "already exists"; then
+          if [ $EXIT -ne 0 ] && echo "$OUTPUT" | grep -qE "already (exists|uploaded)"; then
             echo "axiom_mesh_core already published, continuing"
             exit 0
           fi
@@ -97,7 +97,7 @@ jobs:
           OUTPUT=$(cargo publish --locked 2>&1)
           EXIT=$?
           echo "$OUTPUT"
-          if [ $EXIT -ne 0 ] && echo "$OUTPUT" | grep -q "already exists"; then
+          if [ $EXIT -ne 0 ] && echo "$OUTPUT" | grep -qE "already (exists|uploaded)"; then
             echo "axiom_engine already published, continuing"
             exit 0
           fi
