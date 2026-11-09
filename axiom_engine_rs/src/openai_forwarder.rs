@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 /// Default endpoint for a local [OpenDrop](https://github.com/fernandogarzaaa/OpenDrop)
@@ -261,6 +262,42 @@ fn bearer_value(key: &str) -> String {
     }
 }
 
+/// Resolve the idempotency key for one upstream request.
+///
+/// A client-supplied `Idempotency-Key` is honored unchanged. Otherwise the
+/// key is derived deterministically from the original request body +
+/// session id (see `derive_idempotency_key`), so the first attempt and any
+/// retry of the same request carry the same key and the upstream dedupes
+/// instead of executing twice. A blank client-supplied value falls back to
+/// the derived key.
+pub fn resolve_idempotency_key(
+    client_supplied: Option<&str>,
+    payload: &Value,
+    session_id: &str,
+) -> String {
+    match client_supplied.filter(|key| !key.trim().is_empty()) {
+        Some(key) => key.to_string(),
+        None => derive_idempotency_key(payload, session_id),
+    }
+}
+
+/// Derive a stable idempotency key from the original request body +
+/// session id. Deterministic for a given body value and session id, so a
+/// retry re-sends the key the first attempt used.
+pub fn derive_idempotency_key(payload: &Value, session_id: &str) -> String {
+    let canonical = serde_json::to_string(payload).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(session_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(canonical.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    format!("axiom-{hex}")
+}
+
 pub struct OpenAiForwardedResponse {
     pub status: u16,
     pub content_type: Option<String>,
@@ -270,6 +307,8 @@ pub struct OpenAiForwardedResponse {
 #[derive(Debug)]
 pub enum OpenAiForwarderError {
     Network(String),
+    Upstream { status: u16, body: String },
+    Decode(String),
     MissingAuth,
 }
 
@@ -277,6 +316,10 @@ impl std::fmt::Display for OpenAiForwarderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OpenAiForwarderError::Network(m) => write!(f, "network error: {m}"),
+            OpenAiForwarderError::Upstream { status, body } => {
+                write!(f, "upstream {status}: {body}")
+            }
+            OpenAiForwarderError::Decode(m) => write!(f, "decode error: {m}"),
             OpenAiForwarderError::MissingAuth => write!(
                 f,
                 "no upstream credential: client sent no Authorization header \
@@ -428,5 +471,50 @@ mod tests {
     fn no_signal_falls_back_to_default() {
         assert_eq!(resolve_base_url(None, None, None), None);
         assert_eq!(resolve_base_url(Some("openai"), None, None), None);
+    }
+
+    #[test]
+    fn resolve_idempotency_key_honors_client_supplied_key() {
+        let payload = serde_json::json!({"model": "gpt-5.5", "input": "hello"});
+        assert_eq!(
+            super::resolve_idempotency_key(Some("client-key-123"), &payload, "sess-1"),
+            "client-key-123"
+        );
+    }
+
+    #[test]
+    fn derive_idempotency_key_is_deterministic_and_scoped() {
+        let payload = serde_json::json!({"model": "gpt-5.5", "input": "hello"});
+        let first = super::derive_idempotency_key(&payload, "sess-1");
+        let second = super::derive_idempotency_key(&payload, "sess-1");
+        assert_eq!(
+            first, second,
+            "same body + session must derive the same key"
+        );
+        assert!(
+            first.starts_with("axiom-"),
+            "derived key carries the axiom- prefix"
+        );
+        assert_ne!(
+            super::derive_idempotency_key(&payload, "sess-2"),
+            first,
+            "a different session derives a different key"
+        );
+        let other = serde_json::json!({"model": "gpt-5.5", "input": "different"});
+        assert_ne!(
+            super::derive_idempotency_key(&other, "sess-1"),
+            first,
+            "a different body derives a different key"
+        );
+        assert_eq!(
+            super::resolve_idempotency_key(None, &payload, "sess-1"),
+            first,
+            "no client key resolves to the derived key"
+        );
+        assert_eq!(
+            super::resolve_idempotency_key(Some("  "), &payload, "sess-1"),
+            first,
+            "a blank client key resolves to the derived key"
+        );
     }
 }

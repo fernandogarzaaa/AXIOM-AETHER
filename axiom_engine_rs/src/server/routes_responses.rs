@@ -694,7 +694,7 @@ async fn create_response(
         }
         .into_response();
     };
-    let client_auth = OpenAiClientAuth {
+    let mut client_auth = OpenAiClientAuth {
         authorization: headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -704,6 +704,26 @@ async fn create_response(
     let session_override = headers
         .get("x-axiom-session-id")
         .and_then(|value| value.to_str().ok());
+    // One stable idempotency key for every upstream attempt of this
+    // request: the client-supplied `Idempotency-Key` when present,
+    // otherwise derived from the original body + session id. The same
+    // `client_auth` is reused for the first attempt and any retry below,
+    // so a 5xx retry cannot double-execute (see `resolve_idempotency_key`).
+    let idempotency_key = crate::openai_forwarder::resolve_idempotency_key(
+        client_auth
+            .extra_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("idempotency-key"))
+            .map(|(_, value)| value.as_str()),
+        &body,
+        session_override.unwrap_or("anonymous"),
+    );
+    client_auth
+        .extra_headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("idempotency-key"));
+    client_auth
+        .extra_headers
+        .push(("idempotency-key".to_string(), idempotency_key));
     let compressed = match compressed_responses_payload(
         &state,
         &body,
@@ -721,11 +741,18 @@ async fn create_response(
     };
     let outbound = compressed.as_ref().unwrap_or(&body);
     let forward_started = Instant::now();
+    // The retry decision is the shared predicate (`should_retry_openai` /
+    // `should_retry_status`): retry Network, 5xx, and 400 caused by
+    // compression; never 401/403/429/Decode. A retry is safe only because
+    // every attempt carries the same stable idempotency key resolved above.
     let mut upstream = match forwarder.forward_responses(outbound, &client_auth).await {
         Ok(response) => response,
-        Err(OpenAiForwarderError::Network(error)) if compressed.is_some() => {
+        Err(err)
+            if compressed.is_some()
+                && crate::context_compressor::should_retry_openai(&err) =>
+        {
             eprintln!(
-                "[axiom-ttt] compressed Responses network failure ({error}); retrying original payload"
+                "[axiom-ttt] compressed Responses forward failed ({err}); retrying original payload"
             );
             state.controls.record_degraded_fallback();
             match forwarder.forward_responses(&body, &client_auth).await {
@@ -736,7 +763,7 @@ async fn create_response(
         Err(error) => return map_openai_forwarder_error(error).into_response(),
     };
     if compressed.is_some()
-        && (upstream.status() == StatusCode::BAD_REQUEST || upstream.status().is_server_error())
+        && crate::context_compressor::should_retry_status(upstream.status().as_u16())
     {
         eprintln!(
             "[axiom-ttt] compressed Responses returned {}; retrying original payload",

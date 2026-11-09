@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use axiom_engine::config::AxiomConfig;
 use axiom_engine::context_compressor::CompressorConfig;
 use axiom_engine::inference::InferencePipeline;
+use axiom_engine::openai_forwarder::resolve_idempotency_key;
 use axiom_engine::openai_forwarder::OpenAiForwarder;
 use axiom_engine::server::{create_router, AppState};
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use candle_core::Device;
@@ -233,4 +234,235 @@ async fn recording_persists_scrubbed_exchange_when_enabled() {
     assert_eq!(records[0].session_id, "rectest");
     assert_eq!(records[0].response["streamed"], true);
     assert_eq!(records[0].response["status"], 200);
+}
+
+/// One captured upstream request for the retry tests: its JSON body plus the
+/// `Idempotency-Key` header it carried, if any.
+type KeyedRequest = (Value, Option<String>);
+
+fn heavy_responses_body() -> Value {
+    let heavy_history =
+        "historical assistant answer with useful context about the build system ".repeat(80);
+    json!({"model":"gpt-5.5","input":[
+        {"role":"assistant","content":heavy_history},
+        {"role":"user","content":"continue"}
+    ]})
+}
+
+#[tokio::test]
+async fn compressed_5xx_retry_carries_same_idempotency_key() {
+    std::env::set_var("AXIOM_RESPONSES_COMPRESS", "1");
+    let captured = Arc::new(Mutex::new(Vec::<KeyedRequest>::new()));
+    async fn upstream(
+        State(captured): State<Arc<Mutex<Vec<KeyedRequest>>>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let key = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let mut requests = captured.lock().unwrap();
+        requests.push((body, key));
+        if requests.len() == 1 {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "boom"})),
+            )
+        } else {
+            (
+                StatusCode::OK,
+                Json(json!({"id": "resp_ok", "object": "response"})),
+            )
+        }
+    }
+    let upstream_app = Router::new()
+        .route("/v1/responses", post(upstream))
+        .with_state(captured.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+
+    let test_pipeline = tokio::task::spawn_blocking(pipeline).await.unwrap();
+    let state = AppState::new(test_pipeline, "test".into())
+        .with_openai_forwarder(Some(OpenAiForwarder::new(None, Some(base))))
+        .with_compressor_config(CompressorConfig {
+            enabled: true,
+            heavy_message_threshold_tokens: 1,
+            recall_top_k: 8,
+        });
+    let app = create_router(state);
+    let original = heavy_responses_body();
+    let response = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test")
+                .body(Body::from(original.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 2, "a 5xx must trigger exactly one retry");
+    assert!(
+        requests[0].0["input"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<axiom_context_fingerprint"),
+        "first attempt must carry the compressed payload"
+    );
+    assert_eq!(
+        requests[1].0, original,
+        "retry must resend the original payload"
+    );
+    let first_key = requests[0]
+        .1
+        .as_ref()
+        .expect("first attempt must carry an idempotency key");
+    let second_key = requests[1]
+        .1
+        .as_ref()
+        .expect("retry must carry an idempotency key");
+    assert_eq!(
+        first_key, second_key,
+        "retry must reuse the first attempt's key"
+    );
+    assert_eq!(
+        *first_key,
+        resolve_idempotency_key(None, &original, "anonymous"),
+        "derived key must come from the original body + session id"
+    );
+    task.abort();
+    std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
+}
+
+#[tokio::test]
+async fn client_supplied_idempotency_key_honored_on_retry() {
+    std::env::set_var("AXIOM_RESPONSES_COMPRESS", "1");
+    let captured = Arc::new(Mutex::new(Vec::<KeyedRequest>::new()));
+    async fn upstream(
+        State(captured): State<Arc<Mutex<Vec<KeyedRequest>>>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let key = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let mut requests = captured.lock().unwrap();
+        requests.push((body, key));
+        if requests.len() == 1 {
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": "boom"})))
+        } else {
+            (
+                StatusCode::OK,
+                Json(json!({"id": "resp_ok", "object": "response"})),
+            )
+        }
+    }
+    let upstream_app = Router::new()
+        .route("/v1/responses", post(upstream))
+        .with_state(captured.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+
+    let test_pipeline = tokio::task::spawn_blocking(pipeline).await.unwrap();
+    let state = AppState::new(test_pipeline, "test".into())
+        .with_openai_forwarder(Some(OpenAiForwarder::new(None, Some(base))))
+        .with_compressor_config(CompressorConfig {
+            enabled: true,
+            heavy_message_threshold_tokens: 1,
+            recall_top_k: 8,
+        });
+    let app = create_router(state);
+    let original = heavy_responses_body();
+    let response = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test")
+                .header("idempotency-key", "client-key-abc")
+                .body(Body::from(original.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 2, "a 5xx must trigger exactly one retry");
+    assert_eq!(
+        requests[0].1.as_deref(),
+        Some("client-key-abc"),
+        "first attempt must honor the client-supplied key unchanged"
+    );
+    assert_eq!(
+        requests[1].1.as_deref(),
+        Some("client-key-abc"),
+        "retry must honor the client-supplied key unchanged"
+    );
+    task.abort();
+    std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
+}
+
+#[tokio::test]
+async fn compressed_429_does_not_retry() {
+    std::env::set_var("AXIOM_RESPONSES_COMPRESS", "1");
+    let captured = Arc::new(Mutex::new(Vec::<KeyedRequest>::new()));
+    async fn upstream(
+        State(captured): State<Arc<Mutex<Vec<KeyedRequest>>>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let key = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        captured.lock().unwrap().push((body, key));
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "slow down"})),
+        )
+    }
+    let upstream_app = Router::new()
+        .route("/v1/responses", post(upstream))
+        .with_state(captured.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+
+    let test_pipeline = tokio::task::spawn_blocking(pipeline).await.unwrap();
+    let state = AppState::new(test_pipeline, "test".into())
+        .with_openai_forwarder(Some(OpenAiForwarder::new(None, Some(base))))
+        .with_compressor_config(CompressorConfig {
+            enabled: true,
+            heavy_message_threshold_tokens: 1,
+            recall_top_k: 8,
+        });
+    let app = create_router(state);
+    let original = heavy_responses_body();
+    let response = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test")
+                .body(Body::from(original.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "a 429 must never be retried: re-sending a rate limit is harmful"
+    );
+    task.abort();
+    std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
 }
