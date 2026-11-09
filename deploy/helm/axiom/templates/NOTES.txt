@@ -1,7 +1,7 @@
 Axiom-TTT deployed as "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
 
 Replicas:        {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.minReplicas }}–{{ .Values.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.replicaCount }}{{ end }}
-Image:           {{ .Values.image.repository }}:{{ .Values.image.tag }}
+Image:           {{ .Values.image.repository }}:{{ .Values.image.tag }}{{ with .Values.image.digest }}@{{ . }}{{ end }}
 Fleet gossip:    {{ if .Values.gossip.enabled }}ENABLED ({{ .Values.gossip.schedule }}){{ else }}disabled{{ end }}
 Checkpoint seed: {{ if .Values.checkpoint.url }}{{ .Values.checkpoint.url }}{{ else }}NONE — random-init (set checkpoint.url for a trained model){{ end }}
 

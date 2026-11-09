@@ -10,6 +10,11 @@ image:
   # Replace with your CUDA-enabled build (the default GHCR image is CPU-only).
   repository: ghcr.io/fernandogarzaaa/axiom-aether
   tag: cuda
+  # Clear the digest pinned in values.yaml: it is the digest of the CPU-only
+  # latest image, and the chart renders repo:tag@digest when set. Leaving it
+  # would silently pull the CPU image under the cuda tag onto GPU nodes.
+  # Set this to the digest of your own CUDA build once you have one.
+  digest: ""
 
 config:
   device: cuda
