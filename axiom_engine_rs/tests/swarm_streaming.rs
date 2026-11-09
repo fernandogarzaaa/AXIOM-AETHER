@@ -67,6 +67,7 @@ impl FakeOllama {
         let addr = listener.local_addr().unwrap();
         let stats = Arc::new(FakeStats::default());
         let serve_stats = stats.clone();
+        let chunks = Arc::new(chunks);
         tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
@@ -134,7 +135,7 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<(String, Str
 
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
-    chunks: Vec<FakeChunk>,
+    chunks: Arc<Vec<FakeChunk>>,
     stats: Arc<FakeStats>,
 ) {
     let Some((method, path, body)) = read_request(&mut socket).await else {
@@ -169,7 +170,7 @@ async fn handle_connection(
             stats.aborted.store(true, Ordering::SeqCst);
             return;
         }
-        for chunk in &chunks {
+        for chunk in chunks.iter() {
             sleep(chunk.delay_before).await;
             let line = serde_json::to_string(&json!({
                 "message": {"role": "assistant", "content": chunk.content},
@@ -272,12 +273,17 @@ async fn first_chunk_arrives_before_full_body_completes() {
 
 #[tokio::test]
 async fn slow_consumer_bounds_memory_via_backpressure() {
-    // 512 chunks of 64 KiB = 32 MiB total. The bounded channel holds 16
+    // 2048 chunks of 64 KiB = 128 MiB total. The bounded channel holds 16
     // deltas, so once it fills the producer must stop reading the socket and
     // the fake's writes must stall: bytes written while nobody drains stay
-    // far below the 32 MiB total.
+    // far below the 128 MiB total. The bound is deliberately loose (32 MiB):
+    // the producer itself holds at most 16 x 64 KiB = 1 MiB in the channel,
+    // but kernel socket buffers on the runner can absorb ~8 MiB before the
+    // fake's writes stall, and that fixed overhead is not producer memory.
+    // (A 4 MiB bound passed locally but failed on the CI runner, which
+    // wrote ~8.6 MiB into its larger socket buffers.)
     let big = "x".repeat(64 * 1024);
-    let chunks: Vec<FakeChunk> = (0..512)
+    let chunks: Vec<FakeChunk> = (0..2048)
         .map(|_| FakeChunk {
             content: big.clone(),
             delay_before: Duration::from_millis(0),
@@ -293,8 +299,8 @@ async fn slow_consumer_bounds_memory_via_backpressure() {
     sleep(Duration::from_millis(800)).await;
     let written = fake.stats.bytes_written.load(Ordering::SeqCst);
     assert!(
-        written < 4 * 1024 * 1024,
-        "slow consumer must bound memory: fake wrote {written} bytes of 32 MiB while nobody drained"
+        written < 32 * 1024 * 1024,
+        "slow consumer must bound memory: fake wrote {written} bytes of 128 MiB while nobody drained"
     );
     assert!(
         written > 0,
@@ -302,7 +308,7 @@ async fn slow_consumer_bounds_memory_via_backpressure() {
     );
     // Draining delivers every chunk, in order.
     let mut received = 0usize;
-    while let Some(item) = timeout(Duration::from_secs(30), stream.receiver.recv())
+    while let Some(item) = timeout(Duration::from_secs(60), stream.receiver.recv())
         .await
         .expect("drain must not hang")
     {
@@ -310,7 +316,7 @@ async fn slow_consumer_bounds_memory_via_backpressure() {
         assert_eq!(delta.len(), 64 * 1024);
         received += 1;
     }
-    assert_eq!(received, 512, "all chunks must arrive once drained");
+    assert_eq!(received, 2048, "all chunks must arrive once drained");
 }
 
 #[tokio::test]
