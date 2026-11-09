@@ -298,7 +298,7 @@ pub async fn run_server(
         None
     };
     // Optional data-plane auth: when AXIOM_API_KEY is set, every route except
-    // ops (/healthz,/readyz,/metrics) and /mcp requires `X-Axiom-Key: <key>`.
+    // ops (/healthz,/readyz) and /mcp requires `X-Axiom-Key: <key>`.
     // Trim before storing: a key sourced from a secret file often carries a
     // trailing newline, and `require_api_key` compares against the trimmed
     // presented header — so an untrimmed stored key would 401 every request.
