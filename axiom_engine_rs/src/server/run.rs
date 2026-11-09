@@ -168,7 +168,44 @@ pub async fn run_server(
         );
     }
 
+    // Production readiness gate (audit Finding 5, P1): resolve the
+    // checkpoint verification state once, from the files on disk, before the
+    // server binds. `AXIOM_REQUIRE_VERIFIED_CHECKPOINT=1` is opt-in and
+    // default-off, so local-first boots are unchanged. A pinned
+    // `AXIOM_CHECKPOINT_SHA256` is what makes a checkpoint provable: without
+    // it the state is Unverified and the gate (when on) holds the pod out of
+    // rotation. The server still starts when the gate fails — /healthz stays
+    // live and /readyz reports 503 with the reason, which is the correct
+    // Kubernetes signal (a refused start would hide the cause from probes).
+    let require_verified_checkpoint = env_flag_enabled(
+        std::env::var("AXIOM_REQUIRE_VERIFIED_CHECKPOINT")
+            .ok()
+            .as_deref(),
+    );
+    let checkpoint_status = resolve_checkpoint_status(
+        FsPath::new(checkpoint_path),
+        std::env::var("AXIOM_TOKENIZER")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .as_deref()
+            .map(FsPath::new),
+        std::env::var("AXIOM_CHECKPOINT_SHA256").ok().as_deref(),
+    );
+    if require_verified_checkpoint {
+        match checkpoint_status {
+            CheckpointStatus::Verified => println!(
+                "[+] Production checkpoint verified (sha256 matches AXIOM_CHECKPOINT_SHA256) — /readyz will report ready"
+            ),
+            other => eprintln!(
+                "[axiom] WARNING: AXIOM_REQUIRE_VERIFIED_CHECKPOINT=1 but the checkpoint is {} ({}) — /readyz will return 503 until a verified checkpoint is present",
+                other.as_str(),
+                other.reason()
+            ),
+        }
+    }
+
     let state = AppState::new(pipeline, model_id)
+        .with_checkpoint_gate(require_verified_checkpoint, checkpoint_status)
         .with_claude_backend(claude_backend)
         .with_anthropic_forwarder(anthropic_forwarder)
         .with_openai_forwarder(openai_forwarder)

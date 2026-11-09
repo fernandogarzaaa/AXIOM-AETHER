@@ -51,6 +51,7 @@ unset. When you add a variable, add it here.
 | `AXIOM_PRODUCTION_BPE` | auto | Unset: use the production model `axiom init` installed under `~/.axiom/models/` when both checkpoint and tokenizer are there, else the legacy model. `1`: force the production path (`AXIOM_BPE_CKPT`/`AXIOM_TOKENIZER`, else the installed model, else `checkpoints/`). `0`: force the legacy model. |
 | `AXIOM_TOKENIZER` / `AXIOM_BPE_CKPT` | `checkpoints/axiom_bpe.json` / `checkpoints/axiom_production_bpe.bin` | Tokenizer and checkpoint paths. |
 | `AXIOM_CHECKPOINT_URL` / `AXIOM_TOKENIZER_URL` | unset | Fetch at boot; pair with `AXIOM_CHECKPOINT_SHA256` / `AXIOM_TOKENIZER_SHA256` to fail closed on a mismatch. |
+| `AXIOM_REQUIRE_VERIFIED_CHECKPOINT` | unset (off) | `1` makes `GET /readyz` return 503 unless the production checkpoint exists, its tokenizer is present, and its SHA-256 matches `AXIOM_CHECKPOINT_SHA256`. Off by default: the legacy bootstrap model still reports ready. Set to `1` in production alongside a pinned `AXIOM_CHECKPOINT_SHA256`; pinning the hash alone does not enable the gate. |
 | `AXIOM_EMB_CKPT` | `checkpoints/axiom_embedder.bin` | Embedding model used by MCP memory recall and `eval_recall`. |
 | `AXIOM_FORGET_GATE` | `1.0` | Parameter-free forget gate α on the delta rule (α < 1 decays fast-weight memory). |
 | `AXIOM_VIBE` / `AXIOM_VIBE_PRIME` | see README | Persistent fast-weight memory controls. |

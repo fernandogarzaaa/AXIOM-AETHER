@@ -219,6 +219,101 @@ impl SessionData {
     }
 }
 
+/// Which production checkpoint, if any, the server started with, and whether
+/// its integrity was proven at startup.
+///
+/// * `Verified` — the checkpoint file exists, its tokenizer is present, and
+///   its SHA-256 matches the pinned `AXIOM_CHECKPOINT_SHA256`.
+/// * `Absent` — the checkpoint file does not exist (nothing to serve).
+/// * `Mismatched` — the checkpoint hash differs from the pinned hash, or a
+///   required weight file (the tokenizer) is missing.
+/// * `Unverified` — the checkpoint exists but no hash was pinned, so its
+///   integrity was never proven. This is the state of every fetch done
+///   without `AXIOM_CHECKPOINT_SHA256` (fetch_base_model in config.rs logs
+///   the computed digest as unverified in that case).
+///
+/// The status is computed once at startup by [`resolve_checkpoint_status`]
+/// and carried on [`AppState`]; `/readyz` consults it, it never re-hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointStatus {
+    Verified,
+    Absent,
+    Mismatched,
+    Unverified,
+}
+
+impl CheckpointStatus {
+    /// Short machine-readable label, reported in `/readyz` responses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckpointStatus::Verified => "verified",
+            CheckpointStatus::Absent => "absent",
+            CheckpointStatus::Mismatched => "mismatched",
+            CheckpointStatus::Unverified => "unverified",
+        }
+    }
+
+    /// Human-readable reason for `/readyz` 503 bodies. Each string names
+    /// the failure so an operator can act on it without reading code.
+    pub fn reason(self) -> &'static str {
+        match self {
+            CheckpointStatus::Verified => "production checkpoint sha256 verified",
+            CheckpointStatus::Absent => "production checkpoint weights are absent",
+            CheckpointStatus::Mismatched => {
+                "production checkpoint sha256 mismatch, or a required weight file is missing"
+            }
+            CheckpointStatus::Unverified => {
+                "production checkpoint is unverified: no pinned sha256 is configured"
+            }
+        }
+    }
+}
+
+/// Resolve the startup checkpoint status from the files on disk. Pure over
+/// the filesystem (no env reads): callers pass the already-resolved paths
+/// and pinned hash. A file that cannot be opened or read counts as
+/// `Mismatched` — its integrity cannot be proven, so it must not serve.
+pub fn resolve_checkpoint_status(
+    checkpoint_path: &FsPath,
+    tokenizer_path: Option<&FsPath>,
+    expected_sha256: Option<&str>,
+) -> CheckpointStatus {
+    if !checkpoint_path.is_file() {
+        return CheckpointStatus::Absent;
+    }
+    if let Some(tokenizer) = tokenizer_path {
+        if !tokenizer.is_file() {
+            return CheckpointStatus::Mismatched;
+        }
+    }
+    let Some(expected) = expected_sha256.filter(|s| !s.trim().is_empty()) else {
+        return CheckpointStatus::Unverified;
+    };
+    match sha256_file(checkpoint_path) {
+        Some(actual) if actual.eq_ignore_ascii_case(expected.trim()) => {
+            CheckpointStatus::Verified
+        }
+        _ => CheckpointStatus::Mismatched,
+    }
+}
+
+/// Stream a file through SHA-256 without loading it into memory, so a
+/// multi-gigabyte checkpoint hashes with a fixed 64 KiB buffer. `None` when
+/// the file cannot be opened or read.
+fn sha256_file(path: &FsPath) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 /// Global server state shared across all request handlers.
 ///
 /// * `pipeline` — inference pipeline; wrapped in `Mutex` because
@@ -247,6 +342,16 @@ pub struct AppState {
     sequence_versions: Arc<RwLock<HashMap<String, SequenceState>>>,
     /// Canonical model identifier returned in API responses.
     pub model_id: String,
+    /// Production readiness gate (audit Finding 5, P1): when `true`
+    /// (`AXIOM_REQUIRE_VERIFIED_CHECKPOINT=1`), `/readyz` returns 503
+    /// unless `checkpoint_status` is `Verified`. `false` (the default)
+    /// preserves the local-first behavior: the legacy bootstrap model
+    /// reports ready. Read once at startup by `run_server`; never mutated.
+    pub require_verified_checkpoint: bool,
+    /// Startup checkpoint verification state, resolved by
+    /// [`resolve_checkpoint_status`]. Reported in `/readyz` responses even
+    /// when the gate is off, so operators can see what would gate.
+    pub checkpoint_status: CheckpointStatus,
     /// Optional Anthropic Claude backend. When `Some`, generation is
     /// routed through Claude instead of the local Axiom-TTT pipeline.
     pub claude_backend: Arc<Option<ClaudeBackend>>,
@@ -409,6 +514,8 @@ impl AppState {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             sequence_versions: Arc::new(RwLock::new(HashMap::new())),
             model_id,
+            require_verified_checkpoint: false,
+            checkpoint_status: CheckpointStatus::Unverified,
             claude_backend: Arc::new(None),
             router: Arc::new(None),
             mcp: Arc::new(None),
@@ -468,6 +575,19 @@ impl AppState {
     /// `::disabled()` to explicitly no-op).
     pub fn with_keepalive_manager(mut self, manager: crate::keepalive::KeepaliveManager) -> Self {
         self.keepalive = manager;
+        self
+    }
+
+    /// Set the production readiness gate (`AXIOM_REQUIRE_VERIFIED_CHECKPOINT`)
+    /// and the startup checkpoint verification state it consults. Called by
+    /// `run_server` only; tests set it directly to drive `/readyz`.
+    pub fn with_checkpoint_gate(
+        mut self,
+        require_verified: bool,
+        status: CheckpointStatus,
+    ) -> Self {
+        self.require_verified_checkpoint = require_verified;
+        self.checkpoint_status = status;
         self
     }
 

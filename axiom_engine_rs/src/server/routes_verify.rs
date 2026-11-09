@@ -10,11 +10,35 @@ async fn healthz() -> impl IntoResponse {
 /// handler already implies the model loaded. We additionally confirm the
 /// pipeline lock is reachable (not poisoned) and report the live model id so
 /// the probe doubles as a smoke check. Returns 503 if the lock is poisoned.
+///
+/// Production gate (audit Finding 5, P1): when
+/// `AXIOM_REQUIRE_VERIFIED_CHECKPOINT=1`, readiness additionally requires a
+/// verified production checkpoint. The gate consults the startup-computed
+/// `state.checkpoint_status` and returns 503 with a reason when weights are
+/// absent, mismatched, or unverified, so the pod never enters rotation on
+/// the legacy bootstrap model or a corrupt checkpoint. With the flag unset
+/// (the default) behavior is unchanged.
 async fn readyz(State(state): State<AppState>) -> Response {
+    if state.require_verified_checkpoint && state.checkpoint_status != CheckpointStatus::Verified {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "unavailable",
+                "reason": state.checkpoint_status.reason(),
+                "checkpoint": state.checkpoint_status.as_str(),
+                "model": state.model_id,
+            })),
+        )
+            .into_response();
+    }
     match state.pipeline.try_read() {
         Ok(_) | Err(std::sync::TryLockError::WouldBlock) => (
             StatusCode::OK,
-            Json(serde_json::json!({ "status": "ready", "model": state.model_id })),
+            Json(serde_json::json!({
+                "status": "ready",
+                "model": state.model_id,
+                "checkpoint": state.checkpoint_status.as_str(),
+            })),
         )
             .into_response(),
         Err(std::sync::TryLockError::Poisoned(_)) => (
