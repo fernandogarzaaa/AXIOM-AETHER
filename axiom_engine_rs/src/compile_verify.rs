@@ -276,6 +276,12 @@ impl CompileVerifier {
                 b
             })
         });
+        // If this run is cancelled (future dropped) or returns early on a
+        // wait error, the reader tasks must be aborted, not detached.
+        let _reader_guard = AbortReadersOnDrop {
+            stdout: stdout_task.as_ref().map(|t| t.abort_handle()),
+            stderr: stderr_task.as_ref().map(|t| t.abort_handle()),
+        };
         let status = match timeout(self.timeout, child.wait()).await {
             Ok(Ok(status)) => status,
             Ok(Err(e)) => {
@@ -313,27 +319,14 @@ impl CompileVerifier {
         // A descendant holding the pipes keeps the readers alive; give them
         // a short grace, then kill the group so the pipes close and the
         // readers finish instead of hanging the caller.
-        let drain = |mut task: tokio::task::JoinHandle<Vec<u8>>| async move {
-            match timeout(DRAIN_GRACE, &mut task).await {
-                Ok(Ok(bytes)) => bytes,
-                Ok(Err(_)) => Vec::new(),
-                Err(_) => {
-                    if let Some(pid) = pid {
-                        crate::proc_bound::kill_group(pid);
-                    }
-                    match timeout(DRAIN_GRACE, &mut task).await {
-                        Ok(Ok(bytes)) => bytes,
-                        _ => Vec::new(),
-                    }
-                }
-            }
-        };
-        let stdout = match stdout_task {
-            Some(task) => drain(task).await,
+        let mut stdout_task = stdout_task;
+        let mut stderr_task = stderr_task;
+        let stdout = match &mut stdout_task {
+            Some(task) => drain_reader(task, pid).await,
             None => Vec::new(),
         };
-        let stderr = match stderr_task {
-            Some(task) => drain(task).await,
+        let stderr = match &mut stderr_task {
+            Some(task) => drain_reader(task, pid).await,
             None => Vec::new(),
         };
 
@@ -415,6 +408,55 @@ async fn create_rust_workspace(path: &Path, code: &str) -> Result<(), CompileVer
         .await
         .map_err(|e| CompileVerifyError::Io(format!("write src/lib.rs failed: {e}")))?;
     Ok(())
+}
+
+/// Await a bounded reader task, giving a descendant that holds the pipes
+/// one drain grace; if it still has not finished, kill the group and take
+/// whatever the reader collected once the pipes close.
+async fn drain_reader(task: &mut tokio::task::JoinHandle<Vec<u8>>, pid: Option<u32>) -> Vec<u8> {
+    match timeout(DRAIN_GRACE, &mut *task).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            if let Some(pid) = pid {
+                crate::proc_bound::kill_group(pid);
+            }
+            match timeout(DRAIN_GRACE, &mut *task).await {
+                Ok(Ok(bytes)) => bytes,
+                _ => {
+                    // The reader is still stuck on a pipe held open by a
+                    // descendant that escaped the process group (or a
+                    // platform where kill_group is a no-op). Dropping the
+                    // handle would detach the task, leaking it and its
+                    // pipe forever; abort it instead.
+                    task.abort();
+                    Vec::new()
+                }
+            }
+        }
+    }
+}
+
+/// Aborts the bounded reader tasks when the enclosing run ends before they
+/// finish. Dropping a `JoinHandle` only detaches its task, so a run that
+/// is cancelled (its future dropped) or returns early on a wait error
+/// would otherwise leak readers holding pipes open behind an escaped
+/// descendant. Aborting a task that already finished is a no-op, so the
+/// normal path is unaffected.
+struct AbortReadersOnDrop {
+    stdout: Option<tokio::task::AbortHandle>,
+    stderr: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for AbortReadersOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.stdout.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.stderr.take() {
+            handle.abort();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -609,6 +651,54 @@ mod tests {
             "zombie cargo/rustc children: {zombies:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A reader that never finishes (a pipe held open by a descendant
+    /// that escaped the process group, where kill_group cannot reach it)
+    /// must be aborted on the final drain timeout, not detached. Dropping
+    /// the handle would leak the task, its pipe, and its retained output
+    /// forever; repeated runs would accumulate them.
+    #[tokio::test]
+    async fn drain_reader_aborts_a_stuck_reader_on_final_timeout() {
+        let mut task = tokio::spawn(async { std::future::pending::<Vec<u8>>().await });
+        let t0 = std::time::Instant::now();
+        let out = drain_reader(&mut task, None).await;
+        assert!(out.is_empty(), "a stuck reader returns no output");
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "drain returned in {:?}",
+            t0.elapsed()
+        );
+        // Awaiting the task must yield Cancelled promptly: with the old
+        // code the task was detached and still pending, so this times out.
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+        assert!(
+            joined.is_ok(),
+            "reader task was detached, not aborted: still pending after drain"
+        );
+        assert!(
+            joined.unwrap().unwrap_err().is_cancelled(),
+            "reader task must be cancelled"
+        );
+    }
+
+    /// Dropping the reader guard must abort pending readers: the mechanism
+    /// that cleans up when the enclosing run is cancelled or returns early
+    /// on a wait error.
+    #[tokio::test]
+    async fn abort_readers_on_drop_aborts_pending_tasks() {
+        let mut task = tokio::spawn(async { std::future::pending::<Vec<u8>>().await });
+        let guard = AbortReadersOnDrop {
+            stdout: Some(task.abort_handle()),
+            stderr: None,
+        };
+        drop(guard);
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+        assert!(joined.is_ok(), "guard must abort the task, not detach it");
+        assert!(
+            joined.unwrap().unwrap_err().is_cancelled(),
+            "reader task must be cancelled"
+        );
     }
 
     /// A feedback error is an error path too: the workspace must still go.
