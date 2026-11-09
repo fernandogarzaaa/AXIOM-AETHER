@@ -446,6 +446,7 @@ async fn compressed_messages_path(
         .collect::<Vec<_>>()
         .join("\n\n");
 
+    let fingerprint_started = Instant::now();
     let fingerprint = if partitioned.heavy_context.is_empty() {
         // Nothing to ingest — emit a zero-context fingerprint so the
         // outbound payload still carries the schema marker.
@@ -525,6 +526,10 @@ async fn compressed_messages_path(
         }
         fingerprint
     };
+    metrics::observe_stage_latency(
+        metrics::Stage::Fingerprint,
+        fingerprint_started.elapsed().as_secs_f64(),
+    );
 
     eprintln!(
         "[axiom-ttt] compressed session={} heavy_msgs={} heavy_tokens~{} recall_norm={:.3} elapsed_ms={}",
@@ -542,6 +547,10 @@ async fn compressed_messages_path(
     }
 
     let outbound = build_compressed_payload(body, &fingerprint, &partitioned);
+    metrics::observe_stage_latency(
+        metrics::Stage::Compress,
+        started.elapsed().as_secs_f64(),
+    );
     // Strip session_id (and any other Axiom extensions) from the upstream payload.
     let mut outbound = outbound;
     if let Some(obj) = outbound.as_object_mut() {
@@ -798,7 +807,13 @@ async fn compressed_messages_path(
     record_savings(state, &session_id, bytes_in, bytes_out);
 
     if let Some(router) = state.swarm_router.as_ref().as_ref() {
-        match router.route_chat_payload(&outbound).await {
+        let route_started = Instant::now();
+        let routed = router.route_chat_payload(&outbound).await;
+        metrics::observe_stage_latency(
+            metrics::Stage::Route,
+            route_started.elapsed().as_secs_f64(),
+        );
+        match routed {
             Ok(local) => {
                 state
                     .sandbox_local_synthesis(&session_id, &local.content)
@@ -989,6 +1004,7 @@ async fn compressed_messages_path(
     }
 
     // First attempt: forward the lean, compressed payload.
+    let forward_started = Instant::now();
     let mut forwarded = match forwarder
         .forward_messages_json(&outbound, client_auth)
         .await
@@ -1032,6 +1048,11 @@ async fn compressed_messages_path(
             }
         }
     };
+
+    metrics::observe_stage_latency(
+        metrics::Stage::Forward,
+        forward_started.elapsed().as_secs_f64(),
+    );
 
     // S0 (CVM cost stack): record dollar-true cost from the real usage
     // Anthropic just returned, before any opt-in follow-up call might
@@ -1358,6 +1379,7 @@ async fn compressed_openai_chat_path(
         .collect::<Vec<_>>()
         .join("\n\n");
 
+    let fingerprint_started = Instant::now();
     let fingerprint = if partitioned.heavy_context.is_empty() {
         empty_fingerprint(state, &session_id, started)?
     } else {
@@ -1432,6 +1454,10 @@ async fn compressed_openai_chat_path(
         }
         fingerprint
     };
+    metrics::observe_stage_latency(
+        metrics::Stage::Fingerprint,
+        fingerprint_started.elapsed().as_secs_f64(),
+    );
 
     eprintln!(
         "[axiom-ttt] openai compressed session={} heavy_msgs={} heavy_tokens~{} recall_norm={:.3} elapsed_ms={}",
@@ -1447,6 +1473,10 @@ async fn compressed_openai_chat_path(
     }
 
     let mut outbound = build_compressed_payload(body, &fingerprint, &partitioned);
+    metrics::observe_stage_latency(
+        metrics::Stage::Compress,
+        started.elapsed().as_secs_f64(),
+    );
     if let Some(obj) = outbound.as_object_mut() {
         obj.remove("session_id");
         // Axiom-only extension: never forward it upstream (Anthropic rejects
@@ -1487,7 +1517,13 @@ async fn compressed_openai_chat_path(
                 }
             }
         } else {
-            match router.route_chat_payload(&outbound).await {
+            let route_started = Instant::now();
+            let routed = router.route_chat_payload(&outbound).await;
+            metrics::observe_stage_latency(
+                metrics::Stage::Route,
+                route_started.elapsed().as_secs_f64(),
+            );
+            match routed {
                 Ok(local) => {
                     state
                         .sandbox_local_synthesis(&session_id, &local.content)
@@ -1527,6 +1563,7 @@ async fn compressed_openai_chat_path(
     };
 
     let mut fell_back = false;
+    let forward_started = Instant::now();
     let mut upstream = match forwarder
         .forward_chat_completions_text(&outbound, client_auth)
         .await
@@ -1561,6 +1598,11 @@ async fn compressed_openai_chat_path(
             upstream = retry;
         }
     }
+
+    metrics::observe_stage_latency(
+        metrics::Stage::Forward,
+        forward_started.elapsed().as_secs_f64(),
+    );
 
     // Automatic epistemic monitoring (opt-in, AXIOM_EPISTEMIC_AUTO=1): mirror the
     // Anthropic forwarder path for OpenAI-compatible responses. Handles both a

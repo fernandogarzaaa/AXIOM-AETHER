@@ -17,6 +17,7 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn export_metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     state.refresh_session_metrics()?;
+    metrics::refresh_process_memory();
     let mut rendered = metrics::render_metrics();
     let dwe = state.dwe_bus.telemetry();
     rendered.push_str(&format!(

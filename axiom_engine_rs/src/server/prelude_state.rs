@@ -1226,6 +1226,7 @@ impl AppState {
             .count();
         metrics::set_active_sessions(active);
         metrics::set_quantized_sessions(quantized);
+        metrics::set_session_memory_bytes(session_memory_bytes(&sessions));
         Ok(())
     }
 
@@ -1366,7 +1367,33 @@ fn refresh_session_metrics_from_sessions(
         .count();
     metrics::set_active_sessions(active);
     metrics::set_quantized_sessions(quantized);
+    metrics::set_session_memory_bytes(session_memory_bytes(&sessions_guard));
     Ok(())
+}
+
+/// Estimated bytes held by session state, from tensor metadata only
+/// (`elem_count * dtype size` for live tensors; packed bytes plus scales
+/// for quantized descriptors). No tensor data is read or moved, so this
+/// is cheap enough to run on every `/metrics` scrape.
+fn session_memory_bytes(sessions: &HashMap<String, SessionData>) -> u64 {
+    sessions
+        .values()
+        .map(|session| match &session.residency {
+            SessionResidency::Active(states) => states
+                .iter()
+                .map(|state| {
+                    state.elem_count() as u64 * state.dtype().size_in_bytes() as u64
+                })
+                .sum::<u64>(),
+            SessionResidency::Quantized(descriptors) => descriptors
+                .iter()
+                .map(|descriptor| {
+                    descriptor.packed_indices.len() as u64
+                        + descriptor.scales.len() as u64 * 4
+                })
+                .sum::<u64>(),
+        })
+        .sum::<u64>()
 }
 
 // ---------------------------------------------------------------------------
