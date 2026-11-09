@@ -63,6 +63,16 @@ struct FakeOllama {
 
 impl FakeOllama {
     async fn spawn(chunks: Vec<FakeChunk>) -> Self {
+        Self::spawn_with(chunks, true).await
+    }
+
+    /// Like `spawn`, but the fake closes the stream without the terminal
+    /// `done` line, modelling an upstream that dies mid-generation.
+    async fn spawn_without_done(chunks: Vec<FakeChunk>) -> Self {
+        Self::spawn_with(chunks, false).await
+    }
+
+    async fn spawn_with(chunks: Vec<FakeChunk>, send_done: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let stats = Arc::new(FakeStats::default());
@@ -76,7 +86,7 @@ impl FakeOllama {
                 let chunks = chunks.clone();
                 let stats = serve_stats.clone();
                 tokio::spawn(async move {
-                    handle_connection(socket, chunks, stats).await;
+                    handle_connection(socket, chunks, stats, send_done).await;
                 });
             }
         });
@@ -137,6 +147,7 @@ async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     chunks: Arc<Vec<FakeChunk>>,
     stats: Arc<FakeStats>,
+    send_done: bool,
 ) {
     let Some((method, path, body)) = read_request(&mut socket).await else {
         return;
@@ -195,11 +206,13 @@ async fn handle_connection(
         }))
         .unwrap()
             + "\n";
-        if socket.write_all(done.as_bytes()).await.is_err() {
-            stats.aborted.store(true, Ordering::SeqCst);
-            return;
+        if send_done {
+            if socket.write_all(done.as_bytes()).await.is_err() {
+                stats.aborted.store(true, Ordering::SeqCst);
+                return;
+            }
+            stats.bytes_written.fetch_add(done.len(), Ordering::SeqCst);
         }
-        stats.bytes_written.fetch_add(done.len(), Ordering::SeqCst);
         return;
     }
     // Non-stream: wait out the chunk delays, then answer with one object.
@@ -217,6 +230,53 @@ async fn handle_connection(
         body
     );
     let _ = socket.write_all(response.as_bytes()).await;
+}
+
+#[tokio::test]
+async fn stream_ending_without_done_is_reported_as_error() {
+    let fake = FakeOllama::spawn_without_done(vec![
+        FakeChunk {
+            content: "Hel".to_string(),
+            delay_before: Duration::from_millis(0),
+        },
+        FakeChunk {
+            content: "lo world".to_string(),
+            delay_before: Duration::from_millis(0),
+        },
+    ])
+    .await;
+    let router = router_for(&fake.base_url);
+    let mut stream = router
+        .route_chat_stream(&chat_payload())
+        .await
+        .expect("streaming dispatch must succeed");
+    let first = timeout(Duration::from_secs(10), stream.receiver.recv())
+        .await
+        .expect("first chunk must arrive")
+        .expect("channel must stay open")
+        .expect("first chunk must not be an upstream error");
+    assert_eq!(first, "Hel");
+    let second = timeout(Duration::from_secs(10), stream.receiver.recv())
+        .await
+        .expect("second chunk must arrive")
+        .expect("channel must stay open")
+        .expect("second chunk must not be an upstream error");
+    assert_eq!(second, "lo world");
+    // The upstream closed without a `done` line: the stream must end with
+    // an error item, not a clean close that the SSE layer would bless with
+    // a stop chunk and [DONE].
+    let third = timeout(Duration::from_secs(10), stream.receiver.recv())
+        .await
+        .expect("terminal item must arrive")
+        .expect("channel must deliver the error before closing");
+    assert!(
+        third.is_err(),
+        "EOF without done must be an upstream error, got {third:?}"
+    );
+    let after = timeout(Duration::from_secs(10), stream.receiver.recv())
+        .await
+        .expect("channel must close after the error");
+    assert!(after.is_none(), "channel must close after the error");
 }
 
 #[tokio::test]

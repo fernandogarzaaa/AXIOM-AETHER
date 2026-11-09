@@ -294,7 +294,12 @@ impl SwarmRouter {
 /// while it is full, so a slow consumer stalls this task instead of letting
 /// it accumulate the whole generation. A dropped receiver (client
 /// disconnect) makes `send` fail, and this task then returns, dropping the
-/// response and aborting the upstream request.
+/// response and aborting the upstream request. The disconnect is also
+/// observed while waiting for upstream data: the dispatch and every body
+/// read race against `tx.closed()`, so an abandoned request does not keep
+/// consuming inference resources for up to the request timeout. A stream
+/// that ends without a `done` line is an upstream error, not a clean stop:
+/// the SSE layer must not bless a truncated answer with `[DONE]`.
 async fn run_stream_dispatch(
     client: &Client,
     base_url: &str,
@@ -312,18 +317,24 @@ async fn run_stream_dispatch(
         }
     });
     let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
-    let response = match client
-        .post(url)
-        .json(&request)
-        .timeout(STREAM_REQUEST_TIMEOUT)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(e) => {
-            let _ = tx.send(Err(SwarmRouteError::Upstream(e.to_string()))).await;
-            return false;
+    // First-token latency runs from dispatch, not from headers: a slow
+    // model load before the first token counts.
+    let started = Instant::now();
+    let response = tokio::select! {
+        result = client
+            .post(url)
+            .json(&request)
+            .timeout(STREAM_REQUEST_TIMEOUT)
+            .send() => {
+            match result {
+                Ok(response) => response,
+                Err(e) => {
+                    let _ = tx.send(Err(SwarmRouteError::Upstream(e.to_string()))).await;
+                    return false;
+                }
+            }
         }
+        _ = tx.closed() => return false,
     };
     let status = response.status();
     if !status.is_success() {
@@ -338,26 +349,27 @@ async fn run_stream_dispatch(
         return false;
     }
     let mut byte_stream = response.bytes_stream();
-    let mut line_buf = String::new();
+    let mut assembler = OllamaLineAssembler::new();
     let mut first_token = true;
-    let started = Instant::now();
     let mut done = false;
-    while let Some(chunk) = byte_stream.next().await {
-        let chunk = match chunk {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                let _ = tx
-                    .send(Err(SwarmRouteError::Upstream(format!(
-                        "body read failed: {e}"
-                    ))))
-                    .await;
-                return false;
-            }
+    while !done {
+        let chunk = tokio::select! {
+            next = byte_stream.next() => match next {
+                Some(Ok(bytes)) => bytes,
+                Some(Err(e)) => {
+                    let _ = tx
+                        .send(Err(SwarmRouteError::Upstream(format!(
+                            "body read failed: {e}"
+                        ))))
+                        .await;
+                    return false;
+                }
+                None => break,
+            },
+            _ = tx.closed() => return false,
         };
-        line_buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(newline) = line_buf.find('\n') {
-            let line: String = line_buf.drain(..=newline).collect();
-            match parse_ollama_stream_line(line.trim()) {
+        for line in assembler.push(&chunk) {
+            match parse_ollama_stream_line(&line) {
                 Ok(parsed) => {
                     if !parsed.delta.is_empty() {
                         if first_token {
@@ -381,22 +393,65 @@ async fn run_stream_dispatch(
                 }
             }
         }
-        if done {
-            break;
-        }
     }
     if !done {
-        // A trailing partial line with no newline terminator: parse it once.
-        // A stream that ends without a `done` line is incomplete; the
-        // channel closing without a done line tells the SSE layer that.
-        if let Ok(parsed) = parse_ollama_stream_line(line_buf.trim()) {
+        // Trailing bytes with no newline terminator: one last parse attempt.
+        // A stream that ends without a `done` line is incomplete, not a
+        // clean stop: report it so the SSE layer ends without `[DONE]`
+        // instead of blessing a truncated answer.
+        let remainder = assembler.remainder();
+        if let Ok(parsed) = parse_ollama_stream_line(remainder.trim()) {
             if !parsed.delta.is_empty() {
-                let _ = tx.send(Ok(parsed.delta)).await;
+                if first_token {
+                    crate::metrics::observe_first_token_latency(started.elapsed().as_secs_f64());
+                }
+                if tx.send(Ok(parsed.delta)).await.is_err() {
+                    return false;
+                }
             }
             done = parsed.done;
         }
     }
-    done
+    if !done {
+        let _ = tx
+            .send(Err(SwarmRouteError::Upstream(
+                "ollama stream ended without a done line".to_string(),
+            )))
+            .await;
+        return false;
+    }
+    true
+}
+
+/// Assembles newline-delimited records from raw byte chunks. Decoding
+/// happens per complete line, never per network chunk: a multibyte UTF-8
+/// character split across two TCP segments stays intact, because its bytes
+/// are only decoded once the terminating newline has arrived (a UTF-8
+/// sequence never contains `0x0A`).
+struct OllamaLineAssembler {
+    buf: Vec<u8>,
+}
+
+impl OllamaLineAssembler {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Feed raw bytes; returns each complete line, without the newline.
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(bytes);
+        let mut lines = Vec::new();
+        while let Some(newline) = self.buf.iter().position(|b| *b == b'\n') {
+            let line_bytes: Vec<u8> = self.buf.drain(..=newline).collect();
+            lines.push(String::from_utf8_lossy(&line_bytes).trim().to_string());
+        }
+        lines
+    }
+
+    /// Remaining bytes with no newline terminator (a truncated final line).
+    fn remainder(&self) -> String {
+        String::from_utf8_lossy(&self.buf).into_owned()
+    }
 }
 
 /// One parsed line of Ollama's streaming `/api/chat` NDJSON body.
@@ -547,6 +602,41 @@ fn env_truthy(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_assembler_keeps_multibyte_chars_split_across_chunks() {
+        let mut assembler = OllamaLineAssembler::new();
+        let line = "{\"message\":{\"role\":\"assistant\",\"content\":\"a🦀b\"},\"done\":false}\n";
+        let bytes = line.as_bytes();
+        // Split inside the crab emoji (4 bytes F0 9F A6 80): decoding the
+        // first half on its own would corrupt it into replacement chars.
+        let crab = line.find('🦀').unwrap();
+        let split = crab + 2;
+        let first = assembler.push(&bytes[..split]);
+        assert!(
+            first.is_empty(),
+            "no complete line before the newline arrives"
+        );
+        let rest = assembler.push(&bytes[split..]);
+        assert_eq!(rest.len(), 1);
+        assert!(
+            rest[0].contains('🦀'),
+            "emoji must survive the split: {}",
+            rest[0]
+        );
+        assert_eq!(assembler.remainder(), "");
+    }
+
+    #[test]
+    fn line_assembler_returns_each_complete_line_in_order() {
+        let mut assembler = OllamaLineAssembler::new();
+        let lines = assembler.push(b"{\"a\":1}\n{\"b\":2}\n{\"c\":3");
+        assert_eq!(lines, vec!["{\"a\":1}", "{\"b\":2}"]);
+        assert_eq!(assembler.remainder(), "{\"c\":3");
+        let lines = assembler.push(b"}\n");
+        assert_eq!(lines, vec!["{\"c\":3}"]);
+        assert_eq!(assembler.remainder(), "");
+    }
 
     #[test]
     fn stream_line_parses_delta_and_done_flag() {
