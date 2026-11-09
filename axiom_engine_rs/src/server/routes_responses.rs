@@ -687,8 +687,11 @@ async fn responses_websocket(
 ///   conflicting payload under a reused key.
 /// * `FreshKeyOriginal` — 400: the upstream definitively rejected the
 ///   compressed attempt, so it did not execute. Fall back to the original
-///   body under a FRESH derived key (never the client-supplied key, which
-///   names the compressed attempt).
+///   body under a key derived deterministically from the incoming key +
+///   original body (never the client-supplied key itself, which names
+///   the compressed attempt). Deterministic so a client retry with the
+///   same explicit key reuses the same fallback key and the upstream can
+///   dedupe the fallback too.
 enum ResponsesRetry {
     SamePayload,
     FreshKeyOriginal,
@@ -718,22 +721,26 @@ fn with_idempotency_key(auth: &OpenAiClientAuth, key: &str) -> OpenAiClientAuth 
     }
 }
 
-/// Auth for a payload-changing 400 fallback: a fresh derived key for the
-/// original body. `None` is passed as the client-supplied key on purpose:
-/// a client-supplied key names the compressed first attempt and must not
-/// be reused under a different payload.
+/// Auth for a payload-changing 400 fallback: a key derived
+/// deterministically from the resolved incoming key + original body.
+/// Deterministic on purpose: a client retry with the same explicit key
+/// gets the same fallback key, so the upstream can dedupe the fallback
+/// too instead of executing it twice (Codex P2 on the follow-up head).
+/// The `fallback:` domain keeps it distinct from the compressed
+/// attempt's key, which is the resolved key itself when client-supplied
+/// (or the derived key when not). The original body is folded in by
+/// `derive_idempotency_key`, so the same key under a different payload
+/// still yields a different fallback key.
 fn fresh_key_auth(
     client_auth: &OpenAiClientAuth,
     body: &Value,
     session_id: &str,
+    resolved_key: &str,
 ) -> OpenAiClientAuth {
-    let fresh_key = crate::openai_forwarder::resolve_idempotency_key(
-        None,
-        body,
-        session_id,
-        &Uuid::new_v4().to_string(),
-    );
-    with_idempotency_key(client_auth, &fresh_key)
+    let fallback_nonce = format!("fallback:{resolved_key}");
+    let fallback_key =
+        crate::openai_forwarder::derive_idempotency_key(body, session_id, &fallback_nonce);
+    with_idempotency_key(client_auth, &fallback_key)
 }
 
 /// `POST /v1/responses` - native passthrough with optional semantic compression.
@@ -770,7 +777,7 @@ async fn create_response(
     // (Network / 5xx), so such a retry cannot double-execute (see
     // `resolve_idempotency_key` and `responses_retry_action`). A 400
     // fallback is the exception: it changes the payload, so it carries
-    // a fresh derived key instead (see `fresh_key_auth`). The nonce
+    // a deterministic fallback key instead (see `fresh_key_auth`). The nonce
     // keeps independent identical requests distinct: without it, two
     // separate requests with the same body and session would share a key
     // and the upstream would replay the first response for the second.
@@ -790,7 +797,7 @@ async fn create_response(
         .retain(|(name, _)| !name.eq_ignore_ascii_case("idempotency-key"));
     client_auth
         .extra_headers
-        .push(("idempotency-key".to_string(), idempotency_key));
+        .push(("idempotency-key".to_string(), idempotency_key.clone()));
     let compressed = match compressed_responses_payload(
         &state,
         &body,
@@ -845,6 +852,7 @@ async fn create_response(
                         &client_auth,
                         &body,
                         session_override.unwrap_or("anonymous"),
+                        &idempotency_key,
                     );
                     match forwarder.forward_responses(&body, &fallback_auth).await {
                         Ok(response) => response,
@@ -880,6 +888,7 @@ async fn create_response(
                         &client_auth,
                         &body,
                         session_override.unwrap_or("anonymous"),
+                        &idempotency_key,
                     );
                     if let Ok(response) =
                         forwarder.forward_responses(&body, &fallback_auth).await
