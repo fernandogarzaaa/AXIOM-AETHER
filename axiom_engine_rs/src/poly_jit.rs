@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -228,24 +229,74 @@ impl PolyJitEngine {
         if let Some(dir) = request.working_dir.as_deref() {
             command.current_dir(dir);
         }
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|e| PolyJitError::Io(format!("process start failed: {e}")))?;
         let pid = child.id();
-        let output = match timeout(self.timeout, child.wait_with_output()).await {
+        // Bounded readers: each keeps at most MAX_OUTPUT_BYTES (head/tail),
+        // so a spamming verifier cannot grow memory through its output.
+        // `wait_with_output` reads unboundedly and must not be used here.
+        let stdout_task = child.stdout.take().map(|mut out| {
+            tokio::spawn(async move {
+                let mut capped = crate::proc_bound::CappedOutput::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    match out.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => capped.push(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                capped.finish()
+            })
+        });
+        let stderr_task = child.stderr.take().map(|mut err| {
+            tokio::spawn(async move {
+                let mut capped = crate::proc_bound::CappedOutput::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    match err.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => capped.push(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                capped.finish()
+            })
+        });
+        let status = match timeout(self.timeout, child.wait()).await {
             Ok(r) => r.map_err(|e| PolyJitError::Io(format!("process wait failed: {e}")))?,
             Err(_) => {
                 if let Some(pid) = pid {
                     crate::proc_bound::kill_group(pid);
                 }
+                if let Some(task) = &stdout_task {
+                    task.abort();
+                }
+                if let Some(task) = &stderr_task {
+                    task.abort();
+                }
                 return Err(PolyJitError::Timeout(command_string.clone()));
             }
         };
+        // A descendant holding the pipes keeps the readers alive; give them
+        // the same drain grace as the sync runner, then kill the group so
+        // the pipes close and the readers finish.
+        let mut stdout_task = stdout_task;
+        let mut stderr_task = stderr_task;
+        let stdout = match &mut stdout_task {
+            Some(task) => drain_reader(task, pid).await,
+            None => Vec::new(),
+        };
+        let stderr = match &mut stderr_task {
+            Some(task) => drain_reader(task, pid).await,
+            None => Vec::new(),
+        };
         Ok(ProcessOutput {
             command: command_string,
-            status_code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            status_code: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).to_string(),
+            stderr: String::from_utf8_lossy(&stderr).to_string(),
         })
     }
 
@@ -284,6 +335,25 @@ struct ProcessOutput {
     stderr: String,
 }
 
+/// Await a bounded reader task, giving a descendant that holds the pipes
+/// one drain grace; if it still has not finished, kill the group and take
+/// whatever the reader collected once the pipes close.
+async fn drain_reader(task: &mut tokio::task::JoinHandle<Vec<u8>>, pid: Option<u32>) -> Vec<u8> {
+    match timeout(crate::proc_bound::DRAIN_GRACE, &mut *task).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            if let Some(pid) = pid {
+                crate::proc_bound::kill_group(pid);
+            }
+            match timeout(crate::proc_bound::DRAIN_GRACE, &mut *task).await {
+                Ok(Ok(bytes)) => bytes,
+                _ => Vec::new(),
+            }
+        }
+    }
+}
+
 async fn read_source_excerpt(path: Option<&str>) -> Option<String> {
     let path = PathBuf::from(path?);
     let text = tokio::fs::read_to_string(path).await.ok()?;
@@ -317,5 +387,75 @@ mod tests {
     fn deterministic_patch_handles_fixture_marker() {
         let patched = synthesize_patch("AXIOM_POLYJIT_FIXTURE_FAIL").unwrap();
         assert!(patched.contains("AXIOM_POLYJIT_FIXTURE_PASS"));
+    }
+
+    #[tokio::test]
+    async fn run_process_caps_spamming_output() {
+        // 3 MiB of stdout must come back capped at roughly
+        // MAX_OUTPUT_BYTES, the run must still succeed, and the retained
+        // window must show the start and the end of the stream.
+        let engine = PolyJitEngine::new(Duration::from_secs(30));
+        let out = engine
+            .run_process(&PolyJitRunRequest {
+                session_id: "test".to_string(),
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "(yes abcdefghij | head -c 2999999; printf 'END-STDOUT')".to_string(),
+                ],
+                working_dir: None,
+                source_path: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.status_code, Some(0));
+        assert!(
+            out.stdout.len() <= crate::proc_bound::MAX_OUTPUT_BYTES + 128,
+            "stdout capped: got {} bytes",
+            out.stdout.len()
+        );
+        assert!(
+            out.stdout.starts_with("abcdefghij\n"),
+            "head kept the start"
+        );
+        assert!(
+            out.stdout.contains("3000009 bytes"),
+            "marker reports the total"
+        );
+        assert!(out.stdout.ends_with("END-STDOUT"), "tail kept the end");
+    }
+
+    #[tokio::test]
+    async fn run_process_keeps_output_when_a_descendant_holds_the_pipes() {
+        // The child prints, exits at once, and leaves a background
+        // grandchild holding stdout open. The first drain must time out,
+        // the group must be killed, and the second drain must still return
+        // the bytes the reader already collected.
+        let t0 = std::time::Instant::now();
+        let engine = PolyJitEngine::new(Duration::from_secs(30));
+        let out = engine
+            .run_process(&PolyJitRunRequest {
+                session_id: "test".to_string(),
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'PARTIAL-OUTPUT\\n'; (sleep 30 &)".to_string(),
+                ],
+                working_dir: None,
+                source_path: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "returned in {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(out.status_code, Some(0));
+        assert!(
+            out.stdout.contains("PARTIAL-OUTPUT"),
+            "drained output kept: got {:?}",
+            out.stdout
+        );
     }
 }
