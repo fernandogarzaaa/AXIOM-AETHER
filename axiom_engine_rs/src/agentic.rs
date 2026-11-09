@@ -160,7 +160,10 @@ impl EditSet {
 /// [`Transaction::commit`] the changes simply stay. This is the safety boundary:
 /// a rejected multi-file change never half-applies.
 pub struct Transaction {
-    /// path -> Some(original bytes) if it existed, None if it was newly created.
+    /// path -> Some(original bytes) if it existed and was readable, None if it
+    /// did not exist. An original that exists but cannot be read aborts
+    /// [`Transaction::apply`] before any mutation: it is never recorded as
+    /// "did not exist", so rollback can never delete it by mistake.
     /// Raw bytes (not String) so a non-UTF8 file is restored byte-for-byte
     /// rather than mistaken for "newly created" and deleted on rollback.
     snapshot: BTreeMap<PathBuf, Option<Vec<u8>>>,
@@ -169,7 +172,14 @@ pub struct Transaction {
 
 impl Transaction {
     /// Snapshot and apply `edits`. Returns an error (after best-effort rollback)
-    /// if any write fails, so a partial application never escapes.
+    /// if any step fails, so a partial application never escapes.
+    ///
+    /// Two phases. First, snapshot every distinct target BEFORE any mutation:
+    /// a target that exists but cannot be read is an error here, not a
+    /// "did not exist" snapshot, so apply refuses before touching anything.
+    /// Second, write the edits with rollback armed, so any failure in the
+    /// loop (including `create_dir_all`) drops the transaction and rolls
+    /// back what was already written.
     pub fn apply(edits: &EditSet) -> std::io::Result<Self> {
         let mut tx = Transaction {
             snapshot: BTreeMap::new(),
@@ -179,10 +189,22 @@ impl Transaction {
             if tx.snapshot.contains_key(&edit.path) {
                 // Same file targeted twice in one set: keep the first snapshot
                 // (the true pre-transaction state) and let the later write win.
-            } else {
-                let original = std::fs::read(&edit.path).ok();
-                tx.snapshot.insert(edit.path.clone(), original);
+                continue;
             }
+            match std::fs::read(&edit.path) {
+                Ok(bytes) => {
+                    tx.snapshot.insert(edit.path.clone(), Some(bytes));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tx.snapshot.insert(edit.path.clone(), None);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Arm rollback before the first write: from here on, any early
+        // return drops `tx` and `Drop` rolls back what was written.
+        tx.applied = true;
+        for edit in &edits.edits {
             if let Some(parent) = edit.path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent)?;
@@ -191,16 +213,11 @@ impl Transaction {
             let before = std::fs::metadata(&edit.path)
                 .and_then(|m| m.modified())
                 .ok();
-            if let Err(e) = std::fs::write(&edit.path, &edit.content) {
-                // Roll back whatever we already wrote, then surface the error.
-                tx.rollback();
-                return Err(e);
-            }
+            std::fs::write(&edit.path, &edit.content)?;
             // A same-size rewrite in the same second must still look new to
             // mtime-keyed caches (see `mark_fresh`).
             mark_fresh(&edit.path, before);
         }
-        tx.applied = true;
         Ok(tx)
     }
 
@@ -211,23 +228,42 @@ impl Transaction {
     }
 
     /// Restore every touched file to its pre-transaction state, byte-for-byte;
-    /// files that did not exist before are removed.
-    pub fn rollback(&mut self) {
+    /// files that did not exist before are removed. Every file is restored
+    /// even when one restoration fails, and the first error is returned so a
+    /// failed rollback is observable instead of silently leaving files
+    /// modified. Removing a created file that already vanished is not an
+    /// error: the desired end state already holds.
+    pub fn rollback(&mut self) -> std::io::Result<()> {
+        let mut first_error: Option<std::io::Error> = None;
         for (path, original) in &self.snapshot {
-            match original {
+            let result = match original {
                 Some(bytes) => {
                     let before = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-                    let _ = std::fs::write(path, bytes);
-                    // The restored bytes must look newer than the rejected
-                    // candidate's build output, or the next verify runs it.
-                    mark_fresh(path, before);
+                    let r = std::fs::write(path, bytes);
+                    if r.is_ok() {
+                        // The restored bytes must look newer than the rejected
+                        // candidate's build output, or the next verify runs it.
+                        mark_fresh(path, before);
+                    }
+                    r
                 }
-                None => {
-                    let _ = std::fs::remove_file(path);
+                None => match std::fs::remove_file(path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                },
+            };
+            if let Err(e) = result {
+                if first_error.is_none() {
+                    first_error = Some(e);
                 }
             }
         }
         self.applied = false;
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -236,7 +272,7 @@ impl Drop for Transaction {
         // A transaction dropped without commit() (e.g. an early return or panic
         // on a failed verify) must not leave edits applied.
         if self.applied {
-            self.rollback();
+            let _ = self.rollback();
         }
     }
 }
@@ -514,7 +550,7 @@ mod tests {
         std::fs::write(&f, "fn a() {}").unwrap();
         let mut tx = Transaction::apply(&EditSet::new().with(f.clone(), "fn b() {}")).unwrap();
         let cand = std::fs::metadata(&f).unwrap().modified().unwrap();
-        tx.rollback();
+        tx.rollback().unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "fn a() {}");
         let restored = std::fs::metadata(&f).unwrap().modified().unwrap();
         assert!(
@@ -572,6 +608,170 @@ mod tests {
             "existing file restored"
         );
         assert!(!b.exists(), "newly created file removed on rollback");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transaction_apply_rolls_back_first_file_when_second_file_parent_cannot_be_created() {
+        // Repro for audit P1-1: create_dir_all failure on the second file
+        // returned without rolling back, leaving the first file modified.
+        let dir = tmp("rollback_dirfail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "A0").unwrap();
+        // A regular file where the second edit's parent directory must go.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "not a dir").unwrap();
+        let b = blocker.join("sub").join("b.txt");
+
+        let edits = EditSet::new().with(a.clone(), "A1").with(b.clone(), "B1");
+        let result = Transaction::apply(&edits);
+        assert!(
+            result.is_err(),
+            "apply must fail when a parent cannot be created"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "A0",
+            "first file must be rolled back, not left modified"
+        );
+        assert!(!b.exists(), "second file must not exist");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transaction_apply_rolls_back_first_two_files_when_third_file_fails() {
+        let dir = tmp("rollback_thirdfail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "A0").unwrap();
+        std::fs::write(&b, "B0").unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "not a dir").unwrap();
+        let c = blocker.join("sub").join("c.txt");
+
+        let edits = EditSet::new()
+            .with(a.clone(), "A1")
+            .with(b.clone(), "B1")
+            .with(c.clone(), "C1");
+        let result = Transaction::apply(&edits);
+        assert!(
+            result.is_err(),
+            "apply must fail when the third parent cannot be created"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "A0");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "B0");
+        assert!(!c.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transaction_apply_refuses_unreadable_original_before_mutating() {
+        // A directory as an edit target cannot be read (EISDIR), so its
+        // original is unreadable, not nonexistent. Apply must fail BEFORE
+        // touching any other file: content and mtime both untouched.
+        let dir = tmp("rollback_unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.txt");
+        std::fs::write(&good, "G0").unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&good)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let target_dir = dir.join("target_dir");
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        let edits = EditSet::new()
+            .with(good.clone(), "G1")
+            .with(target_dir.clone(), "x");
+        let result = Transaction::apply(&edits);
+        assert!(result.is_err(), "apply must fail on an unreadable original");
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "G0");
+        assert_eq!(
+            std::fs::metadata(&good).unwrap().modified().unwrap(),
+            old,
+            "untouched file must keep its exact mtime: no write happened at all"
+        );
+        assert!(target_dir.is_dir(), "the directory target must still exist");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transaction_rollback_reports_failure_and_restores_remaining_files() {
+        // Repro for audit P1-1: rollback swallowed restoration errors.
+        // Replace one target with a directory after apply, so its restore
+        // fails; rollback must report the error and still restore the other.
+        let dir = tmp("rollback_fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("aaa.txt");
+        let good = dir.join("zzz.txt");
+        std::fs::write(&bad, "BAD0").unwrap();
+        std::fs::write(&good, "GOOD0").unwrap();
+
+        let edits = EditSet::new()
+            .with(bad.clone(), "BAD1")
+            .with(good.clone(), "GOOD1");
+        let mut tx = Transaction::apply(&edits).unwrap();
+        std::fs::remove_file(&bad).unwrap();
+        std::fs::create_dir_all(&bad).unwrap();
+
+        let result = tx.rollback();
+        assert!(result.is_err(), "rollback must report a failed restoration");
+        assert_eq!(
+            std::fs::read_to_string(&good).unwrap(),
+            "GOOD0",
+            "rollback must keep restoring the remaining files after one failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transaction_rollback_reports_failed_removal_of_created_file() {
+        // The remove arm of rollback must report a real removal failure:
+        // only a file that already vanished (NotFound) is tolerated. A
+        // created file replaced by a directory cannot be removed, so
+        // rollback must fail even though the other file still restores.
+        let dir = tmp("rollback-remove-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("aaa_existing.txt");
+        std::fs::write(&existing, "before").unwrap();
+        let created = dir.join("zzz_created.txt");
+        let mut tx = Transaction::apply(
+            &EditSet::new()
+                .with(existing.clone(), "after")
+                .with(created.clone(), "new"),
+        )
+        .unwrap();
+        std::fs::remove_file(&created).unwrap();
+        std::fs::create_dir(&created).unwrap();
+        let result = tx.rollback();
+        assert!(result.is_err(), "rollback must report a failed removal");
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "before");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transaction_rollback_tolerates_already_removed_created_file() {
+        // A created file that vanished before rollback is already in the
+        // desired end state, so rollback succeeds instead of reporting it.
+        let dir = tmp("rollback_gone");
+        std::fs::create_dir_all(&dir).unwrap();
+        let created = dir.join("new.txt");
+
+        let edits = EditSet::new().with(created.clone(), "N1");
+        let mut tx = Transaction::apply(&edits).unwrap();
+        assert!(created.exists());
+        std::fs::remove_file(&created).unwrap();
+
+        assert!(
+            tx.rollback().is_ok(),
+            "already-removed file is not an error"
+        );
+        assert!(!created.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

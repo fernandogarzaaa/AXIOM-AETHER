@@ -248,9 +248,17 @@ impl AgentTask {
             // not the last-committed state.
             self.record(attempt_no, fingerprint, true, output)
         } else {
-            tx.rollback();
+            // A failed rollback leaves the workspace modified: say so in the
+            // record instead of reporting only the verifier failure.
+            let rollback_error = tx.rollback().err();
             self.memory.record_rejected(&self.goal, &edit_set);
-            self.record(attempt_no, fingerprint, false, output)
+            let message = match rollback_error {
+                Some(e) => {
+                    format!("{output}\nROLLBACK FAILED ({e}); workspace may be left modified")
+                }
+                None => output,
+            };
+            self.record(attempt_no, fingerprint, false, message)
         }
     }
 
