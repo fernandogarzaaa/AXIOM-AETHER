@@ -321,6 +321,108 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn local_openai_stream_response_emits_deltas_then_done() {
+        use axum::body::to_bytes;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let stream = crate::swarm_router::SwarmStream {
+            model: "phi4:3.8b".to_string(),
+            receiver: rx,
+        };
+        tx.send(Ok("Hel".to_string())).await.unwrap();
+        tx.send(Ok("lo world".to_string())).await.unwrap();
+        drop(tx);
+        let state = make_test_state().await;
+        let resp = local_openai_chat_stream_response(&state, "sess-stream-test", stream)
+            .expect("stream response must build");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("text/event-stream"),
+            "stream response must be SSE, got {content_type}"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let frames: Vec<&str> = text.split("\n\n").filter(|f| !f.is_empty()).collect();
+        assert_eq!(frames.len(), 4, "two deltas, stop chunk, [DONE]:\n{text}");
+        assert!(
+            frames[0].contains(r#""content":"Hel""#),
+            "first delta frame: {}",
+            frames[0]
+        );
+        assert!(
+            frames[1].contains(r#""content":"lo world""#),
+            "second delta frame: {}",
+            frames[1]
+        );
+        assert!(
+            frames[2].contains(r#""finish_reason":"stop""#),
+            "stop frame: {}",
+            frames[2]
+        );
+        assert_eq!(frames[3], "data: [DONE]");
+        safe_drop(state.pipeline.clone()).await;
+    }
+
+    #[tokio::test]
+    async fn local_openai_stream_response_ends_without_done_on_upstream_error() {
+        use axum::body::to_bytes;
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let stream = crate::swarm_router::SwarmStream {
+            model: "phi4:3.8b".to_string(),
+            receiver: rx,
+        };
+        tx.send(Ok("Hel".to_string())).await.unwrap();
+        tx.send(Err(crate::swarm_router::SwarmRouteError::Upstream(
+            "ollama died".to_string(),
+        )))
+        .await
+        .unwrap();
+        let state = make_test_state().await;
+        let resp = local_openai_chat_stream_response(&state, "sess-stream-err", stream)
+            .expect("stream response must build");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(r#""content":"Hel""#),
+            "delta sent before the error must arrive:\n{text}"
+        );
+        assert!(
+            !text.contains("[DONE]"),
+            "an errored stream must not claim a clean stop:\n{text}"
+        );
+        safe_drop(state.pipeline.clone()).await;
+    }
+
+    #[tokio::test]
+    async fn local_openai_chat_response_returns_single_json_object() {
+        use axum::body::to_bytes;
+        let local = SwarmChatResult {
+            model: "phi4:3.8b".to_string(),
+            content: "Hello world".to_string(),
+        };
+        let resp = local_openai_chat_response(local).expect("response must build");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.contains("application/json"),
+            "non-stream response must be JSON, got {content_type}"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).expect("body must be one JSON object");
+        assert_eq!(json["choices"][0]["message"]["content"], "Hello world");
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert_eq!(json["model"], "phi4:3.8b");
+    }
+
     /// `AppState.pipeline` must be an `RwLock`, not a `Mutex`: the whole point
     /// of switching (see the field doc) is that concurrent readers — e.g. the
     /// `responses_run_fingerprint` JoinSet fan-out — can hold the lock
