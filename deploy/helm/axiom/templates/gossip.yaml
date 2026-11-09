@@ -59,6 +59,17 @@ data:
     TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
     CACERT="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
+    # curl with the data-plane key when configured. The server requires
+    # X-Axiom-Key only when AXIOM_API_KEY is set, so send the header only
+    # when the key is present; key-disabled configs keep working unchanged.
+    curl_auth() {
+      if [ -n "${AXIOM_API_KEY:-}" ]; then
+        curl -H "X-Axiom-Key: $AXIOM_API_KEY" "$@"
+      else
+        curl "$@"
+      fi
+    }
+
     IPS="$(curl -fsS --cacert "$CACERT" -H "Authorization: Bearer $TOKEN" \
       "$API/api/v1/namespaces/$NS/endpoints/$SVC" \
       | jq -r '.subsets[]?.addresses[]?.ip')"
@@ -70,14 +81,14 @@ data:
     echo "[gossip] fleet members:"; echo "$IPS"
 
     for src in $IPS; do
-      export_json="$(curl -fsS --max-time 10 "http://$src:$PORT/v1/immunity" || true)"
+      export_json="$(curl_auth -fsS --max-time 10 "http://$src:$PORT/v1/immunity" || true)"
       if [ -z "$export_json" ]; then
         echo "[gossip] $src: no export (immunity may be unconfigured) — skip"
         continue
       fi
       for dst in $IPS; do
         [ "$dst" = "$src" ] && continue
-        code="$(curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' \
+        code="$(curl_auth -fsS --max-time 10 -o /dev/null -w '%{http_code}' \
           -X POST "http://$dst:$PORT/v1/immunity/merge" \
           -H 'content-type: application/json' --data "$export_json" || echo 000)"
         echo "[gossip] $src -> $dst : $code"
@@ -123,6 +134,14 @@ spec:
                   value: {{ include "axiom.headlessName" . | quote }}
                 - name: AXIOM_TARGET_PORT
                   value: {{ .Values.service.targetPort | quote }}
+                {{- if or .Values.secrets.apiKey .Values.secrets.existingSecret }}
+                - name: AXIOM_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "axiom.secretName" . }}
+                      key: AXIOM_API_KEY
+                      optional: true
+                {{- end }}
               volumeMounts:
                 - name: script
                   mountPath: /scripts
