@@ -1027,6 +1027,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cluster_sync_merges_delta_into_layer_state() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
@@ -1288,6 +1289,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_requires_api_key_when_configured() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         // /metrics is gated by require_api_key: without the key it 401s, with
         // the key it serves the exposition body.
         let state = make_test_state().await.with_api_key(Some("k3y".into()));
@@ -1345,6 +1347,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_open_by_default_when_no_api_key() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         // With AXIOM_API_KEY unset the guard is a passthrough, so /metrics
         // stays open with no header, as before.
         let state = make_test_state().await;
@@ -1366,6 +1369,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_renders_stage_memory_and_stall_series() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         // Drive the new observability surface through the real /metrics
         // route: one observation per stage, one stall, a session-memory
         // value, and an RSS refresh, then assert every new series is in
@@ -1586,6 +1590,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cluster_sync_rejects_out_of_order_delta() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
@@ -1637,6 +1642,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_quantized_session_dequantizes_on_chat_path() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
         let session_id = "quantized-session".to_string();
@@ -1920,6 +1926,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_creation_is_capped() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         let state = make_test_state().await.with_max_sessions(1);
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state);

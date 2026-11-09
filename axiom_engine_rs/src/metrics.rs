@@ -77,6 +77,19 @@ pub static GAUGE_PROCESS_RSS_BYTES: AtomicU64 = AtomicU64::new(0);
 /// estimate, not a heap measurement.
 pub static GAUGE_SESSION_MEMORY_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Test-only lock serializing access to the process-global session-memory
+/// gauge. Lib tests run in parallel, and a `/metrics` scrape (or any
+/// `refresh_session_metrics` call) on an empty test state overwrites the
+/// gauge with zero, which races the set-then-render windows of the gauge
+/// tests. Every test that writes the gauge or asserts on it holds this
+/// lock for its whole body. A tokio mutex, so async tests can hold it
+/// across awaits (a std mutex would trip `await_holding_lock`); the one
+/// sync test uses `blocking_lock`. Never acquire it twice on one thread
+/// (the mutex is not reentrant).
+#[cfg(test)]
+pub(crate) static SESSION_MEMORY_GAUGE_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 const HISTOGRAM_BUCKETS: [f64; 9] = [0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0];
 
 #[derive(Clone)]
@@ -594,6 +607,7 @@ mod tests {
 
     #[test]
     fn test_memory_gauges_render() {
+        let _gauge_guard = SESSION_MEMORY_GAUGE_TEST_LOCK.blocking_lock();
         set_session_memory_bytes(1234);
         let rss = refresh_process_memory();
         #[cfg(target_os = "linux")]
