@@ -20,6 +20,11 @@ fullnameOverride: ""
 checkpoint:
   url: ""          # -> AXIOM_CHECKPOINT_URL  (e.g. https://.../axiom_production_bpe.bin)
   tokenizerUrl: "" # -> AXIOM_TOKENIZER_URL   (e.g. https://.../axiom_bpe.json)
+  # Pinned SHA-256 digests of the checkpoint and tokenizer, verified both at
+  # fetch time and at server startup (see AXIOM_REQUIRE_VERIFIED_CHECKPOINT).
+  # Leave empty for smoke deploys; pin both in production.
+  sha256: ""          # -> AXIOM_CHECKPOINT_SHA256
+  tokenizerSha256: "" # -> AXIOM_TOKENIZER_SHA256
 
 # ---------------------------------------------------------------------------
 # Runtime configuration (non-secret) — rendered into a ConfigMap.
@@ -29,6 +34,16 @@ config:
   rustLog: info
   maxContextTokens: "4096"
   productionBpe: "1"     # AXIOM_PRODUCTION_BPE — load the trained checkpoint dims from the sidecar
+  # Refuse readiness until the production checkpoint is verified:
+  # "1" makes /readyz return 503 unless the checkpoint file exists, its
+  # tokenizer is present, and its SHA-256 matches checkpoint.sha256. When
+  # checkpoint.tokenizerSha256 is pinned, the tokenizer file's SHA-256 must
+  # match it too; without a pinned tokenizer hash the tokenizer is checked
+  # for presence only.
+  # Default "" (off) preserves the local-first default: the legacy bootstrap
+  # model still reports ready. Set to "1" in production alongside a pinned
+  # checkpoint.sha256; pinning the hash alone does NOT enable the gate.
+  requireVerifiedCheckpoint: "" # AXIOM_REQUIRE_VERIFIED_CHECKPOINT
   # Grounding / compression feature flags (off unless set):
   groundCorrect: ""      # "1" to enable the self-correction loop
   adaptiveCompress: ""   # "1" to enable confidence-gated adaptive compression

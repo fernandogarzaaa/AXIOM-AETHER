@@ -399,6 +399,231 @@ mod tests {
         safe_drop(pipeline_arc).await;
     }
 
+    /// Helper: GET /readyz against a fresh router built from `state`.
+    async fn readyz_response(state: AppState) -> (StatusCode, serde_json::Value) {
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        safe_drop(pipeline_arc).await;
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn readyz_503_in_production_mode_with_no_checkpoint() {
+        let state = make_test_state()
+            .await
+            .with_checkpoint_gate(true, CheckpointStatus::Absent);
+        let (status, json) = readyz_response(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["status"], "unavailable");
+        assert!(
+            json["reason"].as_str().unwrap().contains("absent"),
+            "reason must name the absent weights: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_503_in_production_mode_with_unverified_checkpoint() {
+        let state = make_test_state()
+            .await
+            .with_checkpoint_gate(true, CheckpointStatus::Unverified);
+        let (status, json) = readyz_response(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["status"], "unavailable");
+        assert!(
+            json["reason"].as_str().unwrap().contains("unverified"),
+            "reason must name the unverified weights: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_503_in_production_mode_with_mismatched_checkpoint() {
+        let state = make_test_state()
+            .await
+            .with_checkpoint_gate(true, CheckpointStatus::Mismatched);
+        let (status, json) = readyz_response(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["status"], "unavailable");
+        assert!(
+            json["reason"].as_str().unwrap().contains("mismatch"),
+            "reason must name the mismatch: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_200_in_production_mode_with_verified_checkpoint() {
+        let state = make_test_state()
+            .await
+            .with_checkpoint_gate(true, CheckpointStatus::Verified);
+        let (status, json) = readyz_response(state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["checkpoint"], "verified");
+    }
+
+    #[tokio::test]
+    async fn readyz_200_in_non_production_mode_with_legacy_bootstrap() {
+        // The gate is off and no verified checkpoint exists (the legacy
+        // bootstrap model): readiness is unchanged from before this change.
+        let state = make_test_state()
+            .await
+            .with_checkpoint_gate(false, CheckpointStatus::Absent);
+        let (status, json) = readyz_response(state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "ready");
+        let state = make_test_state()
+            .await
+            .with_checkpoint_gate(false, CheckpointStatus::Unverified);
+        let (status, json) = readyz_response(state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "ready");
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_absent_when_file_missing() {
+        let missing = std::path::Path::new("/definitely/not/a/checkpoint.bin");
+        assert_eq!(
+            resolve_checkpoint_status(missing, None, None, None),
+            CheckpointStatus::Absent
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_unverified_without_pinned_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, None, None, None),
+            CheckpointStatus::Unverified
+        );
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, None, Some(""), None),
+            CheckpointStatus::Unverified,
+            "an empty pinned hash is the same as no pinned hash"
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_verified_on_matching_pinned_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"weights"));
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, None, Some(&digest), None),
+            CheckpointStatus::Verified
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_mismatched_on_wrong_pinned_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, None, Some("deadbeef"), None),
+            CheckpointStatus::Mismatched
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_mismatched_when_tokenizer_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"weights"));
+        let missing_tok = dir.path().join("no-tokenizer.json");
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, Some(&missing_tok), Some(&digest), None),
+            CheckpointStatus::Mismatched,
+            "a verified checkpoint without its tokenizer is not servable"
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_verified_when_tokenizer_hash_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        std::fs::write(&tok, b"tokenizer-bytes").unwrap();
+        let ckpt_digest = format!("{:x}", Sha256::digest(b"weights"));
+        let tok_digest = format!("{:x}", Sha256::digest(b"tokenizer-bytes"));
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, Some(&tok), Some(&ckpt_digest), Some(&tok_digest)),
+            CheckpointStatus::Verified
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_mismatched_when_tokenizer_hash_mismatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        std::fs::write(&tok, b"substituted-tokenizer").unwrap();
+        let ckpt_digest = format!("{:x}", Sha256::digest(b"weights"));
+        let pinned_tok_digest = format!("{:x}", Sha256::digest(b"tokenizer-bytes"));
+        assert_eq!(
+            resolve_checkpoint_status(
+                &ckpt,
+                Some(&tok),
+                Some(&ckpt_digest),
+                Some(&pinned_tok_digest)
+            ),
+            CheckpointStatus::Mismatched,
+            "a substituted tokenizer must not pass on a valid checkpoint hash alone"
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_presence_only_without_pinned_tokenizer_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        std::fs::write(&tok, b"any-tokenizer").unwrap();
+        let ckpt_digest = format!("{:x}", Sha256::digest(b"weights"));
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, Some(&tok), Some(&ckpt_digest), None),
+            CheckpointStatus::Verified,
+            "no pinned tokenizer hash keeps presence-only behavior"
+        );
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, Some(&tok), Some(&ckpt_digest), Some("")),
+            CheckpointStatus::Verified,
+            "an empty pinned tokenizer hash is the same as no pinned hash"
+        );
+    }
+
+    #[test]
+    fn resolve_checkpoint_status_mismatched_when_tokenizer_hash_pinned_but_no_tokenizer_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("ckpt.bin");
+        std::fs::write(&ckpt, b"weights").unwrap();
+        let ckpt_digest = format!("{:x}", Sha256::digest(b"weights"));
+        let tok_digest = format!("{:x}", Sha256::digest(b"tokenizer-bytes"));
+        assert_eq!(
+            resolve_checkpoint_status(&ckpt, None, Some(&ckpt_digest), Some(&tok_digest)),
+            CheckpointStatus::Mismatched,
+            "a pinned tokenizer hash with no tokenizer file to check proves nothing"
+        );
+    }
+
     #[tokio::test]
     async fn context_adaptation_cache_skips_identical_context_per_session() {
         let state = make_test_state().await;

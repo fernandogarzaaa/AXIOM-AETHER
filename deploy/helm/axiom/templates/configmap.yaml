@@ -23,6 +23,13 @@ data:
   {{- with .Values.checkpoint.tokenizerUrl }}
   AXIOM_TOKENIZER_URL: {{ . | quote }}
   {{- end }}
+  {{- with .Values.checkpoint.sha256 }}
+  AXIOM_CHECKPOINT_SHA256: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.checkpoint.tokenizerSha256 }}
+  AXIOM_TOKENIZER_SHA256: {{ . | quote }}
+  {{- end }}
+  AXIOM_REQUIRE_VERIFIED_CHECKPOINT: {{ .Values.config.requireVerifiedCheckpoint | quote }}
   {{- with .Values.config.groundCorrect }}
   AXIOM_GROUND_CORRECT: {{ . | quote }}
   {{- end }}
