@@ -94,6 +94,67 @@ async fn require_api_key(State(state): State<AppState>, req: axum::extract::Requ
     next.run(req).await
 }
 
+/// Parse the `AXIOM_CORS_ORIGINS` allowlist: comma-separated exact origins
+/// (e.g. `https://app.example.com,http://localhost:3000`). Entries are
+/// trimmed and empties are dropped. A bare `*` is dropped with a warning:
+/// `AllowOrigin::list` panics on a wildcard, and a wildcard would defeat
+/// the allowlist, so a misconfigured entry must never crash the server or
+/// silently reopen cross-origin access. Unparseable entries are dropped
+/// with a warning for the same reason.
+pub(crate) fn parse_cors_origins(raw: &str) -> Vec<HeaderValue> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .filter_map(|origin| {
+            if origin == "*" {
+                eprintln!(
+                    "[axiom-cors] ignoring wildcard origin '*' in AXIOM_CORS_ORIGINS: \
+                     cross-origin access is allowlist-only, use an explicit origin"
+                );
+                return None;
+            }
+            match HeaderValue::from_str(origin) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    eprintln!(
+                        "[axiom-cors] ignoring unparseable origin in AXIOM_CORS_ORIGINS: {origin:?}"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Read the opt-in cross-origin allowlist from `AXIOM_CORS_ORIGINS`.
+/// Unset or empty means no origin is allowed: default deny.
+pub(crate) fn cors_origins_from_env() -> Vec<HeaderValue> {
+    std::env::var("AXIOM_CORS_ORIGINS")
+        .map(|raw| parse_cors_origins(&raw))
+        .unwrap_or_default()
+}
+
+/// Build the restrictive CORS layer (audit Finding 7, P2). It replaces the
+/// old global `CorsLayer::permissive()`, which in tower-http 0.6.11 allows
+/// any origin, any method, any header, and exposes any header, so any
+/// website could read API responses cross-origin. The replacement allows
+/// only origins listed in `AXIOM_CORS_ORIGINS` (default: none) and keeps
+/// methods, headers, and exposed headers open for those listed origins,
+/// so an allowed dashboard behaves exactly as before. Credentials are not
+/// allowed (as before). Requests without an `Origin` header (same-origin
+/// fetches, curl, non-browser clients) are unaffected: CORS only gates
+/// cross-origin reads by browsers, never the server's willingness to
+/// answer. Authentication for file and execution capabilities is out of
+/// scope here; this change is the CORS allowlist only.
+pub(crate) fn restricted_cors_layer() -> CorsLayer {
+    use tower_http::cors::{AllowOrigin, Any};
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(cors_origins_from_env()))
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers(Any)
+}
+
 /// Build the axum Router with all API routes attached.
 ///
 /// Routes split into three groups:
@@ -191,7 +252,7 @@ pub fn create_router(state: AppState) -> Router {
     public
         .merge(metrics)
         .merge(guarded)
-        .layer(CorsLayer::permissive())
+        .layer(restricted_cors_layer())
         // Codex CLI compresses HTTP request bodies (gzip/zstd); decompress
         // before the Json extractors so /v1/responses accepts them.
         .layer(RequestDecompressionLayer::new())

@@ -1874,4 +1874,128 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // CORS (audit Finding 7, P2): default deny cross-origin, opt-in
+    // allowlist via AXIOM_CORS_ORIGINS. A disallowed origin must get no
+    // Access-Control-Allow-Origin header, so a browser refuses to expose
+    // the response to that origin's scripts. The request itself is still
+    // served (CORS gates the browser read, not the server); only the
+    // header is the assertion.
+    //
+    // The env guard is held only around the env set + router build:
+    // `create_router` reads AXIOM_CORS_ORIGINS once at build time, so the
+    // var is unset again before any request runs. No assertion runs while
+    // the guard is held, so a failing assertion can never poison the
+    // guard for the other tests.
+    async fn cors_get_healthz(
+        allowlist: Option<&str>,
+        origin: Option<&str>,
+    ) -> axum::response::Response {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = {
+            let _guard = ENV_GUARD.lock().expect("env guard poisoned");
+            match allowlist {
+                Some(list) => std::env::set_var("AXIOM_CORS_ORIGINS", list),
+                None => std::env::remove_var("AXIOM_CORS_ORIGINS"),
+            }
+            let app = create_router(state);
+            std::env::remove_var("AXIOM_CORS_ORIGINS");
+            app
+        };
+        let mut builder = Request::builder().method(Method::GET).uri("/healthz");
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        let resp = app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+        safe_drop(pipeline_arc).await;
+        resp
+    }
+
+    #[tokio::test]
+    async fn cors_default_denies_unlisted_origin() {
+        let resp = cors_get_healthz(None, Some("https://evil.example")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "unlisted origin must get no Access-Control-Allow-Origin header, got {:?}",
+            resp.headers().get("access-control-allow-origin")
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_allows_listed_origin() {
+        let resp =
+            cors_get_healthz(Some("https://app.example.com"), Some("https://app.example.com"))
+                .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com"),
+            "listed origin must be echoed back as the allowed origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_disallowed_origin_when_allowlist_set() {
+        let resp =
+            cors_get_healthz(Some("https://app.example.com"), Some("https://other.example")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "origin outside the allowlist must get no Access-Control-Allow-Origin header"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_request_without_origin_gets_no_cors_header() {
+        let resp = cors_get_healthz(None, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "non-browser requests without an Origin header must get no CORS header"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_for_listed_origin_is_allowed() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        let app = {
+            let _guard = ENV_GUARD.lock().expect("env guard poisoned");
+            std::env::set_var("AXIOM_CORS_ORIGINS", "https://app.example.com");
+            let app = create_router(state);
+            std::env::remove_var("AXIOM_CORS_ORIGINS");
+            app
+        };
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/healthz")
+                    .header("origin", "https://app.example.com")
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com"),
+            "preflight from a listed origin must carry the allowed origin"
+        );
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[test]
+    fn parse_cors_origins_trims_and_drops_wildcard_and_empties() {
+        let origins = parse_cors_origins(" https://a.example , ,*, http://localhost:3000 ");
+        let values: Vec<&str> = origins.iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(values, ["https://a.example", "http://localhost:3000"]);
+    }
 }
