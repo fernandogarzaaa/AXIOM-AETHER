@@ -2100,4 +2100,152 @@ mod tests {
         let values: Vec<&str> = origins.iter().map(|v| v.to_str().unwrap()).collect();
         assert_eq!(values, ["https://a.example", "http://localhost:3000"]);
     }
+
+    /// Minimal raw-TCP fake for the route-level streaming-fallback test:
+    /// serves one fixed response per request line. `hit` records whether
+    /// the expected path was requested at all.
+    async fn serve_fixed_responses(
+        listener: tokio::net::TcpListener,
+        routes: Vec<(&'static str, &'static str, &'static str)>,
+        hit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let routes = routes.clone();
+            let hit = hit.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    let Ok(n) = socket.read(&mut tmp).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if buf.len() > 65_536 {
+                        return;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let request_line = head.lines().next().unwrap_or("").to_string();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+                for (route_method, route_path, response) in &routes {
+                    if method == *route_method && path == *route_path {
+                        hit.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        return;
+                    }
+                }
+                let _ = socket
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_startup_failure_falls_back_to_cloud_forwarder() {
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Fake Ollama: /api/tags succeeds (model available) but /api/chat
+        // fails, modelling an upstream that dies between selection and
+        // generation.
+        let ollama_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ollama_addr = ollama_listener.local_addr().unwrap();
+        let ollama_hit = std::sync::Arc::new(AtomicBool::new(false));
+        let ollama_hit_clone = ollama_hit.clone();
+        tokio::spawn(serve_fixed_responses(
+            ollama_listener,
+            vec![
+                (
+                    "GET",
+                    "/api/tags",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 33\r\nConnection: close\r\n\r\n{\"models\":[{\"name\":\"phi4:3.8b\"}]}",
+                ),
+                (
+                    "POST",
+                    "/api/chat",
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nollama exploded",
+                ),
+            ],
+            ollama_hit_clone,
+        ));
+
+        // Fake cloud: answers chat completions with a fixed completion.
+        let cloud_body = r#"{"id":"chatcmpl-cloud","object":"chat.completion","created":1,"model":"cloud","choices":[{"index":0,"message":{"role":"assistant","content":"cloud answer"},"finish_reason":"stop"}]}"#;
+        let cloud_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            cloud_body.len(),
+            cloud_body
+        );
+        let cloud_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cloud_addr = cloud_listener.local_addr().unwrap();
+        let cloud_hit = std::sync::Arc::new(AtomicBool::new(false));
+        let cloud_hit_clone = cloud_hit.clone();
+        tokio::spawn(serve_fixed_responses(
+            cloud_listener,
+            vec![("POST", "/v1/chat/completions", Box::leak(cloud_response.into_boxed_str()))],
+            cloud_hit_clone,
+        ));
+
+        let router = crate::swarm_router::SwarmRouter::new(crate::swarm_router::SwarmRouterConfig {
+            enabled: true,
+            base_url: format!("http://{ollama_addr}"),
+            model_candidates: vec!["phi4:3.8b".to_string()],
+            num_ctx: 4096,
+            timeout_ms: 5_000,
+            mesh_routing: false,
+        });
+        let forwarder = crate::openai_forwarder::OpenAiForwarder::new(
+            None,
+            Some(format!("http://{cloud_addr}")),
+        );
+        let state = make_test_state()
+            .await
+            .with_swarm_router(Some(router))
+            .with_openai_forwarder(Some(forwarder));
+        let auth = crate::openai_forwarder::OpenAiClientAuth {
+            authorization: Some("Bearer test-key".to_string()),
+            extra_headers: vec![],
+        };
+        let body = serde_json::json!({
+            "model": "phi4:3.8b",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+        });
+        let resp = compressed_openai_chat_path(&state, &body, None, &auth)
+            .await
+            .expect("route must answer via the cloud fallback");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec())
+            .unwrap();
+        assert!(
+            ollama_hit.load(Ordering::SeqCst),
+            "the local dispatch must have been attempted first"
+        );
+        assert!(
+            cloud_hit.load(Ordering::SeqCst),
+            "the startup failure must reach the cloud forwarder"
+        );
+        assert!(
+            text.contains("cloud answer"),
+            "the response must carry the cloud answer, got:\n{text}"
+        );
+        assert!(
+            !text.contains("data: [DONE]"),
+            "the fallback response must not be an empty SSE stream, got:\n{text}"
+        );
+        safe_drop(state.pipeline.clone()).await;
+    }
 }

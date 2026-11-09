@@ -72,7 +72,18 @@ impl FakeOllama {
         Self::spawn_with(chunks, false).await
     }
 
+    /// Like `spawn`, but `/api/chat` answers with a non-success status,
+    /// modelling an upstream that is up for `/api/tags` yet fails the
+    /// generation request itself.
+    async fn spawn_failing_chat(chat_status: u16) -> Self {
+        Self::spawn_with_status(vec![], true, chat_status).await
+    }
+
     async fn spawn_with(chunks: Vec<FakeChunk>, send_done: bool) -> Self {
+        Self::spawn_with_status(chunks, send_done, 200).await
+    }
+
+    async fn spawn_with_status(chunks: Vec<FakeChunk>, send_done: bool, chat_status: u16) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let stats = Arc::new(FakeStats::default());
@@ -86,7 +97,7 @@ impl FakeOllama {
                 let chunks = chunks.clone();
                 let stats = serve_stats.clone();
                 tokio::spawn(async move {
-                    handle_connection(socket, chunks, stats, send_done).await;
+                    handle_connection(socket, chunks, stats, send_done, chat_status).await;
                 });
             }
         });
@@ -148,6 +159,7 @@ async fn handle_connection(
     chunks: Arc<Vec<FakeChunk>>,
     stats: Arc<FakeStats>,
     send_done: bool,
+    chat_status: u16,
 ) {
     let Some((method, path, body)) = read_request(&mut socket).await else {
         return;
@@ -166,6 +178,16 @@ async fn handle_connection(
         let _ = socket
             .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await;
+        return;
+    }
+    if chat_status != 200 {
+        let body = "ollama exploded";
+        let response = format!(
+            "HTTP/1.1 {chat_status} Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
         return;
     }
     let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -487,5 +509,23 @@ async fn first_token_latency_is_recorded() {
     assert!(
         count >= 1,
         "at least one first-token observation must be recorded"
+    );
+}
+
+#[tokio::test]
+async fn stream_startup_failure_returns_err_before_any_stream() {
+    // /api/tags succeeds (the model is available) but /api/chat fails:
+    // the dispatch must fail fast with Err so the route can fall back
+    // to the cloud forwarder, instead of returning an Ok stream that
+    // commits an empty SSE response and strands the error there.
+    let fake = FakeOllama::spawn_failing_chat(500).await;
+    let router = router_for(&fake.base_url);
+    let err = match router.route_chat_stream(&chat_payload()).await {
+        Ok(_) => panic!("startup failure must be an Err, not an empty stream"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("ollama status 500"),
+        "error must name the upstream status, got {err}"
     );
 }

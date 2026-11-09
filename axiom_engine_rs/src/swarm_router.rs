@@ -178,22 +178,35 @@ impl SwarmRouter {
     /// immediately with the channel the producer task feeds. The caller
     /// (the SSE body) receives deltas as Ollama emits them; this function
     /// never waits for the full generation.
+    ///
+    /// The `/api/chat` POST and status check run here, before the channel
+    /// exists and before any response is committed: a startup failure
+    /// (connect error or non-success status) returns `Err`, so the route
+    /// can fall through to the cloud forwarder instead of committing an
+    /// empty SSE stream. Only the established body stream is handed to
+    /// the spawned producer. A failure after content has been emitted
+    /// still ends the stream with an error, since the response is
+    /// committed by then.
     pub async fn route_chat_stream(&self, payload: &Value) -> Result<SwarmStream, SwarmRouteError> {
         if !self.config.enabled {
             return Err(SwarmRouteError::Disabled);
         }
         let model = self.select_model_for_dispatch().await?;
-        let (tx, rx) = tokio::sync::mpsc::channel(SWARM_STREAM_CHANNEL_CAPACITY);
-        let client = self.client.clone();
-        let base_url = self.config.base_url.clone();
-        let num_ctx = self.config.num_ctx;
         let messages = translate_messages(payload);
+        let (response, started) = start_stream_request(
+            &self.client,
+            &self.config.base_url,
+            &model,
+            self.config.num_ctx,
+            messages,
+        )
+        .await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(SWARM_STREAM_CHANNEL_CAPACITY);
         let mesh_selector = self.mesh_selector.clone();
         let stream_model = model.clone();
         tokio::spawn(async move {
-            let started = Instant::now();
-            let outcome =
-                run_stream_dispatch(&client, &base_url, &stream_model, num_ctx, messages, tx).await;
+            let task_started = Instant::now();
+            let outcome = run_stream_dispatch(response, started, tx).await;
             // A cancellation says nothing about the model: the client
             // went away, so recording it as a failure would train the
             // selector away from healthy models. Completed and Failed
@@ -204,7 +217,7 @@ impl SwarmRouter {
                 selector.record_outcome(
                     &stream_model,
                     matches!(outcome, StreamOutcome::Completed),
-                    started.elapsed().as_millis() as u64,
+                    task_started.elapsed().as_millis() as u64,
                 );
             }
         });
@@ -305,28 +318,20 @@ enum StreamOutcome {
     Cancelled,
 }
 
-/// Producer half of [`SwarmStream`]: streams one Ollama `/api/chat`
-/// response, sending each content delta through the bounded channel as it
-/// arrives. Returns [`StreamOutcome::Completed`] only when the upstream
-/// stream ended with a `done` line. The channel is the backpressure mechanism: `send` blocks
-/// while it is full, so a slow consumer stalls this task instead of letting
-/// it accumulate the whole generation. A dropped receiver (client
-/// disconnect) makes `send` fail, and this task then returns
-/// [`StreamOutcome::Cancelled`], dropping the response and aborting the
-/// upstream request. The disconnect is also observed while waiting for
-/// upstream data: the dispatch and every body read race against
-/// `tx.closed()`, so an abandoned request does not keep consuming
-/// inference resources for up to the request timeout. A stream that ends
-/// without a `done` line is an upstream error, not a clean stop: the SSE
-/// layer must not bless a truncated answer with `[DONE]`.
-async fn run_stream_dispatch(
+/// Dispatch preamble for [`SwarmRouter::route_chat_stream`]: POST
+/// `/api/chat` with `"stream": true` and check the status, returning the
+/// established response plus the dispatch instant. First-token latency
+/// runs from dispatch, not from headers: a slow model load before the
+/// first token counts. This runs before the channel exists, so a startup
+/// failure is a plain `Err` the route can fall back from, instead of an
+/// error item on an already-committed SSE stream.
+async fn start_stream_request(
     client: &Client,
     base_url: &str,
     model: &str,
     num_ctx: u64,
     messages: Vec<Value>,
-    tx: tokio::sync::mpsc::Sender<Result<String, SwarmRouteError>>,
-) -> StreamOutcome {
+) -> Result<(reqwest::Response, Instant), SwarmRouteError> {
     let request = json!({
         "model": model,
         "stream": true,
@@ -336,37 +341,45 @@ async fn run_stream_dispatch(
         }
     });
     let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
-    // First-token latency runs from dispatch, not from headers: a slow
-    // model load before the first token counts.
     let started = Instant::now();
-    let response = tokio::select! {
-        result = client
-            .post(url)
-            .json(&request)
-            .timeout(STREAM_REQUEST_TIMEOUT)
-            .send() => {
-            match result {
-                Ok(response) => response,
-                Err(e) => {
-                    let _ = tx.send(Err(SwarmRouteError::Upstream(e.to_string()))).await;
-                    return StreamOutcome::Failed;
-                }
-            }
-        }
-        _ = tx.closed() => return StreamOutcome::Cancelled,
-    };
+    let response = client
+        .post(url)
+        .json(&request)
+        .timeout(STREAM_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| SwarmRouteError::Upstream(e.to_string()))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        let _ = tx
-            .send(Err(SwarmRouteError::Upstream(format!(
-                "ollama status {}: {}",
-                status.as_u16(),
-                body
-            ))))
-            .await;
-        return StreamOutcome::Failed;
+        return Err(SwarmRouteError::Upstream(format!(
+            "ollama status {}: {}",
+            status.as_u16(),
+            body
+        )));
     }
+    Ok((response, started))
+}
+
+/// Producer half of [`SwarmStream`]: streams one Ollama `/api/chat`
+/// response, sending each content delta through the bounded channel as it
+/// arrives. Returns [`StreamOutcome::Completed`] only when the upstream
+/// stream ended with a `done` line. The channel is the backpressure mechanism: `send` blocks
+/// while it is full, so a slow consumer stalls this task instead of letting
+/// it accumulate the whole generation. A dropped receiver (client
+/// disconnect) makes `send` fail, and this task then returns
+/// [`StreamOutcome::Cancelled`], dropping the response and aborting the
+/// upstream request. The disconnect is also observed while waiting for
+/// upstream data: every body read races against `tx.closed()`, so an
+/// abandoned request does not keep consuming inference resources for up
+/// to the request timeout. A stream that ends without a `done` line is an
+/// upstream error, not a clean stop: the SSE layer must not bless a
+/// truncated answer with `[DONE]`.
+async fn run_stream_dispatch(
+    response: reqwest::Response,
+    started: Instant,
+    tx: tokio::sync::mpsc::Sender<Result<String, SwarmRouteError>>,
+) -> StreamOutcome {
     let mut byte_stream = response.bytes_stream();
     let mut assembler = OllamaLineAssembler::new();
     let mut first_token = true;
