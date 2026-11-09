@@ -393,8 +393,8 @@ pub struct AppState {
     /// (intended only for trusted/local networks).
     pub mcp_token: Arc<Option<String>>,
     /// Optional pre-shared key guarding the data-plane routes (`AXIOM_API_KEY`).
-    /// When `Some`, every route except the ops endpoints (`/healthz`, `/readyz`,
-    /// `/metrics`) and `/mcp` (which has its own `AXIOM_MCP_TOKEN`) requires the
+    /// When `Some`, every route except the ops endpoints (`/healthz`, `/readyz`)
+    /// and `/mcp` (which has its own `AXIOM_MCP_TOKEN`) requires the
     /// header `X-Axiom-Key: <key>`. A dedicated header is used — not
     /// `Authorization`/`x-api-key` — so it never collides with the client
     /// credentials the `/v1/messages` proxy relays upstream. When `None`, the
