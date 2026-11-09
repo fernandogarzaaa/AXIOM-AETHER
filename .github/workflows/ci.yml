@@ -309,6 +309,23 @@ jobs:
           cache-from: type=gha,scope=ci-docker
           cache-to: type=gha,mode=max,scope=ci-docker
 
+  # Phase 2: every deployable image reference must carry a sha256 digest
+  # pin. scripts/check-pinned-images.sh enforces it over values.yaml, the
+  # chart templates, and the Dockerfile. It needs no network and no toolchain
+  # beyond bash and python3, so it runs as its own cheap job.
+  pinned-images:
+    name: Pinned container images
+    needs: protocol
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check every image reference is digest-pinned
+        run: ./scripts/check-pinned-images.sh
+
   # The Python reference implementation in axiom_engine/ (published as the
   # `axiom-engine` PyPI package) ships its own PyTorch test suite that no job
   # used to run, so it could rot silently. Exercise it on CPU-only torch.

@@ -10,7 +10,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Builder — compile the Rust binary
 # ---------------------------------------------------------------------------
-FROM rust:1.98-bookworm AS builder
+FROM rust:1.98-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS builder
 
 # Install build dependencies (tree-sitter needs a C compiler)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -39,7 +39,7 @@ RUN cd axiom_engine_rs && \
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime — lean image with just the binary and entrypoint
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 # Install runtime dependencies (ca-certificates for HTTPS, curl for checkpoint
 # download in the entrypoint, libssl for TLS).
