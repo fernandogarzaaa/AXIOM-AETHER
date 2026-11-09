@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -62,6 +63,34 @@ impl Histogram {
 struct SessionMetricEntry {
     active: bool,
     quantized: bool,
+}
+
+/// Maximum number of per-session series `render_metrics` emits. Each emitted
+/// session produces two series (`state="active"` and `state="quantized"`), so
+/// the per-session cardinality is bounded at `2 * MAX_EMITTED_SESSIONS`.
+/// The aggregate gauges (`axiom_active_sessions`, `axiom_quantized_sessions`)
+/// already carry the totals, so per-session detail is diagnostic only and a
+/// cap costs nothing an operator needs. The emitted set is chosen
+/// deterministically (sorted by hashed label), so output is stable across
+/// scrapes for a fixed registry.
+pub const MAX_EMITTED_SESSIONS: usize = 100;
+
+/// Hash a client-supplied session id into the label emitted in
+/// `axiom_session_residency`: SHA-256 hex, truncated to 16 characters
+/// (64 bits). SHA-256 is one-way, so the raw id is not recoverable from the
+/// label; a preimage requires guessing the id. The hash is unsalted and
+/// deterministic, so one session keeps a stable series across scrapes and
+/// restarts. Truncation to 64 bits keeps labels short while accidental
+/// collision stays negligible (birthday bound: about 2.7e-12 at 10,000
+/// sessions, about 2.7e-8 at 1,000,000). Residual risk: anyone who can guess
+/// a session id can confirm its presence in the output. That oracle is
+/// limited to key holders, because `/metrics` is gated by `require_api_key`
+/// whenever `AXIOM_API_KEY` is set. Hashing happens at render time only: the
+/// registry still keys on the raw id, so `remove_session` and
+/// `mark_session_quantized` keep working unchanged.
+fn hash_session_id(session_id: &str) -> String {
+    let digest = Sha256::digest(session_id.as_bytes());
+    format!("{digest:x}")[..16].to_string()
 }
 
 static SESSION_METRICS: LazyLock<Mutex<HashMap<String, SessionMetricEntry>>> =
@@ -133,9 +162,10 @@ pub fn render_metrics() -> String {
         .map(|registry| {
             let mut entries = registry
                 .iter()
-                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .map(|(id, entry)| (hash_session_id(id), entry.clone()))
                 .collect::<Vec<_>>();
             entries.sort_by(|left, right| left.0.cmp(&right.0));
+            entries.truncate(MAX_EMITTED_SESSIONS);
             entries
         })
         .unwrap_or_default();
@@ -183,15 +213,15 @@ pub fn render_metrics() -> String {
 
     body.push_str("# HELP axiom_session_residency Session residency states.\n");
     body.push_str("# TYPE axiom_session_residency gauge\n");
-    for (session_id, entry) in session_entries {
+    for (session_label, entry) in session_entries {
         body.push_str(&format!(
             "axiom_session_residency{{session_id=\"{}\",state=\"active\"}} {}\n",
-            escape_label_value(&session_id),
+            escape_label_value(&session_label),
             if entry.active { 1 } else { 0 }
         ));
         body.push_str(&format!(
             "axiom_session_residency{{session_id=\"{}\",state=\"quantized\"}} {}\n",
-            escape_label_value(&session_id),
+            escape_label_value(&session_label),
             if entry.quantized { 1 } else { 0 }
         ));
     }
@@ -210,6 +240,65 @@ fn escape_label_value(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Independent oracle for the label the renderer must emit for a session
+    /// id: SHA-256 hex, truncated to 16 characters. Computed here from the
+    /// spec, not by calling the implementation, so the test fails if the
+    /// renderer emits anything else (including the raw id).
+    fn expected_session_label(session_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(session_id.as_bytes());
+        format!("{digest:x}")[..16].to_string()
+    }
+
+    /// Every `axiom_session_residency` label in the rendered output must be
+    /// a 16-char lowercase hex hash, never a raw client id. This is the
+    /// invariant that holds regardless of how many sessions are registered
+    /// (the cap may truncate a given session from the emitted set, so a
+    /// per-id presence assertion would be order-dependent through the shared
+    /// global registry).
+    fn assert_labels_are_truncated_hashes(rendered: &str) {
+        let mut found = 0;
+        for line in rendered.lines() {
+            if !line.starts_with("axiom_session_residency{") {
+                continue;
+            }
+            let label = line
+                .split("session_id=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("residency line must carry a session_id label");
+            assert_eq!(label.len(), 16, "session label is not 16 chars: {label}");
+            assert!(
+                label
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "session label is not lowercase hex: {label}"
+            );
+            found += 1;
+        }
+        assert!(found > 0, "no residency lines rendered");
+    }
+
+    #[test]
+    fn test_hash_session_id_is_truncated_sha256() {
+        // Direct unit test of the mapping: deterministic, and equal to the
+        // independently computed SHA-256 hex truncation.
+        assert_eq!(
+            hash_session_id("session-a"),
+            expected_session_label("session-a")
+        );
+        assert_eq!(
+            hash_session_id("session-a"),
+            hash_session_id("session-a"),
+            "same id must map to a stable label across renders"
+        );
+        assert_ne!(
+            hash_session_id("session-a"),
+            hash_session_id("session-b"),
+            "distinct ids must map to distinct labels"
+        );
+    }
+
     #[test]
     fn test_render_metrics_contains_histogram_and_session_registry() {
         add_prefilled_tokens(4);
@@ -223,7 +312,52 @@ mod tests {
 
         assert!(rendered.contains("axiom_total_tokens_prefilled"));
         assert!(rendered.contains("axiom_prefill_latency_seconds_bucket"));
-        assert!(rendered.contains("session-a"));
-        assert!(rendered.contains("session-b"));
+        // Session ids are emitted only as truncated SHA-256 labels, never raw.
+        assert!(!rendered.contains("session-a"));
+        assert!(!rendered.contains("session-b"));
+        assert_labels_are_truncated_hashes(&rendered);
+    }
+
+    #[test]
+    fn test_render_metrics_never_emits_raw_adversarial_session_ids() {
+        let long_id = "a".repeat(5_000);
+        let tricky_id = "we\"ird\\\\id\nwith\nnewlines";
+        let quote_id = "\"quoted\"";
+        register_session(&long_id);
+        register_session(tricky_id);
+        register_session(quote_id);
+
+        let rendered = render_metrics();
+
+        for raw in [&long_id, tricky_id, quote_id] {
+            assert!(
+                !rendered.contains(raw),
+                "rendered metrics leaked raw session id"
+            );
+        }
+        // Every emitted label is a truncated hash, so no adversarial id can
+        // break out of the label value either.
+        assert_labels_are_truncated_hashes(&rendered);
+    }
+
+    #[test]
+    fn test_render_metrics_bounds_per_session_series() {
+        // 250 distinct sessions must not produce 250 per-session series: the
+        // bound is 100 emitted sessions x 2 states = 200 residency lines.
+        for index in 0..250 {
+            register_session(&format!("bound-test-{index}"));
+        }
+
+        let rendered = render_metrics();
+        let residency_lines = rendered
+            .lines()
+            .filter(|line| line.starts_with("axiom_session_residency{"))
+            .count();
+
+        assert!(residency_lines > 0);
+        assert!(
+            residency_lines <= 200,
+            "rendered {residency_lines} per-session residency lines, bound is 200"
+        );
     }
 }
