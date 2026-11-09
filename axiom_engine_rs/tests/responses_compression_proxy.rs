@@ -735,3 +735,89 @@ async fn network_error_retry_resends_same_payload_and_key() {
     server.abort();
     std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
 }
+
+/// A client retry with the same explicit key must reuse the same fallback
+/// key: if the fallback response was lost, the retry's fallback has to
+/// dedupe against the first fallback instead of executing twice. The
+/// mock 400s every odd attempt (compressed) and 200s every even one
+/// (fallback), so two identical inbound requests produce four upstream
+/// requests with two equal fallback keys.
+#[tokio::test]
+async fn client_retry_reuses_same_fallback_key() {
+    std::env::set_var("AXIOM_RESPONSES_COMPRESS", "1");
+    let captured = Arc::new(Mutex::new(Vec::<KeyedRequest>::new()));
+    async fn upstream(
+        State(captured): State<Arc<Mutex<Vec<KeyedRequest>>>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let key = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let mut requests = captured.lock().unwrap();
+        requests.push((body, key));
+        if requests.len() % 2 == 1 {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "reject fingerprint"})),
+            )
+        } else {
+            (
+                StatusCode::OK,
+                Json(json!({"id": "resp_ok", "object": "response"})),
+            )
+        }
+    }
+    let upstream_app = Router::new()
+        .route("/v1/responses", post(upstream))
+        .with_state(captured.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+
+    let original = heavy_responses_body();
+    for _ in 0..2 {
+        let app = compressed_proxy_app(base.clone()).await;
+        assert_eq!(
+            post_responses(app, &original, Some("client-key-abc")).await,
+            StatusCode::OK
+        );
+    }
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        4,
+        "two client retries must produce two compressed attempts and two fallbacks"
+    );
+    assert_eq!(
+        requests[0].1.as_deref(),
+        Some("client-key-abc"),
+        "first compressed attempt must honor the client-supplied key"
+    );
+    assert_eq!(
+        requests[2].1.as_deref(),
+        Some("client-key-abc"),
+        "retried compressed attempt must honor the client-supplied key"
+    );
+    assert_eq!(
+        requests[1].0, original,
+        "first fallback must resend the original payload"
+    );
+    assert_eq!(
+        requests[3].0, original,
+        "retried fallback must resend the original payload"
+    );
+    assert_ne!(
+        requests[1].1.as_deref(),
+        Some("client-key-abc"),
+        "fallback must not reuse the client-supplied key"
+    );
+    assert_eq!(
+        requests[1].1, requests[3].1,
+        "a client retry must reuse the same fallback key so the upstream dedupes the fallback"
+    );
+    task.abort();
+    std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
+}
