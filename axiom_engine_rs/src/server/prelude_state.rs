@@ -1226,8 +1226,40 @@ impl AppState {
             .count();
         metrics::set_active_sessions(active);
         metrics::set_quantized_sessions(quantized);
-        metrics::set_session_memory_bytes(session_memory_bytes(&sessions));
+        // Both session stores count: the legacy registry above plus the
+        // compression fast-weight store, which holds its own live tensors
+        // and is where compressed-request memory actually accumulates.
+        metrics::set_session_memory_bytes(
+            session_memory_bytes(&sessions) + self.ttt_sessions_memory_bytes(),
+        );
         Ok(())
+    }
+
+    /// Bytes held by the compression fast-weight store (`ttt_sessions`),
+    /// which is separate from the legacy `/v1/sessions` registry. Each
+    /// live session holds its per-layer fast-weight tensors behind an
+    /// async mutex; `try_lock` keeps the scrape non-blocking, so a
+    /// session mid-update is skipped this scrape and counted on the
+    /// next one instead of stalling `/metrics`.
+    fn ttt_sessions_memory_bytes(&self) -> u64 {
+        self.ttt_sessions
+            .snapshot_handles()
+            .iter()
+            .map(|(_, states)| {
+                states
+                    .try_lock()
+                    .map(|guard| {
+                        guard
+                            .iter()
+                            .map(|state| {
+                                state.elem_count() as u64
+                                    * state.dtype().size_in_bytes() as u64
+                            })
+                            .sum::<u64>()
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
     fn trigger_lru_vram_budget(&self) {
@@ -1367,6 +1399,8 @@ fn refresh_session_metrics_from_sessions(
         .count();
     metrics::set_active_sessions(active);
     metrics::set_quantized_sessions(quantized);
+    // Legacy sessions only here; the /metrics scrape refresh adds the
+    // compression fast-weight store as well and is authoritative.
     metrics::set_session_memory_bytes(session_memory_bytes(&sessions_guard));
     Ok(())
 }

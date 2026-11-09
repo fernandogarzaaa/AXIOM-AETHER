@@ -1378,6 +1378,13 @@ mod tests {
         metrics::refresh_process_memory();
 
         let state = make_test_state().await;
+        // A live fast-weight session in the compression store (4x4 f32 =
+        // 64 bytes) must count toward the session-memory gauge: the
+        // legacy registry alone would report zero here.
+        let ttt_tensor = Tensor::ones((4, 4), DType::F32, &state.device).unwrap();
+        state
+            .ttt_sessions
+            .insert_states("test-ttt-session".into(), vec![ttt_tensor]);
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state);
         let resp = app
@@ -1407,6 +1414,20 @@ mod tests {
         }
         assert!(rendered.contains("axiom_process_rss_bytes"));
         assert!(rendered.contains("axiom_session_memory_bytes"));
+        let memory_line = rendered
+            .lines()
+            .find(|line| line.starts_with("axiom_session_memory_bytes "))
+            .expect("session memory gauge must be rendered");
+        let memory_value: u64 = memory_line
+            .split_whitespace()
+            .nth(1)
+            .expect("session memory value must exist")
+            .parse()
+            .expect("session memory value must parse");
+        assert!(
+            memory_value >= 64,
+            "session memory gauge must include the 64-byte fast-weight session, got {memory_value}"
+        );
         assert!(rendered.contains("axiom_stream_backpressure_stalls_total"));
         safe_drop(pipeline_arc).await;
     }

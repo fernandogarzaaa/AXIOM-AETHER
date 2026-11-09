@@ -71,8 +71,10 @@ pub static COUNTER_STREAM_BACKPRESSURE_STALLS: AtomicU64 = AtomicU64::new(0);
 pub static GAUGE_PROCESS_RSS_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Estimated bytes held by session state: live tensor storage
-/// (`elem_count * dtype size`, metadata only) plus quantized descriptors.
-/// Refreshed with the session counts; an estimate, not a heap measurement.
+/// (`elem_count * dtype size`, metadata only) from both the legacy
+/// `/v1/sessions` registry and the compression fast-weight store, plus
+/// quantized descriptors. Refreshed with the session counts; an
+/// estimate, not a heap measurement.
 pub static GAUGE_SESSION_MEMORY_BYTES: AtomicU64 = AtomicU64::new(0);
 
 const HISTOGRAM_BUCKETS: [f64; 9] = [0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0];
@@ -197,6 +199,9 @@ fn stage_histogram(stage: Stage) -> &'static LazyLock<Mutex<Histogram>> {
     }
 }
 
+/// Record one stage observation. Stage histograms count completed stages
+/// only: error returns and skipped attempts are not sampled, so the
+/// distribution describes successful stage executions, not attempts.
 pub fn observe_stage_latency(stage: Stage, seconds: f64) {
     let seconds = seconds.max(0.0);
     if let Ok(mut histogram) = stage_histogram(stage).lock() {
