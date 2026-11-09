@@ -342,6 +342,133 @@ mod tests {
         safe_drop(state.pipeline.clone()).await;
     }
 
+    /// Cancellation mid-generation must not leak transient sub-sessions.
+    /// Audit section 6 / issue #93: dropping `compressed_responses_payload`
+    /// while fingerprints are generating must reach the same cleanup the
+    /// error branches use, and no detached fingerprint task may recreate a
+    /// sub-session after that cleanup ran. The session ids are minted
+    /// (`responses-<uuid>#r<ordinal>`) so the test identifies them by the
+    /// `#r` suffix in this state's own store.
+    //
+    // The env guard is held across the short poll loop below on purpose: it
+    // serializes access to the process-global AXIOM_RESPONSES_COMPRESS var
+    // while the payload reads it. The payload task never takes the guard and
+    // the only other holders are short synchronous tests, so no deadlock is
+    // possible; the guard is dropped before the long settle awaits.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn cancelled_responses_compression_leaves_no_transient_subsessions() {
+        let _env_guard = ENV_GUARD.lock().expect("env guard poisoned");
+        std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
+        let state = make_test_state().await;
+        state.controls.set_enabled(true);
+        state.controls.set_threshold(1);
+
+        // Eight runs (assistant messages separated by user messages, then a
+        // final user query) with long contexts, so generation is still in
+        // flight when the test cancels it. Concurrency is capped at 4, so
+        // later runs are still queued behind the first four.
+        let long_text = "The quick brown fox jumps over the lazy dog. ".repeat(400);
+        let mut input = Vec::new();
+        for ordinal in 0..8usize {
+            input.push(serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "content": format!("Run {ordinal} context. {long_text}"),
+            }));
+            input.push(serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": format!("interlude {ordinal}"),
+            }));
+        }
+        input.push(serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": "latest query",
+        }));
+        let body = serde_json::json!({ "input": input });
+
+        fn transient_subsessions(state: &AppState) -> Vec<String> {
+            state
+                .ttt_sessions
+                .snapshot_handles()
+                .into_iter()
+                .map(|(id, _)| id)
+                .filter(|id| id.contains("#r"))
+                .collect()
+        }
+
+        let run_state = state.clone();
+        let run_body = body.clone();
+        let handle = tokio::spawn(async move {
+            compressed_responses_payload(&run_state, &run_body, None, true).await
+        });
+
+        // Wait until generation is observably in flight: at least one
+        // fingerprint task has registered its transient sub-session.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut seen_in_flight = false;
+        while tokio::time::Instant::now() < deadline {
+            if !transient_subsessions(&state).is_empty() {
+                seen_in_flight = true;
+                break;
+            }
+            if handle.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            seen_in_flight,
+            "generation finished before cancellation could land mid-flight; \
+             lengthen the run contexts so fingerprints are still generating"
+        );
+        // The payload reads AXIOM_RESPONSES_COMPRESS once at its start, which
+        // has passed by now (fingerprint tasks are running). Release the env
+        // guard before any further await: holding a std MutexGuard across an
+        // await trips clippy::await_holding_lock.
+        drop(_env_guard);
+        let in_flight = transient_subsessions(&state);
+        assert!(
+            !in_flight.is_empty(),
+            "expected at least one transient sub-session at cancel time"
+        );
+
+        // Cancel mid-generation: abort the task (drops the payload future).
+        handle.abort();
+        let aborted = handle.await;
+        assert!(aborted.is_err(), "aborted task must report cancellation");
+        assert!(
+            aborted.unwrap_err().is_cancelled(),
+            "aborted task must report a cancellation, not a panic"
+        );
+
+        // Settle: detached blocking fingerprint work runs to completion
+        // even after the abort, so wait until no transient sub-session
+        // remains, then keep watching through a quiet period — a session
+        // recreated after cleanup must fail this test, not slip past it.
+        let settle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !transient_subsessions(&state).is_empty()
+            && tokio::time::Instant::now() < settle_deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let remaining = transient_subsessions(&state);
+        assert!(
+            remaining.is_empty(),
+            "cancelled compression leaked transient sub-sessions: {remaining:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let recreated = transient_subsessions(&state);
+        assert!(
+            recreated.is_empty(),
+            "fingerprint tasks recreated transient sub-sessions after cleanup: {recreated:?}"
+        );
+
+        safe_drop(state.pipeline.clone()).await;
+    }
+
     fn seed_active_test_session(state: &AppState, session_id: &str) {
         let now = unix_now();
         let states = state
