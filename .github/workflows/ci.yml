@@ -191,6 +191,46 @@ jobs:
       - name: End-to-end smoke (every pillar composes)
         run: ./scripts/demo_end_to_end.sh
 
+  # Phase 3 item 4: graded session-concurrency stress harness
+  # (axiom_engine_rs/tests/session_concurrency_stress.rs). The full `test`
+  # job above already runs it, but this job runs it alone with --nocapture
+  # so the measured baseline (p95 latency, RSS delta, registry size per
+  # concurrency level) is visible in its own log, and so a stress-only
+  # failure is diagnosable without digging through the whole suite.
+  # The bounds it asserts are ratios against the level-1 baseline, not
+  # absolute milliseconds: CI runners are not a perf lab.
+  session-concurrency-stress:
+    name: Session concurrency stress
+    needs: protocol
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            axiom_engine_rs/target
+          key: ci-stress-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+          restore-keys: ci-stress-${{ runner.os }}-
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
+
+      - name: Graded concurrency stress (p95 / RSS / registry bounds)
+        working-directory: axiom_engine_rs
+        run: cargo test --release --locked --test session_concurrency_stress -- --nocapture
+
   # The `experimental` feature (docs/EXPERIMENTAL.md) gates wired-but-unproven
   # subsystems out of the default build. The `test` job above already covers the
   # feature-OFF surface; this job keeps the feature-ON surface compiling and its
