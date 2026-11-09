@@ -314,8 +314,10 @@ async fn compressed_5xx_retry_carries_same_idempotency_key() {
         "first attempt must carry the compressed payload"
     );
     assert_eq!(
-        requests[1].0, original,
-        "retry must resend the original payload"
+        requests[1].0, requests[0].0,
+        "a 5xx retry must resend the same compressed payload, not the original: \
+         the first attempt may have executed, so a different payload under the \
+         same key can be rejected as conflicting"
     );
     let first_key = requests[0]
         .1
@@ -406,6 +408,10 @@ async fn client_supplied_idempotency_key_honored_on_retry() {
         Some("client-key-abc"),
         "retry must honor the client-supplied key unchanged"
     );
+    assert_eq!(
+        requests[1].0, requests[0].0,
+        "a 5xx retry must resend the same compressed payload under the same key"
+    );
     task.abort();
     std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
 }
@@ -465,5 +471,277 @@ async fn compressed_429_does_not_retry() {
         "a 429 must never be retried: re-sending a rate limit is harmful"
     );
     task.abort();
+    std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+fn keyed_upstream_app(
+    captured: Arc<Mutex<Vec<KeyedRequest>>>,
+    first_status: StatusCode,
+) -> Router {
+    async fn upstream(
+        State((captured, first_status)): State<(Arc<Mutex<Vec<KeyedRequest>>>, StatusCode)>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let key = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let mut requests = captured.lock().unwrap();
+        requests.push((body, key));
+        if requests.len() == 1 {
+            (first_status, Json(json!({"error": "boom"})))
+        } else {
+            (
+                StatusCode::OK,
+                Json(json!({"id": "resp_ok", "object": "response"})),
+            )
+        }
+    }
+    Router::new()
+        .route("/v1/responses", post(upstream))
+        .with_state((captured, first_status))
+}
+
+async fn compressed_proxy_app(base: String) -> Router {
+    let test_pipeline = tokio::task::spawn_blocking(pipeline).await.unwrap();
+    let state = AppState::new(test_pipeline, "test".into())
+        .with_openai_forwarder(Some(OpenAiForwarder::new(None, Some(base))))
+        .with_compressor_config(CompressorConfig {
+            enabled: true,
+            heavy_message_threshold_tokens: 1,
+            recall_top_k: 8,
+        });
+    create_router(state)
+}
+
+async fn post_responses(app: Router, original: &Value, extra_key: Option<&str>) -> StatusCode {
+    let mut request = Request::post("/v1/responses")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer test");
+    if let Some(key) = extra_key {
+        request = request.header("idempotency-key", key);
+    }
+    let response = app
+        .oneshot(request.body(Body::from(original.to_string())).unwrap())
+        .await
+        .unwrap();
+    response.status()
+}
+
+/// A 400 is a definitive rejection: the compressed attempt did not execute,
+/// so the fallback resends the original body with a FRESH key. Reusing the
+/// first attempt's key under a different payload can be rejected by an
+/// upstream that validates payload equality for reused idempotency keys.
+#[tokio::test]
+async fn compressed_400_fallback_uses_fresh_key_and_original_payload() {
+    std::env::set_var("AXIOM_RESPONSES_COMPRESS", "1");
+    let captured = Arc::new(Mutex::new(Vec::<KeyedRequest>::new()));
+    let upstream_app = keyed_upstream_app(captured.clone(), StatusCode::BAD_REQUEST);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+
+    let app = compressed_proxy_app(base).await;
+    let original = heavy_responses_body();
+    assert_eq!(
+        post_responses(app, &original, None).await,
+        StatusCode::OK
+    );
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 2, "a 400 must trigger exactly one fallback");
+    assert!(
+        requests[0].0["input"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<axiom_context_fingerprint"),
+        "first attempt must carry the compressed payload"
+    );
+    assert_eq!(
+        requests[1].0, original,
+        "a 400 fallback must resend the original payload"
+    );
+    let first_key = requests[0]
+        .1
+        .as_ref()
+        .expect("first attempt must carry an idempotency key");
+    let second_key = requests[1]
+        .1
+        .as_ref()
+        .expect("fallback must carry an idempotency key");
+    assert_ne!(
+        first_key, second_key,
+        "a payload-changing fallback must not reuse the first attempt's key"
+    );
+    assert!(
+        second_key.starts_with("axiom-"),
+        "fallback key must be a fresh derived key, got {second_key}"
+    );
+    task.abort();
+    std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
+}
+
+/// A client-supplied key is honored on the first attempt but must NOT be
+/// reused when the fallback changes the payload: the key names the original
+/// compressed attempt, not the uncompressed retry.
+#[tokio::test]
+async fn client_supplied_key_not_reused_on_400_fallback() {
+    std::env::set_var("AXIOM_RESPONSES_COMPRESS", "1");
+    let captured = Arc::new(Mutex::new(Vec::<KeyedRequest>::new()));
+    let upstream_app = keyed_upstream_app(captured.clone(), StatusCode::BAD_REQUEST);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+
+    let app = compressed_proxy_app(base).await;
+    let original = heavy_responses_body();
+    assert_eq!(
+        post_responses(app, &original, Some("client-key-abc")).await,
+        StatusCode::OK
+    );
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 2, "a 400 must trigger exactly one fallback");
+    assert_eq!(
+        requests[0].1.as_deref(),
+        Some("client-key-abc"),
+        "first attempt must honor the client-supplied key unchanged"
+    );
+    assert_ne!(
+        requests[1].1.as_deref(),
+        Some("client-key-abc"),
+        "fallback must not reuse the client-supplied key under a different payload"
+    );
+    assert!(
+        requests[1]
+            .1
+            .as_ref()
+            .is_some_and(|key| key.starts_with("axiom-")),
+        "fallback key must be a fresh derived key"
+    );
+    assert_eq!(
+        requests[1].0, original,
+        "a 400 fallback must resend the original payload"
+    );
+    task.abort();
+    std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
+}
+
+/// A network failure has an unknown outcome: the first attempt may have
+/// executed, so the retry resends the SAME compressed payload under the
+/// SAME key. The mock drops the first connection without responding, which
+/// surfaces as a `Network` error to the forwarder.
+#[tokio::test]
+async fn network_error_retry_resends_same_payload_and_key() {
+    std::env::set_var("AXIOM_RESPONSES_COMPRESS", "1");
+    let captured = Arc::new(Mutex::new(Vec::<KeyedRequest>::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured_server = captured.clone();
+    let attempts_server = attempts.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let captured = captured_server.clone();
+            let attempts = attempts_server.clone();
+            tokio::spawn(async move {
+                let attempt =
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (body, key) = loop {
+                    match tokio::io::AsyncReadExt::read(&mut stream, &mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                    if let Some(header_end) = find_subsequence(&buf, b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                        let content_length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                if name.trim().eq_ignore_ascii_case("content-length") {
+                                    value.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= header_end + 4 + content_length {
+                            let body_bytes =
+                                &buf[header_end + 4..header_end + 4 + content_length];
+                            let body: Value =
+                                serde_json::from_slice(body_bytes).expect("valid json body");
+                            let key = head.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                if name.trim().eq_ignore_ascii_case("idempotency-key") {
+                                    Some(value.trim().to_string())
+                                } else {
+                                    None
+                                }
+                            });
+                            break (body, key);
+                        }
+                    }
+                };
+                captured.lock().unwrap().push((body, key));
+                if attempt == 1 {
+                    // Close without responding: a network error.
+                    return;
+                }
+                let payload = b"{\"id\":\"resp_ok\",\"object\":\"response\"}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ =
+                    tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, payload).await;
+                let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
+            });
+        }
+    });
+
+    let app = compressed_proxy_app(base).await;
+    let original = heavy_responses_body();
+    assert_eq!(
+        post_responses(app, &original, None).await,
+        StatusCode::OK
+    );
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "a network error must trigger exactly one retry"
+    );
+    assert!(
+        requests[0].0["input"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<axiom_context_fingerprint"),
+        "first attempt must carry the compressed payload"
+    );
+    assert_eq!(
+        requests[1].0, requests[0].0,
+        "a network-error retry must resend the same compressed payload"
+    );
+    assert_eq!(
+        requests[0].1, requests[1].1,
+        "a network-error retry must reuse the first attempt's key"
+    );
+    assert!(
+        requests[0].1.as_ref().is_some(),
+        "both attempts must carry an idempotency key"
+    );
+    server.abort();
     std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
 }
