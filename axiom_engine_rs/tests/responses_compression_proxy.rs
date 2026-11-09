@@ -475,13 +475,12 @@ async fn compressed_429_does_not_retry() {
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
-fn keyed_upstream_app(
-    captured: Arc<Mutex<Vec<KeyedRequest>>>,
-    first_status: StatusCode,
-) -> Router {
+fn keyed_upstream_app(captured: Arc<Mutex<Vec<KeyedRequest>>>, first_status: StatusCode) -> Router {
     async fn upstream(
         State((captured, first_status)): State<(Arc<Mutex<Vec<KeyedRequest>>>, StatusCode)>,
         headers: HeaderMap,
@@ -548,10 +547,7 @@ async fn compressed_400_fallback_uses_fresh_key_and_original_payload() {
 
     let app = compressed_proxy_app(base).await;
     let original = heavy_responses_body();
-    assert_eq!(
-        post_responses(app, &original, None).await,
-        StatusCode::OK
-    );
+    assert_eq!(post_responses(app, &original, None).await, StatusCode::OK);
 
     let requests = captured.lock().unwrap();
     assert_eq!(requests.len(), 2, "a 400 must trigger exactly one fallback");
@@ -653,8 +649,7 @@ async fn network_error_retry_resends_same_payload_and_key() {
             let captured = captured_server.clone();
             let attempts = attempts_server.clone();
             tokio::spawn(async move {
-                let attempt =
-                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
                 let (body, key) = loop {
@@ -676,8 +671,7 @@ async fn network_error_retry_resends_same_payload_and_key() {
                             })
                             .unwrap_or(0);
                         if buf.len() >= header_end + 4 + content_length {
-                            let body_bytes =
-                                &buf[header_end + 4..header_end + 4 + content_length];
+                            let body_bytes = &buf[header_end + 4..header_end + 4 + content_length];
                             let body: Value =
                                 serde_json::from_slice(body_bytes).expect("valid json body");
                             let key = head.lines().find_map(|line| {
@@ -702,8 +696,7 @@ async fn network_error_retry_resends_same_payload_and_key() {
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     payload.len()
                 );
-                let _ =
-                    tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, payload).await;
                 let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
             });
@@ -712,10 +705,7 @@ async fn network_error_retry_resends_same_payload_and_key() {
 
     let app = compressed_proxy_app(base).await;
     let original = heavy_responses_body();
-    assert_eq!(
-        post_responses(app, &original, None).await,
-        StatusCode::OK
-    );
+    assert_eq!(post_responses(app, &original, None).await, StatusCode::OK);
 
     let requests = captured.lock().unwrap();
     assert_eq!(
