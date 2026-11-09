@@ -399,50 +399,74 @@ mod tests {
                 .collect()
         }
 
-        let run_state = state.clone();
-        let run_body = body.clone();
-        let handle = tokio::spawn(async move {
-            compressed_responses_payload(&run_state, &run_body, None, true).await
-        });
+        // Drive the payload and cancel it mid-generation. Bounded retry on
+        // the observation step only: under heavy parallel load this test's
+        // poll loop can be starved long enough for the whole generation to
+        // finish before it wakes, which proves nothing either way. A retry
+        // re-drives from scratch; the leak assertions below never retry, so
+        // a real leak still fails deterministically.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let run_state = state.clone();
+            let run_body = body.clone();
+            let handle = tokio::spawn(async move {
+                compressed_responses_payload(&run_state, &run_body, None, true).await
+            });
 
-        // Wait until generation is observably in flight: at least one
-        // fingerprint task has registered its transient sub-session.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut seen_in_flight = false;
-        while tokio::time::Instant::now() < deadline {
-            if !transient_subsessions(&state).is_empty() {
-                seen_in_flight = true;
-                break;
+            // Wait until generation is observably in flight: at least one
+            // fingerprint task has registered its transient sub-session.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut seen_in_flight = false;
+            while tokio::time::Instant::now() < deadline {
+                if !transient_subsessions(&state).is_empty() {
+                    seen_in_flight = true;
+                    break;
+                }
+                if handle.is_finished() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            if handle.is_finished() {
-                break;
+            if !seen_in_flight {
+                // Generation finished before this attempt could observe it.
+                // Join the completed run (its normal path cleans up) and
+                // retry the observation; never assert the leak from here.
+                let _ = handle.await;
+                let leftover = transient_subsessions(&state);
+                assert!(
+                    leftover.is_empty(),
+                    "completed run left transient sub-sessions behind: {leftover:?}"
+                );
+                assert!(
+                    attempt < 3,
+                    "generation finished before cancellation could land mid-flight \
+                     on 3 attempts; lengthen the run contexts so fingerprints are \
+                     still generating"
+                );
+                continue;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            // The payload reads AXIOM_RESPONSES_COMPRESS once at its start, which
+            // has passed by now (fingerprint tasks are running). Release the env
+            // guard before any further await: holding a std MutexGuard across an
+            // await trips clippy::await_holding_lock.
+            drop(_env_guard);
+            let in_flight = transient_subsessions(&state);
+            assert!(
+                !in_flight.is_empty(),
+                "expected at least one transient sub-session at cancel time"
+            );
+
+            // Cancel mid-generation: abort the task (drops the payload future).
+            handle.abort();
+            let aborted = handle.await;
+            assert!(aborted.is_err(), "aborted task must report cancellation");
+            assert!(
+                aborted.unwrap_err().is_cancelled(),
+                "aborted task must report a cancellation, not a panic"
+            );
+            break;
         }
-        assert!(
-            seen_in_flight,
-            "generation finished before cancellation could land mid-flight; \
-             lengthen the run contexts so fingerprints are still generating"
-        );
-        // The payload reads AXIOM_RESPONSES_COMPRESS once at its start, which
-        // has passed by now (fingerprint tasks are running). Release the env
-        // guard before any further await: holding a std MutexGuard across an
-        // await trips clippy::await_holding_lock.
-        drop(_env_guard);
-        let in_flight = transient_subsessions(&state);
-        assert!(
-            !in_flight.is_empty(),
-            "expected at least one transient sub-session at cancel time"
-        );
-
-        // Cancel mid-generation: abort the task (drops the payload future).
-        handle.abort();
-        let aborted = handle.await;
-        assert!(aborted.is_err(), "aborted task must report cancellation");
-        assert!(
-            aborted.unwrap_err().is_cancelled(),
-            "aborted task must report a cancellation, not a panic"
-        );
 
         // Settle: detached blocking fingerprint work runs to completion
         // even after the abort, so wait until no transient sub-session

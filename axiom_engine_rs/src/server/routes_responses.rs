@@ -277,26 +277,38 @@ async fn responses_run_fingerprint(
             .map_err(|error| ApiError::Internal(format!("session allocation failed: {error}")))?;
         let mut states = session.blocking_lock();
         let context_ids = pipeline.encode_text(&context);
-        adapt_session_blocking(&pipeline, &mut states, &context_ids)
-            .map_err(|error| ApiError::Internal(format!("TTT adapt failed: {error}")))?;
-        let query_ids = pipeline.encode_text(&query);
-        let memory = extract_memory_vector_blocking(
-            &pipeline,
-            &mut states,
-            &query_ids,
-            &session_for_task,
-            context_ids.len(),
-            started,
-            top_k,
-        )
-        .map_err(|error| ApiError::Internal(format!("memory extraction failed: {error}")))?;
+        // Capture the outcome instead of `?`-ing out: the cancellation
+        // self-cleanup below must run on the error paths too, or a failed
+        // adapt/extract after cancellation lands leaks the sub-session
+        // (CodeRabbit review on PR #288).
+        let memory = match adapt_session_blocking(&pipeline, &mut states, &context_ids)
+            .map_err(|error| ApiError::Internal(format!("TTT adapt failed: {error}")))
+        {
+            Ok(()) => {
+                let query_ids = pipeline.encode_text(&query);
+                extract_memory_vector_blocking(
+                    &pipeline,
+                    &mut states,
+                    &query_ids,
+                    &session_for_task,
+                    context_ids.len(),
+                    started,
+                    top_k,
+                )
+                .map_err(|error| {
+                    ApiError::Internal(format!("memory extraction failed: {error}"))
+                })
+            }
+            Err(error) => Err(error),
+        };
         // Cancellation landed while this closure was adapting: the parent
         // future is gone, so drop this run's sub-session here instead of
-        // leaving it for a cleanup that already ran.
+        // leaving it for a cleanup that already ran. Runs on success and
+        // error alike.
         if is_transient && cancelled.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = store.take_session(&session_for_task);
         }
-        Ok(memory)
+        memory
     })
     .await
     .map_err(|error| ApiError::Internal(format!("blocking task join failed: {error}")))??;
