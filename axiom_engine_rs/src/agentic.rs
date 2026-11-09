@@ -23,7 +23,7 @@
 //! *measured* by the evaluation harness ([`crate::agentic_eval`]) as a
 //! success-rate over seeded broken-repo fixtures — a number, never a claim.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -156,9 +156,12 @@ impl EditSet {
 /// All-or-nothing application of an [`EditSet`]: snapshot every targeted file's
 /// current bytes (recording which did not exist), write the new contents, and
 /// hand control back to the caller to verify. On [`Transaction::rollback`] every
-/// file is restored byte-for-byte (and created files are removed); on
-/// [`Transaction::commit`] the changes simply stay. This is the safety boundary:
-/// a rejected multi-file change never half-applies.
+/// file whose write was attempted is restored byte-for-byte (and created files
+/// are removed); on [`Transaction::commit`] the changes simply stay. This is
+/// the safety boundary: a rejected multi-file change never half-applies.
+/// Rollback restores only attempted targets, never files the write loop never
+/// reached: rewriting an untouched file can corrupt it (a rollback write under
+/// a file-size limit truncates a file the transaction never modified).
 pub struct Transaction {
     /// path -> Some(original bytes) if it existed and was readable, None if it
     /// did not exist. An original that exists but cannot be read aborts
@@ -167,6 +170,12 @@ pub struct Transaction {
     /// Raw bytes (not String) so a non-UTF8 file is restored byte-for-byte
     /// rather than mistaken for "newly created" and deleted on rollback.
     snapshot: BTreeMap<PathBuf, Option<Vec<u8>>>,
+    /// Targets whose writes were attempted, in path order. A path is recorded
+    /// immediately before its write, so a failing write (which may have
+    /// partially modified its target) is included, while a target the write
+    /// loop never reached is never restored. `rollback` restores exactly
+    /// these paths.
+    attempted: BTreeSet<PathBuf>,
     applied: bool,
 }
 
@@ -183,6 +192,7 @@ impl Transaction {
     pub fn apply(edits: &EditSet) -> std::io::Result<Self> {
         let mut tx = Transaction {
             snapshot: BTreeMap::new(),
+            attempted: BTreeSet::new(),
             applied: false,
         };
         for edit in &edits.edits {
@@ -210,6 +220,10 @@ impl Transaction {
                     std::fs::create_dir_all(parent)?;
                 }
             }
+            // Record the attempt BEFORE the write: a failing write may have
+            // partially modified its target, so it must be restored, while
+            // a target the loop never reaches must never be touched.
+            tx.attempted.insert(edit.path.clone());
             let before = std::fs::metadata(&edit.path)
                 .and_then(|m| m.modified())
                 .ok();
@@ -225,17 +239,24 @@ impl Transaction {
     pub fn commit(mut self) {
         self.applied = false; // disarm Drop's rollback
         self.snapshot.clear();
+        self.attempted.clear();
     }
 
-    /// Restore every touched file to its pre-transaction state, byte-for-byte;
-    /// files that did not exist before are removed. Every file is restored
-    /// even when one restoration fails, and the first error is returned so a
-    /// failed rollback is observable instead of silently leaving files
-    /// modified. Removing a created file that already vanished is not an
-    /// error: the desired end state already holds.
+    /// Restore every file whose write was attempted to its pre-transaction
+    /// state, byte-for-byte; files that did not exist before are removed.
+    /// Targets the write loop never reached are left exactly as they were:
+    /// rewriting one could corrupt it (a rollback write under a file-size
+    /// limit truncates a file the transaction never modified). Every
+    /// attempted file is restored even when one restoration fails, and the
+    /// first error is returned so a failed rollback is observable instead of
+    /// silently leaving files modified. Removing a created file that already
+    /// vanished is not an error: the desired end state already holds.
     pub fn rollback(&mut self) -> std::io::Result<()> {
         let mut first_error: Option<std::io::Error> = None;
-        for (path, original) in &self.snapshot {
+        for path in &self.attempted {
+            let Some(original) = self.snapshot.get(path) else {
+                continue;
+            };
             let result = match original {
                 Some(bytes) => {
                     let before = std::fs::metadata(path).and_then(|m| m.modified()).ok();
@@ -663,6 +684,108 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "A0");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "B0");
         assert!(!c.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Repro for the Codex P2 on PR #276: rollback rewrote every
+    /// snapshotted target, including files the write loop never reached.
+    /// Under a file-size limit that rewrite itself corrupts a file the
+    /// transaction never modified: with RLIMIT_FSIZE=1024 and SIGXFSZ
+    /// ignored, a failing 2048-byte first edit leaves a later 4096-byte
+    /// file truncated to 1024 bytes during rollback, while the parent
+    /// commit leaves it intact.
+    ///
+    /// A file-size limit is process-wide, so the repro runs in a child
+    /// process (this same test binary, filtered to this test) and the
+    /// parent only asserts the child passed.
+    #[test]
+    #[cfg(unix)]
+    fn transaction_rollback_leaves_unreached_files_untouched() {
+        if std::env::var_os("AXIOM_ROLLBACK_RLIMIT_REPRO").is_none() {
+            let exe = std::env::current_exe().unwrap();
+            let out = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "agentic::tests::transaction_rollback_leaves_unreached_files_untouched",
+                    "--test-threads=1",
+                ])
+                .env("AXIOM_ROLLBACK_RLIMIT_REPRO", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "rlimit repro child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        rollback_leaves_unreached_files_untouched_under_limit();
+    }
+
+    /// Child-process body of the test above: runs under RLIMIT_FSIZE=1024
+    /// with SIGXFSZ ignored, so the first (2048-byte) write fails with
+    /// EFBIG after a partial write and rollback runs under the limit.
+    #[cfg(unix)]
+    fn rollback_leaves_unreached_files_untouched_under_limit() {
+        let dir = tmp("rollback_unreached");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "A0").unwrap();
+        let b_original = vec![b'x'; 4096];
+        std::fs::write(&b, &b_original).unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        // Save the current limits, cap file size at 1024, and ignore the
+        // signal that would otherwise kill the process on overflow.
+        unsafe {
+            let mut old_rlimit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut old_rlimit), 0);
+            assert_ne!(libc::signal(libc::SIGXFSZ, libc::SIG_IGN), libc::SIG_ERR);
+            let capped = libc::rlimit {
+                rlim_cur: 1024,
+                rlim_max: old_rlimit.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &capped), 0);
+            let result = Transaction::apply(
+                &EditSet::new()
+                    .with(a.clone(), "A".repeat(2048))
+                    .with(b.clone(), "B".repeat(4096)),
+            );
+            // Restore the limits before asserting anything: no later file
+            // operation in this process may run under the cap.
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &old_rlimit), 0);
+            libc::signal(libc::SIGXFSZ, libc::SIG_DFL);
+            assert!(
+                result.is_err(),
+                "apply must fail when the first write hits the file-size limit"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "A0",
+            "attempted file must be rolled back after a partial write"
+        );
+        assert_eq!(
+            std::fs::read(&b).unwrap(),
+            b_original,
+            "unreached file must keep its exact bytes: rollback must not have rewritten it under the limit"
+        );
+        assert_eq!(
+            std::fs::metadata(&b).unwrap().modified().unwrap(),
+            old,
+            "unreached file must keep its exact mtime"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
