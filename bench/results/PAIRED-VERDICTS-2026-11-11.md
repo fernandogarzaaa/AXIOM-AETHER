@@ -16,9 +16,8 @@ derived mechanically from those committed tables, method stated below.
 
 - Paired run: `bench/results/PAIRED-FULL-2026-11-11.md` (PR #293:
   seed 42, 40 cells, arms A-E, 0 pending; rerun reproduced run order
-  and all 40 outcomes). The file is not on main yet; read it at the
-  #293 head:
-  https://github.com/fernandogarzaaa/AXIOM-AETHER/blob/3c1314b5aaacedcd273c4504dd50dd105d1f2559/bench/results/PAIRED-FULL-2026-11-11.md
+  and all 40 outcomes). The file is on main since #293 merged
+  (2026-11-11).
 - Seed-424242 baseline: `bench/results/UNSEEN-SEED424242-2026-11-10.md`
   (24-fixture class-balanced subset, 17/24) and
   `bench/results/repair-unseen-seed424242-36-2026-11-10.md` (full
@@ -174,9 +173,8 @@ dollars, and is not a substitute either.
   live gate today is the unit test
   `regressed_arm_fails_the_guardrail_it_is_built_to_trip`
   (`paired.rs`, in `#[cfg(test)]`), which runs under `cargo test`.
-  Wiring the demo into CI is blocked on #293 merging: the `paired`
-  subcommand does not exist on main, so a CI step calling it would
-  fail. After rebase onto post-#293 main, add `--fail-on-guardrail`
+  Wiring the demo into CI is unblocked now that #293 has merged: the
+  `paired` subcommand exists on main, so add `--fail-on-guardrail`
   to the smoke step and a step that runs `paired --demo-regression
   --fail-on-guardrail` and requires a nonzero exit.
 - The paired and unseen numbers above are crew-measured and recorded

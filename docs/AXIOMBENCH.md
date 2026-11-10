@@ -386,24 +386,7 @@ the qualification run:
 
 ---
 
-## Reproduce what exists today
-
-```bash
-# Deterministic pillars (cognition, trust, fleet):
-cargo run --release --features tools --bin axiombench
-
-# Compression at scale:
-cargo run --release --bin axiom -- bench axiom_engine_rs/src
-
-# Cost pillar without live upstream credentials:
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_axiombench_cost_mock.ps1
-```
-
-Note: `axiombench` only rewrites the marked table block in `RESULTS.md` (§2);
-the hand-maintained caveats below it are preserved, and the `cost` row is
-carried over when the pillar is not run.
-
-## 4. Guardrail qualification verdicts (Phase 4 item 3)
+## 5. Guardrail qualification verdicts (Phase 4 item 3)
 
 The per-arm promotion verdicts on the Phase 4 paired run (PR #293)
 and unseen baselines (PR #294) are recorded in
@@ -434,11 +417,27 @@ plus an explicit reliability guardrail):
   harness spends $0. A real cost verdict needs a live-agent run with
   billed-token accounting; wall-clock time is not a substitute.
 
-Open item: the demo-regression FAIL is not wired into CI yet. PR
-#293's CI runs only `paired --smoke`, without `--fail-on-guardrail`
-and without a `--demo-regression` step. That wiring is blocked on
-#293 merging (the `paired` subcommand does not exist on main) and is
-specified in the verdicts file for the rebase onto post-#293 main.
-The live gate today is the unit test
+Open item: the demo-regression FAIL is not wired into CI yet. Main's
+CI runs only `paired --smoke`, without `--fail-on-guardrail` and
+without a `--demo-regression` step. That wiring is unblocked now that
+#293 has merged (the `paired` subcommand exists on main) and is
+specified in the verdicts file. The live gate today is the unit test
 `regressed_arm_fails_the_guardrail_it_is_built_to_trip`, which runs
-under `cargo test` on #293's branch.
+under `cargo test` on main.
+
+## Reproduce what exists today
+
+```bash
+# Deterministic pillars (cognition, trust, fleet):
+cargo run --release --features tools --bin axiombench
+
+# Compression at scale:
+cargo run --release --bin axiom -- bench axiom_engine_rs/src
+
+# Cost pillar without live upstream credentials:
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_axiombench_cost_mock.ps1
+```
+
+Note: `axiombench` only rewrites the marked table block in `RESULTS.md` (§2);
+the hand-maintained caveats below it are preserved, and the `cost` row is
+carried over when the pillar is not run.
