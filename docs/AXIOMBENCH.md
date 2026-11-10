@@ -386,6 +386,45 @@ the qualification run:
 
 ---
 
+## 5. Guardrail qualification verdicts (Phase 4 item 3)
+
+The per-arm promotion verdicts on the Phase 4 paired run (PR #293)
+and unseen baselines (PR #294) are recorded in
+`bench/results/PAIRED-VERDICTS-2026-11-11.md`. Summary, under the
+audit section 5 promotion rule (measured task-success non-inferiority
+plus an explicit reliability guardrail):
+
+- D repair: PROMOTE (narrow). Measured 6/8 vs baseline 0/8, unsafe
+  0.00, rollback 1.00, complete coverage, rerun reproduced. Scope is
+  the deterministic repair loop on the 8-fixture paired set only. No
+  cost claim attaches: cost was not measured.
+- B retrieval, C CVM, E full stack: HOLD. Each guardrail PASSES, but
+  the identical 6/8 is replication of the same deterministic loop, not
+  a measured toggle effect: the overlays have no read site in the
+  solve path. Each promotes only after a real toggle ablation shows
+  it differing from D.
+- D-regressed: FAIL by design (negative control, unsafe 1.00,
+  rollback 0.00).
+- Overlap disclosure: the seed-424242 "genuinely unseen" headline is
+  overstated. 21 of 36 fixtures sit at a previously tuned (file, line)
+  site (18 share the full (file, line, class) triple); the clean
+  held-out rate is 6/15 on fresh sites against 13/21 at tuned sites,
+  not the headline 19/36. One fixture, mesh-L489-flow-04, is the
+  identical fault in both the tuning table and the unseen suite. Quote
+  6/15 alongside 19/36, never 19/36 alone, until the suite is
+  regenerated at new sites and re-baselined.
+- Cost guardrail: not-applicable on every arm. The deterministic
+  harness spends $0. A real cost verdict needs a live-agent run with
+  billed-token accounting; wall-clock time is not a substitute.
+
+Open item: the demo-regression FAIL is not wired into CI yet. Main's
+CI runs only `paired --smoke`, without `--fail-on-guardrail` and
+without a `--demo-regression` step. That wiring is unblocked now that
+#293 has merged (the `paired` subcommand exists on main) and is
+specified in the verdicts file. The live gate today is the unit test
+`regressed_arm_fails_the_guardrail_it_is_built_to_trip`, which runs
+under `cargo test` on main.
+
 ## Reproduce what exists today
 
 ```bash
