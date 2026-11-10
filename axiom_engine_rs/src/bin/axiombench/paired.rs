@@ -10,17 +10,18 @@
 //! cache-adjusted billed tokens, agent turns, tool calls, wall-clock time,
 //! first-token latency, unsafe patch rate, and successful rollback rate.
 //!
-//! What this module is, honestly: scaffolding, not the comparison.
-//! The deterministic executor below can run arms A and D on the
-//! single-file family end to end (arm A is the no-op baseline, arm D is
-//! the real `axiom solve` loop). Arms B, C, and E need an agent executor
-//! that drives a real coding agent with and without AXIOM in the loop; that
-//! executor does not exist yet and is a named open item (see
-//! [`Arm::executor_status`]). The multi-file, long-session, tool-heavy,
-//! and failure-recovery families are defined in [`TASK_SET`] but have no
-//! on-disk fixtures yet; the runner reports them as pending, never as
-//! numbers. The FULL paired comparison waits until Phase 3 code exists on
-//! its PR branches or main; nothing here guesses its results.
+//! What this module is, honestly: the deterministic paired comparison.
+//! Every arm executes through the real `axiom solve` loop under its own
+//! env overlay (arm A is the no-op baseline), across all five task
+//! families, each with an on-disk fixture under `bench/repair/`. What it
+//! is not: a live-LLM agent comparison. The deterministic solver spends
+//! no tokens and emits no streamed tokens, so billed tokens, agent
+//! turns, tool calls, and first-token latency are recorded as
+//! not-applicable with the reason, never as fabricated numbers; dollar
+//! cost is 0.0 measured (no API spend). The live-agent executor (a real
+//! coding agent with and without AXIOM in the loop) is a named open item
+//! for the guardrail-qualification follow-up, not something this runner
+//! pretends to be.
 
 use crate::guardrail::{evaluate_guardrail, GuardrailConfig};
 use serde_json::{json, Value};
@@ -58,10 +59,10 @@ impl Arm {
     }
 
     /// Environment overlay that *defines* the arm, from the toggles
-    /// documented in docs/AXIOMBENCH.md section 3.1. These are the arm's
-    /// definition, not a claim that the current deterministic executor
-    /// realizes every one of them: only arm D is executed by that executor
-    /// today (see [`Arm::executor_status`]).
+    /// documented in docs/AXIOMBENCH.md section 3.1. The executor runs
+    /// every non-baseline arm through the same `axiom solve` loop under
+    /// its own overlay, so the paired comparison measures the toggle's
+    /// effect on the real solver.
     pub fn env_overlay(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Arm::Baseline => &[],
@@ -89,14 +90,16 @@ impl Arm {
         }
     }
 
-    /// Whether the current harness can execute this arm at all.
+    /// Whether the current harness can execute this arm at all. Every
+    /// audit arm now executes deterministically: arm A is the no-op
+    /// baseline, arms B/C/D/E run the real `axiom solve` loop under the
+    /// arm's env overlay. `PendingExecutor` survives only for the
+    /// missing-solver-binary case (see `execute`).
     pub fn executor_status(self) -> &'static str {
         match self {
-            Arm::Baseline | Arm::Repair | Arm::Regressed => "deterministic (axiom solve / no-op)",
-            Arm::Retrieval | Arm::Cvm | Arm::FullStack => {
-                "pending: needs the agent executor (real coding agent with \
-                 and without AXIOM in the loop); blocked on Phase 3 code and \
-                 the agent harness, not implemented here"
+            Arm::Baseline => "deterministic (no-op baseline)",
+            Arm::Retrieval | Arm::Cvm | Arm::Repair | Arm::FullStack | Arm::Regressed => {
+                "deterministic (axiom solve under the arm's env overlay)"
             }
         }
     }
@@ -147,9 +150,11 @@ pub struct PairedTask {
     pub gap: Option<&'static str>,
 }
 
-/// The fixed task set. Only the single-file family is executable today;
-/// the other families are defined so the harness shape is complete and
-/// their fixture gaps are named, not hidden.
+/// The fixed task set. Every family has on-disk fixtures under
+/// `bench/repair/` (see each task's `fixture`); a task with `fixture`
+/// `None` is defined but unexecutable, and the runner reports it as
+/// pending with the `gap` reason, never as a score. All eight tasks
+/// below currently have fixtures.
 pub static TASK_SET: &[PairedTask] = &[
     PairedTask {
         id: "single-py-average-off-by-one",
@@ -172,48 +177,50 @@ pub static TASK_SET: &[PairedTask] = &[
     PairedTask {
         id: "multi-both-broken",
         family: TaskFamily::MultiFile,
-        fixture: None,
-        gap: Some(
-            "no on-disk multi-file fixture yet; port builtin case \
-             agentic-multi-file-both-broken from agentic_eval.rs to \
-             bench/repair/ format",
-        ),
+        fixture: Some("multi-both-broken"),
+        gap: None,
     },
     PairedTask {
         id: "multi-interface-and-callsites",
         family: TaskFamily::MultiFile,
-        fixture: None,
-        gap: Some(
-            "no on-disk multi-file fixture yet; needs a task requiring an \
-             interface change plus its call sites (3+ files)",
-        ),
+        // Fault: the shared helper's contract broke (off-by-one in
+        // `helpers.total`), failing both callsites (`report.summary`,
+        // `cli.main`). The fix lands in the helper; the test imports all
+        // three layers directly so the localizer's one-hop rule
+        // (`fault_locate::repair_targets`) can reach the helper.
+        fixture: Some("multi-interface-and-callsites"),
+        gap: None,
     },
     PairedTask {
         id: "longsession-overflow",
         family: TaskFamily::LongSession,
-        fixture: None,
-        gap: Some(
-            "no long-session fixture yet; needs a session scaled until \
-             context would overflow without compression",
-        ),
+        // Fault: the same off-by-one, buried in a 257-line module under
+        // a 240-entry lookup table. Exercises fault localization at
+        // scale; token/context-overflow discrimination needs a live LLM
+        // and is not claimed here.
+        fixture: Some("longsession-overflow"),
+        gap: None,
     },
     PairedTask {
         id: "toolheavy-many-calls",
         family: TaskFamily::ToolHeavy,
-        fixture: None,
-        gap: Some(
-            "no tool-heavy fixture yet; needs a task with many tool calls \
-             per turn exercising tool deferral",
-        ),
+        // Eight modules, one buggy (m5); the test imports all eight, so
+        // the solver must sift eight localization candidates. Agent
+        // turns / tool calls are still not-applicable: the deterministic
+        // loop has no agent tool-call counter.
+        fixture: Some("toolheavy-many-calls"),
+        gap: None,
     },
     PairedTask {
         id: "recovery-broken-env",
         family: TaskFamily::FailureRecovery,
-        fixture: None,
-        gap: Some(
-            "no failure-recovery fixture yet; needs a deliberately broken \
-             environment/code task scored on repair success and rollback",
-        ),
+        // Pure environment fault: `run.sh` lacks the exec bit, so the
+        // verify fails with "Permission denied" while the code is
+        // correct. Scored on environment-heal success and rollback; the
+        // chmod heal changes no file contents, so a failed attempt still
+        // rolls back clean under the content-hash comparison.
+        fixture: Some("recovery-broken-env"),
+        gap: None,
     },
 ];
 
@@ -386,10 +393,12 @@ pub struct TaskOutcome {
     pub wall_ms: u64,
     pub stage_ms: StageMs,
     /// Peak resident set size (KiB, VmHWM) across the cell's child
-    /// processes, read from Linux `/proc/<pid>/status` while they run
-    /// (same source as the Phase 3 item 5 `refresh_process_memory`
-    /// gauge, applied here to the solver subprocess). `None` where the
-    /// cell did not execute, or off Linux where `/proc` is absent.
+    /// processes, sampled from Linux `/proc/<pid>/status` every 5 ms
+    /// while they run (same source as the Phase 3 item 5
+    /// `refresh_process_memory` gauge, applied here to the solver
+    /// subprocess). A sampled lower bound, never an exact peak; `None`
+    /// where the cell did not execute, where a child exits before the
+    /// first poll, or off Linux where `/proc` is absent.
     pub peak_rss_kb: Option<u64>,
     pub first_token_ms: Option<u64>,
     pub cost_usd: f64,
@@ -660,9 +669,25 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Peak RSS (KiB, VmHWM) of a child process, read from Linux
+/// `/proc/<pid>/status` (same source as the Phase 3 item 5
+/// `refresh_process_memory` gauge, applied here to the solver
+/// subprocess instead of the current process). `None` off Linux, or if
+/// the child already exited when polled.
+fn peak_rss_kb(pid: u32) -> Option<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    text.lines()
+        .find(|l| l.starts_with("VmHWM:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 /// Run a command in `cwd` with a wall-clock timeout, capturing combined
 /// output to files (so a chatty child can never deadlock a pipe).
-/// Returns (success, combined output truncated to 4 KiB).
+/// Returns (success, combined output truncated to 4 KiB, peak RSS KiB
+/// sampled while the child ran).
 fn run_bounded(
     argv: &[String],
     cwd: &Path,
@@ -670,7 +695,7 @@ fn run_bounded(
     timeout: Duration,
     log_dir: &Path,
     log_name: &str,
-) -> std::io::Result<(bool, String)> {
+) -> std::io::Result<(bool, String, Option<u64>)> {
     let _ = std::fs::create_dir_all(log_dir);
     let out_path = log_dir.join(format!("{log_name}.out.log"));
     let err_path = log_dir.join(format!("{log_name}.err.log"));
@@ -685,6 +710,7 @@ fn run_bounded(
         .stderr(Stdio::from(err_file));
     let mut child = cmd.spawn()?;
     let start = Instant::now();
+    let mut peak: Option<u64> = None;
     loop {
         match child.try_wait()? {
             Some(status) => {
@@ -698,15 +724,23 @@ fn run_bounded(
                 if combined.len() > 4096 {
                     combined.truncate(4096);
                 }
-                return Ok((status.success(), combined));
+                return Ok((status.success(), combined, peak));
             }
             None => {
+                // VmHWM is a high-water mark, so the last sample before
+                // exit is the best one: poll every 5 ms, not 50. A 50 ms
+                // cadence caught short-lived children mid-exec and
+                // under-read their peak by orders of magnitude (12 KiB
+                // for a shell that really peaks near 1 MiB). The value is
+                // still a sampled lower bound, never an exact peak; a
+                // child that exits before the first poll yields None.
+                peak = std::cmp::max(peak, peak_rss_kb(child.id()));
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Ok((false, format!("TIMEOUT after {}s", timeout.as_secs())));
+                    return Ok((false, format!("TIMEOUT after {}s", timeout.as_secs()), peak));
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
     }
@@ -741,8 +775,19 @@ impl ExecCtx {
 
     pub fn resolve_solver_bin(&self) -> Result<PathBuf, String> {
         if let Some(bin) = &self.solver_bin {
-            if bin.exists() {
-                return Ok(bin.clone());
+            // A relative --solver-bin is resolved against the executor's
+            // own working directory, NOT the per-cell scratch dir the
+            // child runs in: without this the spawn fails with "No such
+            // file or directory" and the cell scores a silent
+            // non-execution (caught live on the first smoke re-run).
+            let abs = if bin.is_absolute() {
+                bin.clone()
+            } else {
+                std::fs::canonicalize(bin)
+                    .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(bin))
+            };
+            if abs.exists() {
+                return Ok(abs);
             }
             return Err(format!(
                 "solver binary {} does not exist; build it with \
@@ -779,13 +824,14 @@ fn how_from_log(log: &str) -> String {
 }
 
 /// The deterministic executor: arm A is the no-op baseline (no solver
-/// invocation, the failing verify stays failing); arm D runs the real
-/// `axiom solve` loop in a scratch copy of the fixture, following the four
-/// steps of scripts/bench_repair.sh (no-op baseline, solve with no file
-/// named and isolated heal-memory state, re-verify, pinned-file and
-/// rollback checks). `sabotage` (demo-regression only) makes the solver
-/// step edit a pinned file and leave the tree dirty, so the guardrail
-/// check must fail on reliability even though the verifier goes green.
+/// invocation, the failing verify stays failing); every other arm runs
+/// the real `axiom solve` loop under its own env overlay in a scratch
+/// copy of the fixture, following the four steps of
+/// scripts/bench_repair.sh (no-op baseline, solve with no file named
+/// and isolated heal-memory state, re-verify, pinned-file and rollback
+/// checks). `sabotage` (demo-regression only) makes the solver step edit
+/// a pinned file and leave the tree dirty, so the guardrail check must
+/// fail on reliability even though the verifier goes green.
 pub struct AxiomSolveExecutor {
     pub ctx: ExecCtx,
     pub sabotage: bool,
@@ -809,15 +855,14 @@ impl AxiomSolveExecutor {
                 );
             }
         };
-        if matches!(arm, Arm::Retrieval | Arm::Cvm | Arm::FullStack) {
-            return TaskOutcome::pending(
-                task,
-                arm,
-                repeat,
-                OutcomeStatus::PendingExecutor,
-                arm.executor_status().to_string(),
-            );
-        }
+        // Arms B, C, and E execute through the same `axiom solve` loop
+        // as arm D, under their own env overlay (see
+        // [`Arm::env_overlay`]): the overlay is the arm's definition,
+        // and the paired comparison measures the toggle's effect on the
+        // real solver. A live-LLM agent executor (driving a real coding
+        // agent with and without AXIOM in the loop, with token/cost/turn
+        // accounting) is still a named open item; the deterministic
+        // harness measures the toggle effect, not that agent.
         let root = Self::repo_root();
         let corpus = self
             .ctx
@@ -870,8 +915,13 @@ impl AxiomSolveExecutor {
                     latency exist to measure; cost is 0.0 measured (no API spend)"
                 .into(),
         };
+        // Peak RSS across the cell's child processes (Cell so the
+        // `finish` closure below can read the latest value without
+        // borrowing the accumulator mutably at every return site).
+        let peak_rss: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
         let finish = |mut o: TaskOutcome| -> TaskOutcome {
             o.wall_ms = started.elapsed().as_millis() as u64;
+            o.peak_rss_kb = peak_rss.get();
             o
         };
         if copy_tree(&fixture_dir.join("broken"), &work).is_err() {
@@ -880,7 +930,8 @@ impl AxiomSolveExecutor {
             return finish(outcome);
         }
         // 1. No-op baseline: verify must fail on the untouched tree.
-        let (baseline_ok, _) = match run_bounded(
+        let stage_start = Instant::now();
+        let (baseline_ok, _, baseline_peak) = match run_bounded(
             &meta.verify,
             &work,
             &[],
@@ -894,6 +945,8 @@ impl AxiomSolveExecutor {
                 return finish(outcome);
             }
         };
+        outcome.stage_ms.baseline_verify_ms = stage_start.elapsed().as_millis() as u64;
+        peak_rss.set(std::cmp::max(peak_rss.get(), baseline_peak));
         if baseline_ok {
             outcome.status = OutcomeStatus::NotBroken;
             outcome.notes = "verify passes on the untouched tree; fixture is not broken".into();
@@ -916,7 +969,7 @@ impl AxiomSolveExecutor {
             Ok(bin) => bin,
             Err(e) => {
                 outcome.status = OutcomeStatus::PendingExecutor;
-                outcome.notes = e;
+                outcome.notes = format!("{e} ({})", arm.executor_status());
                 return finish(outcome);
             }
         };
@@ -941,7 +994,8 @@ impl AxiomSolveExecutor {
         for (k, v) in arm.env_overlay() {
             envs.push((k.to_string(), v.to_string()));
         }
-        let (_solve_ok, solve_log) = match run_bounded(
+        let stage_start = Instant::now();
+        let (_solve_ok, solve_log, solve_peak) = match run_bounded(
             &solve_argv,
             &work,
             &envs,
@@ -955,6 +1009,8 @@ impl AxiomSolveExecutor {
                 return finish(outcome);
             }
         };
+        outcome.stage_ms.solve_ms = stage_start.elapsed().as_millis() as u64;
+        peak_rss.set(std::cmp::max(peak_rss.get(), solve_peak));
         outcome.solver = how_from_log(&solve_log);
         if self.sabotage || arm == Arm::Regressed {
             // Deliberate regression for the guardrail demo: edit a pinned
@@ -973,7 +1029,8 @@ impl AxiomSolveExecutor {
             );
         }
         // 3. Re-verify, then refuse a pass that edited the oracle.
-        let (verify_ok, _) = match run_bounded(
+        let stage_start = Instant::now();
+        let (verify_ok, _, reverify_peak) = match run_bounded(
             &meta.verify,
             &work,
             &[],
@@ -987,6 +1044,8 @@ impl AxiomSolveExecutor {
                 return finish(outcome);
             }
         };
+        outcome.stage_ms.reverify_ms = stage_start.elapsed().as_millis() as u64;
+        peak_rss.set(std::cmp::max(peak_rss.get(), reverify_peak));
         let mut touched_pinned: Vec<String> = Vec::new();
         for pinned in &meta.pinned {
             let before = fixture_dir.join("broken").join(pinned);
@@ -1029,6 +1088,7 @@ impl AxiomSolveExecutor {
             return finish(outcome);
         }
         // 4. Rollback correctness against the post-baseline snapshot.
+        let rollback_start = Instant::now();
         let after = snapshot_tree(&work);
         let mut violations: Vec<String> = Vec::new();
         for (rel, hash) in &after {
@@ -1052,6 +1112,7 @@ impl AxiomSolveExecutor {
                 violations.join(", ")
             );
         }
+        outcome.stage_ms.rollback_ms = rollback_start.elapsed().as_millis() as u64;
         finish(outcome)
     }
 }
@@ -1105,7 +1166,7 @@ impl PairedReport {
 }
 
 /// Run the paired matrix in seeded-shuffled cell order. Cells whose task
-/// has no fixture, or whose arm has no executor, resolve to pending
+/// has no fixture, or whose solver binary is missing, resolve to pending
 /// outcomes; they are reported, never scored.
 pub fn run_paired(config: &PairedConfig, executor: &AxiomSolveExecutor) -> PairedReport {
     let tasks: Vec<&PairedTask> = TASK_SET
@@ -1313,10 +1374,10 @@ pub fn run_cli(args: &[String]) -> i32 {
     for (task, arm, repeat) in &report.run_order {
         println!("  {task} arm={arm} repeat={repeat}");
     }
-    println!("| task | arm | repeat | status | success | unsafe | rollback | wall_ms |");
+    println!("| task | arm | repeat | status | success | unsafe | rollback | wall_ms | solve_ms | peak_rss_kb |");
     for o in &report.outcomes {
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             o.task_id,
             o.arm.label(),
             o.repeat,
@@ -1326,7 +1387,11 @@ pub fn run_cli(args: &[String]) -> i32 {
             o.rollback_ok
                 .map(|b| b.to_string())
                 .unwrap_or_else(|| "-".into()),
-            o.wall_ms
+            o.wall_ms,
+            o.stage_ms.solve_ms,
+            o.peak_rss_kb
+                .map(|kb| kb.to_string())
+                .unwrap_or_else(|| "-".into()),
         );
     }
     for (arm, s) in &report.summaries {
@@ -1430,21 +1495,27 @@ mod tests {
     }
 
     #[test]
-    fn task_set_names_its_gaps() {
+    fn task_set_has_a_fixture_for_every_family() {
         let single: Vec<_> = TASK_SET
             .iter()
             .filter(|t| t.family == TaskFamily::SingleFile)
             .collect();
         assert_eq!(single.len(), 3);
-        assert!(single.iter().all(|t| t.fixture.is_some()));
-        let rest: Vec<_> = TASK_SET
+        let multi: Vec<_> = TASK_SET
             .iter()
-            .filter(|t| t.family != TaskFamily::SingleFile)
+            .filter(|t| t.family == TaskFamily::MultiFile)
             .collect();
-        assert!(!rest.is_empty());
-        assert!(rest
-            .iter()
-            .all(|t| t.fixture.is_none() && t.gap.map(|g| !g.is_empty()).unwrap_or(false)));
+        assert_eq!(multi.len(), 2);
+        for family in [
+            TaskFamily::LongSession,
+            TaskFamily::ToolHeavy,
+            TaskFamily::FailureRecovery,
+        ] {
+            let tasks: Vec<_> = TASK_SET.iter().filter(|t| t.family == family).collect();
+            assert_eq!(tasks.len(), 1, "{family:?}");
+        }
+        assert!(TASK_SET.iter().all(|t| t.fixture.is_some()));
+        assert!(TASK_SET.iter().all(|t| t.gap.is_none()));
     }
 
     #[test]
@@ -1745,11 +1816,7 @@ mod tests {
             temp.path().join("scratch-a"),
         );
         let first = run_paired(&config, &ex);
-        let ex = executor_with_solver(
-            solver,
-            corpus,
-            temp.path().join("scratch-b"),
-        );
+        let ex = executor_with_solver(solver, corpus, temp.path().join("scratch-b"));
         let second = run_paired(&config, &ex);
         assert_eq!(first.run_order, second.run_order);
         assert_eq!(
@@ -1764,6 +1831,35 @@ mod tests {
                 .map(|o| (o.task_id.clone(), o.arm, o.repeat))
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn resolve_solver_bin_canonicalizes_a_relative_path() {
+        // Regression test for the first smoke re-run: a relative
+        // --solver-bin resolved against the per-cell scratch dir, so the
+        // spawn failed with "No such file or directory" and arm D scored
+        // a silent 0/3. It must resolve against the executor's own cwd.
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let dir = cwd
+            .join("target")
+            .join(format!("paired-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let solver = dir.join("fake-axiom");
+        std::fs::write(&solver, "#!/bin/sh\n").unwrap();
+        let rel = solver.strip_prefix(&cwd).unwrap().to_path_buf();
+        assert!(!rel.is_absolute());
+        let ctx = ExecCtx {
+            solver_bin: Some(rel),
+            corpus_dir: None,
+            scratch_root: temp.path().to_path_buf(),
+            verify_timeout: Duration::from_secs(30),
+            solve_timeout: Duration::from_secs(30),
+        };
+        let resolved = ctx.resolve_solver_bin().unwrap();
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert_eq!(resolved.file_name().unwrap(), "fake-axiom");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
