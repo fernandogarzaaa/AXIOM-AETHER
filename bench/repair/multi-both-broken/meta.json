@@ -1,1 +1,0 @@
-{"lang": "sh", "verify": ["sh", "-c", "sh a.sh && sh b.sh"], "kind": "agentic", "source": "port of agentic_eval.rs builtin agentic-multi-file-both-broken", "pinned": []}
