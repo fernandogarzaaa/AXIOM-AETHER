@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axiom_engine::config::AxiomConfig;
@@ -817,6 +818,129 @@ async fn client_retry_reuses_same_fallback_key() {
     assert_eq!(
         requests[1].1, requests[3].1,
         "a client retry must reuse the same fallback key so the upstream dedupes the fallback"
+    );
+    task.abort();
+    std::env::remove_var("AXIOM_RESPONSES_COMPRESS");
+}
+
+async fn post_responses_full(app: Router, original: &Value, key: &str) -> (StatusCode, String) {
+    let response = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test")
+                .header("idempotency-key", key)
+                .body(Body::from(original.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Codex P2, review 5848952420: a client retry after a lost successful
+/// compressed response, with the same explicit key, must NOT trigger a
+/// fresh-key fallback. The retried compressed payload differs (fresh
+/// transient session UUID in the fingerprint), so an upstream that
+/// enforces idempotency rejects it as a 400 conflict — and that 400
+/// means the first attempt already executed, so resubmitting the
+/// original body under a fresh key would execute the operation twice.
+/// The proxy must return the 400 as-is and send no third request.
+#[tokio::test]
+async fn compressed_400_idempotency_conflict_does_not_fallback() {
+    std::env::set_var("AXIOM_RESPONSES_COMPRESS", "1");
+    type IdempotencyStore = Arc<Mutex<HashMap<String, Value>>>;
+    let captured = Arc::new(Mutex::new(Vec::<KeyedRequest>::new()));
+    let store: IdempotencyStore = Arc::new(Mutex::new(HashMap::new()));
+    async fn upstream(
+        State((captured, store)): State<(Arc<Mutex<Vec<KeyedRequest>>>, IdempotencyStore)>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let key = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .expect("every attempt must carry an idempotency key");
+        {
+            let mut requests = captured.lock().unwrap();
+            requests.push((body.clone(), Some(key.clone())));
+        }
+        let mut store = store.lock().unwrap();
+        match store.get(&key) {
+            Some(seen) if *seen != body => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {
+                    "message": "Idempotency key reused with different payload",
+                    "type": "idempotency_error",
+                    "code": "idempotency_key_reused",
+                }})),
+            ),
+            Some(_) => (
+                StatusCode::OK,
+                Json(json!({"id": "resp_replay", "object": "response"})),
+            ),
+            None => {
+                store.insert(key, body);
+                (
+                    StatusCode::OK,
+                    Json(json!({"id": "resp_ok", "object": "response"})),
+                )
+            }
+        }
+    }
+    let upstream_app = Router::new()
+        .route("/v1/responses", post(upstream))
+        .with_state((captured.clone(), store.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, upstream_app).await.unwrap() });
+
+    let original = heavy_responses_body();
+    // First request succeeds; the client loses the response.
+    let app = compressed_proxy_app(base.clone()).await;
+    assert_eq!(
+        post_responses_full(app, &original, "client-key-abc")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    // Client retries with the same explicit key after losing the response.
+    let app = compressed_proxy_app(base.clone()).await;
+    let (status, body) = post_responses_full(app, &original, "client-key-abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.contains("idempotency"),
+        "the upstream 400 body must be relayed to the client, got: {body}"
+    );
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "an idempotency conflict must trigger no fallback: a third request would re-execute the already-successful operation"
+    );
+    assert_ne!(
+        requests[0].0, requests[1].0,
+        "the retried compressed payload must differ (fresh transient session UUID in the fingerprint); that difference is what makes the upstream see a conflict"
+    );
+    assert_eq!(
+        requests[0].1.as_deref(),
+        Some("client-key-abc"),
+        "first compressed attempt must honor the client-supplied key"
+    );
+    assert_eq!(
+        requests[1].1.as_deref(),
+        Some("client-key-abc"),
+        "retried compressed attempt must honor the client-supplied key"
+    );
+    assert!(
+        requests.iter().all(|(payload, _)| *payload != original),
+        "no request may carry the original body under a fresh fallback key"
     );
     task.abort();
     std::env::remove_var("AXIOM_RESPONSES_COMPRESS");

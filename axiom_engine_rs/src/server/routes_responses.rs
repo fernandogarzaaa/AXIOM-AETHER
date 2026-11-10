@@ -685,29 +685,60 @@ async fn responses_websocket(
 ///   first attempt may have executed. Retry the SAME compressed payload
 ///   under the SAME key, so the upstream dedupes instead of seeing a
 ///   conflicting payload under a reused key.
-/// * `FreshKeyOriginal` — 400: the upstream definitively rejected the
-///   compressed attempt, so it did not execute. Fall back to the original
-///   body under a key derived deterministically from the incoming key +
-///   original body (never the client-supplied key itself, which names
-///   the compressed attempt). Deterministic so a client retry with the
-///   same explicit key reuses the same fallback key and the upstream can
-///   dedupe the fallback too.
+/// * `FreshKeyOriginal` — 400 that is NOT an idempotency conflict: the
+///   upstream definitively rejected the compressed attempt, so it did not
+///   execute. Fall back to the original body under a key derived
+///   deterministically from the incoming key + original body (never the
+///   client-supplied key itself, which names the compressed attempt).
+///   Deterministic so a client retry with the same explicit key reuses the
+///   same fallback key and the upstream can dedupe the fallback too. A
+///   400 that reports an idempotency-key/payload conflict is excluded
+///   (see `is_idempotency_conflict`): the upstream already holds an
+///   attempt under this key, so a fresh-key fallback would execute the
+///   operation a second time.
 enum ResponsesRetry {
     SamePayload,
     FreshKeyOriginal,
 }
 
+/// Whether a 400 body reports an idempotency-key/payload conflict: the
+/// upstream already holds an attempt under this key with a different
+/// payload, so the first attempt may already have executed successfully
+/// and no payload-changing fallback is safe. Upstreams phrase the
+/// conflict differently (OpenAI `idempotency_key_reused`, "idempotency
+/// key reused with a different payload", Stripe-style "same parameters"),
+/// so match on the raw body, case-insensitively, requiring a conflict
+/// token alongside the `idempot` stem: a plain mention (e.g.
+/// "idempotency-key header missing") is not a conflict and still falls
+/// back.
+fn is_idempotency_conflict(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    // The `idempot` stem covers "idempotency", "idempotent" (Stripe's
+    // "Keys for idempotent requests ..."), and "idempotence".
+    if !lower.contains("idempot") {
+        return false;
+    }
+    ["conflict", "reus", "different", "mismatch", "same parameters"]
+        .iter()
+        .any(|token| lower.contains(token))
+}
+
 /// Classify a retryable compressed-Responses failure. `status` is `None`
 /// for a transport failure and `Some(status)` for an upstream HTTP status.
+/// `body` is the upstream error body when one was captured (`Some` for a
+/// 400 whose body was read, else `None`); a 400 whose body reports an
+/// idempotency-key/payload conflict returns `None` — the first attempt
+/// may already have executed, so no payload-changing fallback is safe.
 /// Returns `None` for failures the original payload cannot fix (401/403/
 /// 429/other 4xx), which must not be retried. The retryable set is the
 /// shared `should_retry_status` predicate, not a second copy of its rule:
 /// a 400 fallback resends the original payload under a fresh key, any
 /// other retryable status resends the same payload under the same key.
-fn responses_retry_action(status: Option<u16>) -> Option<ResponsesRetry> {
+fn responses_retry_action(status: Option<u16>, body: Option<&str>) -> Option<ResponsesRetry> {
     match status {
         None => Some(ResponsesRetry::SamePayload),
         Some(status) if !crate::context_compressor::should_retry_status(status) => None,
+        Some(400) if body.is_some_and(is_idempotency_conflict) => None,
         Some(400) => Some(ResponsesRetry::FreshKeyOriginal),
         Some(_) => Some(ResponsesRetry::SamePayload),
     }
@@ -756,6 +787,23 @@ struct ResponsesRetryAttempt<'a> {
     session_id: &'a str,
     idempotency_key: &'a str,
     controls: &'a CompressionControls,
+}
+
+/// Rebuild an axum response from a buffered upstream body. Used when the
+/// 400 path consumed the upstream stream to inspect it: the buffered
+/// bytes are the only copy of the error body left.
+fn buffered_upstream_response(
+    status: StatusCode,
+    content_type: HeaderValue,
+    body: Vec<u8>,
+) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|error| {
+            ApiError::Internal(format!("response build failed: {error}")).into_response()
+        })
 }
 
 /// Run one retry attempt for a compressed-Responses forward, as decided
@@ -871,10 +919,13 @@ async fn create_response(
     // Network / 5xx retries resend the SAME payload under the SAME key
     // (the first attempt may have executed), while a 400 fallback resends
     // the ORIGINAL payload under a FRESH key (the first attempt was
-    // definitively rejected). Never 401/403/429/Decode. Note the behavior
-    // change from the original PR: a 5xx retry no longer falls back to
-    // the uncompressed payload, because changing the payload after an
-    // unknown outcome is not safe under idempotency.
+    // definitively rejected) — except a 400 that reports an
+    // idempotency-key/payload conflict, which must never fall back: the
+    // first attempt may already have executed under this key. Never
+    // 401/403/429/Decode. Note the behavior change from the original PR:
+    // a 5xx retry no longer falls back to the uncompressed payload,
+    // because changing the payload after an unknown outcome is not safe
+    // under idempotency.
     let mut upstream = match forwarder.forward_responses(outbound, &client_auth).await {
         Ok(response) => response,
         Err(err) if compressed.is_some() => {
@@ -887,14 +938,16 @@ async fn create_response(
             // The Upstream arm is unreachable in practice: `send_json_with`
             // returns `Ok` for every HTTP status, so no Upstream error is
             // ever produced. It stays for exhaustiveness.
-            let status = match &err {
-                OpenAiForwarderError::Network(_) => None,
-                OpenAiForwarderError::Upstream { status, .. } => Some(*status),
+            let (status, error_body) = match &err {
+                OpenAiForwarderError::Network(_) => (None, None),
+                OpenAiForwarderError::Upstream { status, body } => {
+                    (Some(*status), Some(body.as_str()))
+                }
                 OpenAiForwarderError::Decode(_) | OpenAiForwarderError::MissingAuth => {
                     return map_openai_forwarder_error(err).into_response();
                 }
             };
-            match responses_retry_action(status) {
+            match responses_retry_action(status, error_body) {
                 Some(action) => {
                     let context = format!("forward failed ({err})");
                     let attempt = ResponsesRetryAttempt {
@@ -916,7 +969,97 @@ async fn create_response(
         Err(error) => return map_openai_forwarder_error(error).into_response(),
     };
     if compressed.is_some() {
-        if let Some(action) = responses_retry_action(Some(upstream.status().as_u16())) {
+        if upstream.status() == StatusCode::BAD_REQUEST {
+            // A 400 needs its body inspected before any payload-changing
+            // fallback: if the upstream reports an idempotency-key/payload
+            // conflict, the compressed attempt may already have executed
+            // under this key — a client retry after a lost response
+            // carries a fresh transient session UUID in the fingerprint,
+            // so the upstream sees a different payload under the
+            // previously successful key — and a fresh-key fallback would
+            // execute the operation twice (Codex P2, review 5848952420).
+            // Only the 400 path buffers: success and streaming bodies
+            // keep streaming untouched.
+            let content_type = upstream
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+            let context = format!("returned {}", StatusCode::BAD_REQUEST);
+            let attempt = ResponsesRetryAttempt {
+                outbound,
+                body: &body,
+                client_auth: &client_auth,
+                session_id: session_override.unwrap_or("anonymous"),
+                idempotency_key: &idempotency_key,
+                controls: &state.controls,
+            };
+            match upstream.bytes().await {
+                Ok(bytes) => {
+                    let body_text = String::from_utf8_lossy(&bytes).into_owned();
+                    if is_idempotency_conflict(&body_text) {
+                        eprintln!(
+                            "[axiom-ttt] compressed Responses returned 400 idempotency conflict; not falling back with a fresh key"
+                        );
+                        return buffered_upstream_response(
+                            StatusCode::BAD_REQUEST,
+                            content_type,
+                            bytes.to_vec(),
+                        );
+                    }
+                    match responses_retry_action(Some(400), Some(&body_text)) {
+                        Some(action) => {
+                            match retry_responses_forward(forwarder, action, &context, &attempt)
+                                .await
+                            {
+                                Ok(response) => upstream = response,
+                                Err(_) => {
+                                    // The fallback failed: return the
+                                    // original 400 body, not the retry error.
+                                    return buffered_upstream_response(
+                                        StatusCode::BAD_REQUEST,
+                                        content_type,
+                                        bytes.to_vec(),
+                                    );
+                                }
+                            }
+                        }
+                        // Unreachable for a non-conflict 400 (400 is
+                        // retryable), but fail closed: return the 400
+                        // instead of falling back.
+                        None => {
+                            return buffered_upstream_response(
+                                StatusCode::BAD_REQUEST,
+                                content_type,
+                                bytes.to_vec(),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    // The body could not be read, so no conflict could be
+                    // identified: keep the previous status-only behavior
+                    // (attempt the 400 fallback) and surface the retry
+                    // error if it fails.
+                    eprintln!(
+                        "[axiom-ttt] compressed Responses returned 400 but its body could not be read ({error}); falling back on status alone"
+                    );
+                    match retry_responses_forward(
+                        forwarder,
+                        ResponsesRetry::FreshKeyOriginal,
+                        &context,
+                        &attempt,
+                    )
+                    .await
+                    {
+                        Ok(response) => upstream = response,
+                        Err(error) => return map_openai_forwarder_error(error).into_response(),
+                    }
+                }
+            }
+        } else if let Some(action) =
+            responses_retry_action(Some(upstream.status().as_u16()), None)
+        {
             let context = format!("returned {}", upstream.status());
             let attempt = ResponsesRetryAttempt {
                 outbound,

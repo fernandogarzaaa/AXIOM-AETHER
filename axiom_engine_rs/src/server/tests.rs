@@ -48,9 +48,11 @@ mod tests {
         // every status: a drift in either rule fails here, not silently
         // in production. 400 is the only FreshKeyOriginal; every other
         // retryable status resends the same payload; transport failure
-        // (None) also resends the same payload.
+        // (None) also resends the same payload. The body is `None` here
+        // (status-only decision); a 400 whose body reports an
+        // idempotency conflict is excluded by the test below.
         for status in 100..=599u16 {
-            let action = responses_retry_action(Some(status));
+            let action = responses_retry_action(Some(status), None);
             if crate::context_compressor::should_retry_status(status) {
                 assert!(action.is_some(), "status {status} must retry");
                 if status == 400 {
@@ -70,10 +72,59 @@ mod tests {
         }
         assert!(
             matches!(
-                responses_retry_action(None),
+                responses_retry_action(None, None),
                 Some(ResponsesRetry::SamePayload)
             ),
             "transport failure must resend the same payload"
+        );
+    }
+
+    #[test]
+    fn responses_400_idempotency_conflict_excluded_from_fallback() {
+        // Codex P2, review 5848952420: a 400 that reports an
+        // idempotency-key/payload conflict means the first attempt may
+        // already have executed under this key, so no payload-changing
+        // fallback is safe — the fresh-key retry would execute the
+        // operation twice.
+        for body in [
+            r#"{"error":{"message":"Idempotency key reused with different payload","type":"idempotency_error","code":"idempotency_key_reused"}}"#,
+            "idempotency conflict: same key, different request",
+            "Keys for idempotent requests can only be used with the same parameters",
+            "IDEMPOTENCY_KEY_REUSED",
+        ] {
+            assert!(
+                responses_retry_action(Some(400), Some(body)).is_none(),
+                "conflict body must not fall back: {body}"
+            );
+            assert!(is_idempotency_conflict(body), "detector must match: {body}");
+        }
+        // A plain 400 with no conflict still falls back, and a bare
+        // idempotency mention without a conflict token does too.
+        for body in [
+            r#"{"error":"reject fingerprint"}"#,
+            "bad request: model not found",
+            "idempotency-key header missing",
+        ] {
+            assert!(
+                matches!(
+                    responses_retry_action(Some(400), Some(body)),
+                    Some(ResponsesRetry::FreshKeyOriginal)
+                ),
+                "plain 400 must still fall back: {body}"
+            );
+            assert!(!is_idempotency_conflict(body), "detector must not match: {body}");
+        }
+        // The exclusion is 400-only: a conflict body on a 5xx still
+        // resends the same payload under the same key.
+        assert!(
+            matches!(
+                responses_retry_action(
+                    Some(500),
+                    Some("idempotency conflict: same key, different request")
+                ),
+                Some(ResponsesRetry::SamePayload)
+            ),
+            "a 5xx conflict body must still retry the same payload"
         );
     }
 
