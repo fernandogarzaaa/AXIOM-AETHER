@@ -1374,8 +1374,9 @@ fn parse_arm(name: &str) -> Option<Arm> {
 }
 
 /// Run the `paired` subcommand. Returns a process exit code: 0 when the
-/// run completed (guardrail verdicts are printed, not fatal, unless
-/// `--fail-on-guardrail` is given); 2 on a usage error.
+/// run completed, 1 when `--fail-on-guardrail` is given and any
+/// non-baseline arm's verdict is FAIL (including an arm with zero
+/// executed cells, which fails as unevaluable); 2 on a usage error.
 pub fn run_cli(args: &[String]) -> i32 {
     let mut smoke = false;
     let mut demo_regression = false;
@@ -1497,10 +1498,13 @@ pub fn run_cli(args: &[String]) -> i32 {
         if *arm == Arm::Baseline {
             continue;
         }
-        // Only arms with executed cells get a verdict; pending arms are
-        // reported as unevaluable, never silently passed.
+        // Every non-baseline arm gets a verdict, including a
+        // zero-executed arm, which fails as unevaluable ("no executed
+        // tasks"); a FAIL verdict fails the exit status under
+        // --fail-on-guardrail, so a run that executed nothing can
+        // never qualify.
         let verdict = evaluate_guardrail(&baseline, summary, &cfg);
-        if summary.executed > 0 && !verdict.pass {
+        if !verdict.pass {
             any_guardrail_fail = true;
         }
         guardrail_lines.push((
@@ -2178,6 +2182,46 @@ mod tests {
             "solver result must survive a log longer than 4 KiB: {:?}",
             out.solver
         );
+    }
+
+    #[test]
+    fn fail_on_guardrail_fails_when_no_arm_executed() {
+        // Codex P2 (re-review of the final head): with a missing
+        // solver binary, arm D has zero executed cells and its
+        // guardrail verdict is FAIL ("no executed tasks"), but the
+        // exit status ignored that failure, so --fail-on-guardrail
+        // exited 0 without executing the candidate arm. A run that
+        // executed nothing must never qualify.
+        let temp = tempfile::tempdir().unwrap();
+        let code = run_cli(&[
+            "--smoke".to_string(),
+            "--solver-bin".to_string(),
+            "/nonexistent-axiom-binary".to_string(),
+            "--scratch".to_string(),
+            temp.path().join("scratch").to_string_lossy().into_owned(),
+            "--out".to_string(),
+            temp.path()
+                .join("paired.json")
+                .to_string_lossy()
+                .into_owned(),
+            "--fail-on-guardrail".to_string(),
+        ]);
+        assert_eq!(code, 1, "missing solver must fail --fail-on-guardrail");
+        // Without the flag the same run still exits 0: verdicts are
+        // printed, not fatal.
+        let code = run_cli(&[
+            "--smoke".to_string(),
+            "--solver-bin".to_string(),
+            "/nonexistent-axiom-binary".to_string(),
+            "--scratch".to_string(),
+            temp.path().join("scratch2").to_string_lossy().into_owned(),
+            "--out".to_string(),
+            temp.path()
+                .join("paired2.json")
+                .to_string_lossy()
+                .into_owned(),
+        ]);
+        assert_eq!(code, 0);
     }
 
     #[test]
