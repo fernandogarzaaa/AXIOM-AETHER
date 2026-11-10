@@ -16,15 +16,20 @@ derived mechanically from those committed tables, method stated below.
 
 - Paired run: `bench/results/PAIRED-FULL-2026-11-11.md` (PR #293:
   seed 42, 40 cells, arms A-E, 0 pending; rerun reproduced run order
-  and all 40 outcomes).
+  and all 40 outcomes). The file is not on main yet; read it at the
+  #293 head:
+  https://github.com/fernandogarzaaa/AXIOM-AETHER/blob/3c1314b5aaacedcd273c4504dd50dd105d1f2559/bench/results/PAIRED-FULL-2026-11-11.md
 - Seed-424242 baseline: `bench/results/UNSEEN-SEED424242-2026-11-10.md`
   (24-fixture class-balanced subset, 17/24) and
   `bench/results/repair-unseen-seed424242-36-2026-11-10.md` (full
-  36-fixture run, 19/36) (PR #294).
+  36-fixture run, 19/36) (PR #294). Both files are not on main yet;
+  read them at the #294 head:
+  https://github.com/fernandogarzaaa/AXIOM-AETHER/blob/20f1c6037dc3478b60d44818e7beb7f50a5b4b5a/bench/results/UNSEEN-SEED424242-2026-11-10.md
+  https://github.com/fernandogarzaaa/AXIOM-AETHER/blob/20f1c6037dc3478b60d44818e7beb7f50a5b4b5a/bench/results/repair-unseen-seed424242-36-2026-11-10.md
 - Codeflaws baseline: `bench/results/UNSEEN-CODEFLAWS-2026-11-10.md`
   (7/12 repair-test passes) and
   `bench/results/heldout-codeflaws-2026-11-11.md` (4/7 held-out
-  validated) (PR #294).
+  validated) (PR #294), same #294 head as above.
 - Prior held-out anchor: QuixBugs 9/40 (22.5%), from the Phase 4 plan.
 
 ## Inputs: the paired run
@@ -81,33 +86,51 @@ triple with the prior repair-seeded-mesh-core tuning tables (seed 7
 and seed 2026). I reproduced that count from the committed tables
 and split the repair outcomes by it:
 
-- Tuning triples: 56 distinct (file, line, class) triples across
+- Tuning sites: 46 distinct (file, line) sites across
   `bench/results/repair-seeded-mesh-core-2026-v2-2026-11-06.md` and
-  `bench/results/repair-seeded-mesh-core-seed7-2026-11-06.md`.
-  Triples are parsed from fixture names (`<file>-L<line>-<class>-<n>`).
-- Unseen 36: 18 fixtures overlap a tuning triple, 18 do not.
-- Repair split: overlapping sites 12/18 repaired (66.7%); genuinely
-  fresh sites 7/18 repaired (38.9%). Headline 19/36 (52.8%) mixes the
-  two.
+  `bench/results/repair-seeded-mesh-core-seed7-2026-11-06.md`
+  (56 distinct (file, line, class) triples on those sites).
+  Keys are parsed from fixture names (`<file>-L<line>-<class>-<n>`).
+- Unseen 36: 21 fixtures sit at a previously tuned site, 15 at fresh
+  sites. By the narrower (file, line, class) triple, 18 overlap and
+  18 do not. The 3 fixtures that change key are idc-L78-cast (FAIL),
+  idc-L80-shift (FAIL), and mesh-L471-minmax (PASS): same site as a
+  tuning fixture, different class. The site key is the stricter and
+  correct one for a "genuinely unseen" claim, so the site split is
+  the headline and the triple split is reported alongside it.
+- Repair split by site: tuned sites 13/21 repaired (61.9%); fresh
+  sites 6/15 repaired (40.0%). Headline 19/36 (52.8%) mixes the two.
+  By triple: tuned 12/18 (66.7%), fresh 7/18 (38.9%). Both keys agree
+  on the fresh-site rate within about 1 point; the counts differ.
+- Exact repeat: `mesh-L489-flow-04` is the identical fixture in both
+  the seed-2026 tuning table and the unseen table: same name, same
+  mutation (api-swap, L489 `break` -> `continue`), both PASS.
+  `mesh-L491-bool-20` (unseen) repeats the L491 `false` -> `true`
+  mutation tuned as `-09` (seed 2026) and `-19` (seed 7). The overlap
+  is therefore not only same-site-same-class: at least one fault is
+  the same fault. An earlier draft of this file claimed overlapping
+  faults were distinct instances; that claim was wrong and is
+  withdrawn here.
 
 What this does to the claim: the 19/36 number cannot be read as a
-clean held-out rate. It overstates generalization by about 14
-percentage points against the fresh-site rate (52.8% vs 38.9%). The
-honest held-out number from this suite is 7/18 on fresh sites. The
-"genuinely unseen" label applies to 18 fixtures, not 36.
+clean held-out rate. It overstates generalization by about 13
+percentage points against the fresh-site rate (52.8% vs 40.0%). The
+honest held-out number from this suite is 6/15 on fresh sites. The
+"genuinely unseen" label applies to 15 fixtures by site (18 by
+triple), not 36.
 
 What it does not do: it does not overturn the D promotion above,
 which rests on the paired set, a different fixture set. It does not
-imply the 12 overlapping repairs are invalid: an overlapping triple
-is the same site and fault class as a tuning fixture, not the same
-fault instance, and the repair operators were tuned on the tuning
-fixtures, not on these instances. It does mean the suite cannot
-carry a generalization claim at face value.
+imply the overlapping repairs are all invalid: most overlapping
+fixtures are same-site-same-class faults rather than exact repeats
+(only the L489 case is a full-name repeat). It does mean the suite
+cannot carry a generalization claim at face value.
 
 Remediation (not done here, named as the follow-up): regenerate the
-seeded suite at sites with no tuning triple, re-baseline, and report
-the fresh-site rate as the headline. Until then, quote 7/18 fresh
-alongside 19/36, never 19/36 alone.
+seeded suite at sites with no tuning history (file, line), not just
+no matching triple, drop the repeated fixtures, re-baseline, and
+report the fresh-site rate as the headline. Until then, quote 6/15
+fresh alongside 19/36, never 19/36 alone.
 
 The Codeflaws number is the cleaner generalization signal and is
 unaffected by this overlap: different language (C), different oracle

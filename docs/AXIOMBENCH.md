@@ -423,11 +423,13 @@ plus an explicit reliability guardrail):
 - D-regressed: FAIL by design (negative control, unsafe 1.00,
   rollback 0.00).
 - Overlap disclosure: the seed-424242 "genuinely unseen" headline is
-  overstated. 18 of 36 fixtures share a (file, line, class) triple
-  with the prior tuning tables; the clean held-out rate is 7/18 on
-  fresh sites against 12/18 on previously tuned sites, not the
-  headline 19/36. Quote 7/18 alongside 19/36, never 19/36 alone,
-  until the suite is regenerated at new sites and re-baselined.
+  overstated. 21 of 36 fixtures sit at a previously tuned (file, line)
+  site (18 share the full (file, line, class) triple); the clean
+  held-out rate is 6/15 on fresh sites against 13/21 at tuned sites,
+  not the headline 19/36. One fixture, mesh-L489-flow-04, is the
+  identical fault in both the tuning table and the unseen suite. Quote
+  6/15 alongside 19/36, never 19/36 alone, until the suite is
+  regenerated at new sites and re-baselined.
 - Cost guardrail: not-applicable on every arm. The deterministic
   harness spends $0. A real cost verdict needs a live-agent run with
   billed-token accounting; wall-clock time is not a substitute.
