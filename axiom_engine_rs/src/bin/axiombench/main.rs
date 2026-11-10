@@ -7,11 +7,16 @@
 //! Usage: `axiombench [--live] [--out <path>]`
 //!   --live         include the cost pillar (needs a running proxy + corpus)
 //!   --out <path>   results JSON path (default bench/results/<unix_ts>.json)
+//!   `axiombench paired [--smoke] [--demo-regression] ...`
+//!                  run the paired A-E matrix (see paired.rs); smoke mode
+//!                  runs arms A/D on the single-file family end to end.
 
 mod cognition;
 mod corpus;
 mod cost;
 mod fleet;
+mod guardrail;
+mod paired;
 mod trust;
 
 use cognition::PillarResult;
@@ -162,6 +167,7 @@ fn write_results_md(root: &Path, results: &[PillarResult], generated: u64) -> st
 enum Command {
     Bench { live: bool, out: Option<PathBuf> },
     Corpus(Vec<String>),
+    Paired(Vec<String>),
 }
 
 fn parse_args() -> Command {
@@ -170,6 +176,9 @@ fn parse_args() -> Command {
     let argv = std::env::args().skip(1).collect::<Vec<_>>();
     if argv.first().map(String::as_str) == Some("corpus") {
         return Command::Corpus(argv.into_iter().skip(1).collect());
+    }
+    if argv.first().map(String::as_str) == Some("paired") {
+        return Command::Paired(argv.into_iter().skip(1).collect());
     }
     let mut args = argv.into_iter();
     while let Some(a) = args.next() {
@@ -186,6 +195,7 @@ fn main() {
     let command = parse_args();
     let (live, out) = match command {
         Command::Bench { live, out } => (live, out),
+        Command::Paired(args) => std::process::exit(paired::run_cli(&args)),
         Command::Corpus(args) => {
             if let Err(error) = corpus::run(&args) {
                 eprintln!("[axiombench] {error}");

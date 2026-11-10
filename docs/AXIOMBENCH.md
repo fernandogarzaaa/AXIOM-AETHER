@@ -212,6 +212,116 @@ AXIOMBench report must carry one of these three labels next to it, not just
 in a preamble** — the existing `RESULTS.md`'s per-row `n` column is the
 right pattern to extend, not replace.
 
+## 4. Phase 4 prep — paired harness, guardrails, unseen suites (2026-11-10, scaffolding)
+
+This section records what the Phase 4 prep crew built. It is scaffolding:
+the harness runs, the suites exist, the guardrail check is implemented
+and demonstrated, but the FULL paired comparison has not run and its
+results are not guessed anywhere here. It waits until Phase 3 code
+exists on its PR branches or main.
+
+### 4.1 Paired runner
+
+`axiombench paired` (`axiom_engine_rs/src/bin/axiombench/paired.rs`)
+implements the audit section 5 matrix: arms A baseline, B retrieval,
+C CVM, D repair, E full stack; families single-file, multi-file,
+long-session, tool-heavy, failure-recovery; fixed task set, model,
+budget, environment, and oracle recorded in the report JSON
+(`bench/results/paired-<unix>.json`) with a stable fingerprint;
+run order randomized by seed (SplitMix64 + Fisher-Yates, a fixed seed
+reproduces identical order); repeats to estimate variance. Primary
+measure is verified task-success rate; secondaries are end-to-end
+dollar cost, cache-adjusted billed tokens, agent turns, tool calls,
+wall-clock time, first-token latency, unsafe patch rate, and successful
+rollback rate. Every secondary carries its provenance next to the
+value: deterministic arms have no tokens, turns, or first-token
+latency to measure, so those are recorded as not-applicable, never as
+a fabricated zero; dollar cost is 0.0 measured (no API spend).
+
+What executes today: arms A and D on the single-file family
+(`--smoke`), via the real `axiom solve` loop in a scratch copy of each
+`bench/repair/` fixture, following the four steps of
+`scripts/bench_repair.sh` (no-op baseline, solve with no file named
+and isolated heal-memory state, re-verify, pinned-file and rollback
+checks). Arm A runs no solver, so the failing verify stays failing.
+The other families are defined in the task set with their fixture gaps
+named; arms B, C, and E need an agent executor that drives a real
+coding agent with and without AXIOM in the loop, which does not exist
+yet. Those cells are reported as pending, never scored.
+
+```bash
+# Smoke run: arms A/D on the single-file family, one repeat, seed 42:
+cargo run --release --features tools --bin axiombench -- paired --smoke
+# Full scaffold (pending cells reported, not scored):
+cargo run --release --features tools --bin axiombench -- paired
+# Guardrail demonstration (arm D vs a deliberately regressed arm):
+cargo run --release --features tools --bin axiombench -- paired --demo-regression
+```
+
+### 4.2 Guardrail qualification
+
+`axiom_engine_rs/src/bin/axiombench/guardrail.rs` implements the
+audit section 5 promotion rule as part of the bench runner output
+(pass/fail per arm vs baseline, printed and written into the paired
+report JSON under `guardrails`):
+
+- **Task-success non-inferiority.** The arm's verified task-success
+  rate must stay within 5 percentage points of the baseline arm's
+  rate. A cheaper arm that solves fewer tasks does not promote.
+- **Reliability guardrail.** Unsafe patch rate must be 0 (no edit to
+  the oracle, ever) and successful rollback rate over failed attempts
+  must be 1.0 (every failed attempt leaves the tree byte-identical).
+- **Cost guardrail.** When the baseline has a measured cost per
+  success, the arm's cost per success must not exceed it by more than
+  2x. When either side has no measured cost (the deterministic harness
+  spends $0), the rule is recorded as not-applicable, never as a pass
+  on invented numbers.
+- An arm with no executed cells cannot be evaluated: the verdict is a
+  fail with reason "no executed tasks", not a silent pass.
+
+Demonstration (local run, `--demo-regression`): the baseline arm
+passes against itself, arm D passes on the smoke family, and the
+deliberately regressed arm (solver sabotaged to edit a pinned file
+and skip rollback) fails on the reliability guardrail even though its
+verifier goes green. See the run output recorded in
+`bench/results/paired-*.json` for the run that demonstrates it.
+
+### 4.3 Genuinely unseen bug suites
+
+Two suites under `bench/corpus/`, both excluded from all tuning until
+the qualification run:
+
+- **Seeded, seed 424242** (`bench/corpus/unseen-seed424242/`): 24 fresh
+  seeded faults in `axiom_mesh_core` from a different seed and a
+  revised generator (new `strlit` class) than seeds 7/2026. See its
+  README for the unseen argument and the honest caveat that `strlit`
+  contributed 0 faults in this crate. Baseline recorded in
+  `bench/results/UNSEEN-SEED424242-2026-11-10.md`.
+- **Human-written, Codeflaws** (`bench/corpus/unseen-codeflaws/`): 12
+  human-written C defects crawled from Codeforces (Tan et al.),
+  imported by `scripts/import_codeflaws.py` under a deterministic
+  selection rule (first WRONG_ANSWER defects in detail-file order with
+  a ≤150-line buggy submission, ≤15-line fix diff, ≥2 repair-test
+  inputs; accepted program must pass and buggy program must fail the
+  fixture oracle, or the defect is skipped). Unseen because no repair
+  operator or ordering rule was ever tuned on Codeflaws, and because
+  its programs are C single-file submissions, a different language and
+  shape from QuixBugs' Python algorithms. Baseline recorded in
+  `bench/results/UNSEEN-CODEFLAWS-2026-11-10.md`.
+
+### 4.4 Open items (blocked on Phase 3 code or the agent executor)
+
+- The agent executor for arms B, C, and E (real coding agent with and
+  without AXIOM in the loop, with token/cost/turn accounting).
+- On-disk fixtures for the multi-file, long-session, tool-heavy, and
+  failure-recovery families (gaps named per task in `paired.rs`).
+- The full paired comparison run (all arms x all families x repeats)
+  and its guardrail verdicts. It waits for Phase 3 code on its PR
+  branches or main; the harness does not guess its results.
+- Per-stage latency / first-token latency wiring from Phase 3 item 5
+  into the paired secondaries (currently not-applicable for
+  deterministic arms).
+
 ---
 
 ## Reproduce what exists today
