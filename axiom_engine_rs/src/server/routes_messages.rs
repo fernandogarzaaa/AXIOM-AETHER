@@ -1466,15 +1466,39 @@ async fn compressed_openai_chat_path(
     record_savings(state, &session_id, bytes_in, bytes_out);
 
     if let Some(router) = state.swarm_router.as_ref().as_ref() {
-        match router.route_chat_payload(&outbound).await {
-            Ok(local) => {
-                state
-                    .sandbox_local_synthesis(&session_id, &local.content)
-                    .await;
-                return local_openai_chat_response(&outbound, local);
+        // Genuine token streaming (Phase 3 item 1): when the client asked
+        // for a stream, dispatch with "stream": true and feed the Ollama
+        // NDJSON deltas through a bounded channel into the SSE body as they
+        // arrive, instead of buffering the whole answer and emitting it as
+        // one body. The non-stream path below is untouched.
+        if outbound
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            match router.route_chat_stream(&outbound).await {
+                Ok(stream) => {
+                    return local_openai_chat_stream_response(state, &session_id, stream);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[swarm-router] local OpenAI stream route unavailable; falling back: {e}"
+                    )
+                }
             }
-            Err(e) => {
-                eprintln!("[swarm-router] local OpenAI route unavailable; falling back: {e}")
+        } else {
+            match router.route_chat_payload(&outbound).await {
+                Ok(local) => {
+                    state
+                        .sandbox_local_synthesis(&session_id, &local.content)
+                        .await;
+                    return local_openai_chat_response(local);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[swarm-router] local OpenAI route unavailable; falling back: {e}"
+                    )
+                }
             }
         }
     }
@@ -1618,41 +1642,16 @@ fn openai_assistant_answer(body: &str) -> String {
     answer
 }
 
-fn local_openai_chat_response(
-    outbound: &Value,
-    local: SwarmChatResult,
-) -> Result<Response, ApiError> {
+/// Non-stream local OpenAI-compatible chat completion: one JSON object.
+/// The old stream branch built the ENTIRE SSE body as one String from the
+/// already-complete content and returned it as a single body; that fake
+/// stream is gone. Streaming is `local_openai_chat_stream_response`, fed by
+/// the bounded channel from `SwarmRouter::route_chat_stream`.
+fn local_openai_chat_response(local: SwarmChatResult) -> Result<Response, ApiError> {
     let completion_id = format!("chatcmpl-local-{}", Uuid::new_v4());
     let created = unix_now();
     let model = local.model;
     let content = local.content;
-    let stream = outbound
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    if stream {
-        let mut body = String::new();
-        for piece in content.split_inclusive(' ') {
-            body.push_str("data: ");
-            body.push_str(&openai_stream_delta(
-                &completion_id,
-                created,
-                &model,
-                piece,
-            )?);
-            body.push_str("\n\n");
-        }
-        body.push_str("data: ");
-        body.push_str(&openai_stream_stop(&completion_id, created, &model)?);
-        body.push_str("\n\n");
-        body.push_str("data: [DONE]\n\n");
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(axum::body::Body::from(body))
-            .map_err(|e| ApiError::Internal(format!("local stream response build failed: {e}")));
-    }
 
     let body = openai_completion_body(&completion_id, created, &model, &content)?;
     Response::builder()
@@ -1660,6 +1659,125 @@ fn local_openai_chat_response(
         .header(header::CONTENT_TYPE, "application/json")
         .body(axum::body::Body::from(body))
         .map_err(|e| ApiError::Internal(format!("local response build failed: {e}")))
+}
+
+/// Phases of the channel-fed local SSE body: deltas while the Ollama stream
+/// runs, then the terminal stop chunk, then the `[DONE]` sentinel.
+enum LocalStreamPhase {
+    Deltas,
+    Stop,
+    Done,
+    End,
+}
+
+struct LocalStreamState {
+    receiver: Option<
+        tokio::sync::mpsc::Receiver<Result<String, crate::swarm_router::SwarmRouteError>>,
+    >,
+    completion_id: String,
+    created: u64,
+    model: String,
+    accumulated: String,
+    phase: LocalStreamPhase,
+    state: AppState,
+    session_id: String,
+}
+
+/// Channel-fed local SSE body: each delta arriving on the bounded channel
+/// becomes one `chat.completion.chunk` event as it arrives. Nothing is
+/// buffered up front, so the first token reaches the client while Ollama is
+/// still generating. Dropping the SSE stream (client disconnect) drops the
+/// channel receiver, which aborts the upstream Ollama request.
+fn local_openai_chat_stream_response(
+    state: &AppState,
+    session_id: &str,
+    stream: crate::swarm_router::SwarmStream,
+) -> Result<Response, ApiError> {
+    let completion_id = format!("chatcmpl-local-{}", Uuid::new_v4());
+    let created = unix_now();
+    let sse_stream = stream::unfold(
+        LocalStreamState {
+            receiver: Some(stream.receiver),
+            completion_id,
+            created,
+            model: stream.model,
+            accumulated: String::new(),
+            phase: LocalStreamPhase::Deltas,
+            state: state.clone(),
+            session_id: session_id.to_string(),
+        },
+        |mut st| async move {
+            loop {
+                match st.phase {
+                    LocalStreamPhase::Deltas => {
+                        let rx = st.receiver.as_mut()?;
+                        match rx.recv().await {
+                            Some(Ok(delta)) => {
+                                st.accumulated.push_str(&delta);
+                                let Ok(frame) = openai_stream_delta(
+                                    &st.completion_id,
+                                    st.created,
+                                    &st.model,
+                                    &delta,
+                                ) else {
+                                    return None;
+                                };
+                                return Some((
+                                    Ok::<Event, Infallible>(Event::default().data(frame)),
+                                    st,
+                                ));
+                            }
+                            Some(Err(e)) => {
+                                // Upstream failed mid-stream: end without
+                                // the [DONE] sentinel so the client sees an
+                                // incomplete stream instead of a clean stop.
+                                eprintln!(
+                                    "[swarm-router] local stream upstream error: {e}"
+                                );
+                                return None;
+                            }
+                            None => {
+                                st.phase = LocalStreamPhase::Stop;
+                            }
+                        }
+                    }
+                    LocalStreamPhase::Stop => {
+                        st.phase = LocalStreamPhase::Done;
+                        // Mirror the non-stream path: run the sandbox
+                        // synthesis pass over the assembled answer once the
+                        // stream completes. Detached: the client already has
+                        // every token.
+                        let synth_state = st.state.clone();
+                        let synth_session = st.session_id.clone();
+                        let content = std::mem::take(&mut st.accumulated);
+                        tokio::spawn(async move {
+                            synth_state
+                                .sandbox_local_synthesis(&synth_session, &content)
+                                .await;
+                        });
+                        let Ok(frame) =
+                            openai_stream_stop(&st.completion_id, st.created, &st.model)
+                        else {
+                            return None;
+                        };
+                        return Some((
+                            Ok::<Event, Infallible>(Event::default().data(frame)),
+                            st,
+                        ));
+                    }
+                    LocalStreamPhase::Done => {
+                        st.phase = LocalStreamPhase::End;
+                        return Some((
+                            Ok::<Event, Infallible>(Event::default().data("[DONE]")),
+                            st,
+                        ));
+                    }
+                    LocalStreamPhase::End => return None,
+                }
+            }
+        },
+    );
+    Ok(Sse::new(sse_stream).into_response())
 }
 
 fn openai_stream_delta(

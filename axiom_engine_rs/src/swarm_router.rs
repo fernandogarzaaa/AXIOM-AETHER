@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,6 +13,34 @@ use crate::mesh_router::MeshModelSelector;
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_MODELS: [&str; 4] = ["phi4:3.8b", "deepseek-r1:8b", "llama3.3:8b", "llama3.1:8b"];
 const DEFAULT_NUM_CTX: u64 = 4096;
+
+/// How long one streamed generation may run. The non-stream dispatch caps
+/// the whole request at `config.timeout_ms` (2 s by default), which a token
+/// stream outlives by design, so the streaming request carries its own
+/// generous cap instead. Client disconnect still aborts the request
+/// immediately, via the dropped channel receiver.
+const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// Upper bound on the upstream error body embedded in
+/// [`SwarmRouteError::Upstream`]. An error page can be arbitrarily large,
+/// and embedding all of it would bloat every log line and error string
+/// downstream, so only the head is kept.
+const MAX_UPSTREAM_ERROR_BODY_CHARS: usize = 512;
+
+/// Upper bound on the upstream error body read from the wire, in bytes.
+/// Four bytes cover the longest single UTF-8 char, so this cap always
+/// yields at least MAX_UPSTREAM_ERROR_BODY_CHARS characters.
+const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 2048;
+
+/// How long the bounded error-body read may take. A slow error body must
+/// not delay cloud fallback.
+const UPSTREAM_ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound of the streaming channel between the Ollama producer task and the
+/// SSE consumer. This is the backpressure mechanism: a slow consumer blocks
+/// the producer on `send` once 16 deltas are queued, instead of the
+/// producer accumulating the whole generation in memory.
+pub const SWARM_STREAM_CHANNEL_CAPACITY: usize = 16;
 
 #[derive(Clone)]
 pub struct SwarmRouter {
@@ -73,6 +102,19 @@ pub struct SwarmChatResult {
     pub content: String,
 }
 
+/// A live token stream from one Ollama `/api/chat` dispatch.
+///
+/// The producer task posts with `"stream": true`, parses NDJSON delta lines
+/// as they arrive, and sends each non-empty delta through the bounded
+/// channel. The receiver is the SSE body: dropping it (client disconnect)
+/// makes the producer's next `send` fail, which drops the upstream response
+/// and aborts the Ollama request. The channel closing without an error item
+/// means the stream completed cleanly (the final `done` line arrived).
+pub struct SwarmStream {
+    pub model: String,
+    pub receiver: tokio::sync::mpsc::Receiver<Result<String, SwarmRouteError>>,
+}
+
 #[derive(Debug, Deserialize)]
 struct OllamaTags {
     #[serde(default)]
@@ -124,6 +166,16 @@ impl SwarmRouter {
         &self.config
     }
 
+    /// Last mesh latency (ms) recorded for `model` on this router, if
+    /// any. `None` when mesh routing is off or no outcome has been
+    /// recorded yet. Observability hook: see
+    /// `MeshModelSelector::last_recorded_latency_ms`.
+    pub fn last_recorded_mesh_latency_ms(&self, model: &str) -> Option<u64> {
+        self.mesh_selector
+            .as_ref()
+            .and_then(|selector| selector.last_recorded_latency_ms(model))
+    }
+
     pub async fn route_chat_payload(
         &self,
         payload: &Value,
@@ -132,15 +184,7 @@ impl SwarmRouter {
             return Err(SwarmRouteError::Disabled);
         }
 
-        let available = self.available_models().await?;
-        let model = match &self.mesh_selector {
-            Some(selector) => selector.select(&available),
-            None => select_model(&self.config.model_candidates, &available),
-        }
-        .ok_or_else(|| SwarmRouteError::NoModel {
-            requested: self.config.model_candidates.clone(),
-            available: available.clone(),
-        })?;
+        let model = self.select_model_for_dispatch().await?;
 
         // Timed and outcome-recorded as one unit so the mesh selector (when
         // enabled) learns from exactly what happened dispatching to this
@@ -153,6 +197,94 @@ impl SwarmRouter {
         }
         let content = result?;
         Ok(SwarmChatResult { model, content })
+    }
+
+    /// Streaming dispatch: POST `/api/chat` with `"stream": true` and return
+    /// immediately with the channel the producer task feeds. The caller
+    /// (the SSE body) receives deltas as Ollama emits them; this function
+    /// never waits for the full generation.
+    ///
+    /// The `/api/chat` POST and status check run here, before the channel
+    /// exists and before any response is committed: a startup failure
+    /// (connect error or non-success status) returns `Err`, so the route
+    /// can fall through to the cloud forwarder instead of committing an
+    /// empty SSE stream. Only the established body stream is handed to
+    /// the spawned producer. A failure after content has been emitted
+    /// still ends the stream with an error, since the response is
+    /// committed by then.
+    pub async fn route_chat_stream(&self, payload: &Value) -> Result<SwarmStream, SwarmRouteError> {
+        if !self.config.enabled {
+            return Err(SwarmRouteError::Disabled);
+        }
+        let model = self.select_model_for_dispatch().await?;
+        let messages = translate_messages(payload);
+        let dispatch_started = Instant::now();
+        let (response, started) = match start_stream_request(
+            &self.client,
+            &self.config.base_url,
+            &model,
+            self.config.num_ctx,
+            messages,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A startup failure never reaches the producer task, so
+                // record it here: without this the selector never learns
+                // the model is failing and keeps preferring it. Only
+                // startup failures record; a client disconnect still
+                // records nothing (see the Cancelled exclusion below).
+                if let Some(selector) = &self.mesh_selector {
+                    selector.record_outcome(
+                        &model,
+                        false,
+                        dispatch_started.elapsed().as_millis() as u64,
+                    );
+                }
+                return Err(e);
+            }
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(SWARM_STREAM_CHANNEL_CAPACITY);
+        let mesh_selector = self.mesh_selector.clone();
+        let stream_model = model.clone();
+        tokio::spawn(async move {
+            let outcome = run_stream_dispatch(response, started, tx).await;
+            // A cancellation says nothing about the model: the client
+            // went away, so recording it as a failure would train the
+            // selector away from healthy models. Completed and Failed
+            // both feed the selector unchanged.
+            if let (Some(selector), false) =
+                (&mesh_selector, matches!(outcome, StreamOutcome::Cancelled))
+            {
+                // Latency runs from dispatch, not from the spawned task:
+                // a model that spends time loading before returning
+                // headers must not earn a fast-model reward for the short
+                // response that follows. This matches the first-token
+                // timer, which already starts before dispatch.
+                selector.record_outcome(
+                    &stream_model,
+                    matches!(outcome, StreamOutcome::Completed),
+                    dispatch_started.elapsed().as_millis() as u64,
+                );
+            }
+        });
+        Ok(SwarmStream {
+            model,
+            receiver: rx,
+        })
+    }
+
+    async fn select_model_for_dispatch(&self) -> Result<String, SwarmRouteError> {
+        let available = self.available_models().await?;
+        match &self.mesh_selector {
+            Some(selector) => selector.select(&available),
+            None => select_model(&self.config.model_candidates, &available),
+        }
+        .ok_or_else(|| SwarmRouteError::NoModel {
+            requested: self.config.model_candidates.clone(),
+            available,
+        })
     }
 
     async fn dispatch_to_model(
@@ -220,6 +352,287 @@ impl SwarmRouter {
         }
         parse_tags_models(&body).map_err(SwarmRouteError::Decode)
     }
+}
+
+/// Outcome of one streamed dispatch, for mesh-selector learning.
+/// `Completed` and `Failed` feed `record_outcome`; `Cancelled` must not:
+/// a client disconnect (dropped receiver, failed send, or `tx.closed()`
+/// winning the race) says nothing about the model, and recording it as a
+/// failure would train the selector away from healthy models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Dispatch preamble for [`SwarmRouter::route_chat_stream`]: POST
+/// `/api/chat` with `"stream": true` and check the status, returning the
+/// established response plus the dispatch instant. First-token latency
+/// runs from dispatch, not from headers: a slow model load before the
+/// first token counts. This runs before the channel exists, so a startup
+/// failure is a plain `Err` the route can fall back from, instead of an
+/// Reads at most a bounded prefix of an upstream error body, with a short
+/// deadline. A non-success response can carry an arbitrarily large or slow
+/// body; consuming all of it would stall the fallback path, so only the
+/// head is read and only briefly. A multi-byte char cut by the byte cap
+/// becomes a replacement character, which is fine for an error string.
+async fn read_error_body_prefix(response: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let mut stream = response.bytes_stream();
+    let read = async {
+        while buf.len() < MAX_UPSTREAM_ERROR_BODY_BYTES {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    let take = (MAX_UPSTREAM_ERROR_BODY_BYTES - buf.len()).min(chunk.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(UPSTREAM_ERROR_BODY_READ_TIMEOUT, read).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// error item on an already-committed SSE stream.
+async fn start_stream_request(
+    client: &Client,
+    base_url: &str,
+    model: &str,
+    num_ctx: u64,
+    messages: Vec<Value>,
+) -> Result<(reqwest::Response, Instant), SwarmRouteError> {
+    let request = json!({
+        "model": model,
+        "stream": true,
+        "messages": messages,
+        "options": {
+            "num_ctx": num_ctx
+        }
+    });
+    let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
+    let started = Instant::now();
+    let response = client
+        .post(url)
+        .json(&request)
+        .timeout(STREAM_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| SwarmRouteError::Upstream(e.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = read_error_body_prefix(response).await;
+        let body: String = body.chars().take(MAX_UPSTREAM_ERROR_BODY_CHARS).collect();
+        return Err(SwarmRouteError::Upstream(format!(
+            "ollama status {}: {}",
+            status.as_u16(),
+            body
+        )));
+    }
+    Ok((response, started))
+}
+
+/// Producer half of [`SwarmStream`]: streams one Ollama `/api/chat`
+/// response, sending each content delta through the bounded channel as it
+/// arrives. Returns [`StreamOutcome::Completed`] only when the upstream
+/// stream ended with a `done` line. The channel is the backpressure mechanism: `send` blocks
+/// while it is full, so a slow consumer stalls this task instead of letting
+/// it accumulate the whole generation. A dropped receiver (client
+/// disconnect) makes `send` fail, and this task then returns
+/// [`StreamOutcome::Cancelled`], dropping the response and aborting the
+/// upstream request. The disconnect is also observed while waiting for
+/// upstream data: every body read races against `tx.closed()`, so an
+/// abandoned request does not keep consuming inference resources for up
+/// to the request timeout. A stream that ends without a `done` line is an
+/// upstream error, not a clean stop: the SSE layer must not bless a
+/// truncated answer with `[DONE]`.
+async fn run_stream_dispatch(
+    response: reqwest::Response,
+    started: Instant,
+    tx: tokio::sync::mpsc::Sender<Result<String, SwarmRouteError>>,
+) -> StreamOutcome {
+    let mut byte_stream = response.bytes_stream();
+    let mut assembler = OllamaLineAssembler::new();
+    let mut first_token = true;
+    let mut done = false;
+    while !done {
+        let chunk = tokio::select! {
+            next = byte_stream.next() => match next {
+                Some(Ok(bytes)) => bytes,
+                Some(Err(e)) => {
+                    let _ = tx
+                        .send(Err(SwarmRouteError::Upstream(format!(
+                            "body read failed: {e}"
+                        ))))
+                        .await;
+                    return StreamOutcome::Failed;
+                }
+                None => break,
+            },
+            _ = tx.closed() => return StreamOutcome::Cancelled,
+        };
+        let lines = match assembler.push(&chunk) {
+            Ok(lines) => lines,
+            Err(e) => {
+                let _ = tx.send(Err(e)).await;
+                return StreamOutcome::Failed;
+            }
+        };
+        for line in lines {
+            match parse_ollama_stream_line(&line) {
+                Ok(parsed) => {
+                    if !parsed.delta.is_empty() {
+                        if first_token {
+                            crate::metrics::observe_first_token_latency(
+                                started.elapsed().as_secs_f64(),
+                            );
+                            first_token = false;
+                        }
+                        if tx.send(Ok(parsed.delta)).await.is_err() {
+                            return StreamOutcome::Cancelled;
+                        }
+                    }
+                    if parsed.done {
+                        done = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return StreamOutcome::Failed;
+                }
+            }
+        }
+    }
+    if !done {
+        // Trailing bytes with no newline terminator: one last parse attempt.
+        // A stream that ends without a `done` line is incomplete, not a
+        // clean stop: report it so the SSE layer ends without `[DONE]`
+        // instead of blessing a truncated answer.
+        let remainder = assembler.remainder();
+        if let Ok(parsed) = parse_ollama_stream_line(remainder.trim()) {
+            if !parsed.delta.is_empty() {
+                if first_token {
+                    crate::metrics::observe_first_token_latency(started.elapsed().as_secs_f64());
+                }
+                if tx.send(Ok(parsed.delta)).await.is_err() {
+                    return StreamOutcome::Cancelled;
+                }
+            }
+            done = parsed.done;
+        }
+    }
+    if !done {
+        let _ = tx
+            .send(Err(SwarmRouteError::Upstream(
+                "ollama stream ended without a done line".to_string(),
+            )))
+            .await;
+        return StreamOutcome::Failed;
+    }
+    StreamOutcome::Completed
+}
+
+/// Maximum bytes one unterminated NDJSON line may occupy. Without a cap
+/// a missing newline lets the buffer grow until the 30-minute request
+/// timeout ends the stream.
+const MAX_NDJSON_LINE_BYTES: usize = 1 << 20;
+
+/// Assembles newline-delimited records from raw byte chunks. Decoding
+/// happens per complete line, never per network chunk: a multibyte UTF-8
+/// character split across two TCP segments stays intact, because its bytes
+/// are only decoded once the terminating newline has arrived (a UTF-8
+/// sequence never contains `0x0A`).
+struct OllamaLineAssembler {
+    buf: Vec<u8>,
+    /// Offset up to which `buf` has already been scanned for a newline.
+    /// Each push only scans the bytes appended since the last scan, so a
+    /// long unterminated line costs linear time instead of a full rescan
+    /// per push. Reset to 0 whenever a line is drained, since the drain
+    /// shifts the unscanned tail to the front.
+    scan_offset: usize,
+}
+
+impl OllamaLineAssembler {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            scan_offset: 0,
+        }
+    }
+
+    /// Feed raw bytes; returns each complete line, without the newline.
+    /// Fails with `SwarmRouteError::Upstream` when the unterminated tail
+    /// passes `MAX_NDJSON_LINE_BYTES`: an upstream that never sends a
+    /// newline must not grow the buffer unbounded.
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, SwarmRouteError> {
+        self.buf.extend_from_slice(bytes);
+        let mut lines = Vec::new();
+        loop {
+            match self.buf[self.scan_offset..]
+                .iter()
+                .position(|b| *b == b'\n')
+            {
+                Some(relative) => {
+                    let newline = self.scan_offset + relative;
+                    let line_bytes: Vec<u8> = self.buf.drain(..=newline).collect();
+                    lines.push(String::from_utf8_lossy(&line_bytes).trim().to_string());
+                    self.scan_offset = 0;
+                }
+                None => {
+                    self.scan_offset = self.buf.len();
+                    break;
+                }
+            }
+        }
+        if self.buf.len() > MAX_NDJSON_LINE_BYTES {
+            return Err(SwarmRouteError::Upstream(
+                "ollama stream line exceeded maximum length".to_string(),
+            ));
+        }
+        Ok(lines)
+    }
+
+    /// Remaining bytes with no newline terminator (a truncated final line).
+    fn remainder(&self) -> String {
+        String::from_utf8_lossy(&self.buf).into_owned()
+    }
+}
+
+/// One parsed line of Ollama's streaming `/api/chat` NDJSON body.
+struct OllamaStreamLine {
+    delta: String,
+    done: bool,
+}
+
+/// Parse one NDJSON line from a streaming Ollama `/api/chat` response.
+/// Content comes from `message.content` (chat) with `response` (generate)
+/// as a fallback; `done` marks the terminal line, which may itself carry
+/// the last content. An `error` field or unparseable line fails the stream
+/// instead of being silently skipped.
+fn parse_ollama_stream_line(line: &str) -> Result<OllamaStreamLine, SwarmRouteError> {
+    if line.is_empty() {
+        return Ok(OllamaStreamLine {
+            delta: String::new(),
+            done: false,
+        });
+    }
+    let value: Value = serde_json::from_str(line)
+        .map_err(|e| SwarmRouteError::Upstream(format!("ollama stream line decode failed: {e}")))?;
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        return Err(SwarmRouteError::Upstream(format!(
+            "ollama stream error: {error}"
+        )));
+    }
+    let delta = value
+        .pointer("/message/content")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("response").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let done = value.get("done").and_then(Value::as_bool).unwrap_or(false);
+    Ok(OllamaStreamLine { delta, done })
 }
 
 impl SwarmRouterConfig {
@@ -335,6 +748,123 @@ fn env_truthy(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_assembler_keeps_multibyte_chars_split_across_chunks() {
+        let mut assembler = OllamaLineAssembler::new();
+        let line = "{\"message\":{\"role\":\"assistant\",\"content\":\"a🦀b\"},\"done\":false}\n";
+        let bytes = line.as_bytes();
+        // Split inside the crab emoji (4 bytes F0 9F A6 80): decoding the
+        // first half on its own would corrupt it into replacement chars.
+        let crab = line.find('🦀').unwrap();
+        let split = crab + 2;
+        let first = assembler.push(&bytes[..split]).unwrap();
+        assert!(
+            first.is_empty(),
+            "no complete line before the newline arrives"
+        );
+        let rest = assembler.push(&bytes[split..]).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert!(
+            rest[0].contains('🦀'),
+            "emoji must survive the split: {}",
+            rest[0]
+        );
+        assert_eq!(assembler.remainder(), "");
+    }
+
+    #[test]
+    fn line_assembler_returns_each_complete_line_in_order() {
+        let mut assembler = OllamaLineAssembler::new();
+        let lines = assembler.push(b"{\"a\":1}\n{\"b\":2}\n{\"c\":3").unwrap();
+        assert_eq!(lines, vec!["{\"a\":1}", "{\"b\":2}"]);
+        assert_eq!(assembler.remainder(), "{\"c\":3");
+        let lines = assembler.push(b"}\n").unwrap();
+        assert_eq!(lines, vec!["{\"c\":3}"]);
+        assert_eq!(assembler.remainder(), "");
+    }
+
+    #[test]
+    fn line_assembler_rejects_unterminated_line_past_cap() {
+        let mut assembler = OllamaLineAssembler::new();
+        // Exactly at the cap is still accepted; one byte more fails.
+        let at_cap = vec![b'x'; MAX_NDJSON_LINE_BYTES];
+        assert!(assembler.push(&at_cap).unwrap().is_empty());
+        assert!(assembler.push(b"x").is_err());
+
+        // The cap also trips when the line grows across many small
+        // pushes, not just one big one.
+        let mut assembler = OllamaLineAssembler::new();
+        for _ in 0..=MAX_NDJSON_LINE_BYTES / 1024 {
+            if assembler.push(&[b'y'; 1024]).is_err() {
+                return;
+            }
+        }
+        panic!("assembler accepted more than the cap across small pushes");
+    }
+
+    #[test]
+    fn line_assembler_completes_long_line_fed_in_small_chunks() {
+        // A 512 KiB line fed 1 KiB at a time exercises the scan offset:
+        // each push must only scan its new bytes and still deliver the
+        // line intact once the newline arrives.
+        let mut assembler = OllamaLineAssembler::new();
+        let chunk = [b'z'; 1024];
+        for _ in 0..512 {
+            assert!(assembler.push(&chunk).unwrap().is_empty());
+        }
+        let lines = assembler.push(b"\n").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), 512 * 1024);
+        assert_eq!(assembler.remainder(), "");
+    }
+
+    #[test]
+    fn stream_line_parses_delta_and_done_flag() {
+        let parsed = parse_ollama_stream_line(
+            r#"{"message":{"role":"assistant","content":"Hel"},"done":false}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.delta, "Hel");
+        assert!(!parsed.done);
+
+        let parsed = parse_ollama_stream_line(
+            r#"{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.delta, "");
+        assert!(parsed.done);
+    }
+
+    #[test]
+    fn stream_line_carries_final_content_with_done() {
+        let parsed = parse_ollama_stream_line(
+            r#"{"message":{"role":"assistant","content":"world"},"done":true}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.delta, "world");
+        assert!(parsed.done);
+    }
+
+    #[test]
+    fn stream_line_falls_back_to_response_field() {
+        let parsed = parse_ollama_stream_line(r#"{"response":"hi","done":false}"#).unwrap();
+        assert_eq!(parsed.delta, "hi");
+        assert!(!parsed.done);
+    }
+
+    #[test]
+    fn stream_line_empty_is_no_delta_no_done() {
+        let parsed = parse_ollama_stream_line("").unwrap();
+        assert_eq!(parsed.delta, "");
+        assert!(!parsed.done);
+    }
+
+    #[test]
+    fn stream_line_error_and_malformed_fail_the_stream() {
+        assert!(parse_ollama_stream_line(r#"{"error":"model not found"}"#).is_err());
+        assert!(parse_ollama_stream_line("not json at all").is_err());
+    }
 
     #[test]
     fn parses_tags_and_selects_first_available_candidate() {

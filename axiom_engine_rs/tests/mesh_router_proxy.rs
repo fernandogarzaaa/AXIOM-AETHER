@@ -46,6 +46,21 @@ async fn chat_handler(
         )
             .into_response();
     }
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        // Streaming reply: one NDJSON content line plus the terminal
+        // `done` line, as Ollama emits for `"stream": true`. Without the
+        // terminal line the producer reports the stream Failed and the
+        // selector would penalize a healthy model.
+        let ndjson = format!(
+            "{{\"message\":{{\"role\":\"assistant\",\"content\":\"ok from {model}\"}},\"done\":false}}\n{{\"done\":true}}\n"
+        );
+        return (
+            axum::http::StatusCode::OK,
+            [("content-type", "application/x-ndjson")],
+            ndjson,
+        )
+            .into_response();
+    }
     Json(json!({"message": {"role": "assistant", "content": format!("ok from {model}")}}))
         .into_response()
 }
@@ -116,6 +131,48 @@ async fn mesh_routing_learns_around_a_failing_top_priority_model() {
     // deliberately tight — a bug here previously took 8-13 failed calls
     // to recover from (see record_outcome's doc comment), and a loose
     // bound would hide a regression back to that behavior.
+    assert!(
+        deepseek_count >= 18,
+        "expected mesh routing to recover within ~1-2 calls, got phi4={phi4_count} deepseek={deepseek_count}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_routing_learns_around_a_failing_top_priority_model_on_streaming() {
+    // Streaming mirror of mesh_routing_learns_around_a_failing_top_priority_model:
+    // phi4 is top priority but always 500s on /api/chat startup, while
+    // deepseek streams fine. Over repeated calls, mesh routing must learn
+    // to stop sending traffic to phi4. Before the fix, a startup failure
+    // exited through `?` before record_outcome, so the selector never
+    // learned and every call retried phi4.
+    let (base_url, mock) = start_mock(vec!["phi4:3.8b".to_string()]).await;
+    let router = SwarmRouter::new(config(base_url, true));
+
+    for _ in 0..20 {
+        match router
+            .route_chat_stream(&json!({"messages": [{"role": "user", "content": "hi"}]}))
+            .await
+        {
+            Ok(mut stream) => {
+                // Drain to completion so the healthy model's Completed
+                // outcome is recorded before the next selection.
+                while stream.receiver.recv().await.is_some() {}
+            }
+            Err(e) => {
+                assert!(
+                    matches!(e, SwarmRouteError::Upstream(_)),
+                    "expected startup Upstream error, got {e:?}"
+                );
+            }
+        }
+    }
+
+    let dispatched = mock.dispatched.lock().unwrap();
+    let phi4_count = dispatched.iter().filter(|m| *m == "phi4:3.8b").count();
+    let deepseek_count = dispatched.iter().filter(|m| *m == "deepseek-r1:8b").count();
+    assert_eq!(phi4_count + deepseek_count, 20);
+    // Same tight bound as the payload mirror: one recorded startup
+    // failure should hand every subsequent call to deepseek.
     assert!(
         deepseek_count >= 18,
         "expected mesh routing to recover within ~1-2 calls, got phi4={phi4_count} deepseek={deepseek_count}"
