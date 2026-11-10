@@ -111,7 +111,6 @@ impl Arm {
                 ("AXIOM_TTT_COMPRESS", "1"),
                 ("AXIOM_RESPONSES_COMPRESS", "1"),
                 ("AXIOM_VIBE", "0"),
-                ("AXIOM_HEAL_MEMORY", "0"),
             ],
             Arm::Repair | Arm::Regressed => &[
                 ("AXIOM_TTT_COMPRESS", "0"),
@@ -788,7 +787,8 @@ fn run_bounded(
                     combined.push_str(&text);
                 }
                 if combined.len() > 4096 {
-                    combined.truncate(4096);
+                    let cut = floor_char_boundary(&combined, 4096);
+                    combined.truncate(cut);
                 }
                 return Ok((status.success(), combined, peak));
             }
@@ -892,6 +892,19 @@ impl ExecCtx {
     }
 }
 
+/// Clamp a byte index down to a UTF-8 char boundary in `s` (never
+/// above `s.len()`). `str::truncate` and byte-index slicing panic when
+/// the cut lands inside a multi-byte character; solver output can
+/// contain non-ASCII paths and arrows, so every truncation in this
+/// module goes through here.
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 fn how_from_log(log: &str) -> String {
     for pat in [
         "mutation repair verified green",
@@ -902,7 +915,8 @@ fn how_from_log(log: &str) -> String {
     ] {
         if let Some(pos) = log.find(pat) {
             let end = log[pos..].find('\n').map(|i| pos + i).unwrap_or(log.len());
-            return log[pos..end.min(pos + 120)].trim().to_string();
+            let cut = floor_char_boundary(log, end.min(pos + 120));
+            return log[pos..cut].trim().to_string();
         }
     }
     String::new()
@@ -1100,7 +1114,7 @@ impl AxiomSolveExecutor {
             envs.push((k.to_string(), v.to_string()));
         }
         let stage_start = Instant::now();
-        let (_solve_ok, solve_log, solve_peak) = match run_bounded(
+        let (_solve_ok, _solve_log, solve_peak) = match run_bounded(
             &solve_argv,
             &work,
             &envs,
@@ -1121,7 +1135,18 @@ impl AxiomSolveExecutor {
         };
         outcome.stage_ms.solve_ms = stage_start.elapsed().as_millis() as u64;
         peak_rss.set(std::cmp::max(peak_rss.get(), solve_peak));
-        outcome.solver = how_from_log(&solve_log);
+        // The result line is printed last, so a chatty solver pushes it
+        // past the 4 KiB cut run_bounded applies to its returned
+        // string. Read the full solve logs (already on disk) for the
+        // result instead, so outcome.solver survives a long log.
+        let mut full_solve_log = String::new();
+        if let Ok(text) = std::fs::read_to_string(logs.join("solve.out.log")) {
+            full_solve_log.push_str(&text);
+        }
+        if let Ok(text) = std::fs::read_to_string(logs.join("solve.err.log")) {
+            full_solve_log.push_str(&text);
+        }
+        outcome.solver = how_from_log(&full_solve_log);
         if self.sabotage || arm == Arm::Regressed {
             // Deliberate regression for the guardrail demo: edit a pinned
             // file (the oracle) and leave the tree dirty.
@@ -1942,6 +1967,19 @@ mod tests {
             env.contains("AXIOM_RESPONSES_COMPRESS=1"),
             "arm C must run with responses compression on:\n{env}"
         );
+        // CodeRabbit: arm C must keep the executor's isolated
+        // heal-memory path, not disable it with AXIOM_HEAL_MEMORY=0.
+        // Heal memory affects failure classification and absorption,
+        // so disabling it for one arm changes solver behavior in an
+        // unrecorded way.
+        assert!(
+            env.lines().any(|l| l.starts_with("AXIOM_HEAL_MEMORY=/")),
+            "arm C must keep the executor's isolated heal-memory path:\n{env}"
+        );
+        assert!(
+            !env.lines().any(|l| l == "AXIOM_HEAL_MEMORY=0"),
+            "arm C must not disable heal memory:\n{env}"
+        );
 
         let out = ex.execute(&single_task(), Arm::Retrieval, 1);
         assert!(out.success, "{out:?}");
@@ -2088,6 +2126,58 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(dead, "descendant sleeper {pid} survived the timeout kill");
+    }
+
+    #[test]
+    fn floor_char_boundary_never_splits_a_character() {
+        // "é" is two bytes: in "aébc" it spans bytes [1, 3), so
+        // index 2 lands inside it and clamps to 1; index 3 starts
+        // "b" and is already a boundary.
+        assert_eq!(floor_char_boundary("aébc", 2), 1);
+        assert_eq!(floor_char_boundary("aébc", 3), 3);
+        assert_eq!(floor_char_boundary("aébc", 99), 5);
+        assert_eq!(floor_char_boundary("", 10), 0);
+    }
+
+    #[test]
+    fn how_from_log_truncates_at_a_char_boundary() {
+        // CodeRabbit: log[pos..end.min(pos + 120)] panics when
+        // pos + 120 lands inside a multi-byte character. The pattern
+        // is 30 bytes, then one space, then "é" (2 bytes each):
+        // byte 120 falls inside the 45th "é" and must clamp down,
+        // not panic.
+        let log = format!("mutation repair verified green {}", "é".repeat(100));
+        let out = how_from_log(&log);
+        assert!(out.starts_with("mutation repair verified green"));
+        assert!(
+            out.len() <= 120,
+            "truncated to at most 120 bytes: {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn solver_result_survives_a_long_log() {
+        // CodeRabbit: run_bounded truncates combined output to 4 KiB,
+        // and the solver prints its result line last, so a chatty
+        // solver pushes the result past the cut and leaves
+        // outcome.solver empty. The executor must read the full solve
+        // logs for the result, not the truncated string.
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = corpus_with_fixture(temp.path());
+        let solver = fake_solver(
+            temp.path(),
+            "chatty.sh",
+            "#!/bin/sh\npython3 -c \"print('x' * 5000)\"\necho 'mutation repair verified green (off-by-one:L2)'\nsed -i 's/x \\* 2 + 1/x * 2/' calc.py\n",
+        );
+        let ex = executor_with_solver(solver, corpus, temp.path().join("scratch"));
+        let out = ex.execute(&single_task(), Arm::Repair, 1);
+        assert!(out.success, "{out:?}");
+        assert!(
+            out.solver.contains("mutation repair verified green"),
+            "solver result must survive a log longer than 4 KiB: {:?}",
+            out.solver
+        );
     }
 
     #[test]

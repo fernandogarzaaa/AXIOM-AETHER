@@ -299,7 +299,7 @@ fabricated from time-to-first-stdout-byte.
 ```bash
 # Smoke run: arms A/D on the single-file family, one repeat, seed 42:
 cargo run --release --features tools --bin axiombench -- paired --smoke
-# Full scaffold (pending cells reported, not scored):
+# Full matrix (default repeats=3; the recorded run used --repeats 1):
 cargo run --release --features tools --bin axiombench -- paired
 # Guardrail demonstration (arm D vs a deliberately regressed arm):
 cargo run --release --features tools --bin axiombench -- paired --demo-regression
@@ -329,9 +329,13 @@ report JSON under `guardrails`):
 Demonstration (local run, `--demo-regression`): the baseline arm
 passes against itself, arm D passes on the smoke family, and the
 deliberately regressed arm (solver sabotaged to edit a pinned file
-and skip rollback) fails on the reliability guardrail even though its
-verifier goes green. See the run output recorded in
-`bench/results/paired-*.json` for the run that demonstrates it.
+and skip rollback) fails on the reliability guardrail, whether its
+verifier goes green (the JavaScript fixture, where the sabotage is a
+valid comment and the cell scores OVERFIT) or not (the Python and
+shell fixtures, where it is a syntax error and the cell scores a
+rollback violation). See the run output recorded in
+`bench/results/PAIRED-SMOKE-2026-11-10.md` for the run that
+demonstrates it.
 
 ### 4.3 Genuinely unseen bug suites
 
