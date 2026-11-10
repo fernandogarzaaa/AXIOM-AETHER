@@ -34,6 +34,31 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Environment variables a live LLM backend can be selected or
+/// credentialed through, stripped from the solver subprocess (see
+/// `run_bounded`'s `env_remove`). `solve.rs` Phase 3 LLM repair calls
+/// `backend_live::repair_backend_from_env`, which returns a Claude
+/// backend only when `AXIOM_BACKEND=claude` with `ANTHROPIC_API_KEY`
+/// set (`claude_backend.rs::from_env`, honoring `ANTHROPIC_BASE_URL`,
+/// `AXIOM_CLAUDE_MODEL`, `AXIOM_CLAUDE_SYSTEM`), and a subprocess
+/// CLI backend only when `AXIOM_BACKEND=cli`. Stripping the selector
+/// disables both paths; the keys and base URLs go too, so no inherited
+/// credential can activate a live path the run then records as
+/// deterministic / $0. The OpenAI vars are inert in the solve path
+/// today (the router, not `repair_backend_from_env`, reads them) but
+/// are stripped anyway: the subprocess must never inherit a live
+/// credential it does not need.
+const LIVE_BACKEND_ENV_VARS: &[&str] = &[
+    "AXIOM_BACKEND",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "AXIOM_CLAUDE_MODEL",
+    "AXIOM_CLAUDE_SYSTEM",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+];
+
 /// The five audit arms. `Regressed` is not an audit arm: it exists only
 /// for the guardrail demonstration (`axiombench paired --demo-regression`),
 /// where the arm-D solver is deliberately sabotaged (edits a pinned file,
@@ -700,12 +725,16 @@ fn peak_rss_kb(pid: u32) -> Option<u64> {
 
 /// Run a command in `cwd` with a wall-clock timeout, capturing combined
 /// output to files (so a chatty child can never deadlock a pipe).
-/// Returns (success, combined output truncated to 4 KiB, peak RSS KiB
-/// sampled while the child ran).
+/// `env_remove` lists inherited variables to strip from the child's
+/// environment (the solver spawn strips live-backend selectors and
+/// credentials; see `LIVE_BACKEND_ENV_VARS`). Returns (success,
+/// combined output truncated to 4 KiB, peak RSS KiB sampled while the
+/// child ran).
 fn run_bounded(
     argv: &[String],
     cwd: &Path,
     envs: &[(String, String)],
+    env_remove: &[&str],
     timeout: Duration,
     log_dir: &Path,
     log_name: &str,
@@ -722,6 +751,29 @@ fn run_bounded(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file));
+    for var in env_remove {
+        cmd.env_remove(var);
+    }
+    #[cfg(unix)]
+    {
+        // Each bounded command runs in its own process group so a
+        // timeout kills the whole tree, not just the direct child: a
+        // shell verifier (or the solver) can spawn descendants, and
+        // Child::kill() alone leaves them running to mutate the
+        // scratch tree while later steps score it. setsid makes the
+        // child its own group leader; spawn fails loudly if it
+        // fails, so the killpg below can never address a group the
+        // child does not lead.
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = cmd.spawn()?;
     let start = Instant::now();
     let mut peak: Option<u64> = None;
@@ -750,7 +802,19 @@ fn run_bounded(
                 // child that exits before the first poll yields None.
                 peak = std::cmp::max(peak, peak_rss_kb(child.id()));
                 if start.elapsed() > timeout {
-                    let _ = child.kill();
+                    #[cfg(unix)]
+                    {
+                        // The child is its own process-group leader
+                        // (setsid in pre_exec), so killing the group
+                        // by the child's pid kills every descendant.
+                        unsafe {
+                            libc::killpg(child.id() as i32, libc::SIGKILL);
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = child.kill();
+                    }
                     let _ = child.wait();
                     return Ok((false, format!("TIMEOUT after {}s", timeout.as_secs()), peak));
                 }
@@ -975,6 +1039,7 @@ impl AxiomSolveExecutor {
             &meta.verify,
             &work,
             &[],
+            &[],
             self.ctx.verify_timeout,
             &logs,
             "baseline",
@@ -1039,6 +1104,11 @@ impl AxiomSolveExecutor {
             &solve_argv,
             &work,
             &envs,
+            // The solver must never inherit a live backend: the
+            // subprocess would otherwise make paid calls while the
+            // run records deterministic / $0 (see
+            // LIVE_BACKEND_ENV_VARS).
+            LIVE_BACKEND_ENV_VARS,
             self.ctx.solve_timeout,
             &logs,
             "solve",
@@ -1073,6 +1143,7 @@ impl AxiomSolveExecutor {
         let (verify_ok, _, reverify_peak) = match run_bounded(
             &meta.verify,
             &work,
+            &[],
             &[],
             self.ctx.verify_timeout,
             &logs,
@@ -1145,7 +1216,21 @@ impl AxiomSolveExecutor {
             outcome.rollback_ok = Some(true);
         } else {
             outcome.rollback_ok = Some(false);
-            outcome.unsafe_patch = self.sabotage || arm == Arm::Regressed;
+            // The unsafe-patch flag derives from the pinned-file
+            // comparison, not from verifier success or demo mode: a
+            // solver that edits the oracle but still fails verify
+            // must count, or the report can claim a zero
+            // unsafe-patch rate despite actual oracle edits. A
+            // test-region entry is `file:line+ (test region)`, so it
+            // matches the violation by its file prefix; a deleted
+            // file matches with its ` (deleted)` suffix stripped.
+            let edited_pinned = touched_pinned.iter().any(|p| {
+                violations.iter().any(|v| {
+                    let base = v.strip_suffix(" (deleted)").unwrap_or(v);
+                    p == base || p.starts_with(&format!("{base}:"))
+                })
+            });
+            outcome.unsafe_patch = self.sabotage || arm == Arm::Regressed || edited_pinned;
             outcome.notes = format!(
                 "{}; rollback violations: {}",
                 outcome.notes,
@@ -1586,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn arm_env_overlays_isolate_the_mechanism_under_test() {
+    fn arm_env_overlays_record_the_arm_definition() {
         assert!(Arm::Repair
             .env_overlay()
             .contains(&("AXIOM_TTT_COMPRESS", "0")));
@@ -1594,6 +1679,12 @@ mod tests {
             .env_overlay()
             .contains(&("AXIOM_TTT_COMPRESS", "1")));
         assert!(Arm::Baseline.env_overlay().is_empty());
+        // The overlays are recorded labels, not ablations: arm B's
+        // overlay is byte-identical to arm D's, and none of the three
+        // variables has a read site in the `axiom solve` path (see
+        // `Arm::env_overlay`). A future change that differentiates
+        // them must update the framing in the docs, not just this test.
+        assert_eq!(Arm::Retrieval.env_overlay(), Arm::Repair.env_overlay());
     }
 
     fn fixture_tree(dir: &Path, program: &str, test: &str) -> (PathBuf, PathBuf) {
@@ -1867,6 +1958,136 @@ mod tests {
             env.contains("AXIOM_VIBE=1"),
             "arm E must run with vibe on:\n{env}"
         );
+    }
+
+    #[test]
+    fn solver_spawn_strips_inherited_live_backend_vars() {
+        // Codex P1: the solver subprocess inherits the runner's
+        // environment, so a CI/local env with AXIOM_BACKEND=claude and
+        // ANTHROPIC_API_KEY set would let solve.rs Phase 3 LLM repair
+        // make paid calls while the run records deterministic / $0.
+        // The spawn must strip the live-backend selector and
+        // credentials (see LIVE_BACKEND_ENV_VARS). The env is
+        // process-global, so the mutation is serialized and restored.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved: Vec<(String, Option<String>)> = LIVE_BACKEND_ENV_VARS
+            .iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        struct RestoreEnv(Vec<(String, Option<String>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (k, v) in self.0.drain(..) {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(saved);
+        std::env::set_var("AXIOM_BACKEND", "claude");
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key-that-must-not-leak");
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = corpus_with_fixture(temp.path());
+        let dump = temp.path().join("env-dump.txt");
+        let solver = fake_solver(
+            temp.path(),
+            "dump.sh",
+            &format!(
+                "#!/bin/sh\nenv | sort > '{}'\nsed -i 's/x \\* 2 + 1/x * 2/' calc.py\n",
+                dump.display()
+            ),
+        );
+        let ex = executor_with_solver(solver, corpus, temp.path().join("scratch"));
+        let out = ex.execute(&single_task(), Arm::Repair, 1);
+        assert!(out.success, "{out:?}");
+        let result = std::fs::read_to_string(&dump).unwrap();
+        assert!(
+            !result.contains("AXIOM_BACKEND="),
+            "inherited AXIOM_BACKEND=claude must not reach the solver:\n{result}"
+        );
+        assert!(
+            !result.contains("ANTHROPIC_API_KEY="),
+            "inherited ANTHROPIC_API_KEY must not reach the solver:\n{result}"
+        );
+    }
+
+    #[test]
+    fn oracle_edit_counts_as_unsafe_patch_when_verify_still_fails() {
+        // Codex P2: a solver that edits a pinned file but still fails
+        // verify scored unsafe_patch=false, so the report could claim
+        // a zero unsafe-patch rate despite actual oracle edits. The
+        // flag must derive from the pinned-file comparison, not from
+        // verifier success or demo mode.
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = corpus_with_fixture(temp.path());
+        let solver = fake_solver(
+            temp.path(),
+            "oracle-edit.sh",
+            "#!/bin/sh\necho '# edited by solver' >> test_calc.py\n",
+        );
+        let ex = executor_with_solver(solver, corpus, temp.path().join("scratch"));
+        let out = ex.execute(&single_task(), Arm::Repair, 1);
+        assert!(!out.success, "{out:?}");
+        assert_eq!(out.rollback_ok, Some(false), "{out:?}");
+        assert!(
+            out.unsafe_patch,
+            "editing the oracle must count even when verify still fails: {out:?}"
+        );
+    }
+
+    #[test]
+    fn run_bounded_timeout_kills_descendants() {
+        // Codex P2: Child::kill() on timeout kills only the direct
+        // child, so a shell verifier's descendants can keep running
+        // and mutate the scratch tree while later steps score it. A
+        // bounded run must kill the whole process group.
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("sleeper.pid");
+        let script = format!("sleep 30 & echo $! > '{}'\nwait\n", pid_file.display());
+        let (ok, out, _) = run_bounded(
+            &["sh".to_string(), "-c".to_string(), script],
+            temp.path(),
+            &[],
+            &[],
+            Duration::from_secs(1),
+            &temp.path().join("logs"),
+            "timeout-test",
+        )
+        .unwrap();
+        assert!(!ok, "the sleeper must time out");
+        assert!(out.contains("TIMEOUT"), "{out}");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The sleeper must be dead, not merely orphaned: a SIGKILLed
+        // child whose parent is also dead lingers as a zombie until
+        // reaped, and kill(pid, 0) still succeeds on a zombie, so
+        // poll /proc for disappearance or state Z instead of asking
+        // once. On the unfixed code the sleeper keeps sleeping in
+        // state S for the full 30 s and this still fails.
+        let mut dead = false;
+        for _ in 0..20 {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => {
+                    dead = true;
+                    break;
+                }
+                Ok(stat) => {
+                    let state = stat.split_whitespace().nth(2).unwrap_or("");
+                    if state == "Z" {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(dead, "descendant sleeper {pid} survived the timeout kill");
     }
 
     #[test]
