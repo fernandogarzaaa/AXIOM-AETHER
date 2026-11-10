@@ -350,6 +350,19 @@ impl OutcomeStatus {
     }
 }
 
+/// Per-stage wall-clock breakdown of one executed cell (Phase 3 item 5
+/// observability, wired into the runner at the harness level: the runner's
+/// own pipeline stages, baseline verify / solve / re-verify / rollback
+/// check, timed where they run). All zeros until the executor fills them
+/// in; a pending cell keeps the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageMs {
+    pub baseline_verify_ms: u64,
+    pub solve_ms: u64,
+    pub reverify_ms: u64,
+    pub rollback_ms: u64,
+}
+
 /// One cell of the paired matrix: one arm x one task x one repeat.
 ///
 /// Secondary measures carry an explicit label next to the value, per the
@@ -371,6 +384,13 @@ pub struct TaskOutcome {
     /// the cell did not execute.
     pub rollback_ok: Option<bool>,
     pub wall_ms: u64,
+    pub stage_ms: StageMs,
+    /// Peak resident set size (KiB, VmHWM) across the cell's child
+    /// processes, read from Linux `/proc/<pid>/status` while they run
+    /// (same source as the Phase 3 item 5 `refresh_process_memory`
+    /// gauge, applied here to the solver subprocess). `None` where the
+    /// cell did not execute, or off Linux where `/proc` is absent.
+    pub peak_rss_kb: Option<u64>,
     pub first_token_ms: Option<u64>,
     pub cost_usd: f64,
     pub billed_tokens: u64,
@@ -399,6 +419,8 @@ impl TaskOutcome {
             unsafe_patch: false,
             rollback_ok: None,
             wall_ms: 0,
+            stage_ms: StageMs::default(),
+            peak_rss_kb: None,
             first_token_ms: None,
             cost_usd: 0.0,
             billed_tokens: 0,
@@ -420,6 +442,13 @@ impl TaskOutcome {
             "unsafe_patch": self.unsafe_patch,
             "rollback_ok": self.rollback_ok,
             "wall_ms": self.wall_ms,
+            "stage_ms": {
+                "baseline_verify_ms": self.stage_ms.baseline_verify_ms,
+                "solve_ms": self.stage_ms.solve_ms,
+                "reverify_ms": self.stage_ms.reverify_ms,
+                "rollback_ms": self.stage_ms.rollback_ms,
+            },
+            "peak_rss_kb": self.peak_rss_kb,
             "first_token_ms": self.first_token_ms,
             "cost_usd": self.cost_usd,
             "billed_tokens": self.billed_tokens,
@@ -829,6 +858,8 @@ impl AxiomSolveExecutor {
             unsafe_patch: false,
             rollback_ok: Some(true),
             wall_ms: 0,
+            stage_ms: StageMs::default(),
+            peak_rss_kb: None,
             first_token_ms: None,
             cost_usd: 0.0,
             billed_tokens: 0,
@@ -1612,6 +1643,8 @@ mod tests {
                 unsafe_patch: false,
                 rollback_ok: Some(true),
                 wall_ms: 10,
+                stage_ms: StageMs::default(),
+                peak_rss_kb: None,
                 first_token_ms: None,
                 cost_usd: 0.0,
                 billed_tokens: 0,
@@ -1625,5 +1658,158 @@ mod tests {
         assert_eq!(s.executed, 1);
         assert_eq!(s.successes, 1);
         assert_eq!(summarize(Arm::Retrieval, &outcomes).executed, 0);
+    }
+
+    #[test]
+    fn retrieval_cvm_fullstack_arms_execute_through_the_solver() {
+        // Failing-test-first for the B/C/E executors: on the scaffold
+        // these arms resolve to PendingExecutor; the paired matrix needs
+        // them executed through the same `axiom solve` loop under their
+        // own env overlay (the mechanism each arm isolates).
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = corpus_with_fixture(temp.path());
+        let solver = fake_solver(
+            temp.path(),
+            "fix.sh",
+            "#!/bin/sh\nsed -i 's/x \\* 2 + 1/x * 2/' calc.py\n",
+        );
+        let ex = executor_with_solver(solver, corpus, temp.path().join("scratch"));
+        for arm in [Arm::Retrieval, Arm::Cvm, Arm::FullStack] {
+            let out = ex.execute(&single_task(), arm, 1);
+            assert_eq!(out.status, OutcomeStatus::Executed, "arm {arm:?}: {out:?}");
+            assert!(out.success, "arm {arm:?}: {out:?}");
+            assert!(!out.unsafe_patch, "arm {arm:?}: {out:?}");
+            assert_eq!(out.rollback_ok, Some(true), "arm {arm:?}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn arm_env_overlay_reaches_the_solver() {
+        // The arm's env overlay must actually reach the solver process:
+        // arm C runs with compression on, arm B with it off, arm E with
+        // vibe on. A solver that dumps its environment proves the
+        // plumbing instead of trusting the overlay table.
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = corpus_with_fixture(temp.path());
+        let dump = temp.path().join("env-dump.txt");
+        let solver = fake_solver(
+            temp.path(),
+            "dump.sh",
+            &format!(
+                "#!/bin/sh\nenv | sort > '{}'\nsed -i 's/x \\* 2 + 1/x * 2/' calc.py\n",
+                dump.display()
+            ),
+        );
+        let ex = executor_with_solver(solver, corpus, temp.path().join("scratch"));
+        let out = ex.execute(&single_task(), Arm::Cvm, 1);
+        assert!(out.success, "{out:?}");
+        let env = std::fs::read_to_string(&dump).unwrap();
+        assert!(
+            env.contains("AXIOM_TTT_COMPRESS=1"),
+            "arm C must run with compression on:\n{env}"
+        );
+        assert!(
+            env.contains("AXIOM_RESPONSES_COMPRESS=1"),
+            "arm C must run with responses compression on:\n{env}"
+        );
+
+        let out = ex.execute(&single_task(), Arm::Retrieval, 1);
+        assert!(out.success, "{out:?}");
+        let env = std::fs::read_to_string(&dump).unwrap();
+        assert!(
+            env.contains("AXIOM_TTT_COMPRESS=0"),
+            "arm B must run with compression off:\n{env}"
+        );
+
+        let out = ex.execute(&single_task(), Arm::FullStack, 1);
+        assert!(out.success, "{out:?}");
+        let env = std::fs::read_to_string(&dump).unwrap();
+        assert!(
+            env.contains("AXIOM_VIBE=1"),
+            "arm E must run with vibe on:\n{env}"
+        );
+    }
+
+    #[test]
+    fn fixed_seed_reproduces_identical_full_run_order() {
+        // Stronger than the shuffle unit test: two full `run_paired`
+        // runs under the same seed must produce the identical cell order
+        // and the identical per-cell task/arm/repeat sequence.
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = corpus_with_fixture(temp.path());
+        let solver = fake_solver(temp.path(), "noop.sh", "#!/bin/sh\nexit 0\n");
+        let config = PairedConfig::full_scaffold();
+        let ex = executor_with_solver(
+            solver.clone(),
+            corpus.clone(),
+            temp.path().join("scratch-a"),
+        );
+        let first = run_paired(&config, &ex);
+        let ex = executor_with_solver(
+            solver,
+            corpus,
+            temp.path().join("scratch-b"),
+        );
+        let second = run_paired(&config, &ex);
+        assert_eq!(first.run_order, second.run_order);
+        assert_eq!(
+            first
+                .outcomes
+                .iter()
+                .map(|o| (o.task_id.clone(), o.arm, o.repeat))
+                .collect::<Vec<_>>(),
+            second
+                .outcomes
+                .iter()
+                .map(|o| (o.task_id.clone(), o.arm, o.repeat))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn executed_cells_record_stage_timings_and_peak_rss() {
+        // Phase 3 item 5 wiring at the harness level: an executed cell
+        // must carry its per-stage breakdown (baseline verify / solve /
+        // re-verify / rollback) and the solver subprocess peak RSS,
+        // measured, never a fabricated zero.
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = corpus_with_fixture(temp.path());
+        let solver = fake_solver(
+            temp.path(),
+            "fix-slow.sh",
+            "#!/bin/sh\nsleep 0.05\nsed -i 's/x \\* 2 + 1/x * 2/' calc.py\n",
+        );
+        let ex = executor_with_solver(solver, corpus, temp.path().join("scratch"));
+        let out = ex.execute(&single_task(), Arm::Repair, 1);
+        assert_eq!(out.status, OutcomeStatus::Executed, "{out:?}");
+        assert!(out.success, "{out:?}");
+        assert!(
+            out.stage_ms.baseline_verify_ms > 0,
+            "baseline verify stage must be timed: {out:?}"
+        );
+        assert!(
+            out.stage_ms.solve_ms > 0,
+            "solve stage must be timed: {out:?}"
+        );
+        assert!(
+            out.stage_ms.reverify_ms > 0,
+            "re-verify stage must be timed: {out:?}"
+        );
+        assert!(
+            out.stage_ms.baseline_verify_ms
+                + out.stage_ms.solve_ms
+                + out.stage_ms.reverify_ms
+                + out.stage_ms.rollback_ms
+                <= out.wall_ms,
+            "stage times must fit inside wall time: {out:?}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            out.peak_rss_kb.unwrap_or(0) > 0,
+            "peak RSS must be measured on Linux: {out:?}"
+        );
+        let json = out.to_json();
+        assert!(json["stage_ms"]["solve_ms"].as_u64().unwrap() > 0);
+        assert!(json.get("peak_rss_kb").is_some());
     }
 }
