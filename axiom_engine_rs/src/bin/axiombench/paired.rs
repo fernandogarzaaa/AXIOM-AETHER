@@ -253,9 +253,10 @@ pub static TASK_SET: &[PairedTask] = &[
         family: TaskFamily::FailureRecovery,
         // Pure environment fault: `run.sh` lacks the exec bit, so the
         // verify fails with "Permission denied" while the code is
-        // correct. Scored on environment-heal success and rollback; the
-        // chmod heal changes no file contents, so a failed attempt still
-        // rolls back clean under the content-hash comparison.
+        // correct. Scored on environment-heal success and rollback;
+        // the chmod heal changes the file's mode, so a failed attempt
+        // does NOT roll back clean: the snapshot includes unix modes
+        // precisely so a mode-only change counts as a violation.
         fixture: Some("recovery-broken-env"),
         gap: None,
     },
@@ -321,7 +322,14 @@ impl PairedConfig {
     /// checked for "same task set / model / budget / environment / oracle".
     pub fn fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
-        for task in TASK_SET {
+        // Only the selected families, with the same predicate
+        // `run_paired` uses: hashing the whole catalog made runs
+        // with different --family selections share a fingerprint, so
+        // unlike results could be treated as comparable.
+        for task in TASK_SET
+            .iter()
+            .filter(|t| self.families.contains(&t.family))
+        {
             hasher.update(task.id.as_bytes());
             hasher.update(task.family.label().as_bytes());
             hasher.update(task.fixture.unwrap_or("").as_bytes());
@@ -655,8 +663,27 @@ fn sha256_file(path: &Path) -> Option<String> {
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
-/// Snapshot of a scratch tree: relative path -> sha256, excluding verifier
-/// artifacts. Used for the rollback comparison.
+/// Unix permission bits of `path` (0 off Unix): the rollback snapshot
+/// compares content hashes, so a heal that only chmods a file (e.g.
+/// `self_heal::heal_permission_denied` making `run.sh` executable)
+/// would otherwise be invisible and the cell would report a clean
+/// rollback despite leaving the tree modified.
+#[cfg(unix)]
+fn snapshot_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn snapshot_mode(_path: &Path) -> u32 {
+    0
+}
+
+/// Snapshot of a scratch tree: relative path -> sha256 plus unix
+/// mode, excluding verifier artifacts. Used for the rollback
+/// comparison.
 fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, String> {
     let mut out = BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
@@ -675,7 +702,7 @@ fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, String> {
                 stack.push(path);
             } else if ft.is_file() {
                 if let Some(hash) = sha256_file(&path) {
-                    out.insert(rel, hash);
+                    out.insert(rel, format!("{hash}:{:o}", snapshot_mode(&path)));
                 }
             }
         }
@@ -2347,6 +2374,45 @@ mod tests {
         let out = ex.execute(&single_task(), Arm::Repair, 1);
         assert_eq!(out.status, OutcomeStatus::PendingExecutor, "{out:?}");
         assert_eq!(out.rollback_ok, None, "{out:?}");
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_family_selection() {
+        // Codex P2 (re-review): fingerprint() hashed the whole
+        // TASK_SET and never incorporated self.families, so `paired
+        // --smoke` and `paired --smoke --family multi-file` shared a
+        // fingerprint despite executing entirely different tasks.
+        let smoke = PairedConfig::smoke();
+        let mut multi = PairedConfig::smoke();
+        multi.families = vec![TaskFamily::MultiFile];
+        assert_ne!(smoke.fingerprint(), multi.fingerprint());
+        let mut multi2 = PairedConfig::smoke();
+        multi2.families = vec![TaskFamily::MultiFile];
+        assert_eq!(multi.fingerprint(), multi2.fingerprint());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_tree_sees_permission_changes() {
+        // Codex P2 (re-review): the rollback snapshot stored only
+        // content hashes, so a heal that only chmods a file (e.g.
+        // heal_permission_denied making run.sh executable) was
+        // invisible and the cell reported a clean rollback despite a
+        // modified tree.
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("run.sh");
+        std::fs::write(&file, "#!/bin/sh\nexit 0\n").unwrap();
+        let before = snapshot_tree(temp.path());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&file).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&file, perms).unwrap();
+        }
+        let after = snapshot_tree(temp.path());
+        assert_ne!(before, after, "a chmod must change the snapshot");
+        // Content-only comparison still works: identical trees match.
+        assert_eq!(after, snapshot_tree(temp.path()));
     }
 
     #[test]
