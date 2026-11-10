@@ -27,6 +27,15 @@ const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 /// downstream, so only the head is kept.
 const MAX_UPSTREAM_ERROR_BODY_CHARS: usize = 512;
 
+/// Upper bound on the upstream error body read from the wire, in bytes.
+/// Four bytes cover the longest single UTF-8 char, so this cap always
+/// yields at least MAX_UPSTREAM_ERROR_BODY_CHARS characters.
+const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 2048;
+
+/// How long the bounded error-body read may take. A slow error body must
+/// not delay cloud fallback.
+const UPSTREAM_ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Bound of the streaming channel between the Ollama producer task and the
 /// SSE consumer. This is the backpressure mechanism: a slow consumer blocks
 /// the producer on `send` once 16 deltas are queued, instead of the
@@ -363,6 +372,29 @@ enum StreamOutcome {
 /// runs from dispatch, not from headers: a slow model load before the
 /// first token counts. This runs before the channel exists, so a startup
 /// failure is a plain `Err` the route can fall back from, instead of an
+/// Reads at most a bounded prefix of an upstream error body, with a short
+/// deadline. A non-success response can carry an arbitrarily large or slow
+/// body; consuming all of it would stall the fallback path, so only the
+/// head is read and only briefly. A multi-byte char cut by the byte cap
+/// becomes a replacement character, which is fine for an error string.
+async fn read_error_body_prefix(response: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    let mut stream = response.bytes_stream();
+    let read = async {
+        while buf.len() < MAX_UPSTREAM_ERROR_BODY_BYTES {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    let take = (MAX_UPSTREAM_ERROR_BODY_BYTES - buf.len()).min(chunk.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(UPSTREAM_ERROR_BODY_READ_TIMEOUT, read).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// error item on an already-committed SSE stream.
 async fn start_stream_request(
     client: &Client,
@@ -390,7 +422,7 @@ async fn start_stream_request(
         .map_err(|e| SwarmRouteError::Upstream(e.to_string()))?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_error_body_prefix(response).await;
         let body: String = body.chars().take(MAX_UPSTREAM_ERROR_BODY_CHARS).collect();
         return Err(SwarmRouteError::Upstream(format!(
             "ollama status {}: {}",
