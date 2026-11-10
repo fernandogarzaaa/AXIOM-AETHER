@@ -22,7 +22,10 @@
 //!   numbers.
 //!
 //! An arm with no executed cells cannot be evaluated: the verdict is a
-//! fail with reason "no executed tasks", not a silent pass.
+//! fail with reason "no executed tasks", not a silent pass. The same
+//! holds for a partially evaluated arm: any selected cell left pending
+//! (unevaluable) fails qualification, so an arm never qualifies on a
+//! subset of its task set or on a different task set than the baseline.
 
 use crate::paired::ArmSummary;
 use serde_json::{json, Value};
@@ -94,6 +97,19 @@ pub fn evaluate_guardrail(
             arm_unsafe_patch_rate: None,
             arm_rollback_rate: None,
         };
+    }
+
+    // Complete, matched coverage: a partially pending arm would
+    // otherwise qualify on the subset that happened to run (e.g. a
+    // smoke run without node reports PASS after executing only the
+    // Python and shell tasks), and arm-specific spawn failures can
+    // leave the candidate and baseline evaluated on different task
+    // sets. Any pending cell fails qualification.
+    if arm.pending > 0 {
+        reasons.push(format!(
+            "incomplete task set: {} selected cell(s) pending (unevaluable); qualification requires complete coverage",
+            arm.pending
+        ));
     }
 
     match (baseline_rate, arm_rate) {
@@ -178,6 +194,7 @@ mod tests {
     ) -> ArmSummary {
         ArmSummary {
             executed,
+            pending: 0,
             successes,
             unsafe_patches,
             failed_attempts: failed,
@@ -245,6 +262,21 @@ mod tests {
             v.reasons.iter().any(|r| r.contains("no executed tasks")),
             "{v:?}"
         );
+    }
+
+    #[test]
+    fn partially_pending_arm_fails_qualification() {
+        // Codex P2 (re-review): the guardrail rejected only zero
+        // executed cells, while summarize silently excluded pending
+        // outcomes, so an arm could qualify on a subset of its task
+        // set (e.g. a smoke run without node reports PASS after
+        // executing only the Python and shell tasks).
+        let base = summary(Arm::Baseline, 3, 0, 0, 3, 3, 0.0);
+        let mut arm = summary(Arm::Repair, 2, 2, 0, 0, 0, 0.0);
+        arm.pending = 1;
+        let v = evaluate_guardrail(&base, &arm, &GuardrailConfig::default());
+        assert!(!v.pass, "{v:?}");
+        assert!(v.reasons.iter().any(|r| r.contains("pending")), "{v:?}");
     }
 
     #[test]

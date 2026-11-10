@@ -518,6 +518,11 @@ impl TaskOutcome {
 #[derive(Clone, Debug, Default)]
 pub struct ArmSummary {
     pub executed: usize,
+    /// Selected cells left unevaluable (pending fixture or pending
+    /// executor). Excluded from the rates above, but counted so the
+    /// guardrail can require complete coverage: an arm never
+    /// qualifies on a subset of its task set.
+    pub pending: usize,
     pub successes: usize,
     pub unsafe_patches: usize,
     /// Failed attempts (executed, not successful) and how many of them
@@ -585,6 +590,9 @@ pub fn summarize(arm: Arm, outcomes: &[TaskOutcome]) -> ArmSummary {
                 }
                 s.total_cost_usd += o.cost_usd;
                 s.total_wall_ms += o.wall_ms;
+            }
+            OutcomeStatus::PendingFixture | OutcomeStatus::PendingExecutor => {
+                s.pending += 1;
             }
             _ => {}
         }
@@ -1366,6 +1374,7 @@ impl PairedReport {
                 json!({
                     "arm": arm.label(),
                     "executed": s.executed,
+                    "pending": s.pending,
                     "successes": s.successes,
                     "success_rate": s.success_rate(),
                     "unsafe_patch_rate": s.unsafe_patch_rate(),
@@ -1614,9 +1623,10 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
     for (arm, s) in &report.summaries {
         println!(
-            "[arm {}] executed={} successes={} success_rate={} unsafe_patch_rate={} rollback_rate={}",
+            "[arm {}] executed={} pending={} successes={} success_rate={} unsafe_patch_rate={} rollback_rate={}",
             arm.label(),
             s.executed,
+            s.pending,
             s.successes,
             s.success_rate()
                 .map(|r| format!("{:.1}%", r * 100.0))
@@ -1981,6 +1991,47 @@ mod tests {
         assert_eq!(s.executed, 1);
         assert_eq!(s.successes, 1);
         assert_eq!(summarize(Arm::Retrieval, &outcomes).executed, 0);
+    }
+
+    #[test]
+    fn summarize_counts_pending_cells() {
+        // Codex P2 (re-review): summarize silently dropped pending
+        // outcomes, so a partially evaluated arm could qualify on a
+        // subset of its task set. The summary must count them so the
+        // guardrail can require complete coverage.
+        let task = single_task();
+        let outcomes = vec![
+            TaskOutcome::pending(
+                &task,
+                Arm::Repair,
+                1,
+                OutcomeStatus::PendingExecutor,
+                "x".into(),
+            ),
+            TaskOutcome {
+                task_id: task.id.into(),
+                family: task.family,
+                arm: Arm::Repair,
+                repeat: 1,
+                status: OutcomeStatus::Executed,
+                success: true,
+                unsafe_patch: false,
+                rollback_ok: Some(true),
+                wall_ms: 10,
+                stage_ms: StageMs::default(),
+                peak_rss_kb: None,
+                first_token_ms: None,
+                cost_usd: 0.0,
+                billed_tokens: 0,
+                agent_turns: None,
+                tool_calls: None,
+                solver: String::new(),
+                notes: String::new(),
+            },
+        ];
+        let s = summarize(Arm::Repair, &outcomes);
+        assert_eq!(s.executed, 1);
+        assert_eq!(s.pending, 1);
     }
 
     #[test]
