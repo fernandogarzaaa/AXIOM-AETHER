@@ -244,19 +244,35 @@ a fabricated zero; dollar cost is 0.0 measured (no API spend).
 What executes today: all five arms on all five families
 (`--smoke` still runs only arms A/D on the single-file family, for
 CI), via the real `axiom solve` loop in a scratch copy of each
-`bench/repair/` fixture, following the four steps of
+fixture, following the four steps of
 `scripts/bench_repair.sh` (no-op baseline, solve with no file named
 and isolated heal-memory state, re-verify, pinned-file and rollback
 checks). Arm A runs no solver, so the failing verify stays failing.
 Arms B, C, and E run the same loop under their own env overlay (arm
 B: compression off; arm C: compression on; arm E: compression plus
-vibe on), so the paired comparison measures each toggle's effect on
-the real solver. Every family has an on-disk fixture:
-`multi-both-broken` (port of the `agentic-multi-file-both-broken`
-builtin: both scripts broken, only a coordinated two-file fix passes),
+vibe on). The overlays are recorded labels, not ablations: the three
+overlay variables have no read site in the `axiom solve` path
+(`AXIOM_TTT_COMPRESS` is read only by the server startup path,
+`AXIOM_RESPONSES_COMPRESS` only by the Responses route,
+`AXIOM_VIBE` only by the server startup path, and `SolveOptions`
+carries no vibe path), and arm B's overlay is byte-identical to arm
+D's. B/C/D/E therefore execute the same deterministic loop, and
+their identical scores are replication, not a measured null effect
+of the toggles. Cross-arm mechanism comparisons stay unevaluable
+until the toggles are wired into solve; the paired run's valid
+comparisons are arm A vs the executing arms (the guardrails) and
+replication across arms. Every family has an on-disk fixture.
+Six live in `bench/repair/`, the corpus `bench_repair.sh --check`
+scores (every fixture there must be repairable, so the two tasks
+the deterministic solver cannot repair do not live there). Those
+two, `multi-both-broken` (port of the
+`agentic-multi-file-both-broken` builtin: both scripts broken, only
+a coordinated two-file fix passes) and `longsession-overflow`
+(off-by-one buried in a 257-line module under a 240-entry lookup
+table), live in `bench/paired/`, a paired-only diagnostic corpus
+the repair gate never sees. The other fixtures:
 `multi-interface-and-callsites` (shared-helper contract broken,
-two callsites), `longsession-overflow` (off-by-one buried in a
-257-line module under a 240-entry lookup table),
+two callsites),
 `toolheavy-many-calls` (eight modules, one buggy),
 `recovery-broken-env` (pure environment fault: `run.sh` lacks the
 exec bit; the code is correct, the environment heal fixes it).
@@ -342,11 +358,18 @@ the qualification run:
 
 ### 4.4 Open items (after item 1)
 
+- Wire the arm toggles into the `axiom solve` path so the paired
+  arms become real ablations. Today the three overlay variables
+  have no read site in solve (see section 4): B's overlay is
+  byte-identical to D's, and C/E differ only in labels. Until that
+  wiring lands, B/C/D/E execute the same deterministic loop and
+  cross-arm mechanism comparisons are unevaluable; the recorded
+  6/8-each scores are replication, not a toggle effect.
 - The live-LLM agent executor for arms B, C, and E (real coding
   agent with and without AXIOM in the loop, with token/cost/turn
   accounting and first-token latency measured on the streamed server
-  path). The deterministic harness measures each toggle's effect on
-  the real solver; it does not pretend to be that agent.
+  path). The deterministic harness runs the real solver under each
+  arm's recorded overlay; it does not pretend to be that agent.
 - Repeats 2-3 of the full matrix for variance: the recorded run is
   repeats=1 (40 cells); the scaffold default is repeats=3.
 - A full-matrix run against the release solver binary: the recorded

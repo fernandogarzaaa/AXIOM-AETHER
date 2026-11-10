@@ -80,11 +80,13 @@ value is a sampled lower bound, never an exact peak.
 Not measured, by design: billed tokens, agent turns, tool calls, and
 first-token latency are `null` with the reason in each cell's notes
 (the deterministic solver spends no tokens and emits no streamed
-tokens); dollar cost is 0.0 measured. The toggles did not separate the
-arms on this task set: B/C/D/E all score 6/8 with the same two misses,
-so the paired comparison finds no toggle effect at repeats=1 on these
-eight tasks. That is a measured null result, not a failure of the
-harness. Variance across repeats is still open (repeats 2-3 not run).
+tokens); dollar cost is 0.0 measured. B/C/D/E all score 6/8 with the
+same two misses, but that is replication, not a measured null
+effect of the toggles: the three overlay variables have no read site
+in the `axiom solve` path, and arm B's overlay is byte-identical to
+arm D's (see docs/AXIOMBENCH.md section 4). The arms execute the
+same deterministic loop under different labels. Variance across
+repeats is still open (repeats 2-3 not run).
 
 ## Reproduction
 

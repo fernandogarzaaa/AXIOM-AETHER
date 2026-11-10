@@ -13,7 +13,9 @@
 //! What this module is, honestly: the deterministic paired comparison.
 //! Every arm executes through the real `axiom solve` loop under its own
 //! env overlay (arm A is the no-op baseline), across all five task
-//! families, each with an on-disk fixture under `bench/repair/`. What it
+//! families, each with an on-disk fixture under `bench/repair/` or,
+//! for tasks the deterministic solver cannot repair, under
+//! `bench/paired/` (see `ExecCtx::paired_corpus_dir`). What it
 //! is not: a live-LLM agent comparison. The deterministic solver spends
 //! no tokens and emits no streamed tokens, so billed tokens, agent
 //! turns, tool calls, and first-token latency are recorded as
@@ -61,8 +63,17 @@ impl Arm {
     /// Environment overlay that *defines* the arm, from the toggles
     /// documented in docs/AXIOMBENCH.md section 3.1. The executor runs
     /// every non-baseline arm through the same `axiom solve` loop under
-    /// its own overlay, so the paired comparison measures the toggle's
-    /// effect on the real solver.
+    /// its own overlay. The overlay is a recorded label, not an
+    /// ablation: the three variables have no read site in the `axiom
+    /// solve` path (`AXIOM_TTT_COMPRESS` is read only by the server
+    /// startup path via `CompressorConfig::from_env`,
+    /// `AXIOM_RESPONSES_COMPRESS` only by the Responses route,
+    /// `AXIOM_VIBE` only by the server startup path, and
+    /// `SolveOptions` carries no vibe path), and arm B's overlay is
+    /// byte-identical to arm D's. B/C/D/E therefore execute the same
+    /// deterministic loop; cross-arm mechanism comparisons stay
+    /// unevaluable until the toggles are wired into solve (see
+    /// docs/AXIOMBENCH.md section 4.4).
     pub fn env_overlay(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Arm::Baseline => &[],
@@ -139,7 +150,9 @@ impl TaskFamily {
 }
 
 /// One task in the fixed task set. `fixture` is a directory under
-/// `bench/repair/` (the on-disk corpus format from docs/BENCH-REPAIR.md).
+/// `bench/repair/` (the on-disk corpus format from docs/BENCH-REPAIR.md)
+/// or, for tasks the deterministic solver cannot repair, under
+/// `bench/paired/`; resolved by `resolve_fixture_dir`.
 /// `None` means the task is defined but has no fixture yet: the runner
 /// reports it as pending with the `gap` reason, never as a score.
 #[derive(Clone, Debug)]
@@ -151,7 +164,7 @@ pub struct PairedTask {
 }
 
 /// The fixed task set. Every family has on-disk fixtures under
-/// `bench/repair/` (see each task's `fixture`); a task with `fixture`
+/// `bench/repair/` or `bench/paired/` (see each task's `fixture`); a task with `fixture`
 /// `None` is defined but unexecutable, and the runner reports it as
 /// pending with the `gap` reason, never as a score. All eight tasks
 /// below currently have fixtures.
@@ -551,7 +564,8 @@ pub fn summarize(arm: Arm, outcomes: &[TaskOutcome]) -> ArmSummary {
 // Executor: runs one arm x one task cell through the real repair loop.
 // ---------------------------------------------------------------------------
 
-/// Fixture metadata (`bench/repair/<name>/meta.json`).
+/// Fixture metadata (`bench/repair/<name>/meta.json` or
+/// `bench/paired/<name>/meta.json`).
 struct FixtureMeta {
     verify: Vec<String>,
     pinned: Vec<String>,
@@ -755,6 +769,12 @@ pub struct ExecCtx {
     /// the repo's `bench/repair/`; tests point it at a temp corpus so
     /// `execute` can be driven end to end without touching the repo.
     pub corpus_dir: Option<PathBuf>,
+    /// Paired-only corpus root holding `bench/paired/<name>/` fixtures:
+    /// tasks the deterministic solver cannot repair, which must not live
+    /// in `bench/repair/` because `scripts/bench_repair.sh --check`
+    /// fails the CI agentic-eval job when any fixture there goes
+    /// unrepaired. Defaults to the repo's `bench/paired/`.
+    pub paired_corpus_dir: Option<PathBuf>,
     /// Scratch root for per-cell work dirs (defaults to the system temp
     /// dir). Kept under one root so a run's trees can be inspected.
     pub scratch_root: PathBuf,
@@ -767,6 +787,7 @@ impl ExecCtx {
         ExecCtx {
             solver_bin: std::env::var("AXIOM_BIN").ok().map(PathBuf::from),
             corpus_dir: None,
+            paired_corpus_dir: None,
             scratch_root: std::env::temp_dir().join("axiombench-paired"),
             verify_timeout: Duration::from_secs(300),
             solve_timeout: Duration::from_secs(600),
@@ -842,6 +863,29 @@ impl AxiomSolveExecutor {
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
     }
 
+    /// Resolve a fixture directory: the repair corpus first, then the
+    /// paired-only corpus. A name that exists in neither still returns
+    /// the paired path, so the caller reports it unreadable instead of
+    /// silently falling back to a wrong fixture.
+    fn resolve_fixture_dir(&self, name: &str) -> PathBuf {
+        let root = Self::repo_root();
+        let repair = self
+            .ctx
+            .corpus_dir
+            .clone()
+            .unwrap_or_else(|| root.join("bench/repair"));
+        let candidate = repair.join(name);
+        if candidate.is_dir() {
+            return candidate;
+        }
+        let paired = self
+            .ctx
+            .paired_corpus_dir
+            .clone()
+            .unwrap_or_else(|| root.join("bench/paired"));
+        paired.join(name)
+    }
+
     pub fn execute(&self, task: &PairedTask, arm: Arm, repeat: u32) -> TaskOutcome {
         let fixture_name = match task.fixture {
             Some(name) => name,
@@ -857,19 +901,15 @@ impl AxiomSolveExecutor {
         };
         // Arms B, C, and E execute through the same `axiom solve` loop
         // as arm D, under their own env overlay (see
-        // [`Arm::env_overlay`]): the overlay is the arm's definition,
-        // and the paired comparison measures the toggle's effect on the
-        // real solver. A live-LLM agent executor (driving a real coding
-        // agent with and without AXIOM in the loop, with token/cost/turn
-        // accounting) is still a named open item; the deterministic
-        // harness measures the toggle effect, not that agent.
-        let root = Self::repo_root();
-        let corpus = self
-            .ctx
-            .corpus_dir
-            .clone()
-            .unwrap_or_else(|| root.join("bench/repair"));
-        let fixture_dir = corpus.join(fixture_name);
+        // [`Arm::env_overlay`]): the overlay is the arm's definition.
+        // It is not a mechanism ablation (the overlay variables have
+        // no read site in the solve path; see `env_overlay`), so
+        // identical scores across arms are replication, not a measured
+        // toggle effect. A live-LLM agent executor (driving a real
+        // coding agent with and without AXIOM in the loop, with
+        // token/cost/turn accounting) is still a named open item; the
+        // deterministic harness runs the real solver, not that agent.
+        let fixture_dir = self.resolve_fixture_dir(fixture_name);
         let meta = match read_fixture_meta(&fixture_dir) {
             Ok(meta) => meta,
             Err(e) => {
@@ -1516,6 +1556,33 @@ mod tests {
         }
         assert!(TASK_SET.iter().all(|t| t.fixture.is_some()));
         assert!(TASK_SET.iter().all(|t| t.gap.is_none()));
+        // Every fixture must resolve to a real meta.json through the
+        // same resolver `execute` uses, across both corpora: a move
+        // that strands a fixture must fail here, not at run time.
+        let ex = AxiomSolveExecutor {
+            ctx: ExecCtx::default_ctx(),
+            sabotage: false,
+        };
+        for task in TASK_SET {
+            let dir = ex.resolve_fixture_dir(task.fixture.unwrap());
+            assert!(
+                dir.join("meta.json").is_file(),
+                "fixture {} must resolve to a meta.json, got {dir:?}",
+                task.fixture.unwrap()
+            );
+        }
+        // The two fixtures the deterministic solver cannot repair live
+        // in the paired-only corpus, never in bench/repair/: the CI
+        // agentic-eval job fails when any bench/repair fixture goes
+        // unrepaired.
+        for name in ["multi-both-broken", "longsession-overflow"] {
+            assert!(
+                ex.resolve_fixture_dir(name)
+                    .to_string_lossy()
+                    .contains("bench/paired"),
+                "{name} must resolve under bench/paired"
+            );
+        }
     }
 
     #[test]
@@ -1569,6 +1636,7 @@ mod tests {
             ctx: ExecCtx {
                 solver_bin: Some(solver),
                 corpus_dir: Some(corpus),
+                paired_corpus_dir: None,
                 scratch_root: scratch,
                 verify_timeout: Duration::from_secs(30),
                 solve_timeout: Duration::from_secs(30),
@@ -1852,6 +1920,7 @@ mod tests {
         let ctx = ExecCtx {
             solver_bin: Some(rel),
             corpus_dir: None,
+            paired_corpus_dir: None,
             scratch_root: temp.path().to_path_buf(),
             verify_timeout: Duration::from_secs(30),
             solve_timeout: Duration::from_secs(30),
