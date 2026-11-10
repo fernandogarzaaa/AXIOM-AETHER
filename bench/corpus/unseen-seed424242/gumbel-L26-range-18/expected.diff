@@ -1,0 +1,11 @@
+--- a/src/gumbel.rs
++++ b/src/gumbel.rs
+@@ -23,7 +23,7 @@
+ 
+ /// Draw one Gumbel(0, 1) sample per logit: `g = -ln(-ln(u))`, `u ~ U(0,1)`.
+ fn sample_gumbel(n: usize, rng: &mut impl Rng) -> Array1<f32> {
+-    Array1::from_iter((0..=n).map(|_| {
++    Array1::from_iter((0..n).map(|_| {
+         // Clamp away from 0 and 1 so both logs stay finite.
+         let u: f32 = rng.random_range(1e-7..1.0 - 1e-7);
+         -(-u.ln()).ln()

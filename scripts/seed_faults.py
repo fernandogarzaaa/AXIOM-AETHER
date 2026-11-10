@@ -26,6 +26,13 @@ Honesty notes, which travel with every result this produces:
 Usage:
     scripts/seed_faults.py --crate axiom_mesh_core --out /tmp/seeded --n 40 --seed 2026
     AXIOM_REPAIR_CORPUS=/tmp/seeded scripts/bench_repair.sh
+
+Phase 4 unseen suite (2026-11-10): seed 424242 is the qualification seed.
+It uses a different generator revision than seeds 7/2026 (the `strlit` class
+below did not exist when those corpora were generated) and a different seed,
+so no operator or ordering rule was ever tuned against its faults. Its
+fixtures live under bench/corpus/unseen-seed424242/ and are excluded from
+all tuning until the qualification run.
 """
 
 from __future__ import annotations
@@ -100,6 +107,44 @@ def code_mask(line: str) -> list[bool]:
 
 def spaced(line: str, s: int, e: int) -> bool:
     return s > 0 and line[s - 1] == " " and e < len(line) and line[e] == " "
+
+
+def string_spans(line: str) -> list[tuple[int, int, str]]:
+    """(content_start, content_end, content) for genuine string literals.
+
+    Unlike `code_mask`, which blanks string contents along with comments,
+    this returns only real strings: `//` comments end the scan, and char
+    literals are skipped.
+    """
+    out: list[tuple[int, int, str]] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if c == "/" and i + 1 < n and line[i + 1] == "/":
+            break
+        if c == '"':
+            j = i + 1
+            content: list[str] = []
+            while j < n:
+                if line[j] == "\\":
+                    if j + 1 < n:
+                        content.append(line[j + 1])
+                    j += 2
+                    continue
+                if line[j] == '"':
+                    break
+                content.append(line[j])
+                j += 1
+            if j < n and j > i + 1:
+                out.append((i + 1, j, "".join(content)))
+            i = j + 1
+            continue
+        if c == "'" and i + 2 < n and line[i + 2] == "'":
+            i += 3
+            continue
+        i += 1
+    return out
 
 
 def sites_for_line(line_no: int, line: str) -> list[Site]:
@@ -222,6 +267,21 @@ def sites_for_line(line_no: int, line: str) -> list[Site]:
         s, e = m.span(1)
         if ok(s, e):
             out.append(Site(line_no, "flow", m.group(1), "continue" if m.group(1) == "break" else "break", s, e))
+
+    # String-literal mutation (added 2026-11-10 for the Phase 4 unseen suite,
+    # seed 424242: this class did not exist when seeds 7/2026 were generated).
+    # Appends "!" to a short plain string literal. The repair engine has no
+    # operator that can guess the original literal, so this class is outside
+    # its operator set by construction; a test only catches it when it asserts
+    # the exact string. Skips format strings, paths, and URLs.
+    for (start, end, content) in string_spans(line):
+        if len(content) < 2 or len(content) > 32:
+            continue
+        if "{" in content or "}" in content or "/" in content or ":" in content:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9 _.,-]+", content):
+            continue
+        out.append(Site(line_no, "strlit", content, content + "!", start, end))
 
     # Identifier swap: two distinct short identifiers on one line, swapped (outside the set).
     idents = [m for m in re.finditer(rf"\b({IDENT})\b", line) if ok(*m.span(1))]

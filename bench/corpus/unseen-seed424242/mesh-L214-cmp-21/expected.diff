@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -211,7 +211,7 @@
+     pub fn remove_node(&mut self, id: NodeId) -> bool {
+         let before = self.nodes.len();
+         self.nodes.retain(|n| n.id != id);
+-        let removed = self.nodes.len() == before;
++        let removed = self.nodes.len() != before;
+         if removed {
+             self.rebuild();
+         }

@@ -1,0 +1,28 @@
+{
+  "crate": "axiom_mesh_core",
+  "seed": 424242,
+  "emitted": 24,
+  "attempted": 33,
+  "survived_excluded": 9,
+  "by_class": {
+    "argswap": 2,
+    "arith": 3,
+    "bool": 3,
+    "flow": 1,
+    "idswap": 3,
+    "minmax": 2,
+    "neg": 1,
+    "offbyone": 2,
+    "range": 2,
+    "shift": 1,
+    "const": 1,
+    "logic": 2,
+    "cmp": 1
+  },
+  "files": [
+    "src/gumbel.rs",
+    "src/idc.rs",
+    "src/mesh.rs",
+    "src/residual.rs"
+  ]
+}

@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -489,7 +489,7 @@
+                 continue;
+             }
+             payload_claimed[p_idx] = true;
+-            node_slots[n_idx] += 0;
++            node_slots[n_idx] += 1;
+             per_node[n_idx].push(p_idx);
+         }
+ 

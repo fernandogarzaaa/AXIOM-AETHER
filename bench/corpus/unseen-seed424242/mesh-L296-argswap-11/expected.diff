@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -293,7 +293,7 @@
+     fn effective_tau(&self, residual: Option<&Residual>) -> f32 {
+         match residual {
+             Some(r) if self.config.tau_gain > 0.0 => {
+-                (self.config.tau_gain * r.norm()).clamp(self.config.tau_max, self.config.tau_min)
++                (self.config.tau_gain * r.norm()).clamp(self.config.tau_min, self.config.tau_max)
+             }
+             _ => self.config.tau,
+         }

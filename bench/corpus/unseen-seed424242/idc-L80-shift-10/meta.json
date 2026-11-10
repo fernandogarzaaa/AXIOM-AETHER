@@ -1,0 +1,22 @@
+{
+  "lang": "rust",
+  "verify": [
+    "sh",
+    "-c",
+    "CARGO_TARGET_DIR=\"/home/hatch/workspace/axiom-aether-audit-p1/.seed-tmp/axiom_seeded_target\" cargo test --lib -q"
+  ],
+  "kind": "single",
+  "source": "seeded fault, seed=424242, src/idc.rs:80, class=shift",
+  "pinned": [],
+  "test_region": {
+    "file": "src/idc.rs",
+    "from_line": 242
+  },
+  "fault": {
+    "file": "src/idc.rs",
+    "line": 80,
+    "class": "shift",
+    "before": ">>",
+    "after": "<<"
+  }
+}

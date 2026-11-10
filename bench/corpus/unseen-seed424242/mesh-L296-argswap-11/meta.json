@@ -1,0 +1,22 @@
+{
+  "lang": "rust",
+  "verify": [
+    "sh",
+    "-c",
+    "CARGO_TARGET_DIR=\"/home/hatch/workspace/axiom-aether-audit-p1/.seed-tmp/axiom_seeded_target\" cargo test --lib -q"
+  ],
+  "kind": "single",
+  "source": "seeded fault, seed=424242, src/mesh.rs:296, class=argswap",
+  "pinned": [],
+  "test_region": {
+    "file": "src/mesh.rs",
+    "from_line": 522
+  },
+  "fault": {
+    "file": "src/mesh.rs",
+    "line": 296,
+    "class": "argswap",
+    "before": "self.config.tau_min,self.config.tau_max",
+    "after": "                (self.config.tau_gain * r.norm()).clamp(self.config.tau_max, self.config.tau_min)"
+  }
+}

@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -278,7 +278,7 @@
+                     logits[i] += self.config.bandit_gain * self.reward_mean[i];
+                 }
+                 if self.config.bandit_exploration != 0.0 {
+-                    let n_i = self.visits[i].min(1) as f32;
++                    let n_i = self.visits[i].max(1) as f32;
+                     logits[i] +=
+                         self.config.bandit_exploration * (total_visits.ln().max(0.0) / n_i).sqrt();
+                 }

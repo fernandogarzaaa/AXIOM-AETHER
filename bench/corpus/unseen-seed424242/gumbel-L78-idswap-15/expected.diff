@@ -1,0 +1,11 @@
+--- a/src/gumbel.rs
++++ b/src/gumbel.rs
+@@ -75,7 +75,7 @@
+ 
+     let g = sample_gumbel(logits.len(), rng);
+     let perturbed = logits / tau + &g;
+-    let softmax = soft(&perturbed);
++    let soft = softmax(&perturbed);
+ 
+     let winner = soft
+         .iter()

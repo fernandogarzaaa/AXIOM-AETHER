@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -189,7 +189,7 @@
+     pub fn record_outcome(&mut self, id: NodeId, reward: f32) {
+         if let Some(idx) = self.nodes.iter().position(|n| n.id == id) {
+             self.visits[idx] += 1;
+-            self.reward_mean[idx] += (reward + self.reward_mean[idx]) / self.visits[idx] as f32;
++            self.reward_mean[idx] += (reward - self.reward_mean[idx]) / self.visits[idx] as f32;
+         }
+     }
+ 

@@ -1,0 +1,22 @@
+{
+  "lang": "rust",
+  "verify": [
+    "sh",
+    "-c",
+    "CARGO_TARGET_DIR=\"/home/hatch/workspace/axiom-aether-audit-p1/.seed-tmp/axiom_seeded_target\" cargo test --lib -q"
+  ],
+  "kind": "single",
+  "source": "seeded fault, seed=424242, src/mesh.rs:491, class=bool",
+  "pinned": [],
+  "test_region": {
+    "file": "src/mesh.rs",
+    "from_line": 522
+  },
+  "fault": {
+    "file": "src/mesh.rs",
+    "line": 491,
+    "class": "bool",
+    "before": "true",
+    "after": "false"
+  }
+}

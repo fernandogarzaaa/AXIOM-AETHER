@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -266,7 +266,7 @@
+                 logits[i] -= self.config.capacity_penalty * n as f32;
+             }
+         }
+-        if self.config.bandit_gain != 0.0 && self.config.bandit_exploration != 0.0 {
++        if self.config.bandit_gain != 0.0 || self.config.bandit_exploration != 0.0 {
+             // UCB1-style: total_visits/node_visits are floored at 1 rather
+             // than special-cased at 0, an "optimistic initialization"
+             // simplification that avoids infinities (which would poison

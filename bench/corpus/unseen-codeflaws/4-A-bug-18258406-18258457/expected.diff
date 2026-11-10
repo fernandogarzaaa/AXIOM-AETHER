@@ -1,0 +1,4 @@
+--- a/4-A-18258406.c
++++ b/4-A-18258457.c
+@@ -3,7 +3,7 @@
+ { 	int w ; 	scanf ("%d", &w);-	if (w>=w && w %2==0)+	if (w>=4 && w %2==0) 		printf( "YES"); 	else printf ("NO"); 	

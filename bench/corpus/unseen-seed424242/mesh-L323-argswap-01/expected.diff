@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -320,7 +320,7 @@
+             });
+         }
+ 
+-        let field = self.field(residual, payload);
++        let field = self.field(payload, residual);
+         let fan_out = self.config.fan_out.min(self.nodes.len()).max(1);
+         let tau = self.effective_tau(residual);
+ 

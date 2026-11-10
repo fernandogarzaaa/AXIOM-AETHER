@@ -1,0 +1,4 @@
+--- a/58-A-18163826.c
++++ b/58-A-18163845.c
+@@ -16,7 +16,7 @@
+     if(i==5)             printf("YES");     else-        printf("No");+        printf("NO");     return 0;  }

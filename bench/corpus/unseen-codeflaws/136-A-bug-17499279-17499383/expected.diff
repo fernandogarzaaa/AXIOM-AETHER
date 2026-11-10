@@ -1,0 +1,4 @@
+--- a/136-A-17499279.c
++++ b/136-A-17499383.c
+@@ -1,7 +1,7 @@
+ #include <stdio.h> #include <string.h> -#define MXS 100*2-1+1+#define MXS 1024  int main(int argc, char *argv[]) {     int n, k, i;

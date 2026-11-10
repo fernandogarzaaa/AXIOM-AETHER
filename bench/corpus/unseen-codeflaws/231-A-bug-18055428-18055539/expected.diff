@@ -1,0 +1,4 @@
+--- a/231-A-18055428.c
++++ b/231-A-18055539.c
+@@ -8,7 +8,7 @@
+     {         scanf("%d%d%d",&p,&v,&t);         total_problems[i]=p*100+v*10+t;-      if(total_problems[i]==011||total_problems[i]==101||total_problems[i]==110||total_problems[i]==111)+      if(total_problems[i]==11||total_problems[i]==101||total_problems[i]==110||total_problems[i]==111)         count++;     } 
