@@ -733,12 +733,57 @@ impl CompressionControls {
 ///   The original payload cannot fix these and re-sending a 429 is harmful → no retry.
 /// * `MissingAuth` / `Decode` — no credential, or we *did* get a response we just
 ///   could not parse → retrying the original changes nothing → no retry.
+///
+/// The status half of this decision lives in `should_retry_status`, shared
+/// with the OpenAI forwarder through `should_retry_openai`.
 pub fn should_retry_uncompressed(err: &crate::anthropic_forwarder::ForwarderError) -> bool {
     use crate::anthropic_forwarder::ForwarderError;
     match err {
         ForwarderError::Network(_) => true,
-        ForwarderError::Upstream { status, .. } => *status >= 500 || *status == 400,
+        ForwarderError::Upstream { status, .. } => should_retry_status(*status),
         ForwarderError::Decode(_) | ForwarderError::MissingAuth => false,
+    }
+}
+
+/// The single retry decision shared by every upstream forwarder.
+///
+/// Retry only when the original payload has a real chance of succeeding
+/// where the failed attempt did not, or when the failure is transient:
+///
+/// * 5xx — the upstream failed. The outcome is unknown, so the retry is
+///   safe only because it carries the same stable idempotency key as the
+///   first attempt (see `resolve_idempotency_key` in `openai_forwarder`):
+///   the upstream dedupes instead of double-executing. This guarantee
+///   holds for the Responses path only: the Messages path sends no
+///   `Idempotency-Key` and resends a different (uncompressed) body on
+///   retry, so its 5xx/Network retries do not share it. A follow-up adds
+///   the key to the Messages path; until then, do not read this comment
+///   as claiming Messages retries are deduplicated.
+/// * 400 — a Bad Request our own transform (fingerprint/skeleton block,
+///   model rewrite) plausibly caused. The untouched body may succeed.
+/// * Anything else — 401/403/407/429/other 4xx — is a failure the
+///   original payload cannot fix, and re-sending a 429 is actively harmful.
+///
+/// The rule this encodes: when the upstream outcome is unknown AND the
+/// operation is non-idempotent, do not retry. The idempotency key is what
+/// moves Network/5xx retries to the safe side of that rule. Without a
+/// stable key on both attempts, a retry of an unknown-outcome request
+/// would risk a second execution.
+pub fn should_retry_status(status: u16) -> bool {
+    status >= 500 || status == 400
+}
+
+/// OpenAI-side twin of [`should_retry_uncompressed`]: the same status
+/// discrimination applied to an [`OpenAiForwarderError`]. `Network` is a
+/// transient failure. `Upstream` retries only on 5xx/400. `Decode` means a
+/// response arrived that we could not parse, so the original payload
+/// changes nothing. `MissingAuth` means no credential exists at all.
+pub fn should_retry_openai(err: &crate::openai_forwarder::OpenAiForwarderError) -> bool {
+    use crate::openai_forwarder::OpenAiForwarderError;
+    match err {
+        OpenAiForwarderError::Network(_) => true,
+        OpenAiForwarderError::Upstream { status, .. } => should_retry_status(*status),
+        OpenAiForwarderError::Decode(_) | OpenAiForwarderError::MissingAuth => false,
     }
 }
 
@@ -927,5 +972,70 @@ mod tests {
         let cfg = CompressorConfig::from_env();
         assert!(!cfg.enabled);
         assert_eq!(cfg.heavy_message_threshold_tokens, 512);
+    }
+
+    #[test]
+    fn retry_status_matrix_retries_network_5xx_and_400_only() {
+        use crate::anthropic_forwarder::ForwarderError;
+        assert!(should_retry_uncompressed(&ForwarderError::Network(
+            "reset".into()
+        )));
+        for status in [400, 500, 502, 503] {
+            assert!(
+                should_retry_uncompressed(&ForwarderError::Upstream {
+                    status,
+                    body: String::new(),
+                }),
+                "status {status} must retry"
+            );
+            assert!(should_retry_status(status), "status {status} must retry");
+        }
+        for status in [401, 403, 407, 429, 404, 422] {
+            assert!(
+                !should_retry_uncompressed(&ForwarderError::Upstream {
+                    status,
+                    body: String::new(),
+                }),
+                "status {status} must not retry"
+            );
+            assert!(
+                !should_retry_status(status),
+                "status {status} must not retry"
+            );
+        }
+        assert!(!should_retry_uncompressed(&ForwarderError::Decode(
+            "bad json".into()
+        )));
+        assert!(!should_retry_uncompressed(&ForwarderError::MissingAuth));
+    }
+
+    #[test]
+    fn retry_openai_matrix_matches_anthropic_discrimination() {
+        use crate::openai_forwarder::OpenAiForwarderError;
+        assert!(should_retry_openai(&OpenAiForwarderError::Network(
+            "reset".into()
+        )));
+        for status in [400, 500, 502, 503] {
+            assert!(
+                should_retry_openai(&OpenAiForwarderError::Upstream {
+                    status,
+                    body: String::new(),
+                }),
+                "OpenAI status {status} must retry"
+            );
+        }
+        for status in [401, 403, 407, 429, 404, 422] {
+            assert!(
+                !should_retry_openai(&OpenAiForwarderError::Upstream {
+                    status,
+                    body: String::new(),
+                }),
+                "OpenAI status {status} must not retry"
+            );
+        }
+        assert!(!should_retry_openai(&OpenAiForwarderError::Decode(
+            "bad json".into()
+        )));
+        assert!(!should_retry_openai(&OpenAiForwarderError::MissingAuth));
     }
 }
