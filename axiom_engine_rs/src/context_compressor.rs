@@ -753,7 +753,12 @@ pub fn should_retry_uncompressed(err: &crate::anthropic_forwarder::ForwarderErro
 /// * 5xx — the upstream failed. The outcome is unknown, so the retry is
 ///   safe only because it carries the same stable idempotency key as the
 ///   first attempt (see `resolve_idempotency_key` in `openai_forwarder`):
-///   the upstream dedupes instead of double-executing.
+///   the upstream dedupes instead of double-executing. This guarantee
+///   holds for the Responses path only: the Messages path sends no
+///   `Idempotency-Key` and resends a different (uncompressed) body on
+///   retry, so its 5xx/Network retries do not share it. A follow-up adds
+///   the key to the Messages path; until then, do not read this comment
+///   as claiming Messages retries are deduplicated.
 /// * 400 — a Bad Request our own transform (fingerprint/skeleton block,
 ///   model rewrite) plausibly caused. The untouched body may succeed.
 /// * Anything else — 401/403/407/429/other 4xx — is a failure the

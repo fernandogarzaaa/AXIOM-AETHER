@@ -43,6 +43,41 @@ mod tests {
     }
 
     #[test]
+    fn responses_retry_action_follows_shared_retry_predicate() {
+        // Ties `responses_retry_action` to `should_retry_status` across
+        // every status: a drift in either rule fails here, not silently
+        // in production. 400 is the only FreshKeyOriginal; every other
+        // retryable status resends the same payload; transport failure
+        // (None) also resends the same payload.
+        for status in 100..=599u16 {
+            let action = responses_retry_action(Some(status));
+            if crate::context_compressor::should_retry_status(status) {
+                assert!(action.is_some(), "status {status} must retry");
+                if status == 400 {
+                    assert!(
+                        matches!(action, Some(ResponsesRetry::FreshKeyOriginal)),
+                        "status 400 must take the fresh-key original fallback"
+                    );
+                } else {
+                    assert!(
+                        matches!(action, Some(ResponsesRetry::SamePayload)),
+                        "status {status} must resend the same payload"
+                    );
+                }
+            } else {
+                assert!(action.is_none(), "status {status} must not retry");
+            }
+        }
+        assert!(
+            matches!(
+                responses_retry_action(None),
+                Some(ResponsesRetry::SamePayload)
+            ),
+            "transport failure must resend the same payload"
+        );
+    }
+
+    #[test]
     fn responses_compression_header_can_disable_one_request() {
         let mut headers = HeaderMap::new();
         assert!(responses_compression_header_enabled(&headers));

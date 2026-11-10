@@ -700,13 +700,16 @@ enum ResponsesRetry {
 /// Classify a retryable compressed-Responses failure. `status` is `None`
 /// for a transport failure and `Some(status)` for an upstream HTTP status.
 /// Returns `None` for failures the original payload cannot fix (401/403/
-/// 429/other 4xx), which must not be retried.
+/// 429/other 4xx), which must not be retried. The retryable set is the
+/// shared `should_retry_status` predicate, not a second copy of its rule:
+/// a 400 fallback resends the original payload under a fresh key, any
+/// other retryable status resends the same payload under the same key.
 fn responses_retry_action(status: Option<u16>) -> Option<ResponsesRetry> {
     match status {
         None => Some(ResponsesRetry::SamePayload),
-        Some(status) if status >= 500 => Some(ResponsesRetry::SamePayload),
+        Some(status) if !crate::context_compressor::should_retry_status(status) => None,
         Some(400) => Some(ResponsesRetry::FreshKeyOriginal),
-        Some(_) => None,
+        Some(_) => Some(ResponsesRetry::SamePayload),
     }
 }
 
@@ -741,6 +744,55 @@ fn fresh_key_auth(
     let fallback_key =
         crate::openai_forwarder::derive_idempotency_key(body, session_id, &fallback_nonce);
     with_idempotency_key(client_auth, &fallback_key)
+}
+
+/// Everything a Responses retry attempt needs beyond the forwarder, the
+/// decided action, and the log context. Bundled so the shared helper
+/// stays under clippy's argument limit.
+struct ResponsesRetryAttempt<'a> {
+    outbound: &'a Value,
+    body: &'a Value,
+    client_auth: &'a OpenAiClientAuth,
+    session_id: &'a str,
+    idempotency_key: &'a str,
+    controls: &'a CompressionControls,
+}
+
+/// Run one retry attempt for a compressed-Responses forward, as decided
+/// by `responses_retry_action`. Shared by the error path (the first
+/// attempt failed) and the status path (the first attempt returned a
+/// retryable status); the callers differ only in how they handle a
+/// failed retry. `context` names the first attempt's outcome in the log
+/// line, e.g. `forward failed (...)` or `returned 503`.
+async fn retry_responses_forward(
+    forwarder: &OpenAiForwarder,
+    action: ResponsesRetry,
+    context: &str,
+    attempt: &ResponsesRetryAttempt<'_>,
+) -> Result<reqwest::Response, OpenAiForwarderError> {
+    match action {
+        ResponsesRetry::SamePayload => {
+            eprintln!("[axiom-ttt] compressed Responses {context}; retrying same payload");
+            forwarder
+                .forward_responses(attempt.outbound, attempt.client_auth)
+                .await
+        }
+        ResponsesRetry::FreshKeyOriginal => {
+            eprintln!(
+                "[axiom-ttt] compressed Responses {context}; retrying original payload with fresh key"
+            );
+            attempt.controls.record_degraded_fallback();
+            let fallback_auth = fresh_key_auth(
+                attempt.client_auth,
+                attempt.body,
+                attempt.session_id,
+                attempt.idempotency_key,
+            );
+            forwarder
+                .forward_responses(attempt.body, &fallback_auth)
+                .await
+        }
+    }
 }
 
 /// `POST /v1/responses` - native passthrough with optional semantic compression.
@@ -826,6 +878,15 @@ async fn create_response(
     let mut upstream = match forwarder.forward_responses(outbound, &client_auth).await {
         Ok(response) => response,
         Err(err) if compressed.is_some() => {
+            // `should_retry_openai` is the production consumer of the
+            // shared retry rule: Decode/MissingAuth never retry, Network
+            // always does, Upstream only on 5xx/400.
+            if !crate::context_compressor::should_retry_openai(&err) {
+                return map_openai_forwarder_error(err).into_response();
+            }
+            // The Upstream arm is unreachable in practice: `send_json_with`
+            // returns `Ok` for every HTTP status, so no Upstream error is
+            // ever produced. It stays for exhaustiveness.
             let status = match &err {
                 OpenAiForwarderError::Network(_) => None,
                 OpenAiForwarderError::Upstream { status, .. } => Some(*status),
@@ -834,27 +895,17 @@ async fn create_response(
                 }
             };
             match responses_retry_action(status) {
-                Some(ResponsesRetry::SamePayload) => {
-                    eprintln!(
-                        "[axiom-ttt] compressed Responses forward failed ({err}); retrying same payload"
-                    );
-                    match forwarder.forward_responses(outbound, &client_auth).await {
-                        Ok(response) => response,
-                        Err(error) => return map_openai_forwarder_error(error).into_response(),
-                    }
-                }
-                Some(ResponsesRetry::FreshKeyOriginal) => {
-                    eprintln!(
-                        "[axiom-ttt] compressed Responses forward failed ({err}); retrying original payload with fresh key"
-                    );
-                    state.controls.record_degraded_fallback();
-                    let fallback_auth = fresh_key_auth(
-                        &client_auth,
-                        &body,
-                        session_override.unwrap_or("anonymous"),
-                        &idempotency_key,
-                    );
-                    match forwarder.forward_responses(&body, &fallback_auth).await {
+                Some(action) => {
+                    let context = format!("forward failed ({err})");
+                    let attempt = ResponsesRetryAttempt {
+                        outbound,
+                        body: &body,
+                        client_auth: &client_auth,
+                        session_id: session_override.unwrap_or("anonymous"),
+                        idempotency_key: &idempotency_key,
+                        controls: &state.controls,
+                    };
+                    match retry_responses_forward(forwarder, action, &context, &attempt).await {
                         Ok(response) => response,
                         Err(error) => return map_openai_forwarder_error(error).into_response(),
                     }
@@ -866,36 +917,19 @@ async fn create_response(
     };
     if compressed.is_some() {
         if let Some(action) = responses_retry_action(Some(upstream.status().as_u16())) {
-            match action {
-                ResponsesRetry::SamePayload => {
-                    eprintln!(
-                        "[axiom-ttt] compressed Responses returned {}; retrying same payload",
-                        upstream.status()
-                    );
-                    if let Ok(response) =
-                        forwarder.forward_responses(outbound, &client_auth).await
-                    {
-                        upstream = response;
-                    }
-                }
-                ResponsesRetry::FreshKeyOriginal => {
-                    eprintln!(
-                        "[axiom-ttt] compressed Responses returned {}; retrying original payload with fresh key",
-                        upstream.status()
-                    );
-                    state.controls.record_degraded_fallback();
-                    let fallback_auth = fresh_key_auth(
-                        &client_auth,
-                        &body,
-                        session_override.unwrap_or("anonymous"),
-                        &idempotency_key,
-                    );
-                    if let Ok(response) =
-                        forwarder.forward_responses(&body, &fallback_auth).await
-                    {
-                        upstream = response;
-                    }
-                }
+            let context = format!("returned {}", upstream.status());
+            let attempt = ResponsesRetryAttempt {
+                outbound,
+                body: &body,
+                client_auth: &client_auth,
+                session_id: session_override.unwrap_or("anonymous"),
+                idempotency_key: &idempotency_key,
+                controls: &state.controls,
+            };
+            if let Ok(response) =
+                retry_responses_forward(forwarder, action, &context, &attempt).await
+            {
+                upstream = response;
             }
         }
     }
