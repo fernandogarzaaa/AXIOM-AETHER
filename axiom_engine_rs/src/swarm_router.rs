@@ -21,6 +21,12 @@ const DEFAULT_NUM_CTX: u64 = 4096;
 /// immediately, via the dropped channel receiver.
 const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// Upper bound on the upstream error body embedded in
+/// [`SwarmRouteError::Upstream`]. An error page can be arbitrarily large,
+/// and embedding all of it would bloat every log line and error string
+/// downstream, so only the head is kept.
+const MAX_UPSTREAM_ERROR_BODY_CHARS: usize = 512;
+
 /// Bound of the streaming channel between the Ollama producer task and the
 /// SSE consumer. This is the backpressure mechanism: a slow consumer blocks
 /// the producer on `send` once 16 deltas are queued, instead of the
@@ -385,6 +391,7 @@ async fn start_stream_request(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
+        let body: String = body.chars().take(MAX_UPSTREAM_ERROR_BODY_CHARS).collect();
         return Err(SwarmRouteError::Upstream(format!(
             "ollama status {}: {}",
             status.as_u16(),

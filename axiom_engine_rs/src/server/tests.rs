@@ -2106,7 +2106,7 @@ mod tests {
     /// the expected path was requested at all.
     async fn serve_fixed_responses(
         listener: tokio::net::TcpListener,
-        routes: Vec<(&'static str, &'static str, &'static str)>,
+        routes: Vec<(&'static str, &'static str, String)>,
         hit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2135,6 +2135,36 @@ mod tests {
                     }
                 }
                 let head = String::from_utf8_lossy(&buf).to_string();
+                // Drain the declared request body before responding: the
+                // client may still be sending it, and closing the socket
+                // early turns into a connection reset on the client side.
+                // The drain is capped so a lying Content-Length cannot hang
+                // the fake.
+                let header_end = buf
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|i| i + 4)
+                    .unwrap_or(buf.len());
+                let content_length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.trim().eq_ignore_ascii_case("content-length") {
+                            value.trim().parse().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let buffered_body = buf.len().saturating_sub(header_end);
+                let mut remaining = content_length.saturating_sub(buffered_body).min(65_536);
+                while remaining > 0 {
+                    let chunk = remaining.min(tmp.len());
+                    match socket.read(&mut tmp[..chunk]).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => remaining -= n,
+                    }
+                }
                 let request_line = head.lines().next().unwrap_or("").to_string();
                 let mut parts = request_line.split_whitespace();
                 let method = parts.next().unwrap_or("");
@@ -2171,12 +2201,14 @@ mod tests {
                 (
                     "GET",
                     "/api/tags",
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 33\r\nConnection: close\r\n\r\n{\"models\":[{\"name\":\"phi4:3.8b\"}]}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 33\r\nConnection: close\r\n\r\n{\"models\":[{\"name\":\"phi4:3.8b\"}]}"
+                        .to_string(),
                 ),
                 (
                     "POST",
                     "/api/chat",
-                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nollama exploded",
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nollama exploded"
+                        .to_string(),
                 ),
             ],
             ollama_hit_clone,
@@ -2195,7 +2227,7 @@ mod tests {
         let cloud_hit_clone = cloud_hit.clone();
         tokio::spawn(serve_fixed_responses(
             cloud_listener,
-            vec![("POST", "/v1/chat/completions", Box::leak(cloud_response.into_boxed_str()))],
+            vec![("POST", "/v1/chat/completions", cloud_response)],
             cloud_hit_clone,
         ));
 
