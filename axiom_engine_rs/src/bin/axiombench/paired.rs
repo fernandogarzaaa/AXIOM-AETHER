@@ -892,6 +892,18 @@ impl ExecCtx {
     }
 }
 
+/// Resolve a path to absolute form against the current directory
+/// (no existence requirement, unlike `canonicalize`): a relative
+/// scratch root would otherwise leak into the solver's environment
+/// (see `execute`).
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    }
+}
+
 /// Clamp a byte index down to a UTF-8 char boundary in `s` (never
 /// above `s.len()`). `str::truncate` and byte-index slicing panic when
 /// the cut lands inside a multi-byte character; solver output can
@@ -1008,9 +1020,19 @@ impl AxiomSolveExecutor {
             repeat,
             std::process::id()
         );
-        let work = self.ctx.scratch_root.join(&run_id).join("work");
-        let logs = self.ctx.scratch_root.join(&run_id).join("logs");
-        let state = self.ctx.scratch_root.join(&run_id).join("state");
+        // A relative scratch root would leak into the solver's
+        // environment: AXIOM_HEAL_MEMORY derives from `state`, but
+        // the solver runs with `work` as its cwd, so a relative
+        // heal-memory path resolves under the work tree instead of
+        // the isolated state dir (the recorded full runs show
+        // heal_memory.json files nested under work/.../target/...).
+        // Absolutize once, here, so every derived path (work, logs,
+        // state, and every env value built from them) is absolute
+        // regardless of how the executor was constructed.
+        let scratch_root = absolutize(&self.ctx.scratch_root);
+        let work = scratch_root.join(&run_id).join("work");
+        let logs = scratch_root.join(&run_id).join("logs");
+        let state = scratch_root.join(&run_id).join("state");
         let mut outcome = TaskOutcome {
             task_id: task.id.into(),
             family: task.family,
@@ -1060,6 +1082,12 @@ impl AxiomSolveExecutor {
         ) {
             Ok(r) => r,
             Err(e) => {
+                // A verifier that cannot spawn is an infrastructure
+                // failure, not a measured task outcome: the cell is
+                // unevaluable, never scored as a failure with a
+                // successful rollback.
+                outcome.status = OutcomeStatus::PendingExecutor;
+                outcome.rollback_ok = None;
                 outcome.notes = format!("baseline verify could not run: {e}");
                 return finish(outcome);
             }
@@ -1129,6 +1157,11 @@ impl AxiomSolveExecutor {
         ) {
             Ok(r) => r,
             Err(e) => {
+                // As above: a solver that cannot spawn (e.g. an
+                // existing but non-executable binary) leaves the cell
+                // unevaluable, not executed.
+                outcome.status = OutcomeStatus::PendingExecutor;
+                outcome.rollback_ok = None;
                 outcome.notes = format!("solve could not run: {e}");
                 return finish(outcome);
             }
@@ -1176,6 +1209,10 @@ impl AxiomSolveExecutor {
         ) {
             Ok(r) => r,
             Err(e) => {
+                // As above: a re-verify that cannot spawn leaves the
+                // cell unevaluable, not executed.
+                outcome.status = OutcomeStatus::PendingExecutor;
+                outcome.rollback_ok = None;
                 outcome.notes = format!("re-verify could not run: {e}");
                 return finish(outcome);
             }
@@ -2222,6 +2259,94 @@ mod tests {
                 .into_owned(),
         ]);
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn relative_scratch_root_stays_out_of_the_solver_env() {
+        // Codex P2 (re-review of the final head): with a relative
+        // --scratch, AXIOM_HEAL_MEMORY derived from it resolves under
+        // the solver's work dir (cwd=work) instead of the isolated
+        // state dir. The recorded full runs show heal_memory.json
+        // files nested under work/.../target/...; they only escaped
+        // the rollback check because the path starts with `target/`,
+        // which snapshot_tree excludes. The solver must receive an
+        // absolute heal-memory path.
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("heal_env.txt");
+        let corpus = corpus_with_fixture(temp.path());
+        let solver = fake_solver(
+            temp.path(),
+            "dump_env.sh",
+            &format!(
+                "#!/bin/sh\necho \"$AXIOM_HEAL_MEMORY\" > {}\n",
+                marker.display()
+            ),
+        );
+        // A relative scratch root under the crate's target/
+        // (git-ignored); removed at the end of the test.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let rel_scratch =
+            PathBuf::from("target").join(format!("paired-relative-scratch-test-{nanos}"));
+        let ex = executor_with_solver(solver, corpus, rel_scratch.clone());
+        let out = ex.execute(&single_task(), Arm::Repair, 1);
+        let dumped = std::fs::read_to_string(&marker).unwrap();
+        let dumped = dumped.trim();
+        assert!(
+            PathBuf::from(dumped).is_absolute(),
+            "AXIOM_HEAL_MEMORY must be absolute with a relative scratch root, got {dumped:?} (outcome: {out:?})"
+        );
+        assert!(
+            dumped.contains("paired-relative-scratch-test"),
+            "heal-memory path must stay under the scratch root, got {dumped:?}"
+        );
+        let _ = std::fs::remove_dir_all(&rel_scratch);
+    }
+
+    #[test]
+    fn spawn_failures_are_unevaluable_not_executed() {
+        // Codex P2 (re-review of the final head): when a verifier or
+        // the solver binary cannot be spawned, execute() left the
+        // cell Executed with rollback_ok Some(true), so an
+        // infrastructure failure scored as a measured task failure
+        // with a successful rollback and could still qualify. Both
+        // cases must resolve to PendingExecutor with no rollback claim.
+        // (a) Solver binary exists but is not executable: resolve
+        // succeeds, spawn fails with EACCES.
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = corpus_with_fixture(temp.path());
+        let dead = temp.path().join("solver");
+        std::fs::write(&dead, "#!/bin/sh\n").unwrap(); // mode 0644, not executable
+        let ex = executor_with_solver(dead, corpus, temp.path().join("scratch"));
+        let out = ex.execute(&single_task(), Arm::Repair, 1);
+        assert_eq!(out.status, OutcomeStatus::PendingExecutor, "{out:?}");
+        assert_eq!(out.rollback_ok, None, "{out:?}");
+        // (b) The verifier itself cannot spawn.
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = temp.path().join("corpus");
+        fixture_tree(
+            &corpus,
+            "def double(x):\n    return x * 2 + 1\n",
+            "from calc import double\n\ndef test_double():\n    assert double(3) == 6\n\ntest_double()\n",
+        );
+        std::fs::write(
+            corpus.join("py-double").join("meta.json"),
+            serde_json::json!({
+                "lang": "python",
+                "verify": ["/nonexistent-verifier-binary"],
+                "kind": "single",
+                "pinned": ["test_calc.py"],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let solver = fake_solver(temp.path(), "fix.sh", "#!/bin/sh\n");
+        let ex = executor_with_solver(solver, corpus, temp.path().join("scratch"));
+        let out = ex.execute(&single_task(), Arm::Repair, 1);
+        assert_eq!(out.status, OutcomeStatus::PendingExecutor, "{out:?}");
+        assert_eq!(out.rollback_ok, None, "{out:?}");
     }
 
     #[test]
