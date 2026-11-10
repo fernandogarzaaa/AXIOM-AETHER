@@ -1027,6 +1027,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cluster_sync_merges_delta_into_layer_state() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
@@ -1288,6 +1289,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_requires_api_key_when_configured() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         // /metrics is gated by require_api_key: without the key it 401s, with
         // the key it serves the exposition body.
         let state = make_test_state().await.with_api_key(Some("k3y".into()));
@@ -1345,6 +1347,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_open_by_default_when_no_api_key() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         // With AXIOM_API_KEY unset the guard is a passthrough, so /metrics
         // stays open with no header, as before.
         let state = make_test_state().await;
@@ -1361,6 +1364,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        safe_drop(pipeline_arc).await;
+    }
+
+    #[tokio::test]
+    async fn metrics_renders_stage_memory_and_stall_series() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
+        // Drive the new observability surface through the real /metrics
+        // route: one observation per stage, one stall, a session-memory
+        // value, and an RSS refresh, then assert every new series is in
+        // the exposition body.
+        for stage in metrics::Stage::ALL {
+            metrics::observe_stage_latency(stage, 0.01);
+        }
+        metrics::record_backpressure_stall();
+        // Preload zero, not 2048: with a preloaded value above the
+        // expected 64-byte session the assertion below passes even if
+        // the route stops refreshing session memory. Zero makes a
+        // missing refresh fail the assertion in isolation.
+        metrics::set_session_memory_bytes(0);
+        metrics::refresh_process_memory();
+
+        let state = make_test_state().await;
+        // A live fast-weight session in the compression store (4x4 f32 =
+        // 64 bytes) must count toward the session-memory gauge: the
+        // legacy registry alone would report zero here.
+        let ttt_tensor = Tensor::ones((4, 4), DType::F32, &state.device).unwrap();
+        state
+            .ttt_sessions
+            .insert_states("test-ttt-session".into(), vec![ttt_tensor]);
+        let pipeline_arc = state.pipeline.clone();
+        let app = create_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rendered = String::from_utf8_lossy(&body);
+        for stage in metrics::Stage::ALL {
+            assert!(
+                rendered.contains(&format!(
+                    "axiom_stage_latency_seconds_bucket{{stage=\"{}\"",
+                    stage.as_str()
+                )),
+                "missing stage series for {}",
+                stage.as_str()
+            );
+        }
+        assert!(rendered.contains("axiom_process_rss_bytes"));
+        assert!(rendered.contains("axiom_session_memory_bytes"));
+        let memory_line = rendered
+            .lines()
+            .find(|line| line.starts_with("axiom_session_memory_bytes "))
+            .expect("session memory gauge must be rendered");
+        let memory_value: u64 = memory_line
+            .split_whitespace()
+            .nth(1)
+            .expect("session memory value must exist")
+            .parse()
+            .expect("session memory value must parse");
+        assert!(
+            memory_value >= 64,
+            "session memory gauge must include the 64-byte fast-weight session, got {memory_value}"
+        );
+        assert!(rendered.contains("axiom_stream_backpressure_stalls_total"));
         safe_drop(pipeline_arc).await;
     }
 
@@ -1518,6 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cluster_sync_rejects_out_of_order_delta() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
@@ -1569,6 +1646,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_quantized_session_dequantizes_on_chat_path() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
         let session_id = "quantized-session".to_string();
@@ -1852,6 +1930,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_creation_is_capped() {
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         let state = make_test_state().await.with_max_sessions(1);
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state);
@@ -1875,6 +1954,12 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_upload_with_overflowing_shape_is_rejected_not_panicking() {
+        // Creating a session refreshes the process-global session-memory
+        // gauge synchronously and spawns an LRU refresh that writes it
+        // again, so this test holds the gauge lock for its whole body:
+        // otherwise its 1024-byte refresh can replace the 1234 bytes
+        // `test_memory_gauges_render` sets before it renders.
+        let _gauge_guard = metrics::SESSION_MEMORY_GAUGE_TEST_LOCK.lock().await;
         let state = make_test_state().await;
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state);

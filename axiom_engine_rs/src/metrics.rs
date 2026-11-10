@@ -19,6 +19,77 @@ const FIRST_TOKEN_BUCKETS: [f64; 10] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.
 pub static HISTOGRAM_FIRST_TOKEN_LATENCY: LazyLock<Mutex<Histogram>> =
     LazyLock::new(|| Mutex::new(Histogram::new(&FIRST_TOKEN_BUCKETS)));
 
+/// One pipeline stage whose latency gets its own histogram. A typed enum,
+/// not a string, so a call site cannot invent a stage label and inflate
+/// cardinality: the rendered `stage` label set is exactly `Stage::ALL`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    Compress,
+    Route,
+    Forward,
+    Fingerprint,
+}
+
+impl Stage {
+    pub const ALL: [Stage; 4] = [
+        Stage::Compress,
+        Stage::Route,
+        Stage::Forward,
+        Stage::Fingerprint,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Stage::Compress => "compress",
+            Stage::Route => "route",
+            Stage::Forward => "forward",
+            Stage::Fingerprint => "fingerprint",
+        }
+    }
+}
+
+pub static HISTOGRAM_STAGE_LATENCY_COMPRESS: LazyLock<Mutex<Histogram>> =
+    LazyLock::new(|| Mutex::new(Histogram::new(&HISTOGRAM_BUCKETS)));
+pub static HISTOGRAM_STAGE_LATENCY_ROUTE: LazyLock<Mutex<Histogram>> =
+    LazyLock::new(|| Mutex::new(Histogram::new(&HISTOGRAM_BUCKETS)));
+pub static HISTOGRAM_STAGE_LATENCY_FORWARD: LazyLock<Mutex<Histogram>> =
+    LazyLock::new(|| Mutex::new(Histogram::new(&HISTOGRAM_BUCKETS)));
+pub static HISTOGRAM_STAGE_LATENCY_FINGERPRINT: LazyLock<Mutex<Histogram>> =
+    LazyLock::new(|| Mutex::new(Histogram::new(&HISTOGRAM_BUCKETS)));
+
+/// Times a stream producer blocked on a full bounded channel. Defined here;
+/// the live call site lives in the streaming path (PR #289's
+/// `route_chat_stream`), which does not exist on this branch, so nothing
+/// increments it yet. Counting stalls, not stalled bytes: one stall is one
+/// blocked send.
+pub static COUNTER_STREAM_BACKPRESSURE_STALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Resident set size of this process in bytes. Refreshed from
+/// `/proc/self/statm` on Linux by `refresh_process_memory`; 0 means
+/// unmeasured (non-Linux), never a true reading, since a live process
+/// always has a positive RSS.
+pub static GAUGE_PROCESS_RSS_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Estimated bytes held by session state: live tensor storage
+/// (`elem_count * dtype size`, metadata only) from both the legacy
+/// `/v1/sessions` registry and the compression fast-weight store, plus
+/// quantized descriptors. Refreshed with the session counts; an
+/// estimate, not a heap measurement.
+pub static GAUGE_SESSION_MEMORY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only lock serializing access to the process-global session-memory
+/// gauge. Lib tests run in parallel, and a `/metrics` scrape (or any
+/// `refresh_session_metrics` call) on an empty test state overwrites the
+/// gauge with zero, which races the set-then-render windows of the gauge
+/// tests. Every test that writes the gauge or asserts on it holds this
+/// lock for its whole body. A tokio mutex, so async tests can hold it
+/// across awaits (a std mutex would trip `await_holding_lock`); the one
+/// sync test uses `blocking_lock`. Never acquire it twice on one thread
+/// (the mutex is not reentrant).
+#[cfg(test)]
+pub(crate) static SESSION_MEMORY_GAUGE_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 const HISTOGRAM_BUCKETS: [f64; 9] = [0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0];
 
 #[derive(Clone)]
@@ -132,6 +203,56 @@ pub fn observe_first_token_latency(seconds: f64) {
     }
 }
 
+fn stage_histogram(stage: Stage) -> &'static LazyLock<Mutex<Histogram>> {
+    match stage {
+        Stage::Compress => &HISTOGRAM_STAGE_LATENCY_COMPRESS,
+        Stage::Route => &HISTOGRAM_STAGE_LATENCY_ROUTE,
+        Stage::Forward => &HISTOGRAM_STAGE_LATENCY_FORWARD,
+        Stage::Fingerprint => &HISTOGRAM_STAGE_LATENCY_FINGERPRINT,
+    }
+}
+
+/// Record one stage observation. Stage histograms count completed stages
+/// only: error returns and skipped attempts are not sampled, so the
+/// distribution describes successful stage executions, not attempts.
+pub fn observe_stage_latency(stage: Stage, seconds: f64) {
+    let seconds = seconds.max(0.0);
+    if let Ok(mut histogram) = stage_histogram(stage).lock() {
+        histogram.observe(seconds);
+    }
+}
+
+pub fn record_backpressure_stall() {
+    COUNTER_STREAM_BACKPRESSURE_STALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn set_session_memory_bytes(bytes: u64) {
+    GAUGE_SESSION_MEMORY_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// Refresh the process RSS gauge from the OS. Linux reads
+/// `/proc/self/statm` field 2 (resident pages) times the page size.
+/// Returns the measured bytes, or `None` when the platform has no
+/// measurement (non-Linux: gauge stays 0, documented as unmeasured).
+pub fn refresh_process_memory() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return None;
+        }
+        let bytes = resident_pages.saturating_mul(page_size as u64);
+        GAUGE_PROCESS_RSS_BYTES.store(bytes, Ordering::Relaxed);
+        Some(bytes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 pub fn register_session(session_id: &str) {
     if let Ok(mut registry) = SESSION_METRICS.lock() {
         registry.insert(
@@ -186,6 +307,24 @@ pub fn render_metrics() -> String {
             count: 0,
             sum: 0.0,
         });
+    let stage_histograms: [(Stage, HistogramSnapshot); 4] = Stage::ALL.map(|stage| {
+        let snapshot = stage_histogram(stage)
+            .lock()
+            .map(|guard| guard.snapshot())
+            .unwrap_or(HistogramSnapshot {
+                buckets: HISTOGRAM_BUCKETS
+                    .iter()
+                    .copied()
+                    .map(|bucket| (bucket, 0))
+                    .collect(),
+                count: 0,
+                sum: 0.0,
+            });
+        (stage, snapshot)
+    });
+    let backpressure_stalls = COUNTER_STREAM_BACKPRESSURE_STALLS.load(Ordering::Relaxed);
+    let process_rss_bytes = GAUGE_PROCESS_RSS_BYTES.load(Ordering::Relaxed);
+    let session_memory_bytes = GAUGE_SESSION_MEMORY_BYTES.load(Ordering::Relaxed);
     let session_entries = SESSION_METRICS
         .lock()
         .map(|registry| {
@@ -217,27 +356,47 @@ pub fn render_metrics() -> String {
         quantized_sessions
     ));
 
-    body.push_str(
-        "# HELP axiom_prefill_latency_seconds Time spent inside prefill execution paths.\n",
+    push_histogram_header(
+        &mut body,
+        "axiom_prefill_latency_seconds",
+        "Time spent inside prefill execution paths.",
     );
-    body.push_str("# TYPE axiom_prefill_latency_seconds histogram\n");
-    for (bucket, count) in &histogram.buckets {
-        body.push_str(&format!(
-            "axiom_prefill_latency_seconds_bucket{{le=\"{}\"}} {}\n",
-            bucket, count
-        ));
+    push_histogram_samples(&mut body, "axiom_prefill_latency_seconds", None, &histogram);
+
+    push_histogram_header(
+        &mut body,
+        "axiom_stage_latency_seconds",
+        "Time spent in one pipeline stage (compress, route, forward, fingerprint).",
+    );
+    for (stage, snapshot) in &stage_histograms {
+        push_histogram_samples(
+            &mut body,
+            "axiom_stage_latency_seconds",
+            Some(*stage),
+            snapshot,
+        );
     }
+
+    body.push_str(
+        "# HELP axiom_process_rss_bytes Resident set size of this process in bytes (Linux only; 0 means unmeasured).\n",
+    );
+    body.push_str("# TYPE axiom_process_rss_bytes gauge\n");
+    body.push_str(&format!("axiom_process_rss_bytes {process_rss_bytes}\n"));
+
+    body.push_str(
+        "# HELP axiom_session_memory_bytes Estimated bytes held by session state (live tensors plus quantized descriptors).\n",
+    );
+    body.push_str("# TYPE axiom_session_memory_bytes gauge\n");
     body.push_str(&format!(
-        "axiom_prefill_latency_seconds_bucket{{le=\"+Inf\"}} {}\n",
-        histogram.count
+        "axiom_session_memory_bytes {session_memory_bytes}\n"
     ));
+
+    body.push_str(
+        "# HELP axiom_stream_backpressure_stalls_total Times a stream producer blocked on a full bounded channel.\n",
+    );
+    body.push_str("# TYPE axiom_stream_backpressure_stalls_total counter\n");
     body.push_str(&format!(
-        "axiom_prefill_latency_seconds_sum {}\n",
-        histogram.sum
-    ));
-    body.push_str(&format!(
-        "axiom_prefill_latency_seconds_count {}\n",
-        histogram.count
+        "axiom_stream_backpressure_stalls_total {backpressure_stalls}\n"
     ));
 
     body.push_str(
@@ -279,6 +438,45 @@ pub fn render_metrics() -> String {
     }
 
     body
+}
+
+/// Emit one histogram family's `# HELP` / `# TYPE` declarations. The
+/// Prometheus exposition format allows one of each per metric name, so a
+/// labelled family declares them once here and renders one sample block
+/// per label value via `push_histogram_samples`; calling this per stage
+/// would emit duplicate declarations and get the scrape rejected.
+fn push_histogram_header(body: &mut String, metric: &str, help: &str) {
+    body.push_str(&format!("# HELP {metric} {help}\n"));
+    body.push_str(&format!("# TYPE {metric} histogram\n"));
+}
+
+/// Render one histogram's samples. With no stage the output is the bare
+/// `metric_bucket{le="..."}` / `metric_sum` / `metric_count` shape the
+/// prefill series already used; with a stage the same lines carry a
+/// `stage="..."` label (sum and count included, as a labelled family
+/// requires).
+fn push_histogram_samples(
+    body: &mut String,
+    metric: &str,
+    stage: Option<Stage>,
+    snapshot: &HistogramSnapshot,
+) {
+    let bucket_label = stage.map_or(String::new(), |s| format!("stage=\"{}\",", s.as_str()));
+    let series_label = stage.map_or(String::new(), |s| format!("{{stage=\"{}\"}}", s.as_str()));
+    for (bucket, count) in &snapshot.buckets {
+        body.push_str(&format!(
+            "{metric}_bucket{{{bucket_label}le=\"{bucket}\"}} {count}\n"
+        ));
+    }
+    body.push_str(&format!(
+        "{metric}_bucket{{{bucket_label}le=\"+Inf\"}} {}\n",
+        snapshot.count
+    ));
+    body.push_str(&format!("{metric}_sum{series_label} {}\n", snapshot.sum));
+    body.push_str(&format!(
+        "{metric}_count{series_label} {}\n",
+        snapshot.count
+    ));
 }
 
 fn escape_label_value(value: &str) -> String {
@@ -353,6 +551,124 @@ mod tests {
     }
 
     #[test]
+    fn test_stage_latency_observations_render_per_stage() {
+        // Each pipeline stage must produce its own labelled histogram series
+        // with a sane count after one observation.
+        for stage in Stage::ALL {
+            observe_stage_latency(stage, 0.02);
+        }
+        let rendered = render_metrics();
+        for stage in Stage::ALL {
+            let label = stage.as_str();
+            assert!(
+                rendered.contains(&format!(
+                    "axiom_stage_latency_seconds_bucket{{stage=\"{label}\""
+                )),
+                "missing stage series for {label}"
+            );
+            let count_line = rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with(&format!(
+                        "axiom_stage_latency_seconds_count{{stage=\"{label}\"}}"
+                    ))
+                })
+                .expect("stage count line must be rendered");
+            let count: u64 = count_line
+                .split_whitespace()
+                .nth(1)
+                .expect("count value must exist")
+                .parse()
+                .expect("count must parse");
+            assert!(
+                count >= 1,
+                "stage {label} must record at least one observation"
+            );
+            let sum_line = rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with(&format!(
+                        "axiom_stage_latency_seconds_sum{{stage=\"{label}\"}}"
+                    ))
+                })
+                .expect("stage sum line must be rendered");
+            let sum: f64 = sum_line
+                .split_whitespace()
+                .nth(1)
+                .expect("sum value must exist")
+                .parse()
+                .expect("sum must parse");
+            assert!(
+                sum >= 0.02,
+                "stage {label} sum must cover the 0.02s observation, got {sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_memory_gauges_render() {
+        let _gauge_guard = SESSION_MEMORY_GAUGE_TEST_LOCK.blocking_lock();
+        set_session_memory_bytes(1234);
+        let rss = refresh_process_memory();
+        #[cfg(target_os = "linux")]
+        {
+            let bytes = rss.expect("RSS must be measurable on Linux");
+            assert!(bytes > 0, "measured RSS must be positive, got {bytes}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(rss.is_none(), "RSS is unmeasured off Linux");
+        }
+        let rendered = render_metrics();
+        let rss_line = rendered
+            .lines()
+            .find(|line| line.starts_with("axiom_process_rss_bytes "))
+            .expect("process RSS gauge must be rendered");
+        let rss_value: u64 = rss_line
+            .split_whitespace()
+            .nth(1)
+            .expect("RSS value must exist")
+            .parse()
+            .expect("RSS value must parse");
+        #[cfg(target_os = "linux")]
+        assert!(rss_value > 0, "rendered RSS must be positive on Linux");
+        let memory_line = rendered
+            .lines()
+            .find(|line| line.starts_with("axiom_session_memory_bytes "))
+            .expect("session memory gauge must be rendered");
+        let memory_value: u64 = memory_line
+            .split_whitespace()
+            .nth(1)
+            .expect("session memory value must exist")
+            .parse()
+            .expect("session memory value must parse");
+        assert!(
+            memory_value >= 1234,
+            "session memory gauge must carry the recorded bytes, got {memory_value}"
+        );
+    }
+
+    #[test]
+    fn test_backpressure_stall_counter_renders() {
+        record_backpressure_stall();
+        let rendered = render_metrics();
+        let count_line = rendered
+            .lines()
+            .find(|line| line.starts_with("axiom_stream_backpressure_stalls_total "))
+            .expect("backpressure stall counter must be rendered");
+        let count: u64 = count_line
+            .split_whitespace()
+            .nth(1)
+            .expect("count value must exist")
+            .parse()
+            .expect("count must parse");
+        assert!(
+            count >= 1,
+            "at least one backpressure stall must be recorded"
+        );
+    }
+
+    #[test]
     fn test_first_token_buckets_resolve_multi_second_latency() {
         // A 3 s first token must land in the 5 s bucket but not the
         // 2.5 s bucket: with the old prefill buckets (max finite 1.0 s)
@@ -377,6 +693,90 @@ mod tests {
         assert!(
             bucket_count("5") > bucket_count("2.5"),
             "a 3 s observation must resolve between the 2.5 s and 5 s buckets"
+        );
+    }
+
+    #[test]
+    fn test_stage_render_is_bounded_to_four_stages() {
+        // Four stages, each a 9-bucket histogram plus +Inf, sum, count:
+        // exactly 48 stage lines, no more, regardless of observations.
+        for stage in Stage::ALL {
+            observe_stage_latency(stage, 0.001);
+        }
+        let rendered = render_metrics();
+        let stage_lines = rendered
+            .lines()
+            .filter(|line| line.starts_with("axiom_stage_latency_seconds_"))
+            .count();
+        assert_eq!(
+            stage_lines, 48,
+            "rendered {stage_lines} stage lines, bound is 48"
+        );
+        for line in rendered.lines() {
+            if let Some(rest) = line.split("stage=\"").nth(1) {
+                let label = rest.split('"').next().unwrap_or("");
+                assert!(
+                    ["compress", "route", "forward", "fingerprint"].contains(&label),
+                    "unexpected stage label in rendered metrics: {label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_each_metric_family_declares_help_and_type_once() {
+        // Parse the rendered exposition the way a scraper does: every
+        // `# HELP <name>` and `# TYPE <name>` must appear exactly once per
+        // metric family. The stage family renders four labelled sample
+        // blocks but declares its metadata once; a duplicate declaration
+        // gets the whole scrape rejected.
+        for stage in Stage::ALL {
+            observe_stage_latency(stage, 0.001);
+        }
+        observe_prefill_latency(0.01);
+        let rendered = render_metrics();
+        let mut helps: Vec<&str> = Vec::new();
+        let mut types: Vec<&str> = Vec::new();
+        for line in rendered.lines() {
+            if let Some(name) = line.strip_prefix("# HELP ") {
+                helps.push(name.split_whitespace().next().expect("HELP needs a name"));
+            }
+            if let Some(name) = line.strip_prefix("# TYPE ") {
+                types.push(name.split_whitespace().next().expect("TYPE needs a name"));
+            }
+        }
+        for (kind, names) in [("HELP", &helps), ("TYPE", &types)] {
+            let mut seen = std::collections::HashSet::new();
+            for name in names {
+                assert!(
+                    seen.insert(*name),
+                    "duplicate #{kind} declaration for metric family {name}"
+                );
+            }
+        }
+        assert!(
+            helps.contains(&"axiom_stage_latency_seconds"),
+            "stage family must declare HELP once"
+        );
+        assert!(
+            types.contains(&"axiom_stage_latency_seconds"),
+            "stage family must declare TYPE once"
+        );
+        assert_eq!(
+            helps
+                .iter()
+                .filter(|name| **name == "axiom_stage_latency_seconds")
+                .count(),
+            1,
+            "stage family HELP must appear exactly once"
+        );
+        assert_eq!(
+            types
+                .iter()
+                .filter(|name| **name == "axiom_stage_latency_seconds")
+                .count(),
+            1,
+            "stage family TYPE must appear exactly once"
         );
     }
 

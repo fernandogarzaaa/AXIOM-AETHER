@@ -107,6 +107,7 @@ async fn compressed_responses_payload(
     {
         return Ok(None);
     }
+    let compress_started = Instant::now();
     let Some(plan) = plan_compression(body) else {
         return Ok(None);
     };
@@ -138,6 +139,7 @@ async fn compressed_responses_payload(
     // so a run's recall vector reflects only that run's context. Runs are
     // independent, so fan them out with a small cap and restore plan order
     // before applying the transform.
+    let fingerprint_started = Instant::now();
     let concurrency = responses_run_concurrency(plan.runs.len());
     let mut fingerprints = vec![String::new(); plan.runs.len()];
     let mut tasks = JoinSet::new();
@@ -193,6 +195,11 @@ async fn compressed_responses_payload(
         }
     }
 
+    metrics::observe_stage_latency(
+        metrics::Stage::Fingerprint,
+        fingerprint_started.elapsed().as_secs_f64(),
+    );
+
     // Transient sessions (no client x-axiom-session-id) must not leak their
     // per-run adaptation sub-sessions — nothing will ever drop them. Runs on
     // BOTH the success and error branches of apply_plan and task fan-in.
@@ -238,6 +245,10 @@ async fn compressed_responses_payload(
         context_tokens,
         bytes_in,
         bytes_out
+    );
+    metrics::observe_stage_latency(
+        metrics::Stage::Compress,
+        compress_started.elapsed().as_secs_f64(),
     );
     Ok(Some(compressed))
 }
@@ -709,6 +720,7 @@ async fn create_response(
         }
     };
     let outbound = compressed.as_ref().unwrap_or(&body);
+    let forward_started = Instant::now();
     let mut upstream = match forwarder.forward_responses(outbound, &client_auth).await {
         Ok(response) => response,
         Err(OpenAiForwarderError::Network(error)) if compressed.is_some() => {
@@ -735,6 +747,10 @@ async fn create_response(
             upstream = response;
         }
     }
+    metrics::observe_stage_latency(
+        metrics::Stage::Forward,
+        forward_started.elapsed().as_secs_f64(),
+    );
     let status = upstream.status();
     // The Responses body always streams through untouched, so the record
     // carries the request plus a streamed marker rather than a buffered body.
