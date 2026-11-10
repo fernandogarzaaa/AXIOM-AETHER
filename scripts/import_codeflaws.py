@@ -168,8 +168,17 @@ def main() -> int:
                     f = tar.extractfile(member)
                     if f is not None:
                         (td / name).write_bytes(f.read())
-                buggy = (td / buggy_name).read_text(errors="replace").splitlines()
-                accepted = (td / accepted_name).read_text(errors="replace").splitlines()
+                # NOTE (2026-11-11): these MUST keep their line endings.
+                # splitlines() without keepends strips them, and difflib
+                # then emits a diff whose body lines run together with no
+                # separators: `patch` cannot apply it, and bench_repair.sh
+                # silently labels every Codeflaws PASS "—" instead of
+                # "authored fix"/"different fix". The 12 shipped
+                # expected.diff files were repaired in place (reconstructed
+                # from the blob + the buggy file, verified by patch-apply
+                # and verify.sh per fixture); this keeps it from recurring.
+                buggy = (td / buggy_name).read_text(errors="replace").splitlines(keepends=True)
+                accepted = (td / accepted_name).read_text(errors="replace").splitlines(keepends=True)
                 if len(buggy) > args.max_lines:
                     skipped.append({"id": row["id"], "reason": f"buggy {len(buggy)} lines"})
                     continue

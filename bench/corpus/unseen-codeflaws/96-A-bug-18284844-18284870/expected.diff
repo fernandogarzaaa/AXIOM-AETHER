@@ -1,4 +1,11 @@
 --- a/96-A-18284844.c
 +++ b/96-A-18284870.c
 @@ -39,7 +39,7 @@
-                 if(count>=7)                  break;                else {-                count=0;+                count=1;                }         }     }
+                 if(count>=7)
+                  break;
+                else {
+-                count=0;
++                count=1;
+                }
+         }
+     }

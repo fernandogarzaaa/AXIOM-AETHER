@@ -1,28 +1,122 @@
 {
   "crate": "axiom_mesh_core",
   "seed": 424242,
-  "emitted": 24,
-  "attempted": 33,
-  "survived_excluded": 9,
+  "emitted": 36,
+  "attempted": 48,
+  "survived_excluded": 12,
   "by_class": {
     "argswap": 2,
     "arith": 3,
     "bool": 3,
+    "cast": 3,
+    "cmp": 1,
+    "const": 1,
+    "deref": 2,
     "flow": 1,
     "idswap": 3,
-    "minmax": 2,
+    "logic": 3,
+    "minmax": 4,
     "neg": 1,
     "offbyone": 2,
-    "range": 2,
-    "shift": 1,
-    "const": 1,
-    "logic": 2,
-    "cmp": 1
+    "range": 3,
+    "ret": 3,
+    "shift": 1
   },
   "files": [
     "src/gumbel.rs",
     "src/idc.rs",
     "src/mesh.rs",
     "src/residual.rs"
+  ],
+  "batches": [
+    {
+      "seed": 424242,
+      "emitted": 24,
+      "attempted": 33,
+      "survived_excluded": 9,
+      "by_class": {
+        "argswap": 2,
+        "arith": 3,
+        "bool": 3,
+        "flow": 1,
+        "idswap": 3,
+        "minmax": 2,
+        "neg": 1,
+        "offbyone": 2,
+        "range": 2,
+        "shift": 1,
+        "const": 1,
+        "logic": 2,
+        "cmp": 1
+      }
+    },
+    {
+      "seed": 424243,
+      "emitted": 12,
+      "attempted": 15,
+      "survived_excluded": 3,
+      "by_class": {
+        "cast": 3,
+        "logic": 1,
+        "minmax": 2,
+        "ret": 3,
+        "deref": 2,
+        "range": 1
+      },
+      "compile_split": {
+        "compiles": 4,
+        "compile-error": 8
+      },
+      "compile_by_fixture": {
+        "gumbel-L18-minmax-35": {
+          "class": "minmax",
+          "compile": "compiles"
+        },
+        "idc-L124-cast-29": {
+          "class": "cast",
+          "compile": "compile-error"
+        },
+        "idc-L127-deref-34": {
+          "class": "deref",
+          "compile": "compile-error"
+        },
+        "idc-L78-cast-25": {
+          "class": "cast",
+          "compile": "compile-error"
+        },
+        "mesh-L275-cast-33": {
+          "class": "cast",
+          "compile": "compile-error"
+        },
+        "mesh-L324-minmax-27": {
+          "class": "minmax",
+          "compile": "compiles"
+        },
+        "mesh-L350-range-31": {
+          "class": "range",
+          "compile": "compiles"
+        },
+        "mesh-L351-deref-30": {
+          "class": "deref",
+          "compile": "compile-error"
+        },
+        "mesh-L395-ret-28": {
+          "class": "ret",
+          "compile": "compile-error"
+        },
+        "mesh-L461-ret-36": {
+          "class": "ret",
+          "compile": "compile-error"
+        },
+        "mesh-L488-logic-26": {
+          "class": "logic",
+          "compile": "compiles"
+        },
+        "mesh-L516-ret-32": {
+          "class": "ret",
+          "compile": "compile-error"
+        }
+      }
+    }
   ]
 }

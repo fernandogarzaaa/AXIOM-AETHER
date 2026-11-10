@@ -60,3 +60,15 @@ AXIOM_REPAIR_CORPUS=bench/corpus/unseen-codeflaws scripts/bench_repair.sh
 Baseline result: recorded in `bench/results/UNSEEN-CODEFLAWS-2026-11-10.md`
 (see that file for the number; this README does not duplicate it, so the
 two cannot drift apart).
+
+## Provenance note (2026-11-11)
+
+The 12 shipped `expected.diff` files were unappliable blobs: the
+importer used `splitlines()` without `keepends`, so difflib emitted the
+diff body with no line separators. Each file was reconstructed from its
+blob plus the buggy program and verified by patch-apply plus `verify.sh`
+on the reference program; `scripts/import_codeflaws.py` is fixed to keep
+line endings. The repair oracle never reads `expected.diff`, so the 7/12
+baseline number is unchanged; the fix restores the harness's
+authored-fix/different-fix labelling, which had silently printed "—"
+for every Codeflaws PASS.

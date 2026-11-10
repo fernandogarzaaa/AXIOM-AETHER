@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -348,7 +348,7 @@
+         let mut active: Vec<NodeId> = Vec::with_capacity(fan_out);
+         let mut masked = field.clone();
+         for _ in 0..fan_out {
+-            let sample = gumbel_softmax(masked, tau, self.config.hard, rng);
++            let sample = gumbel_softmax(&masked, tau, self.config.hard, rng);
+             let w = sample.winner;
+             weights[w] = if self.config.hard {
+                 1.0

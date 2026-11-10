@@ -1,0 +1,11 @@
+--- a/src/idc.rs
++++ b/src/idc.rs
+@@ -124,7 +124,7 @@
+                 hash_feature(&mut state, "tests:pass_rate", *passed as f32 / total);
+                 hash_feature(&mut state, "tests:failing", *failed as f32);
+                 for f in failures {
+-                    hash_feature(&mut state, format!("tests:fail:{f}"), 1.0);
++                    hash_feature(&mut state, &format!("tests:fail:{f}"), 1.0);
+                 }
+             }
+         }

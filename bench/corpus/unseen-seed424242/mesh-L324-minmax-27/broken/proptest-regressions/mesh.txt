@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c889747a1986bced215bf84973882c12514dabc1f412cec5bcfed52c938080d6 # shrinks to affinities = [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]], payload = [0.0, 0.0, 0.0, 0.0], fan_out_raw = 1, tau = 0.01, tau_gain = 0.0, capacity_penalty = 0.0, bandit_gain = 0.0, bandit_exploration = 0.0, use_residual = false, goal_raw = [0.0, 0.0, 0.0, 0.0], seed = 0

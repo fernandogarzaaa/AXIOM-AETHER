@@ -1,4 +1,11 @@
 --- a/58-A-17762757.c
 +++ b/58-A-17762804.c
 @@ -21,7 +21,7 @@
-   //  printf("%d",c);   //  exit(0);   if(c==0 || e==0 || f==0 || g<2){-    printf("N0");+    printf("NO");     exit(0);   }   else{
+   //  printf("%d",c);
+   //  exit(0);
+   if(c==0 || e==0 || f==0 || g<2){
+-    printf("N0");
++    printf("NO");
+     exit(0);
+   }
+   else{

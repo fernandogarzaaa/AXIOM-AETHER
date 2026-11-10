@@ -69,13 +69,72 @@ class added to `scripts/seed_faults.py` for the seed-424242 suite:
 outside the operator set by construction, so the rate is not
 tautological.
 
+## Held-out validation (2026-11-11, run Nov 10 UTC / Nov 11 Manila)
+
+**4 of the 7 repair-test passes also pass every held-out input.**
+Full per-fixture table:
+[`heldout-codeflaws-2026-11-11.md`](heldout-codeflaws-2026-11-11.md).
+Method: `scripts/validate_heldout_codeflaws.py` re-ran each accepted
+patch (from the `AXIOM_BENCH_KEEP=1` harness re-run,
+[`repair-unseen-codeflaws-rerun-2026-11-10.md`](repair-unseen-codeflaws-rerun-2026-11-10.md))
+against the pinned `heldout-input-*` / `heldout-output-*` files with the
+same compile flags and stdout normalization as `verify.sh`, and ran the
+same oracle on the reference program (`expected.diff` applied) as a
+sanity check.
+
+| program | repair-test | held-out | verdict |
+|---|---|---|---|
+| 131-A | PASS (authored fix) | 55/55 | HELDOUT-PASS |
+| 133-A | PASS (authored fix) | 84/84 | HELDOUT-PASS |
+| 136-A | PASS (different fix, MXS=300 vs reference 1024) | 100/100 | HELDOUT-PASS |
+| 231-A | PASS (different fix, ident-swap vs reference octal `011`→`11`) | 7/10 | HELDOUT-FAIL |
+| 467-A | PASS (different fix, `(p+2)<=q` vs reference `(q-p)>=2`, algebraically identical) | 24/24 | HELDOUT-PASS |
+| 58-A-17762757 | PASS (different fix, `g=0`→`g=1` vs reference `N0`→`NO`) | solver 25/39, reference 30/39 | REFERENCE-INCONSISTENT |
+| 96-A-18284844 | PASS (different fix, `s[i]==s[i]` vs reference `count=0`→`count=1`) | 21/43 | HELDOUT-FAIL |
+
+The two HELDOUT-FAILs are genuine overfits the repair tests cannot see:
+231-A swaps the `scanf` argument order instead of fixing the octal
+literal, and 96-A-18284844 replaces the comparison with the tautology
+`s[i]==s[i]`, which passes the 3 repair tests and fails 22 of 43
+held-out inputs. The 58-A-17762757 verdict is different: the REFERENCE
+program itself fails 9 of 39 held-out inputs, so the held-out set
+cannot discriminate solver from reference there. Spot-checked by hand:
+heldout-input-pos25 is a 100-character string, and the reference reads
+it with `gets(a)` into `char a[100]`, so glibc aborts on buffer
+overflow and the program prints nothing (expected `YES`). The solver
+patch fails the same 9 inputs plus 5 the reference passes (pos12, 15,
+18, 32, 38), so it is strictly worse than the reference on held-out
+inputs, but the fixture cannot yield a clean pass/fail verdict. The
+qualification run should treat held-out validation as a second score
+(4/7 validated) alongside the repair-test score (7/12), not as a
+replacement for it.
+
+## Provenance notes (2026-11-11)
+
+- `expected.diff` repair: the 12 shipped `expected.diff` files were
+  unappliable blobs (see `scripts/import_codeflaws.py`: the importer
+  used `splitlines()` without `keepends`, so difflib emitted body lines
+  with no separators and `patch` could not apply them). Each file was
+  reconstructed from its blob plus the buggy program and verified by
+  patch-apply plus `verify.sh` on the reference program. The importer
+  is fixed to keep line endings. Consequence: the harness's
+  authored-fix/different-fix labelling now works for Codeflaws (it
+  silently printed "—" for every PASS before); the re-run table above
+  labels 2 authored fixes and 5 different fixes. The 7/12 number is
+  unchanged by the repair: the oracle never reads `expected.diff`.
+- Harness fix: `scripts/bench_repair.sh` now resolves the corpus to an
+  absolute path, because the labelling step runs `patch` after `cd`
+  into a temp dir and a relative corpus path made the `expected.diff`
+  redirect miss (same silent "—" symptom as above).
+- The re-run reproduced the baseline exactly (7/12, same per-fixture
+  outcomes and repair descriptions), so the baseline number stands.
+
 ## Caveats
 
 - n=12 is small. The 58.3% is a baseline number for the qualification
   run, not a general repair rate. The programs are short (11-54 lines)
   and the selection favors small diffs, so this suite is easier than
   arbitrary Codeforces submissions.
-- The oracle is the repair-test set only. Held-out validation
-  (`heldout-input-*`) was not run as part of this baseline; a PASS
-  could in principle fail a held-out input, and the qualification run
-  should check that.
+- The oracle is the repair-test set only. Held-out validation was run
+  after the baseline (see the section above) and is reported as a
+  separate 4/7 number, not folded into the 7/12.

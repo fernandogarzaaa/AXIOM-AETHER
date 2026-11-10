@@ -1,0 +1,11 @@
+--- a/src/idc.rs
++++ b/src/idc.rs
+@@ -75,7 +75,7 @@
+ /// Hash a labeled feature into the state space with a signed contribution.
+ fn hash_feature(state: &mut Array1<f32>, label: &str, value: f32) {
+     let h = fnv1a(label.as_bytes());
+-    let idx = (h % state.len() as u32) as usize;
++    let idx = (h % state.len() as u64) as usize;
+     // Second hash bit decides sign so colliding features don't only add.
+     let sign = if (h >> 32) & 1 == 0 { 1.0 } else { -1.0 };
+     state[idx] += sign * value;

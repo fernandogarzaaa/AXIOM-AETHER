@@ -1,4 +1,11 @@
 --- a/133-A-18048780.c
 +++ b/133-A-18048793.c
 @@ -1,7 +1,7 @@
- #include <stdio.h> #include <string.h> -#define LEN 4+#define LEN 3  int main (int argc, char* *argv) {
+ #include <stdio.h>
+ #include <string.h>
+ 
+-#define LEN 4
++#define LEN 3
+ 
+ int main (int argc, char* *argv)
+ {

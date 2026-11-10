@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -458,7 +458,7 @@
+         residual: Option<&Residual>,
+     ) -> Result<BatchAdhesion, MeshError> {
+         if self.nodes.is_empty() {
+-            Err(MeshError::Empty);
++            return Err(MeshError::Empty);
+         }
+         for p in payloads {
+             if p.len() != self.config.dim {

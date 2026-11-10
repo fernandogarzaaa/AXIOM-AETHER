@@ -1,4 +1,11 @@
 --- a/82-A-18221798.c
 +++ b/82-A-18221807.c
 @@ -15,7 +15,7 @@
-        }      if(n==1)-    printf("sheldon");+    printf("Sheldon");     else if(n==2)     printf("Leonard");     else if(n==3)
+        }
+ 
+     if(n==1)
+-    printf("sheldon");
++    printf("Sheldon");
+     else if(n==2)
+     printf("Leonard");
+     else if(n==3)

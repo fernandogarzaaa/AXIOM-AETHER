@@ -33,6 +33,21 @@ below did not exist when those corpora were generated) and a different seed,
 so no operator or ordering rule was ever tuned against its faults. Its
 fixtures live under bench/corpus/unseen-seed424242/ and are excluded from
 all tuning until the qualification run.
+
+Strengthened suite (2026-11-11, batch 2, seed 424243): three more fault
+classes (`deref`, `cast`, `ret`) plus `--classes` (restrict sampling to
+named classes) and `--exclude-dir` (never re-emit a fault already present
+in a corpus directory). Batch 2 targets the thin classes of batch 1
+(`logic`, `argswap`, `range`, `minmax` had 1-2 faults each) and the new
+classes. In/out of the repair operator set, verified against
+`MutationClass::ALL` in axiom_engine_rs/src/mutation_repair.rs (12
+classes: Comparison, OffByOne, Boolean, Logic, Arithmetic, SwapArgs,
+MissingReturn, ShellTest, ApiSwap, ArgShift, IdentSwap, ImportPath):
+`ret` is INSIDE the set (MissingReturn re-adds a dropped `return`);
+`deref` (drop `&`/`*`) and `cast` (change an `as` target type) are
+OUTSIDE it, by construction. A `deref`/`cast` fault may fail to compile
+rather than fail a test; the oracle is `cargo test --lib`, which fails
+either way, and the corpus records the split per fixture in SEED.json.
 """
 
 from __future__ import annotations
@@ -283,6 +298,85 @@ def sites_for_line(line_no: int, line: str) -> list[Site]:
             continue
         out.append(Site(line_no, "strlit", content, content + "!", start, end))
 
+    # Deref drop (added 2026-11-11 for the strengthened suite): drop a
+    # leading `&` borrow or `*` deref. Outside the repair engine's operator
+    # set by construction (no operator adds `&`/`*`). Expression positions
+    # only: signature lines are already skipped above, and these guards
+    # exclude the lookalikes. `&` immediately after `<` is a generic type
+    # argument (`Option<&T>`); a `&` before the `=`/` in ` of a `let`/`if
+    # let`/`while let`/`for` header is a pattern binding, not a borrow;
+    # an odd count of `|` before the site means it sits inside closure
+    # params (`|a, &b|`); `-> &T` is a return type; `&mut` and `&&` are
+    # not plain borrows. `*` needs an expression operator before it so
+    # multiplication (`a * b`) and raw-pointer types (`*const T`, whose
+    # previous non-space char is `:` or `s`) are excluded.
+    stripped = line.strip()
+    cutoff = 0
+    if stripped.startswith(("let ", "if let ", "while let ")):
+        eq = line.find("=")
+        cutoff = eq + 1 if eq >= 0 else len(line)
+    elif stripped.startswith("for "):
+        inn = line.find(" in ")
+        cutoff = inn + 4 if inn >= 0 else len(line)
+    for m in re.finditer(r"&", line):
+        s = m.start()
+        if s < cutoff:
+            continue
+        if s + 1 >= len(line) or not (line[s + 1].isalpha() or line[s + 1] == "_" or line[s + 1] == "("):
+            continue
+        if line[s + 1 : s + 4] == "mut" or (s + 1 < len(line) and line[s + 1] == "&"):
+            continue
+        if s > 0 and line[s - 1] == "<":
+            continue
+        if not ok(s, s + 1):
+            continue
+        prev = line[:s].rstrip()
+        if not prev or prev[-1] not in "(,=+-*/%<>!&|[":
+            continue
+        if line[:s].count("|") % 2 == 1:
+            continue
+        if re.search(r"->\s*&", line[: s + 1]):
+            continue
+        out.append(Site(line_no, "deref", "&", "", s, s + 1))
+    for m in re.finditer(r"\*", line):
+        s = m.start()
+        if s < cutoff:
+            continue
+        if s + 1 >= len(line) or not (line[s + 1].isalpha() or line[s + 1] == "_" or line[s + 1] == "("):
+            continue
+        if not ok(s, s + 1):
+            continue
+        prev = line[:s].rstrip()
+        if not prev or prev[-1] not in "=([!-+":
+            continue
+        out.append(Site(line_no, "deref", "*", "", s, s + 1))
+
+    # Cast-target change (added 2026-11-11 for the strengthened suite):
+    # `x as u64` -> `x as u32`, etc. Outside the operator set by
+    # construction (no operator rewrites an `as` target type). Measured
+    # on this crate (batch 2): all three emitted cast faults fail to
+    # compile, because the new target type mismatches the operand type
+    # (E0308/E0277, e.g. `f32` -> `f64` next to an `f32` operand). A cast
+    # whose operand types still line up would be a behaviour change
+    # (truncation, or a float-precision change the tests may or may not
+    # catch). Either way the oracle kills it and the fixture records
+    # which (see SEED.json).
+    for m in re.finditer(r"\bas\s+(u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|f32|f64)\b", line):
+        s, e = m.span(1)
+        if ok(s, e):
+            out.append(Site(line_no, "cast", m.group(1), CAST_ALT[m.group(1)], s, e))
+
+    # Dropped early return (added 2026-11-11 for the strengthened suite):
+    # `return Err(...);` -> `Err(...);`. Measured on this crate (batch 2):
+    # all three emitted `ret` faults fail to compile (E0282: type
+    # annotations needed), because dropping `return` removes the type
+    # ascription the `Err(...)`/`None` expression relied on; as a
+    # discarded statement it has no expected type. INSIDE the operator
+    # set: MissingReturn re-adds a dropped `return`.
+    m = re.match(r"^(\s*)(return)(\s+)(.+);\s*$", line)
+    if m and ok(m.start(2), m.end(3)):
+        out.append(Site(line_no, "ret", "return", "", m.start(2), m.end(3)))
+
     # Identifier swap: two distinct short identifiers on one line, swapped (outside the set).
     idents = [m for m in re.finditer(rf"\b({IDENT})\b", line) if ok(*m.span(1))]
     names = []
@@ -311,6 +405,23 @@ RUST_KEYWORDS = set(
     "self Self static struct super trait true type unsafe use where while async await dyn u8 u16 u32 u64 usize i8 i16 "
     "i32 i64 isize f32 f64 bool char str Some None Ok Err Vec String Box Option Result".split()
 )
+
+# Cast-target alternates for the `cast` fault class: each type maps to the
+# nearest type whose values differ (width change, or float precision change).
+CAST_ALT = {
+    "u8": "u16",
+    "u16": "u8",
+    "u32": "u64",
+    "u64": "u32",
+    "usize": "u32",
+    "i8": "i16",
+    "i16": "i8",
+    "i32": "i64",
+    "i64": "i32",
+    "isize": "i32",
+    "f32": "f64",
+    "f64": "f32",
+}
 
 
 def test_region_start(lines: list[str]) -> int:
@@ -360,7 +471,34 @@ def main() -> int:
         action="store_true",
         help="round-robin over fault classes so one prolific class (identifier swaps) cannot dominate the sample",
     )
+    ap.add_argument(
+        "--classes",
+        default=None,
+        help="comma-separated fault classes to sample from (default: all). "
+        "Used to top up thin classes without re-rolling the whole suite.",
+    )
+    ap.add_argument(
+        "--exclude-dir",
+        action="append",
+        default=[],
+        help="corpus directory whose existing fixtures must never be re-emitted: "
+        "a candidate site whose (file, line, class, before, after) matches an "
+        "existing fixture's meta.json fault is skipped. Repeatable.",
+    )
     args = ap.parse_args()
+
+    wanted = None
+    if args.classes:
+        wanted = {c.strip() for c in args.classes.split(",") if c.strip()}
+        known = {
+            "argswap", "arith", "bool", "flow", "idswap", "minmax", "neg",
+            "offbyone", "range", "shift", "const", "logic", "cmp", "strlit",
+            "deref", "cast", "ret",
+        }
+        unknown = wanted - known
+        if unknown:
+            print(f"unknown fault class(es): {sorted(unknown)}", file=sys.stderr)
+            return 2
 
     crate = (REPO / args.crate).resolve()
     out = Path(args.out).resolve()
@@ -383,6 +521,19 @@ def main() -> int:
     files = args.files or sorted(
         str(p.relative_to(crate)) for p in (crate / "src").glob("*.rs") if p.name not in ("lib.rs", "node.rs")
     )
+    excluded: set[tuple[str, int, str, str, str]] = set()
+    for d in args.exclude_dir:
+        for meta_path in Path(d).glob("*/meta.json"):
+            try:
+                fault = json.loads(meta_path.read_text()).get("fault") or {}
+            except (json.JSONDecodeError, OSError):
+                continue
+            if fault.get("file") and fault.get("line") and fault.get("class") is not None:
+                excluded.add(
+                    (fault["file"], int(fault["line"]), fault["class"], fault.get("before", ""), fault.get("after", ""))
+                )
+    if excluded:
+        print(f"excluding {len(excluded)} already-emitted fault(s) from {args.exclude_dir}", file=sys.stderr)
     all_sites: list[tuple[str, list[str], Site]] = []
     for rel in files:
         lines = (crate / rel).read_text().splitlines(keepends=True)
@@ -390,6 +541,8 @@ def main() -> int:
         for i in range(region):
             content = lines[i].rstrip("\n")
             for s in sites_for_line(i, content):
+                if wanted is not None and s.cls not in wanted:
+                    continue
                 all_sites.append((rel, lines, s))
     rng = random.Random(args.seed)
     rng.shuffle(all_sites)
@@ -424,6 +577,8 @@ def main() -> int:
         if key in seen:
             continue
         seen.add(key)
+        if (rel, site.line_no + 1, site.cls, site.before, site.after) in excluded:
+            continue
         attempts += 1
         mutated = list(lines)
         mutated[site.line_no] = new_line + "\n"
