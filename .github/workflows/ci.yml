@@ -188,6 +188,15 @@ jobs:
         working-directory: axiom_engine_rs
         run: cargo run --release --features tools --bin axiombench
 
+      # Phase 4 item 1: the paired runner executes the smallest task
+      # family end to end (arms A/D, single-file, one repeat, seed 42)
+      # through the real `axiom solve` loop. The release solver binary
+      # already exists by this step (Build (release) above); the results
+      # JSON is git-ignored, like the pillars' JSON.
+      - name: AxiomBench (paired smoke)
+        working-directory: axiom_engine_rs
+        run: cargo run --release --features tools --bin axiombench -- paired --smoke --out ../bench/results/paired-ci-smoke.json
+
       - name: End-to-end smoke (every pillar composes)
         run: ./scripts/demo_end_to_end.sh
 

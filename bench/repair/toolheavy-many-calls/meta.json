@@ -1,0 +1,1 @@
+{"lang": "python", "verify": ["python3", "test_all.py"], "kind": "single", "source": "authored 2026-11-11 for Phase 4 paired tool-heavy family", "pinned": ["test_all.py"]}

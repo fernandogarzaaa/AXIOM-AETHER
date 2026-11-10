@@ -212,6 +212,178 @@ AXIOMBench report must carry one of these three labels next to it, not just
 in a preamble** — the existing `RESULTS.md`'s per-row `n` column is the
 right pattern to extend, not replace.
 
+## 4. Phase 4 item 1 — paired runner complete (2026-11-11)
+
+The prep scaffolding is now the completed Phase 4 item 1 runner
+(PR phase4/paired-runner). The full paired comparison HAS run: all
+five arms x all five families, one repeat, seed 42, deterministic (no
+LLM), 40 cells, 0 pending. Results in
+`bench/results/PAIRED-FULL-2026-11-11.md` (the per-run JSON is
+git-ignored, like the pillars' JSON). The harness runs, the suites
+exist, the guardrail check is implemented and demonstrated, and the
+full-run verdicts are recorded, not guessed.
+
+### 4.1 Paired runner
+
+`axiombench paired` (`axiom_engine_rs/src/bin/axiombench/paired.rs`)
+implements the audit section 5 matrix: arms A baseline, B retrieval,
+C CVM, D repair, E full stack; families single-file, multi-file,
+long-session, tool-heavy, failure-recovery; fixed task set, model,
+budget, environment, and oracle recorded in the report JSON
+(`bench/results/paired-<unix>.json`) with a stable fingerprint;
+run order randomized by seed (SplitMix64 + Fisher-Yates, a fixed seed
+reproduces identical order); repeats to estimate variance. Primary
+measure is verified task-success rate; secondaries are end-to-end
+dollar cost, cache-adjusted billed tokens, agent turns, tool calls,
+wall-clock time, first-token latency, unsafe patch rate, and successful
+rollback rate. Every secondary carries its provenance next to the
+value: deterministic arms have no tokens, turns, or first-token
+latency to measure, so those are recorded as not-applicable, never as
+a fabricated zero; dollar cost is 0.0 measured (no API spend).
+
+What executes today: all five arms on all five families
+(`--smoke` still runs only arms A/D on the single-file family, for
+CI), via the real `axiom solve` loop in a scratch copy of each
+fixture, following the four steps of
+`scripts/bench_repair.sh` (no-op baseline, solve with no file named
+and isolated heal-memory state, re-verify, pinned-file and rollback
+checks). Arm A runs no solver, so the failing verify stays failing.
+Arms B, C, and E run the same loop under their own env overlay (arm
+B: compression off; arm C: compression on; arm E: compression plus
+vibe on). The overlays are recorded labels, not ablations: the three
+overlay variables have no read site in the `axiom solve` path
+(`AXIOM_TTT_COMPRESS` is read only by the server startup path,
+`AXIOM_RESPONSES_COMPRESS` only by the Responses route,
+`AXIOM_VIBE` only by the server startup path, and `SolveOptions`
+carries no vibe path), and arm B's overlay is byte-identical to arm
+D's. B/C/D/E therefore execute the same deterministic loop, and
+their identical scores are replication, not a measured null effect
+of the toggles. Cross-arm mechanism comparisons stay unevaluable
+until the toggles are wired into solve; the paired run's valid
+comparisons are arm A vs the executing arms (the guardrails) and
+replication across arms. Every family has an on-disk fixture.
+Six live in `bench/repair/`, the corpus `bench_repair.sh --check`
+scores (every fixture there must be repairable, so the two tasks
+the deterministic solver cannot repair do not live there). Those
+two, `multi-both-broken` (port of the
+`agentic-multi-file-both-broken` builtin: both scripts broken, only
+a coordinated two-file fix passes) and `longsession-overflow`
+(off-by-one buried in a 257-line module under a 240-entry lookup
+table), live in `bench/paired/`, a paired-only diagnostic corpus
+the repair gate never sees. The other fixtures:
+`multi-interface-and-callsites` (shared-helper contract broken,
+two callsites),
+`toolheavy-many-calls` (eight modules, one buggy),
+`recovery-broken-env` (pure environment fault: `run.sh` lacks the
+exec bit; the code is correct, the environment heal fixes it).
+
+Per-stage latency and memory (Phase 3 items 1 and 5, wired at the
+harness level): every executed cell records `stage_ms`
+(baseline-verify / solve / re-verify / rollback wall time, the
+runner's own pipeline stages) and `peak_rss_kb` (the solver
+subprocess peak RSS, VmHWM sampled from Linux `/proc/<pid>/status`
+every 5 ms; a sampled lower bound, never an exact peak, and `null`
+when a sub-10 ms child exits before the first poll). The Phase 3
+signals themselves live in the engine's `metrics.rs`
+(`axiom_first_token_latency_seconds`,
+`axiom_stage_latency_seconds{stage=compress|route|forward|fingerprint}`,
+`axiom_process_rss_bytes`, rendered on the server's `/metrics`);
+the runner cannot read a dead subprocess's in-process histograms, so
+it measures its own stages and the solver's RSS from outside instead.
+First-token latency stays not-applicable in the deterministic harness:
+the solver emits no streamed tokens, so `first_token_ms` is `null`
+with the reason in `notes`, and is measured only by a live-agent run
+against the streamed server path (open item, below), never
+fabricated from time-to-first-stdout-byte.
+
+```bash
+# Smoke run: arms A/D on the single-file family, one repeat, seed 42:
+cargo run --release --features tools --bin axiombench -- paired --smoke
+# Full matrix (default repeats=3; the recorded run used --repeats 1):
+cargo run --release --features tools --bin axiombench -- paired
+# Guardrail demonstration (arm D vs a deliberately regressed arm):
+cargo run --release --features tools --bin axiombench -- paired --demo-regression
+```
+
+### 4.2 Guardrail qualification
+
+`axiom_engine_rs/src/bin/axiombench/guardrail.rs` implements the
+audit section 5 promotion rule as part of the bench runner output
+(pass/fail per arm vs baseline, printed and written into the paired
+report JSON under `guardrails`):
+
+- **Task-success non-inferiority.** The arm's verified task-success
+  rate must stay within 5 percentage points of the baseline arm's
+  rate. A cheaper arm that solves fewer tasks does not promote.
+- **Reliability guardrail.** Unsafe patch rate must be 0 (no edit to
+  the oracle, ever) and successful rollback rate over failed attempts
+  must be 1.0 (every failed attempt leaves the tree byte-identical).
+- **Cost guardrail.** When the baseline has a measured cost per
+  success, the arm's cost per success must not exceed it by more than
+  2x. When either side has no measured cost (the deterministic harness
+  spends $0), the rule is recorded as not-applicable, never as a pass
+  on invented numbers.
+- An arm with no executed cells cannot be evaluated: the verdict is a
+  fail with reason "no executed tasks", not a silent pass.
+
+Demonstration (local run, `--demo-regression`): the baseline arm
+passes against itself, arm D passes on the smoke family, and the
+deliberately regressed arm (solver sabotaged to edit a pinned file
+and skip rollback) fails on the reliability guardrail, whether its
+verifier goes green (the JavaScript fixture, where the sabotage is a
+valid comment and the cell scores OVERFIT) or not (the Python and
+shell fixtures, where it is a syntax error and the cell scores a
+rollback violation). See the run output recorded in
+`bench/results/PAIRED-SMOKE-2026-11-10.md` for the run that
+demonstrates it.
+
+### 4.3 Genuinely unseen bug suites
+
+Two suites under `bench/corpus/`, both excluded from all tuning until
+the qualification run:
+
+- **Seeded, seed 424242** (`bench/corpus/unseen-seed424242/`): 24 fresh
+  seeded faults in `axiom_mesh_core` from a different seed and a
+  revised generator (new `strlit` class) than seeds 7/2026. See its
+  README for the unseen argument and the honest caveat that `strlit`
+  contributed 0 faults in this crate. Baseline recorded in
+  `bench/results/UNSEEN-SEED424242-2026-11-10.md`.
+- **Human-written, Codeflaws** (`bench/corpus/unseen-codeflaws/`): 12
+  human-written C defects crawled from Codeforces (Tan et al.),
+  imported by `scripts/import_codeflaws.py` under a deterministic
+  selection rule (first WRONG_ANSWER defects in detail-file order with
+  a ≤150-line buggy submission, ≤15-line fix diff, ≥2 repair-test
+  inputs; accepted program must pass and buggy program must fail the
+  fixture oracle, or the defect is skipped). Unseen because no repair
+  operator or ordering rule was ever tuned on Codeflaws, and because
+  its programs are C single-file submissions, a different language and
+  shape from QuixBugs' Python algorithms. Baseline recorded in
+  `bench/results/UNSEEN-CODEFLAWS-2026-11-10.md`.
+
+### 4.4 Open items (after item 1)
+
+- Wire the arm toggles into the `axiom solve` path so the paired
+  arms become real ablations. Today the three overlay variables
+  have no read site in solve (see section 4): B's overlay is
+  byte-identical to D's, and C/E differ only in labels. Until that
+  wiring lands, B/C/D/E execute the same deterministic loop and
+  cross-arm mechanism comparisons are unevaluable; the recorded
+  6/8-each scores are replication, not a toggle effect.
+- The live-LLM agent executor for arms B, C, and E (real coding
+  agent with and without AXIOM in the loop, with token/cost/turn
+  accounting and first-token latency measured on the streamed server
+  path). The deterministic harness runs the real solver under each
+  arm's recorded overlay; it does not pretend to be that agent.
+- Repeats 2-3 of the full matrix for variance: the recorded run is
+  repeats=1 (40 cells); the scaffold default is repeats=3.
+- A full-matrix run against the release solver binary: the recorded
+  run used the debug binary (`target/debug/axiom`); CI runs the
+  release binary for the smoke family only.
+- Per-stage latency / first-token latency wiring from Phase 3 item 5
+  into the paired secondaries is done at the harness level (stage
+  timings and solver RSS, above); first-token latency still waits on
+  the live-agent run.
+
 ---
 
 ## Reproduce what exists today

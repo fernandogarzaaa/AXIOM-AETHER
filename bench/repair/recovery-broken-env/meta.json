@@ -1,0 +1,1 @@
+{"lang": "python", "verify": ["sh", "-c", "./run.sh"], "kind": "single", "source": "authored 2026-11-11 for Phase 4 paired failure-recovery family", "pinned": ["test_app.py"]}
