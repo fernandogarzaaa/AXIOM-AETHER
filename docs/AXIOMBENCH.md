@@ -212,13 +212,16 @@ AXIOMBench report must carry one of these three labels next to it, not just
 in a preamble** — the existing `RESULTS.md`'s per-row `n` column is the
 right pattern to extend, not replace.
 
-## 4. Phase 4 prep — paired harness, guardrails, unseen suites (2026-11-10, scaffolding)
+## 4. Phase 4 item 1 — paired runner complete (2026-11-11)
 
-This section records what the Phase 4 prep crew built. It is scaffolding:
-the harness runs, the suites exist, the guardrail check is implemented
-and demonstrated, but the FULL paired comparison has not run and its
-results are not guessed anywhere here. It waits until Phase 3 code
-exists on its PR branches or main.
+The prep scaffolding is now the completed Phase 4 item 1 runner
+(PR phase4/paired-runner). The full paired comparison HAS run: all
+five arms x all five families, one repeat, seed 42, deterministic (no
+LLM), 40 cells, 0 pending. Results in
+`bench/results/PAIRED-FULL-2026-11-11.md` (the per-run JSON is
+git-ignored, like the pillars' JSON). The harness runs, the suites
+exist, the guardrail check is implemented and demonstrated, and the
+full-run verdicts are recorded, not guessed.
 
 ### 4.1 Paired runner
 
@@ -238,16 +241,44 @@ value: deterministic arms have no tokens, turns, or first-token
 latency to measure, so those are recorded as not-applicable, never as
 a fabricated zero; dollar cost is 0.0 measured (no API spend).
 
-What executes today: arms A and D on the single-file family
-(`--smoke`), via the real `axiom solve` loop in a scratch copy of each
+What executes today: all five arms on all five families
+(`--smoke` still runs only arms A/D on the single-file family, for
+CI), via the real `axiom solve` loop in a scratch copy of each
 `bench/repair/` fixture, following the four steps of
 `scripts/bench_repair.sh` (no-op baseline, solve with no file named
 and isolated heal-memory state, re-verify, pinned-file and rollback
 checks). Arm A runs no solver, so the failing verify stays failing.
-The other families are defined in the task set with their fixture gaps
-named; arms B, C, and E need an agent executor that drives a real
-coding agent with and without AXIOM in the loop, which does not exist
-yet. Those cells are reported as pending, never scored.
+Arms B, C, and E run the same loop under their own env overlay (arm
+B: compression off; arm C: compression on; arm E: compression plus
+vibe on), so the paired comparison measures each toggle's effect on
+the real solver. Every family has an on-disk fixture:
+`multi-both-broken` (port of the `agentic-multi-file-both-broken`
+builtin: both scripts broken, only a coordinated two-file fix passes),
+`multi-interface-and-callsites` (shared-helper contract broken,
+two callsites), `longsession-overflow` (off-by-one buried in a
+257-line module under a 240-entry lookup table),
+`toolheavy-many-calls` (eight modules, one buggy),
+`recovery-broken-env` (pure environment fault: `run.sh` lacks the
+exec bit; the code is correct, the environment heal fixes it).
+
+Per-stage latency and memory (Phase 3 items 1 and 5, wired at the
+harness level): every executed cell records `stage_ms`
+(baseline-verify / solve / re-verify / rollback wall time, the
+runner's own pipeline stages) and `peak_rss_kb` (the solver
+subprocess peak RSS, VmHWM sampled from Linux `/proc/<pid>/status`
+every 5 ms; a sampled lower bound, never an exact peak, and `null`
+when a sub-10 ms child exits before the first poll). The Phase 3
+signals themselves live in the engine's `metrics.rs`
+(`axiom_first_token_latency_seconds`,
+`axiom_stage_latency_seconds{stage=compress|route|forward|fingerprint}`,
+`axiom_process_rss_bytes`, rendered on the server's `/metrics`);
+the runner cannot read a dead subprocess's in-process histograms, so
+it measures its own stages and the solver's RSS from outside instead.
+First-token latency stays not-applicable in the deterministic harness:
+the solver emits no streamed tokens, so `first_token_ms` is `null`
+with the reason in `notes`, and is measured only by a live-agent run
+against the streamed server path (open item, below), never
+fabricated from time-to-first-stdout-byte.
 
 ```bash
 # Smoke run: arms A/D on the single-file family, one repeat, seed 42:
@@ -309,18 +340,22 @@ the qualification run:
   shape from QuixBugs' Python algorithms. Baseline recorded in
   `bench/results/UNSEEN-CODEFLAWS-2026-11-10.md`.
 
-### 4.4 Open items (blocked on Phase 3 code or the agent executor)
+### 4.4 Open items (after item 1)
 
-- The agent executor for arms B, C, and E (real coding agent with and
-  without AXIOM in the loop, with token/cost/turn accounting).
-- On-disk fixtures for the multi-file, long-session, tool-heavy, and
-  failure-recovery families (gaps named per task in `paired.rs`).
-- The full paired comparison run (all arms x all families x repeats)
-  and its guardrail verdicts. It waits for Phase 3 code on its PR
-  branches or main; the harness does not guess its results.
+- The live-LLM agent executor for arms B, C, and E (real coding
+  agent with and without AXIOM in the loop, with token/cost/turn
+  accounting and first-token latency measured on the streamed server
+  path). The deterministic harness measures each toggle's effect on
+  the real solver; it does not pretend to be that agent.
+- Repeats 2-3 of the full matrix for variance: the recorded run is
+  repeats=1 (40 cells); the scaffold default is repeats=3.
+- A full-matrix run against the release solver binary: the recorded
+  run used the debug binary (`target/debug/axiom`); CI runs the
+  release binary for the smoke family only.
 - Per-stage latency / first-token latency wiring from Phase 3 item 5
-  into the paired secondaries (currently not-applicable for
-  deterministic arms).
+  into the paired secondaries is done at the harness level (stage
+  timings and solver RSS, above); first-token latency still waits on
+  the live-agent run.
 
 ---
 

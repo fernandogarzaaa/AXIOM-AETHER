@@ -75,3 +75,14 @@ their reason and are never scored: arms B, C, E need the agent executor
 multi-file, long-session, tool-heavy, and failure-recovery families
 have no on-disk fixtures yet. The full paired comparison waits until
 Phase 3 code exists on its PR branches or main.
+
+## Update 2026-11-11 (Phase 4 item 1)
+
+The full paired comparison has now run: all five arms x all five
+families, one repeat, seed 42, 40 cells, 0 pending. Arms B, C, and E
+execute through the same `axiom solve` loop under their env overlays;
+on-disk fixtures now exist for the multi-file, long-session,
+tool-heavy, and failure-recovery families. Results and guardrail
+verdicts are recorded in `bench/results/PAIRED-FULL-2026-11-11.md`
+(arm A 0/8, arms B/C/D/E 6/8 each, all guardrails PASS). The smoke
+run above still reproduces: arm A 0/3, arm D 3/3.
