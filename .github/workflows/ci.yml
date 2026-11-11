@@ -560,3 +560,150 @@ jobs:
 
       - name: Helm auth renders (apiKey set / unset / existingSecret)
         run: python3 deploy/helm/axiom/tests/test_helm_auth.py
+
+  # ===== BEGIN Phase 5 item 2: release gate (aggregate verdict) =====
+  # One release-blocking verdict over the security and correctness
+  # gates. Keep this whole block together: a sibling PR adding a
+  # different job should append its own delimited block after the
+  # END marker below, so the two PRs merge cleanly.
+  #
+  # Part 1 is `needs`: every other job in this workflow. Part 2 is
+  # the script step: it reads the `needs` results, queries the head
+  # commit check runs (which covers jobs from other workflows, e.g.
+  # the agentic eval suite and the docker.yml multi-arch publish),
+  # and reads the PR reviews. It fails when any gate is red.
+  #
+  # `if: ${{ !cancelled() }}` matters: without it, a failing needed
+  # job would SKIP this job instead of failing it, so the PR would
+  # show a skipped gate rather than a red verdict. With it, this job
+  # always renders an explicit PASS or FAIL, except when the run
+  # itself is cancelled.
+  #
+  # Limits, stated plainly. A green verdict here means every
+  # EVALUATED gate passed. Two gates have no evidence yet
+  # (perf-regression, provenance) and still block a release; the
+  # local mirror scripts/release_gate.py reports them NOT_EVALUATED
+  # and exits 1. See docs/RELEASE-GATES.md. The script step also
+  # writes them into the job summary so the gap is visible in the
+  # PR UI, not buried in the log.
+  release-gate:
+    name: Release gate (aggregate verdict)
+    needs:
+      - protocol
+      - lossy-invariant-guard
+      - test
+      - session-concurrency-stress
+      - experimental
+      - msrv
+      - docker-build
+      - pinned-images
+      - python-reference
+      - helm
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    steps:
+      - name: Aggregate verdict (needs + cross-workflow checks + reviews)
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const SELF = "Release gate (aggregate verdict)";
+            const REVIEW_BOTS = ["coderabbitai[bot]", "chatgpt-codex-connector[bot]"];
+            // Cross-workflow checks mapped to gates. `null` means
+            // informational: it never fails the gate. Mirrors
+            // scripts/release_gate.py. Checks absent from this ref are
+            // skipped, not failed: docker.yml only runs on pushes to
+            // main and tags, so its three checks never exist on a PR
+            // head. A present red one fails its gate.
+            const MAPPED = {
+              "Agentic eval suite": "full-tests",
+              "Build linux/amd64": "docker-build",
+              "Build linux/arm64": "docker-build",
+              "Merge into multi-arch manifest": "docker-build",
+              "Regenerate proof-loop metrics": null,
+              "CodeRabbit": null,
+            };
+            // Third-party app checks conclude skipped/neutral when the
+            // app takes no action (e.g. CodeRabbit skips a PR). Those
+            // are informational by definition, never a gate failure.
+            const BENIGN = new Set(["skipped", "neutral"]);
+            const failures = [];
+
+            // Part 1: every needed job in this workflow must succeed.
+            // A needed job that failed makes the others skipped, and a
+            // skipped job is an unevaluated gate, not a pass.
+            const needsCtx = ${{ toJSON(needs) }};
+            for (const [job, ctx] of Object.entries(needsCtx)) {
+              if (ctx.result !== "success") {
+                failures.push(`needs.${job}: ${ctx.result}`);
+              }
+            }
+
+            // Part 2: cross-workflow check runs on the head SHA. On a
+            // PR, context.sha is the merge commit; the runs live under
+            // the PR head SHA, so resolve the ref explicitly.
+            const ref = context.eventName === "pull_request"
+              ? context.payload.pull_request.head.sha
+              : context.sha;
+            const { data: runs } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref,
+              per_page: 100,
+            });
+            // listForRef returns every run for the ref, including
+            // superseded re-runs. Keep the newest run per name.
+            const latest = new Map();
+            for (const run of runs.check_runs) {
+              if (!latest.has(run.name) || run.id > latest.get(run.name).id) {
+                latest.set(run.name, run);
+              }
+            }
+            for (const run of latest.values()) {
+              if (run.name === SELF) continue;
+              if (BENIGN.has(run.conclusion)) continue;
+              const mapped = run.name in MAPPED ? MAPPED[run.name] : "ci.yml";
+              if (mapped === null) continue;
+              if (run.status !== "completed" || run.conclusion !== "success") {
+                failures.push(`${run.name} [${mapped}]: ${run.status}/${run.conclusion}`);
+              }
+            }
+
+            // Part 3: the review gate bites on pull requests only. A
+            // review that only comments still counts as present.
+            let reviewNote = "Review gate skipped: no PR on this event";
+            if (context.eventName === "pull_request") {
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                per_page: 100,
+              });
+              const botSeen = reviews.some(r => REVIEW_BOTS.includes(r.user.login));
+              const approved = reviews.some(r => r.state === "APPROVED");
+              if (!botSeen && !approved) {
+                failures.push("review gate: no CodeRabbit, Codex, or approving human review on this PR");
+              } else {
+                reviewNote = `Review gate PASS (bot review: ${botSeen}, approved: ${approved})`;
+              }
+            }
+
+            const notEvaluated = "perf-regression and provenance are NOT_EVALUATED and still block a release; see docs/RELEASE-GATES.md.";
+            if (failures.length) {
+              await core.summary
+                .addHeading("Release gate: FAIL")
+                .addList(failures)
+                .addRaw(`\n${notEvaluated}`)
+                .write();
+              core.setFailed(`Release gate FAIL: ${failures.join("; ")}`);
+              return;
+            }
+            await core.summary
+              .addHeading("Release gate: PASS (evaluated gates only)")
+              .addRaw(`\n${reviewNote}\n\n${notEvaluated}`)
+              .write();
+            core.info(`Release gate PASS: all evaluated CI gates green. ${reviewNote} ${notEvaluated}`);
+  # ===== END Phase 5 item 2: release gate =====
