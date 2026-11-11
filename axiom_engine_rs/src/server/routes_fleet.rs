@@ -151,6 +151,8 @@ fn merge_origin_allowed(origin: &HeaderValue, allowed: &[HeaderValue]) -> bool {
     origin.as_bytes() != b"null" && allowed.iter().any(|a| a == origin)
 }
 
+/// A refusal from the fleet merge guard or handlers: `status` with a JSON
+/// body `{"error": message}`.
 fn merge_refusal(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
