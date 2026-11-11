@@ -579,3 +579,58 @@ async fn the_api_key_alone_does_not_authorize_a_merge() {
     assert!(PatchMemory::load(&patches).is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn the_immunity_route_has_the_same_host_and_origin_guard() {
+    // The guard is attached to each merge route separately; the Host and
+    // Origin cases above go through `/v1/patches/merge`. Pin the immunity
+    // route too, with a correctly signed export, so dropping its guard fails.
+    let (dir, heal, _patches) = state_dir("immunity_guard");
+    let fp = fingerprint("make", &[]);
+    let signed_immunity = |host: Option<&str>, origin: Option<&str>| {
+        let body =
+            serde_json::to_string(&sign_export(&hostile_immunity_payload(), Some(FLEET_KEY)))
+                .unwrap();
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/immunity/merge")
+            .header("content-type", "application/json");
+        if let Some(host) = host {
+            req = req.header("host", host);
+        }
+        if let Some(origin) = origin {
+            req = req.header("origin", origin);
+        }
+        req.body(Body::from(body)).unwrap()
+    };
+
+    for (label, host, origin) in [
+        ("rebound Host", Some("evil.example:8080"), None),
+        ("missing Host", None, None),
+        (
+            "foreign Origin",
+            Some(LOOPBACK_HOST),
+            Some("https://evil.example"),
+        ),
+        ("null Origin", Some(LOOPBACK_HOST), Some("null")),
+    ] {
+        let app = create_router(keyed_state(&heal).await);
+        let resp = app.oneshot(signed_immunity(host, origin)).await.unwrap();
+        let (status, json) = status_and_json(resp).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {json}");
+        assert!(
+            HealMemory::load(&heal).record(&fp).is_none(),
+            "{label}: a refused merge must leave heal memory untouched"
+        );
+    }
+
+    // The same signed export from an allowlisted Host with no Origin merges.
+    let app = create_router(keyed_state(&heal).await);
+    let resp = app
+        .oneshot(signed_immunity(Some("10.42.0.17:8080"), None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(HealMemory::load(&heal).record(&fp).is_some());
+    let _ = std::fs::remove_dir_all(dir);
+}
