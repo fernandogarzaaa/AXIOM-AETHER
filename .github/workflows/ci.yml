@@ -631,10 +631,18 @@ jobs:
             // Required cross-workflow checks: the gate must see them,
             // not just see no failure. Only "Agentic eval suite" is
             // required on every ref; the docker multi-arch checks are
-            // required on main/tag pushes only, where docker.yml runs.
-            // The local mirror enforces the same rule.
+            // required only on refs that schedule docker.yml: pushes
+            // to main and v* tags, and a manual dispatch on one of
+            // those refs. A push to claude/** or a dispatch on a
+            // working branch never schedules docker.yml, so requiring
+            // its checks there waits the bounded 10 minutes and then
+            // fails on checks that were never scheduled. The local
+            // mirror enforces the same rule.
             const REQUIRED_CROSS = ["Agentic eval suite"];
-            if (context.eventName !== "pull_request") {
+            const DOCKER_REF =
+              context.ref === "refs/heads/main" ||
+              context.ref.startsWith("refs/tags/v");
+            if (DOCKER_REF && context.eventName !== "pull_request") {
               REQUIRED_CROSS.push("Build linux/amd64", "Build linux/arm64", "Merge into multi-arch manifest");
             }
             // Third-party app checks conclude skipped/neutral when the

@@ -306,3 +306,124 @@ def test_main_requires_check_runs_arg():
 
 def test_main_usage_error_on_unreadable_payload(tmp_path):
     assert release_gate.main(["--check-runs", str(tmp_path / "missing.json")]) == 2
+
+
+def without_multi_arch_checks():
+    return [
+        c
+        for c in ALL_CHECKS
+        if not c.startswith("Build linux") and c != "Merge into multi-arch manifest"
+    ]
+
+
+@pytest.mark.parametrize(
+    "event_name,ref,required",
+    [
+        ("push", "refs/heads/main", True),
+        ("push", "refs/tags/v1.2.3", True),
+        ("push", "refs/heads/claude/work", False),
+        ("push", "refs/heads/feature-x", False),
+        ("workflow_dispatch", "refs/heads/main", True),
+        ("workflow_dispatch", "refs/tags/v0.1.0", True),
+        ("workflow_dispatch", "refs/heads/work", False),
+        ("pull_request", "refs/pull/296/merge", False),
+        ("push", "", False),
+        (None, None, False),
+    ],
+)
+def test_docker_checks_required_rule(event_name, ref, required):
+    assert release_gate.docker_checks_required(event_name, ref) is required
+
+
+def test_docker_checks_missing_fails_gate_on_main_push():
+    checks = without_multi_arch_checks()
+    verdicts, _ = release_gate.evaluate_checks(
+        [run(n, run_id=i) for i, n in enumerate(checks, start=1)],
+        "push",
+        "refs/heads/main",
+    )
+    verdict, detail = verdicts["docker-build"]
+    assert verdict == "FAIL"
+    assert "Build linux/amd64: missing" in detail
+
+
+def test_docker_checks_missing_fails_gate_on_tag_push():
+    checks = without_multi_arch_checks()
+    verdicts, _ = release_gate.evaluate_checks(
+        [run(n, run_id=i) for i, n in enumerate(checks, start=1)],
+        "push",
+        "refs/tags/v1.0.0",
+    )
+    assert verdicts["docker-build"][0] == "FAIL"
+
+
+def test_docker_checks_missing_passes_gate_on_claude_push():
+    checks = without_multi_arch_checks()
+    verdicts, _ = release_gate.evaluate_checks(
+        [run(n, run_id=i) for i, n in enumerate(checks, start=1)],
+        "push",
+        "refs/heads/claude/work",
+    )
+    verdict, detail = verdicts["docker-build"]
+    assert verdict == "PASS"
+    assert "not run on this ref" in detail
+
+
+def test_docker_checks_missing_passes_gate_on_dispatch_working_branch():
+    checks = without_multi_arch_checks()
+    verdicts, _ = release_gate.evaluate_checks(
+        [run(n, run_id=i) for i, n in enumerate(checks, start=1)],
+        "workflow_dispatch",
+        "refs/heads/work",
+    )
+    assert verdicts["docker-build"][0] == "PASS"
+
+
+def test_docker_check_skipped_fails_gate_when_required():
+    checks = [run(n, run_id=i) for i, n in enumerate(ALL_CHECKS, start=1)]
+    for c in checks:
+        if c["name"] == "Build linux/arm64":
+            c["conclusion"] = "skipped"
+    verdicts, _ = release_gate.evaluate_checks(checks, "push", "refs/heads/main")
+    verdict, detail = verdicts["docker-build"]
+    assert verdict == "FAIL"
+    assert "Build linux/arm64: skipped" in detail
+
+
+def test_main_event_and_ref_flags_drive_docker_rule(tmp_path, capsys):
+    checks = without_multi_arch_checks()
+    checks_file = tmp_path / "check-runs.json"
+    checks_file.write_text(
+        json.dumps(
+            {"check_runs": [run(n, run_id=i) for i, n in enumerate(checks, start=1)]}
+        )
+    )
+    assert (
+        release_gate.main(
+            [
+                "--check-runs",
+                str(checks_file),
+                "--event-name",
+                "push",
+                "--ref",
+                "refs/heads/main",
+            ]
+        )
+        == 1
+    )
+    assert "VERDICT: FAIL" in capsys.readouterr().out
+    assert (
+        release_gate.main(
+            [
+                "--check-runs",
+                str(checks_file),
+                "--event-name",
+                "push",
+                "--ref",
+                "refs/heads/claude/work",
+            ]
+        )
+        == 1
+    )
+    out = capsys.readouterr().out
+    assert "VERDICT: BLOCKED" in out

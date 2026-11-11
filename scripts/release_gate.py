@@ -37,10 +37,13 @@ import sys
 # "checks_if_present" names checks that only exist on some refs. The
 # docker.yml multi-arch checks run only on pushes to main and on tags,
 # so they are absent from every PR head SHA. On a PR the docker-build
-# gate is proved by the ci.yml no-push build alone; on main the
-# multi-arch checks must also pass when present. A missing conditional
-# check never fails its gate, and a present one that concludes skipped
-# or neutral counts as not run. A present red one fails its gate.
+# gate is proved by the ci.yml no-push build alone. On a ref that
+# schedules docker.yml (pushes to main and v* tags, and a dispatch on
+# one of those refs) the multi-arch checks are required: a missing one
+# fails the gate, matching the CI job. On any other ref a missing
+# conditional check never fails its gate, and a present one that
+# concludes skipped or neutral counts as not run. A present red one
+# fails its gate.
 GATES = {
     "cp1-source": {
         "description": "CP/1 normative source check",
@@ -128,7 +131,24 @@ def latest_by_name(check_runs):
     return by_name
 
 
-def evaluate_checks(check_runs):
+def docker_checks_required(event_name, ref):
+    """Whether docker.yml schedules its checks for this event/ref.
+
+    Mirrors the release-gate job in .github/workflows/ci.yml.
+    docker.yml runs on pushes to main and v* tags. A push to
+    claude/**, a pull request, or a dispatch on a working branch
+    never schedules it, so its checks must not be required there.
+    A dispatch counts only when its ref is main or a v* tag. With
+    no ref given the checks stay optional, preserving the old
+    local-only behavior.
+    """
+    if not ref:
+        return False
+    on_docker_ref = ref == "refs/heads/main" or ref.startswith("refs/tags/v")
+    return on_docker_ref and event_name != "pull_request"
+
+
+def evaluate_checks(check_runs, event_name=None, ref=None):
     """Map check runs onto gates. Returns (verdicts, unmapped)."""
     by_name = latest_by_name(check_runs)
     verdicts = {}
@@ -146,14 +166,33 @@ def evaluate_checks(check_runs):
                 conclusion = by_name[name].get("conclusion")
                 if status != "completed" or conclusion != "success":
                     problems.append(f"{name}: {status}/{conclusion}")
+        # Conditional checks are required only on refs that schedule
+        # their workflow (docker.yml: pushes to main and v* tags, and
+        # a dispatch on one of those refs). Elsewhere a missing one
+        # never fails its gate, and a benign conclusion is not a pass.
+        conditional_required = gate == "docker-build" and docker_checks_required(
+            event_name, ref
+        )
         for name in spec.get("checks_if_present", []):
             if name not in by_name:
-                notes.append(f"{name}: not run on this ref")
+                if conditional_required:
+                    problems.append(
+                        f"{name}: missing (required cross-workflow check "
+                        f"never ran on this ref)"
+                    )
+                else:
+                    notes.append(f"{name}: not run on this ref")
             else:
                 status = by_name[name].get("status")
                 conclusion = by_name[name].get("conclusion")
                 if conclusion in BENIGN_CONCLUSIONS:
-                    notes.append(f"{name}: {conclusion} (informational)")
+                    if conditional_required:
+                        problems.append(
+                            f"{name}: {conclusion} (required cross-workflow "
+                            f"check did not succeed)"
+                        )
+                    else:
+                        notes.append(f"{name}: {conclusion} (informational)")
                 elif status != "completed" or conclusion != "success":
                     problems.append(f"{name}: {status}/{conclusion}")
         if problems:
@@ -198,6 +237,16 @@ def main(argv=None):
     )
     parser.add_argument("--reviews", help="PR reviews JSON from the GitHub API")
     parser.add_argument("--pr", default="", help="PR number, shown in the report only")
+    parser.add_argument(
+        "--event-name",
+        default="push",
+        help="GitHub event name: push, pull_request, workflow_dispatch",
+    )
+    parser.add_argument(
+        "--ref",
+        default="",
+        help="full git ref, e.g. refs/heads/main; drives the docker rule",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -216,7 +265,7 @@ def main(argv=None):
             print(f"release-gate: cannot read reviews file: {e}", file=sys.stderr)
             return 2
 
-    verdicts, unmapped = evaluate_checks(check_runs)
+    verdicts, unmapped = evaluate_checks(check_runs, args.event_name, args.ref)
     review_verdict, review_detail = evaluate_reviews(reviews)
     verdicts["bot-review"] = (review_verdict, review_detail)
 
