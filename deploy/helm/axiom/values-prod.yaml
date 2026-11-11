@@ -1,0 +1,60 @@
+# Production overlay for the Axiom-TTT Helm chart.
+#   helm install axiom deploy/helm/axiom \
+#     -f deploy/helm/axiom/values-prod.yaml \
+#     --set checkpoint.url=<release asset URL> \
+#     --set checkpoint.tokenizerUrl=<release asset URL> \
+#     --set checkpoint.sha256=<pinned sha256> \
+#     --set checkpoint.tokenizerSha256=<pinned sha256>
+#
+# Production-like defaults: three replicas with a quorum PDB, autoscaling,
+# the verified-checkpoint readiness gate ON, gossip authenticated, CORS
+# deny-all, /metrics scraped. The image digest is pinned in values.yaml
+# and is never overridden here; the deploy checklist pins the tag to the
+# release being deployed. Fill every <...> placeholder before install.
+# Never commit a filled-in copy of this file.
+
+replicaCount: 3
+
+checkpoint:
+  sha256: "<sha256 of the release checkpoint asset>"
+  tokenizerSha256: "<sha256 of the release tokenizer asset>"
+
+config:
+  requireVerifiedCheckpoint: "1"
+  extraEnv:
+    # Deny all cross-origin browser calls in production. Add an origin
+    # only by naming it here, never with "*".
+    AXIOM_CORS_ORIGINS: ""
+
+# Secrets come from an existing Secret, never from this file. Create it
+# with kubectl first (see docs/PROD-LIKE-DEPLOY.md). The name below is a
+# placeholder. When set, the chart references it instead of creating one.
+secrets:
+  existingSecret: "axiom-prod-secrets"
+
+metrics:
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels:
+      release: kube-prometheus-stack
+
+# Keep two pods serving through voluntary disruptions.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 75
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi

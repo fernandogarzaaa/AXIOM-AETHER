@@ -1,0 +1,64 @@
+# Staging overlay for the Axiom-TTT Helm chart.
+#   helm install axiom-staging deploy/helm/axiom \
+#     -f deploy/helm/axiom/values-staging.yaml \
+#     --set checkpoint.url=<release asset URL> \
+#     --set checkpoint.tokenizerUrl=<release asset URL> \
+#     --set checkpoint.sha256=<pinned sha256> \
+#     --set checkpoint.tokenizerSha256=<pinned sha256>
+#
+# Production-like on purpose: the readiness gate is ON, the image digest
+# is pinned (inherited from values.yaml, never overridden here), gossip
+# is authenticated, and CORS allows exactly one staging origin. What
+# staging does NOT copy from prod is scale: one replica, no PDB, no
+# autoscaling. Fill every <...> placeholder before install. Never commit
+# a filled-in copy of this file.
+
+replicaCount: 1
+
+# The checkpoint hashes below are placeholders. The deploy checklist
+# (docs/PROD-LIKE-DEPLOY.md) says where the real values come from. With
+# requireVerifiedCheckpoint "1", /readyz returns 503 until the checkpoint
+# file exists and its SHA-256 matches checkpoint.sha256.
+checkpoint:
+  sha256: "<sha256 of the release checkpoint asset>"
+  tokenizerSha256: "<sha256 of the release tokenizer asset>"
+
+config:
+  requireVerifiedCheckpoint: "1"
+  extraEnv:
+    # Exactly one staging origin. Empty string means deny all cross-origin
+    # browser calls, which is the restrictive default. Replace the value
+    # with the real staging origin, never with "*".
+    AXIOM_CORS_ORIGINS: "https://staging.example.invalid"
+
+# Secrets come from an existing Secret, never from this file. Create it
+# with kubectl first (see docs/PROD-LIKE-DEPLOY.md). The name below is a
+# placeholder. When set, the chart references it instead of creating one.
+secrets:
+  existingSecret: "axiom-staging-secrets"
+
+# Scrape /metrics in staging too, so the metrics-gating check in the
+# deploy checklist has something to read.
+metrics:
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels:
+      release: kube-prometheus-stack
+
+# One replica has no quorum to protect. The PDB template skips a single
+# replica anyway; disabling it here states the intent.
+podDisruptionBudget:
+  enabled: false
+
+autoscaling:
+  enabled: false
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
