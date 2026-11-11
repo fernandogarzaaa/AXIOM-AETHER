@@ -149,6 +149,26 @@ jobs:
           Get-Content "$staging.zip.sha256"
           "ASSET_SHA=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Install syft
+        uses: anchore/syft-action@v0
+
+      # Every release archive ships with a source SBOM, a package-level
+      # syft SBOM, and a provenance attestation. --syft-required fails
+      # the build when the syft SBOM is missing, fails, or invalid, so
+      # a release can never silently ship without one. The verify step
+      # re-hashes the archive against its own attestation.
+      - name: Generate SBOM and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$(command -v python3 || command -v python)"
+          "$PY" scripts/generate_attestation.py generate \
+            --artifact "${{ env.ASSET }}" --syft-required
+          "$PY" scripts/generate_attestation.py verify \
+            --artifact "${{ env.ASSET }}" \
+            --provenance "${{ env.ASSET }}.provenance.json" \
+            --sbom "${{ env.ASSET }}.sbom.json"
+
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
@@ -156,6 +176,9 @@ jobs:
           files: |
             ${{ env.ASSET }}
             ${{ env.ASSET_SHA }}
+            ${{ env.ASSET }}.sbom.json
+            ${{ env.ASSET }}.provenance.json
+            ${{ env.ASSET }}.sbom.syft.json
           fail_on_unmatched_files: true
 
   checkpoint:
@@ -221,6 +244,26 @@ jobs:
 
       # Stable, tag-independent asset names so Helm's checkpoint.url can point
       # at releases/latest/download/<file>.
+      - name: Install syft
+        uses: anchore/syft-action@v0
+
+      # Each checkpoint file gets the same treatment as a release
+      # archive: source SBOM, syft SBOM, provenance, then a verify
+      # pass against its own attestation.
+      - name: Generate SBOM and provenance for checkpoint assets
+        run: |
+          set -euo pipefail
+          for f in ckpt_release/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.sbom.json|*.provenance.json|*.sbom.syft.json) continue;; esac
+            python3 scripts/generate_attestation.py generate \
+              --artifact "$f" --syft-required
+            python3 scripts/generate_attestation.py verify \
+              --artifact "$f" \
+              --provenance "$f.provenance.json" \
+              --sbom "$f.sbom.json"
+          done
+
       - name: Upload checkpoint assets
         uses: softprops/action-gh-release@v2
         with:
@@ -231,4 +274,7 @@ jobs:
             ckpt_release/axiom_bpe.json
             ckpt_release/axiom_drift_gate.txt
             ckpt_release/SHA256SUMS.txt
+            ckpt_release/*.sbom.json
+            ckpt_release/*.provenance.json
+            ckpt_release/*.sbom.syft.json
           fail_on_unmatched_files: true
