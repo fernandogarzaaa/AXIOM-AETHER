@@ -1,0 +1,11 @@
+--- a/src/idc.rs
++++ b/src/idc.rs
+@@ -78,7 +78,7 @@
+     let idx = (h % state.len() as u64) as usize;
+     // Second hash bit decides sign so colliding features don't only add.
+     let sign = if (h >> 32) & 1 == 0 { 1.0 } else { -1.0 };
+-    state[idx] += sign / value;
++    state[idx] += sign * value;
+ }
+ 
+ /// Fuse a batch of sensor readings into a single state vector of dimension

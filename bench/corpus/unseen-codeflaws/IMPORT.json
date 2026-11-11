@@ -1,0 +1,110 @@
+{
+  "source": "Codeflaws (Tan et al.), https://github.com/codeflaws/codeflaws",
+  "tarball": "codeflaws.tar.gz",
+  "imported": 12,
+  "skipped": 1,
+  "fixtures": [
+    {
+      "id": "4-A-bug-18258406-18258457",
+      "contest": "DCCR",
+      "buggy_lines": 11,
+      "diff_lines": 11,
+      "inputs": 5,
+      "buggy": "4-A-18258406.c"
+    },
+    {
+      "id": "231-A-bug-18055428-18055539",
+      "contest": "DCCR",
+      "buggy_lines": 17,
+      "diff_lines": 11,
+      "inputs": 3,
+      "buggy": "231-A-18055428.c"
+    },
+    {
+      "id": "96-A-bug-18284844-18284870",
+      "contest": "DCCR",
+      "buggy_lines": 51,
+      "diff_lines": 11,
+      "inputs": 3,
+      "buggy": "96-A-18284844.c"
+    },
+    {
+      "id": "96-A-bug-18173471-18173484",
+      "contest": "DCCR",
+      "buggy_lines": 27,
+      "diff_lines": 11,
+      "inputs": 3,
+      "buggy": "96-A-18173471.c"
+    },
+    {
+      "id": "131-A-bug-18069181-18073244",
+      "contest": "DCCR",
+      "buggy_lines": 27,
+      "diff_lines": 11,
+      "inputs": 6,
+      "buggy": "131-A-18069181.c"
+    },
+    {
+      "id": "133-A-bug-18048780-18048793",
+      "contest": "DCCR",
+      "buggy_lines": 27,
+      "diff_lines": 11,
+      "inputs": 3,
+      "buggy": "133-A-18048780.c"
+    },
+    {
+      "id": "58-A-bug-18163826-18163845",
+      "contest": "DCCR",
+      "buggy_lines": 22,
+      "diff_lines": 11,
+      "inputs": 3,
+      "buggy": "58-A-18163826.c"
+    },
+    {
+      "id": "58-A-bug-17762757-17762804",
+      "contest": "DCCR",
+      "buggy_lines": 54,
+      "diff_lines": 11,
+      "inputs": 6,
+      "buggy": "58-A-17762757.c"
+    },
+    {
+      "id": "467-A-bug-18348808-18348843",
+      "contest": "DCCR",
+      "buggy_lines": 18,
+      "diff_lines": 11,
+      "inputs": 3,
+      "buggy": "467-A-18348808.c"
+    },
+    {
+      "id": "136-A-bug-17499279-17499383",
+      "contest": "DCCR",
+      "buggy_lines": 20,
+      "diff_lines": 11,
+      "inputs": 13,
+      "buggy": "136-A-17499279.c"
+    },
+    {
+      "id": "82-A-bug-18221798-18221807",
+      "contest": "DCCR",
+      "buggy_lines": 32,
+      "diff_lines": 11,
+      "inputs": 4,
+      "buggy": "82-A-18221798.c"
+    },
+    {
+      "id": "271-A-bug-18358749-18358771",
+      "contest": "DCCR",
+      "buggy_lines": 40,
+      "diff_lines": 11,
+      "inputs": 7,
+      "buggy": "271-A-18358749.c"
+    }
+  ],
+  "skip_reasons": [
+    {
+      "id": "71-A-bug-18359456-18359477",
+      "reason": "oracle sanity failed (accepted_ok=True, buggy_ok=True)"
+    }
+  ]
+}

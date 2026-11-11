@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -243,7 +243,7 @@
+         // the right node; resetting is the safe default (a removed node's
+         // calls will still `mark_idle`/`record_outcome` into a no-op once
+         // it's gone, see above).
+-        self.vec = in_flight![0; n];
++        self.in_flight = vec![0; n];
+         self.reward_mean = vec![0.0; n];
+         self.visits = vec![0; n];
+     }

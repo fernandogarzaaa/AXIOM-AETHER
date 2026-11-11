@@ -26,6 +26,38 @@ Honesty notes, which travel with every result this produces:
 Usage:
     scripts/seed_faults.py --crate axiom_mesh_core --out /tmp/seeded --n 40 --seed 2026
     AXIOM_REPAIR_CORPUS=/tmp/seeded scripts/bench_repair.sh
+
+Phase 4 unseen suite (2026-11-10): seed 424242 is the qualification seed.
+It uses a different generator revision than seeds 7/2026 (the `strlit` class
+below did not exist when those corpora were generated) and a different seed,
+so no operator or ordering rule was ever tuned against its faults. Its
+fixtures live under bench/corpus/unseen-seed424242/ and are excluded from
+all tuning until the qualification run.
+
+Strengthened suite (2026-11-11, batch 2, seed 424243): three more fault
+classes (`deref`, `cast`, `ret`) plus `--classes` (restrict sampling to
+named classes) and `--exclude-dir` (never re-emit a fault already present
+in a corpus directory). Batch 2 targets the thin classes of batch 1
+(`logic`, `argswap`, `range`, `minmax` had 1-2 faults each) and the new
+classes. In/out of the repair operator set, verified against
+`MutationClass::ALL` in axiom_engine_rs/src/mutation_repair.rs (12
+classes: Comparison, OffByOne, Boolean, Logic, Arithmetic, SwapArgs,
+MissingReturn, ShellTest, ApiSwap, ArgShift, IdentSwap, ImportPath):
+`ret` is INSIDE the set (MissingReturn re-adds a dropped `return`);
+`deref` (drop `&`/`*`) and `cast` (change an `as` target type) are
+OUTSIDE it, by construction. A `deref`/`cast` fault may fail to compile
+rather than fail a test; the oracle is `cargo test --lib`, which fails
+either way, and the corpus records the split per fixture in SEED.json.
+
+Regenerated batch (2026-11-11, batch 3, seed 424244): Codex review of
+the 36-fixture suite found 18 fixtures share a (file, line, class)
+triple with the prior repair-seeded-mesh-core tuning tables, so the
+suite was not genuinely unseen. Batch 3 replaces those 18 at fresh
+sites, using `--exclude-triples` (never emit a site whose
+(file, line, class) appears in a triples file: the tuning tables plus
+the 18 retained fixtures), so the regenerated suite has zero triple
+overlap with any tuning table. One fixture per triple per run is
+enforced inside the generator as well.
 """
 
 from __future__ import annotations
@@ -33,7 +65,6 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
-import os
 import random
 import re
 import shutil
@@ -100,6 +131,44 @@ def code_mask(line: str) -> list[bool]:
 
 def spaced(line: str, s: int, e: int) -> bool:
     return s > 0 and line[s - 1] == " " and e < len(line) and line[e] == " "
+
+
+def string_spans(line: str) -> list[tuple[int, int, str]]:
+    """(content_start, content_end, content) for genuine string literals.
+
+    Unlike `code_mask`, which blanks string contents along with comments,
+    this returns only real strings: `//` comments end the scan, and char
+    literals are skipped.
+    """
+    out: list[tuple[int, int, str]] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if c == "/" and i + 1 < n and line[i + 1] == "/":
+            break
+        if c == '"':
+            j = i + 1
+            content: list[str] = []
+            while j < n:
+                if line[j] == "\\":
+                    if j + 1 < n:
+                        content.append(line[j + 1])
+                    j += 2
+                    continue
+                if line[j] == '"':
+                    break
+                content.append(line[j])
+                j += 1
+            if j < n and j > i + 1:
+                out.append((i + 1, j, "".join(content)))
+            i = j + 1
+            continue
+        if c == "'" and i + 2 < n and line[i + 2] == "'":
+            i += 3
+            continue
+        i += 1
+    return out
 
 
 def sites_for_line(line_no: int, line: str) -> list[Site]:
@@ -223,6 +292,100 @@ def sites_for_line(line_no: int, line: str) -> list[Site]:
         if ok(s, e):
             out.append(Site(line_no, "flow", m.group(1), "continue" if m.group(1) == "break" else "break", s, e))
 
+    # String-literal mutation (added 2026-11-10 for the Phase 4 unseen suite,
+    # seed 424242: this class did not exist when seeds 7/2026 were generated).
+    # Appends "!" to a short plain string literal. The repair engine has no
+    # operator that can guess the original literal, so this class is outside
+    # its operator set by construction; a test only catches it when it asserts
+    # the exact string. Skips format strings, paths, and URLs.
+    for (start, end, content) in string_spans(line):
+        if len(content) < 2 or len(content) > 32:
+            continue
+        if "{" in content or "}" in content or "/" in content or ":" in content:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9 _.,-]+", content):
+            continue
+        out.append(Site(line_no, "strlit", content, content + "!", start, end))
+
+    # Deref drop (added 2026-11-11 for the strengthened suite): drop a
+    # leading `&` borrow or `*` deref. Outside the repair engine's operator
+    # set by construction (no operator adds `&`/`*`). Expression positions
+    # only: signature lines are already skipped above, and these guards
+    # exclude the lookalikes. `&` immediately after `<` is a generic type
+    # argument (`Option<&T>`); a `&` before the `=`/` in ` of a `let`/`if
+    # let`/`while let`/`for` header is a pattern binding, not a borrow;
+    # an odd count of `|` before the site means it sits inside closure
+    # params (`|a, &b|`); `-> &T` is a return type; `&mut` and `&&` are
+    # not plain borrows. `*` needs an expression operator before it so
+    # multiplication (`a * b`) and raw-pointer types (`*const T`, whose
+    # previous non-space char is `:` or `s`) are excluded.
+    stripped = line.strip()
+    cutoff = 0
+    if stripped.startswith(("let ", "if let ", "while let ")):
+        eq = line.find("=")
+        cutoff = eq + 1 if eq >= 0 else len(line)
+    elif stripped.startswith("for "):
+        inn = line.find(" in ")
+        cutoff = inn + 4 if inn >= 0 else len(line)
+    for m in re.finditer(r"&", line):
+        s = m.start()
+        if s < cutoff:
+            continue
+        if s + 1 >= len(line) or not (line[s + 1].isalpha() or line[s + 1] == "_" or line[s + 1] == "("):
+            continue
+        if line[s + 1 : s + 4] == "mut" or (s + 1 < len(line) and line[s + 1] == "&"):
+            continue
+        if s > 0 and line[s - 1] == "<":
+            continue
+        if not ok(s, s + 1):
+            continue
+        prev = line[:s].rstrip()
+        if not prev or prev[-1] not in "(,=+-*/%<>!&|[":
+            continue
+        if line[:s].count("|") % 2 == 1:
+            continue
+        if re.search(r"->\s*&", line[: s + 1]):
+            continue
+        out.append(Site(line_no, "deref", "&", "", s, s + 1))
+    for m in re.finditer(r"\*", line):
+        s = m.start()
+        if s < cutoff:
+            continue
+        if s + 1 >= len(line) or not (line[s + 1].isalpha() or line[s + 1] == "_" or line[s + 1] == "("):
+            continue
+        if not ok(s, s + 1):
+            continue
+        prev = line[:s].rstrip()
+        if not prev or prev[-1] not in "=([!-+":
+            continue
+        out.append(Site(line_no, "deref", "*", "", s, s + 1))
+
+    # Cast-target change (added 2026-11-11 for the strengthened suite):
+    # `x as u64` -> `x as u32`, etc. Outside the operator set by
+    # construction (no operator rewrites an `as` target type). Measured
+    # on this crate (batch 2): all three emitted cast faults fail to
+    # compile, because the new target type mismatches the operand type
+    # (E0308/E0277, e.g. `f32` -> `f64` next to an `f32` operand). A cast
+    # whose operand types still line up would be a behaviour change
+    # (truncation, or a float-precision change the tests may or may not
+    # catch). Either way the oracle kills it and the fixture records
+    # which (see SEED.json).
+    for m in re.finditer(r"\bas\s+(u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|f32|f64)\b", line):
+        s, e = m.span(1)
+        if ok(s, e):
+            out.append(Site(line_no, "cast", m.group(1), CAST_ALT[m.group(1)], s, e))
+
+    # Dropped early return (added 2026-11-11 for the strengthened suite):
+    # `return Err(...);` -> `Err(...);`. Measured on this crate (batch 2):
+    # all three emitted `ret` faults fail to compile (E0282: type
+    # annotations needed), because dropping `return` removes the type
+    # ascription the `Err(...)`/`None` expression relied on; as a
+    # discarded statement it has no expected type. INSIDE the operator
+    # set: MissingReturn re-adds a dropped `return`.
+    m = re.match(r"^(\s*)(return)(\s+)(.+);\s*$", line)
+    if m and ok(m.start(2), m.end(3)):
+        out.append(Site(line_no, "ret", "return", "", m.start(2), m.end(3)))
+
     # Identifier swap: two distinct short identifiers on one line, swapped (outside the set).
     idents = [m for m in re.finditer(rf"\b({IDENT})\b", line) if ok(*m.span(1))]
     names = []
@@ -251,6 +414,23 @@ RUST_KEYWORDS = set(
     "self Self static struct super trait true type unsafe use where while async await dyn u8 u16 u32 u64 usize i8 i16 "
     "i32 i64 isize f32 f64 bool char str Some None Ok Err Vec String Box Option Result".split()
 )
+
+# Cast-target alternates for the `cast` fault class: each type maps to the
+# nearest type whose values differ (width change, or float precision change).
+CAST_ALT = {
+    "u8": "u16",
+    "u16": "u8",
+    "u32": "u64",
+    "u64": "u32",
+    "usize": "u32",
+    "i8": "i16",
+    "i16": "i8",
+    "i32": "i64",
+    "i64": "i32",
+    "isize": "i32",
+    "f32": "f64",
+    "f64": "f32",
+}
 
 
 def test_region_start(lines: list[str]) -> int:
@@ -300,16 +480,60 @@ def main() -> int:
         action="store_true",
         help="round-robin over fault classes so one prolific class (identifier swaps) cannot dominate the sample",
     )
+    ap.add_argument(
+        "--classes",
+        default=None,
+        help="comma-separated fault classes to sample from (default: all). "
+        "Used to top up thin classes without re-rolling the whole suite.",
+    )
+    ap.add_argument(
+        "--exclude-dir",
+        action="append",
+        default=[],
+        help="corpus directory whose existing fixtures must never be re-emitted: "
+        "a candidate site whose (file, line, class, before, after) matches an "
+        "existing fixture's meta.json fault is skipped. Repeatable.",
+    )
+    ap.add_argument(
+        "--exclude-triples",
+        action="append",
+        default=[],
+        help="file listing (file, line, class) triples, one per line as "
+        "FILE:LINE:CLASS (e.g. src/mesh.rs:489:flow), whose sites must never "
+        "be emitted: a candidate sharing a triple with the file is skipped. "
+        "Used to keep a regenerated suite disjoint from prior tuning tables. "
+        "Repeatable. Triples emitted in this run are excluded the same way, "
+        "so a suite never holds two fixtures at one (file, line, class).",
+    )
     args = ap.parse_args()
+
+    wanted = None
+    if args.classes:
+        wanted = {c.strip() for c in args.classes.split(",") if c.strip()}
+        known = {
+            "argswap", "arith", "bool", "flow", "idswap", "minmax", "neg",
+            "offbyone", "range", "shift", "const", "logic", "cmp", "strlit",
+            "deref", "cast", "ret",
+        }
+        unknown = wanted - known
+        if unknown:
+            print(f"unknown fault class(es): {sorted(unknown)}", file=sys.stderr)
+            return 2
 
     crate = (REPO / args.crate).resolve()
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    target_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "axiom_seeded_target"
     # Debug profile on purpose: it builds incrementally, so each of the up to
     # 64 repair candidates costs ~1-2 s to verify instead of a full release
     # recompile (~10 s+), which makes a 40-fixture run ~1 h instead of ~8 h.
-    verify_sh = args.verify or f'CARGO_TARGET_DIR="{target_dir}" cargo test --lib -q'
+    # Portable target dir (Codex P1, PR #294): resolve the shared target
+    # directory from the runtime environment at VERIFY time, never embed
+    # the generation machine's absolute path in a committed fixture.
+    # `${TMPDIR:-$HOME/.cache}` honours a caller-chosen scratch dir when
+    # one is set, else the user's cache dir (on a real disk: /tmp is a
+    # small tmpfs in this sandbox, so a bare /tmp default would strand
+    # the build there). $HOME is safe to rely on: cargo/rustup need it.
+    verify_sh = args.verify or 'CARGO_TARGET_DIR="${TMPDIR:-$HOME/.cache}/axiom_seeded_target" cargo test --lib -q'
     verify = ["sh", "-c", verify_sh]
 
     # Confirm the pristine crate is green with this verifier.
@@ -323,6 +547,33 @@ def main() -> int:
     files = args.files or sorted(
         str(p.relative_to(crate)) for p in (crate / "src").glob("*.rs") if p.name not in ("lib.rs", "node.rs")
     )
+    excluded: set[tuple[str, int, str, str, str]] = set()
+    for d in args.exclude_dir:
+        for meta_path in Path(d).glob("*/meta.json"):
+            try:
+                fault = json.loads(meta_path.read_text()).get("fault") or {}
+            except (json.JSONDecodeError, OSError):
+                continue
+            if fault.get("file") and fault.get("line") and fault.get("class") is not None:
+                excluded.add(
+                    (fault["file"], int(fault["line"]), fault["class"], fault.get("before", ""), fault.get("after", ""))
+                )
+    if excluded:
+        print(f"excluding {len(excluded)} already-emitted fault(s) from {args.exclude_dir}", file=sys.stderr)
+    excluded_triples: set[tuple[str, int, str]] = set()
+    for triples_path in args.exclude_triples:
+        for raw in Path(triples_path).read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                f, ln, cls = line.rsplit(":", 2)
+            except ValueError:
+                print(f"bad triples line (want FILE:LINE:CLASS): {line!r}", file=sys.stderr)
+                return 2
+            excluded_triples.add((f, int(ln), cls))
+    if excluded_triples:
+        print(f"excluding {len(excluded_triples)} (file, line, class) triple(s) from {args.exclude_triples}", file=sys.stderr)
     all_sites: list[tuple[str, list[str], Site]] = []
     for rel in files:
         lines = (crate / rel).read_text().splitlines(keepends=True)
@@ -330,6 +581,8 @@ def main() -> int:
         for i in range(region):
             content = lines[i].rstrip("\n")
             for s in sites_for_line(i, content):
+                if wanted is not None and s.cls not in wanted:
+                    continue
                 all_sites.append((rel, lines, s))
     rng = random.Random(args.seed)
     rng.shuffle(all_sites)
@@ -364,6 +617,11 @@ def main() -> int:
         if key in seen:
             continue
         seen.add(key)
+        if (rel, site.line_no + 1, site.cls, site.before, site.after) in excluded:
+            continue
+        triple = (rel, site.line_no + 1, site.cls)
+        if triple in excluded_triples:
+            continue
         attempts += 1
         mutated = list(lines)
         mutated[site.line_no] = new_line + "\n"
@@ -395,6 +653,7 @@ def main() -> int:
         )
         (fixture / "expected.diff").write_text("".join(diff))
         emitted += 1
+        excluded_triples.add(triple)
         by_class[site.cls] = by_class.get(site.cls, 0) + 1
         print(f"  [{emitted:02d}] {name}: {site.before!r} -> {site.after!r}", file=sys.stderr)
 

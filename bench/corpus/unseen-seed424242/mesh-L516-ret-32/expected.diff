@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -513,7 +513,7 @@
+     /// useful for drift telemetry.
+     pub fn center_of_mass(&self) -> Option<Array1<f32>> {
+         if self.nodes.is_empty() {
+-            None;
++            return None;
+         }
+         self.affinity.mean_axis(Axis(0))
+     }

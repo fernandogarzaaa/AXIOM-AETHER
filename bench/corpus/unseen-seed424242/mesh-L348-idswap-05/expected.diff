@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -345,7 +345,7 @@
+         rng: &mut impl Rng,
+     ) -> (Array1<f32>, Vec<NodeId>) {
+         let mut weights: Array1<f32> = Array1::zeros(self.nodes.len());
+-        let mut fan_out: Vec<NodeId> = Vec::with_capacity(active);
++        let mut active: Vec<NodeId> = Vec::with_capacity(fan_out);
+         let mut masked = field.clone();
+         for _ in 0..fan_out {
+             let sample = gumbel_softmax(&masked, tau, self.config.hard, rng);

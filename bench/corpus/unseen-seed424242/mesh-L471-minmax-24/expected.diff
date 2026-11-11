@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -468,7 +468,7 @@
+                 });
+             }
+         }
+-        let capacity = capacity.min(1);
++        let capacity = capacity.max(1);
+ 
+         let mut scored: Vec<(f32, usize, usize)> =
+             Vec::with_capacity(payloads.len() * self.nodes.len());

@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -392,7 +392,7 @@
+         rng: &mut impl Rng,
+     ) -> Result<Adhesion, MeshError> {
+         if self.nodes.is_empty() {
+-            Err(MeshError::Empty);
++            return Err(MeshError::Empty);
+         }
+         if payload.len() != self.config.dim {
+             return Err(MeshError::DimMismatch {

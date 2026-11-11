@@ -36,6 +36,14 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRATE="$REPO/axiom_engine_rs"
 BIN="${AXIOM_BIN:-$CRATE/target/release/axiom}"
 CORPUS="${AXIOM_REPAIR_CORPUS:-$REPO/bench/repair}"
+# Resolve to an absolute path (2026-11-11): the authored-fix labelling below
+# runs `patch` after `cd` into a temp dir, so a relative corpus path makes
+# the `expected.diff` redirect miss with "No such file or directory" and
+# every PASS is silently labelled "—" instead of "authored fix" /
+# "different fix". Absolute here keeps the results header identical:
+# `${CORPUS#"$REPO"/}` below still strips the repo prefix.
+[ -d "$CORPUS" ] || { echo "bench_repair.sh: corpus not found: $CORPUS" >&2; exit 1; }
+CORPUS="$(cd "$CORPUS" && pwd)"
 OUTDIR="$REPO/bench/results"
 DATE="$(date +%Y-%m-%d)"
 CHECK=0

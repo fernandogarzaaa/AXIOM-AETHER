@@ -1,0 +1,22 @@
+{
+  "lang": "rust",
+  "verify": [
+    "sh",
+    "-c",
+    "CARGO_TARGET_DIR=\"${TMPDIR:-$HOME/.cache}/axiom_seeded_target\" cargo test --lib -q"
+  ],
+  "kind": "single",
+  "source": "seeded fault, seed=424242, src/gumbel.rs:78, class=idswap",
+  "pinned": [],
+  "test_region": {
+    "file": "src/gumbel.rs",
+    "from_line": 102
+  },
+  "fault": {
+    "file": "src/gumbel.rs",
+    "line": 78,
+    "class": "idswap",
+    "before": "soft<->softmax",
+    "after": "    let softmax = soft(&perturbed);"
+  }
+}

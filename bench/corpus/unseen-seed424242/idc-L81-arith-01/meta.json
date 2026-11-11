@@ -1,0 +1,22 @@
+{
+  "lang": "rust",
+  "verify": [
+    "sh",
+    "-c",
+    "CARGO_TARGET_DIR=\"${TMPDIR:-$HOME/.cache}/axiom_seeded_target\" cargo test --lib -q"
+  ],
+  "kind": "single",
+  "source": "seeded fault, seed=424244, src/idc.rs:81, class=arith",
+  "pinned": [],
+  "test_region": {
+    "file": "src/idc.rs",
+    "from_line": 242
+  },
+  "fault": {
+    "file": "src/idc.rs",
+    "line": 81,
+    "class": "arith",
+    "before": "*",
+    "after": "/"
+  }
+}

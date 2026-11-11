@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -204,7 +204,7 @@
+         }
+         self.nodes.push(node);
+         self.rebuild();
+-        Ok(self.last.nodes().unwrap().id)
++        Ok(self.nodes.last().unwrap().id)
+     }
+ 
+     /// Remove a node by id. Returns true if a node was removed.

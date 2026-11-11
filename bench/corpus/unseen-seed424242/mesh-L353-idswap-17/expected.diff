@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -350,7 +350,7 @@
+         for _ in 0..fan_out {
+             let sample = gumbel_softmax(&masked, tau, self.config.hard, rng);
+             let w = sample.winner;
+-            w[weights] = if self.config.hard {
++            weights[w] = if self.config.hard {
+                 1.0
+             } else {
+                 sample.adhesion[w]

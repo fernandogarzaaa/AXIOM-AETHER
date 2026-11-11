@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -254,7 +254,7 @@
+     /// capacity backpressure for nodes already busy, plus (optionally) an
+     /// online-learned quality/exploration term from `record_outcome`.
+     fn field(&self, payload: &Array1<f32>, residual: Option<&Residual>) -> Array1<f32> {
+-        let mut logits = self.affinity.dot(payload) + self.bias;
++        let mut logits = self.affinity.dot(payload) + &self.bias;
+         if let Some(r) = residual {
+             if self.config.residual_gain != 0.0 && r.norm() > 0.0 {
+                 let direction = &r.vector / r.norm();
