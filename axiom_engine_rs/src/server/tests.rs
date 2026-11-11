@@ -48,6 +48,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_trivial_needs_the_tokenizer_the_checkpoint_was_trained_with() {
+        let bpe = std::path::Path::new("/models/axiom_bpe.json");
+        let other = std::path::Path::new("/models/other_bpe.json");
+
+        // The sidecar names a tokenizer and that file is the one in use.
+        assert_eq!(
+            check_local_trivial_tokenizer(Some(bpe), true, Some("checkpoints/axiom_bpe.json")),
+            Ok(())
+        );
+        // No sidecar: nothing is recorded to compare against. A checkpoint
+        // from before sidecars runs on the hash tokenizer or on a configured
+        // one, as long as the configured one loaded.
+        assert_eq!(check_local_trivial_tokenizer(None, false, None), Ok(()));
+        assert_eq!(check_local_trivial_tokenizer(Some(bpe), true, None), Ok(()));
+        // A sidecar that names no tokenizer is the same as none recorded.
+        assert_eq!(check_local_trivial_tokenizer(None, false, Some("  ")), Ok(()));
+
+        // Trained with a tokenizer file, running on the hash tokenizer.
+        let err = check_local_trivial_tokenizer(None, false, Some("checkpoints/axiom_bpe.json"))
+            .unwrap_err();
+        assert!(err.contains("AXIOM_LOCAL_TRIVIAL"), "{err}");
+        assert!(err.contains("axiom_bpe.json"), "{err}");
+        assert!(err.contains("AXIOM_TOKENIZER is not set"), "{err}");
+        assert!(err.contains("unset AXIOM_LOCAL_TRIVIAL"), "{err}");
+
+        // Trained with one tokenizer file, running on another.
+        let err = check_local_trivial_tokenizer(Some(other), true, Some("axiom_bpe.json"))
+            .unwrap_err();
+        assert!(err.contains("axiom_bpe.json"), "{err}");
+        assert!(err.contains("other_bpe.json"), "{err}");
+
+        // A tokenizer was configured but did not load: the pipeline fell back
+        // to the hash tokenizer, with or without a sidecar.
+        for trained_with in [None, Some("axiom_bpe.json")] {
+            let err = check_local_trivial_tokenizer(Some(bpe), false, trained_with).unwrap_err();
+            assert!(err.contains("did not load"), "{err}");
+            assert!(err.contains("/models/axiom_bpe.json"), "{err}");
+        }
+    }
+
     #[tokio::test]
     async fn local_trivial_is_active_only_when_opted_in_and_verified() {
         let state = make_test_state().await;

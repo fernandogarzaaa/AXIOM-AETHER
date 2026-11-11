@@ -320,6 +320,55 @@ pub fn resolve_local_trivial(
     ))
 }
 
+/// Second half of the startup guard for the local trivial-turn short-circuit:
+/// the tokenizer in use must be the one the checkpoint was trained with.
+///
+/// A verified checkpoint vouches for the weights only. Read through a
+/// different tokenizer, the model's surprisal is noise, and the short-circuit
+/// would end turns on it. The easy way to get there is a checkpoint trained
+/// with a tokenizer file and `AXIOM_TOKENIZER` left unset, or pointing at a
+/// file that does not parse: the pipeline then falls back to the hash
+/// tokenizer and says so only in a startup warning.
+///
+/// * `configured`: `AXIOM_TOKENIZER`, when set.
+/// * `loaded`: whether the pipeline is encoding with a tokenizer file (false
+///   means the hash tokenizer).
+/// * `trained_with`: the tokenizer file recorded in the checkpoint's sidecar
+///   (`<checkpoint>.meta.json`), when it has one.
+///
+/// A checkpoint without a sidecar records nothing about its tokenizer (the
+/// hash-tokenizer checkpoints that predate sidecars are of this kind), so it
+/// is accepted as long as a configured tokenizer did load.
+pub fn check_local_trivial_tokenizer(
+    configured: Option<&FsPath>,
+    loaded: bool,
+    trained_with: Option<&str>,
+) -> std::result::Result<(), String> {
+    const WAYS_OUT: &str = "or unset AXIOM_LOCAL_TRIVIAL";
+    if let Some(path) = configured.filter(|_| !loaded) {
+        return Err(format!(
+            "AXIOM_LOCAL_TRIVIAL is on but the tokenizer at {} did not load, so the model              is running on the hash tokenizer and its surprisal cannot gate local answers:              fix AXIOM_TOKENIZER, {WAYS_OUT}",
+            path.display()
+        ));
+    }
+    let Some(recorded) = trained_with
+        .and_then(|name| FsPath::new(name.trim()).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return Ok(());
+    };
+    match configured.and_then(|path| path.file_name()) {
+        None => Err(format!(
+            "AXIOM_LOCAL_TRIVIAL is on and the checkpoint was trained with the tokenizer              {recorded}, but AXIOM_TOKENIZER is not set, so the model is running on the hash              tokenizer and its surprisal cannot gate local answers: set AXIOM_TOKENIZER to              that tokenizer, {WAYS_OUT}"
+        )),
+        Some(installed) if installed.to_string_lossy() != recorded.as_str() => Err(format!(
+            "AXIOM_LOCAL_TRIVIAL is on and the checkpoint was trained with the tokenizer              {recorded}, but AXIOM_TOKENIZER points at {}: set AXIOM_TOKENIZER to the              tokenizer the checkpoint was trained with, {WAYS_OUT}",
+            installed.to_string_lossy()
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Resolve the startup checkpoint status from the files on disk. Pure over
 /// the filesystem (no env reads): callers pass the already-resolved paths
 /// and pinned hashes. A file that cannot be opened or read counts as

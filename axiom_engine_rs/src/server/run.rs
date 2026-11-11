@@ -200,6 +200,19 @@ pub async fn run_server(
         checkpoint_status,
     )?;
     if local_trivial {
+        // A verified checkpoint read through the wrong tokenizer is no better
+        // a judge than an untrained one: refuse that too.
+        let trained_with = crate::model_meta::ModelMeta::load_checked(checkpoint_path)?
+            .map(|meta| meta.tokenizer);
+        check_local_trivial_tokenizer(
+            std::env::var("AXIOM_TOKENIZER")
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+                .as_deref()
+                .map(FsPath::new),
+            pipeline.has_real_tokenizer(),
+            trained_with.as_deref(),
+        )?;
         println!(
             "[+] Local trivial-turn short-circuit ON (AXIOM_LOCAL_TRIVIAL): small clean \
              tool results may be acknowledged locally without an upstream call"

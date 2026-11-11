@@ -359,6 +359,65 @@ async fn the_server_refuses_to_start_with_the_flag_on_and_no_verified_checkpoint
     );
 }
 
+#[tokio::test]
+async fn the_server_refuses_to_start_when_the_checkpoints_tokenizer_is_not_in_use() {
+    // A verified checkpoint vouches for the weights only. This one's sidecar
+    // says it was trained with a BPE tokenizer, and AXIOM_TOKENIZER is unset,
+    // so the pipeline falls back to the hash tokenizer: the model's surprisal
+    // is noise, and the short-circuit must not end turns on it.
+    use sha2::{Digest, Sha256};
+
+    let _guard = env_lock().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoint = dir.path().join("model.safetensors");
+    // A loadable checkpoint (the loader takes the tensors it recognises and
+    // keeps its init for the rest), pinned by hash so that it is Verified.
+    let tensor = candle_core::Tensor::zeros((1,), candle_core::DType::F32, &Device::Cpu).unwrap();
+    candle_core::safetensors::save(
+        &std::collections::HashMap::from([("unused".to_string(), tensor)]),
+        &checkpoint,
+    )
+    .unwrap();
+    let digest = format!("{:x}", Sha256::digest(std::fs::read(&checkpoint).unwrap()));
+    std::fs::write(
+        dir.path().join("model.meta.json"),
+        r#"{"schema_version":1,"d_model":16,"n_layers":1,"vocab_size":64,"lr_inner":0.001,"norm_eps":1e-6,"val_ce":3.0,"tokenizer":"checkpoints/axiom_bpe.json"}"#,
+    )
+    .unwrap();
+
+    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "on");
+    let _c2 = EnvVarGuard::set("AXIOM_CHECKPOINT_SHA256", &digest);
+    let _c3 = EnvVarGuard::unset("AXIOM_TOKENIZER");
+    let _c4 = EnvVarGuard::unset("AXIOM_TOKENIZER_SHA256");
+
+    let config = AxiomConfig {
+        d_model: 16,
+        n_layers: 1,
+        vocab_size: 64,
+        lr_inner: 1e-3,
+        norm_eps: 1e-6,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        run_server(
+            "127.0.0.1",
+            0,
+            config,
+            checkpoint.to_str().unwrap(),
+            Device::Cpu,
+        ),
+    )
+    .await
+    .expect("run_server must refuse to start, not serve");
+    let err = result.expect_err("the checkpoint's tokenizer is not in use: an error");
+    let message = err.to_string();
+    assert!(message.contains("AXIOM_LOCAL_TRIVIAL"), "{message}");
+    assert!(
+        message.contains("axiom_bpe.json") && message.contains("AXIOM_TOKENIZER"),
+        "names the tokenizer the checkpoint needs: {message}"
+    );
+}
+
 /// The proxy must not end an agent's turn on its own under default settings.
 /// With `AXIOM_LOCAL_TRIVIAL` unset and nothing else configured, a small clean
 /// `tool_result` (a build finished, a file listing) has to reach the model:
