@@ -615,7 +615,8 @@ Useful environment variables:
 | `AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS` | Compression threshold. |
 | `AXIOM_VIBE` / `AXIOM_VIBE_PRIME` | Persistent fast-weight memory controls. |
 | `AXIOM_HEAL_MEMORY` | Path for learned heal memory, or `0`/`off` to disable. |
-| `AXIOM_FLEET_KEY` | Current HMAC key for swarm immunity exchange and DWE fragments. Required when `AXIOM_DWE_LISTEN` is set. |
+| `AXIOM_FLEET_KEY` | Current HMAC key for swarm immunity/patch exchange and DWE fragments. Required when `AXIOM_DWE_LISTEN` is set, and required to merge: without it `POST /v1/immunity/merge` and `POST /v1/patches/merge` return 401, and with it only exports carrying a valid HMAC are merged. |
+| `AXIOM_MERGE_ALLOWED_HOSTS` | Extra `Host` names (comma-separated) accepted on the merge routes; `localhost` and IP literals are always accepted, other names are refused unless listed. |
 | `AXIOM_FLEET_KEY_PREV` | Optional previous fleet key accepted during graceful key rotation; remove after all peers use `AXIOM_FLEET_KEY`. |
 | `AXIOM_VERIFY_RESPONSES` | Opt in to response grounding advisories. |
 | `AXIOM_ROUTER_CONSENSUS` | Set to `1` to enable consensus mode: the router asks two providers and fuses answers via `BetaBelief`. |

@@ -22,7 +22,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::provenance::{sha256_hex, sign_export, verify_export, ProvenanceError, SignedExport};
+use crate::provenance::{
+    sha256_hex, sign_export, verify_export_authenticated, ProvenanceError, SignedExport,
+};
 
 /// One verified candidate fix for a given failure fingerprint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -281,9 +283,13 @@ impl PatchMemory {
 
     /// Verify a peer's signed export and fold its candidates in. New patches are
     /// added; identical ones (same fingerprint+sha) accumulate `verified_count`.
-    /// Rejects the merge if provenance fails (bad hash / wrong key / unsigned
-    /// when a key is required). NEVER applies anything — merging only stores
-    /// candidates for later re-verified application.
+    /// Rejects the merge unless this node holds a fleet key and the export's
+    /// HMAC verifies under it (see
+    /// [`crate::provenance::verify_export_authenticated`]): with `fleet_key ==
+    /// None` every export is refused. Merging only stores candidates, but a
+    /// stored candidate is later written into a source tree and executed by the
+    /// repair loop's verify run, so the store must never hold unauthenticated
+    /// input.
     ///
     /// Uses the legacy [`FleetTrustPolicy::permissive`] (no contribution bounds)
     /// for backward compatibility. Prefer [`Self::merge_signed_guarded`] with
@@ -296,19 +302,19 @@ impl PatchMemory {
         self.merge_signed_guarded(export, fleet_key, FleetTrustPolicy::permissive())
     }
 
-    /// Byzantine-robust merge: verify provenance, then fold the peer's candidates
-    /// in subject to `policy` — bounding how much `verified_count` trust and how
-    /// many new candidates a single peer export can contribute, and dropping
-    /// oversized candidates. The local re-verify gate still decides what is ever
-    /// applied; this only bounds a malicious key-holder's influence on ranking
-    /// and store size.
+    /// Byzantine-robust merge: authenticate the export (fleet key required, HMAC
+    /// must verify), then fold the peer's candidates in subject to `policy` —
+    /// bounding how much `verified_count` trust and how many new candidates a
+    /// single peer export can contribute, and dropping oversized candidates. The
+    /// local re-verify gate still decides what is ever kept; this only bounds a
+    /// malicious key-holder's influence on ranking and store size.
     pub fn merge_signed_guarded(
         &mut self,
         export: &SignedExport,
         fleet_key: Option<&[u8]>,
         policy: FleetTrustPolicy,
     ) -> Result<PatchMergeReport, ProvenanceError> {
-        let payload = verify_export(export, fleet_key)?;
+        let payload = verify_export_authenticated(export, fleet_key)?;
         let peer: PatchMemory =
             serde_json::from_str(payload).map_err(|_| ProvenanceError::BadSchema)?;
         let mut report = PatchMergeReport {
@@ -406,13 +412,48 @@ mod tests {
     }
 
     #[test]
+    fn merge_refuses_every_export_when_no_fleet_key_is_configured() {
+        // A stored candidate is later written to disk and run by the repair
+        // loop, so a node with no fleet key must not accept one from anybody:
+        // not a hash-only export, and not one signed with a key it cannot check.
+        let mut a = PatchMemory::new();
+        a.record_verified("fp", "x.rs", "ATTACKER CONTROLLED");
+        for export in [a.export_signed(None), a.export_signed(Some(b"unknown"))] {
+            for policy in [FleetTrustPolicy::robust(), FleetTrustPolicy::permissive()] {
+                let mut local = PatchMemory::new();
+                assert_eq!(
+                    local
+                        .merge_signed_guarded(&export, None, policy)
+                        .unwrap_err(),
+                    ProvenanceError::NoFleetKey
+                );
+                assert!(local.is_empty(), "a refused merge stores nothing");
+            }
+        }
+        // And an unsigned export is refused even when this node has a key.
+        let mut local = PatchMemory::new();
+        assert_eq!(
+            local
+                .merge_signed(&a.export_signed(None), Some(b"fleet"))
+                .unwrap_err(),
+            ProvenanceError::SignatureMissing
+        );
+        assert!(local.is_empty());
+    }
+
+    #[test]
     fn merge_rejects_tampered_or_wrong_key() {
         let mut a = PatchMemory::new();
         a.record_verified("fp", "x.rs", "GOOD");
-        // Tampered payload → hash mismatch.
-        let mut bad = a.export_signed(None);
+        // Tampered payload → hash mismatch, even with the right key.
+        let mut bad = a.export_signed(Some(b"right"));
         bad.payload.push_str("tampered");
-        assert!(PatchMemory::new().merge_signed(&bad, None).is_err());
+        assert_eq!(
+            PatchMemory::new()
+                .merge_signed(&bad, Some(b"right"))
+                .unwrap_err(),
+            ProvenanceError::HashMismatch
+        );
         // Wrong key.
         let signed = a.export_signed(Some(b"right"));
         assert!(PatchMemory::new()

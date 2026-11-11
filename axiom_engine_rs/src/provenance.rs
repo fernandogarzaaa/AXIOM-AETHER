@@ -46,6 +46,9 @@ pub enum ProvenanceError {
     SignatureInvalid,
     /// The export carries an HMAC but this node has no key to verify it.
     NoKeyToVerify,
+    /// An authenticated verification was requested but this node has no fleet
+    /// key: nothing can prove who produced the export, signed or not.
+    NoFleetKey,
     /// Unrecognised schema.
     BadSchema,
 }
@@ -57,6 +60,9 @@ impl std::fmt::Display for ProvenanceError {
             ProvenanceError::SignatureMissing => "fleet key configured but export is unsigned",
             ProvenanceError::SignatureInvalid => "HMAC signature does not verify",
             ProvenanceError::NoKeyToVerify => "export is signed but no fleet key is configured",
+            ProvenanceError::NoFleetKey => {
+                "no fleet key is configured on this node, so the export cannot be authenticated"
+            }
             ProvenanceError::BadSchema => "unrecognised export schema",
         };
         f.write_str(s)
@@ -129,13 +135,21 @@ pub fn sign_export(payload: &str, fleet_key: Option<&[u8]>) -> SignedExport {
     }
 }
 
-/// Verify a [`SignedExport`] before its payload is trusted.
+/// Check a [`SignedExport`]'s integrity, and its authenticity when a key is
+/// supplied.
 ///
 /// Always checks the SHA-256 integrity. When `fleet_key` is `Some`, the HMAC is
 /// required and must verify (authenticity). When `fleet_key` is `None`, a signed
 /// export is rejected with [`ProvenanceError::NoKeyToVerify`] so a node that
 /// expects unsigned exports cannot be fed a (forgeable-by-anyone) HMAC it cannot
 /// check. Returns the verified payload on success.
+///
+/// With `fleet_key == None` an unsigned export passes on its hash alone. That
+/// is an integrity check only: anyone can compute a SHA-256, so it says nothing
+/// about who produced the payload. It is suitable for tamper evidence on data
+/// the caller already trusts (a certificate written by this process, a file the
+/// operator chose to import). It must never gate input that arrives over the
+/// network; use [`verify_export_authenticated`] there.
 pub fn verify_export<'a>(
     export: &'a SignedExport,
     fleet_key: Option<&[u8]>,
@@ -160,6 +174,28 @@ pub fn verify_export<'a>(
         (None, None) => {}
     }
     Ok(&export.payload)
+}
+
+/// Verify a [`SignedExport`] that crosses a trust boundary (a peer's export
+/// arriving over HTTP). Fails closed: the payload is returned only when this
+/// node holds a fleet key and the export carries an HMAC that verifies under
+/// it.
+///
+/// * no fleet key on this node → [`ProvenanceError::NoFleetKey`], whether or
+///   not the export carries an HMAC. A hash-only export proves nothing about
+///   its sender, and an HMAC this node cannot check proves nothing either.
+/// * fleet key set, export unsigned → [`ProvenanceError::SignatureMissing`].
+/// * fleet key set, HMAC wrong → [`ProvenanceError::SignatureInvalid`].
+///
+/// Schema and SHA-256 integrity are checked exactly as in [`verify_export`].
+pub fn verify_export_authenticated<'a>(
+    export: &'a SignedExport,
+    fleet_key: Option<&[u8]>,
+) -> Result<&'a str, ProvenanceError> {
+    let Some(key) = fleet_key else {
+        return Err(ProvenanceError::NoFleetKey);
+    };
+    verify_export(export, Some(key))
 }
 
 #[cfg(test)]
@@ -236,6 +272,47 @@ mod tests {
     fn signed_export_rejected_when_node_has_no_key() {
         let e = sign_export("payload", Some(b"k"));
         assert_eq!(verify_export(&e, None), Err(ProvenanceError::NoKeyToVerify));
+    }
+
+    #[test]
+    fn authenticated_verify_rejects_everything_without_a_fleet_key() {
+        // Hash-only export: integrity passes, authenticity cannot.
+        let unsigned = sign_export("payload", None);
+        assert_eq!(verify_export(&unsigned, None).unwrap(), "payload");
+        assert_eq!(
+            verify_export_authenticated(&unsigned, None),
+            Err(ProvenanceError::NoFleetKey)
+        );
+        // An HMAC this node has no key to check is not evidence either.
+        let signed = sign_export("payload", Some(b"someone-elses-key"));
+        assert_eq!(
+            verify_export_authenticated(&signed, None),
+            Err(ProvenanceError::NoFleetKey)
+        );
+    }
+
+    #[test]
+    fn authenticated_verify_requires_a_valid_hmac_under_the_fleet_key() {
+        let key = b"fleet-secret";
+        let good = sign_export("payload", Some(key));
+        assert_eq!(
+            verify_export_authenticated(&good, Some(key)).unwrap(),
+            "payload"
+        );
+        assert_eq!(
+            verify_export_authenticated(&sign_export("payload", None), Some(key)),
+            Err(ProvenanceError::SignatureMissing)
+        );
+        assert_eq!(
+            verify_export_authenticated(&sign_export("payload", Some(b"other")), Some(key)),
+            Err(ProvenanceError::SignatureInvalid)
+        );
+        let mut tampered = sign_export("payload", Some(key));
+        tampered.payload = "tampered".into();
+        assert_eq!(
+            verify_export_authenticated(&tampered, Some(key)),
+            Err(ProvenanceError::HashMismatch)
+        );
     }
 
     #[test]

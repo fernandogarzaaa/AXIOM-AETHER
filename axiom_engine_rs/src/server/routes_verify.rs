@@ -222,14 +222,28 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/verify", post(verify_grounding))
         .route("/v1/epistemic/validate", post(validate_epistemic_drift))
         .route("/v1/immunity", get(get_immunity))
-        .route("/v1/immunity/merge", post(post_immunity_merge))
+        // Both merge routes sit behind `require_fleet_merge_trust`: allowlisted
+        // Host, no foreign Origin, and a fleet key on this node. The guard runs
+        // before the body is read, so a refused merge costs no buffering.
+        .route(
+            "/v1/immunity/merge",
+            post(post_immunity_merge).layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_fleet_merge_trust,
+            )),
+        )
         .route("/v1/patches", get(get_patches))
         .route(
             "/v1/patches/merge",
             // Patch candidates carry full file contents, so a signed export of a
             // real fix can exceed axum's 2 MB default body limit. Raise it for
             // this route so larger-but-valid fixes can still gossip.
-            post(post_patches_merge).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+            post(post_patches_merge)
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_fleet_merge_trust,
+                )),
         )
         .route("/v1/budget", post(post_budget))
         .route("/v1/awareness/:id", get(get_awareness))
