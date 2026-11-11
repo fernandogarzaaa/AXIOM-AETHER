@@ -33,6 +33,7 @@ ALL_CHECKS = [
     "Python reference engine (tests)",
     "Agentic eval suite",
     "Session concurrency stress",
+    "Performance regression gate",
     "Pinned container images",
     "Helm chart (lint + auth renders)",
     "Docker image build (no push)",
@@ -50,7 +51,7 @@ def test_main_head_all_green_is_blocked_only_on_missing_evidence():
     assert verdicts["docker-build"][0] == "PASS"
     assert verdicts["full-tests"][0] == "PASS"
     assert verdicts["session-concurrency-stress"][0] == "PASS"
-    assert verdicts["perf-regression"][0] == "NOT_EVALUATED"
+    assert verdicts["perf-regression"][0] == "PASS"
     assert verdicts["provenance"][0] == "NOT_EVALUATED"
     assert unmapped == ["Regenerate proof-loop metrics"]
 
@@ -208,7 +209,7 @@ def test_main_exit_codes(tmp_path, capsys):
     reviews_file.write_text(
         json.dumps([{"user": {"login": "coderabbitai[bot]"}, "state": "COMMENTED"}])
     )
-    # BLOCKED (perf/provenance have no evidence yet), not PASS.
+    # BLOCKED (provenance has no evidence yet), not PASS.
     assert (
         release_gate.main(
             [
@@ -224,14 +225,14 @@ def test_main_exit_codes(tmp_path, capsys):
     )
     out = capsys.readouterr().out
     assert "VERDICT: BLOCKED" in out
-    assert "2 gate(s) without evidence: perf-regression, provenance" in out
+    assert "1 gate(s) without evidence: provenance" in out
     assert release_gate.main(["--check-runs", str(checks_file)]) == 1
 
 
 def test_main_pass_verdict_returns_0(monkeypatch, tmp_path, capsys):
     # The PASS path is unreachable under the real gate table while
-    # perf-regression and provenance have no evidence, so exercise it
-    # under a gate table where every gate has evidence.
+    # provenance has no evidence, so exercise it under a gate table
+    # where every gate has evidence.
     monkeypatch.setattr(
         release_gate,
         "GATES",

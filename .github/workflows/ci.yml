@@ -582,12 +582,14 @@ jobs:
   # itself is cancelled.
   #
   # Limits, stated plainly. A green verdict here means every
-  # EVALUATED gate passed. Two gates have no evidence yet
-  # (perf-regression, provenance) and still block a release; the
-  # local mirror scripts/release_gate.py reports them NOT_EVALUATED
-  # and exits 1. See docs/RELEASE-GATES.md. The script step also
-  # writes them into the job summary so the gap is visible in the
-  # PR UI, not buried in the log.
+  # EVALUATED gate passed. One gate has no per-run evidence yet
+  # (provenance: no CI check run proves it on a push or PR; the
+  # evidence is the release attestation, verified at release time)
+  # and still blocks a release; the local mirror
+  # scripts/release_gate.py reports it NOT_EVALUATED and exits 1.
+  # See docs/RELEASE-GATES.md. The script step also writes it into
+  # the job summary so the gap is visible in the PR UI, not buried
+  # in the log.
   release-gate:
     name: Release gate (aggregate verdict)
     needs:
@@ -595,6 +597,7 @@ jobs:
       - lossy-invariant-guard
       - test
       - session-concurrency-stress
+      - perf-regression
       - experimental
       - msrv
       - docker-build
@@ -753,7 +756,7 @@ jobs:
               }
             }
 
-            const notEvaluated = "perf-regression and provenance are NOT_EVALUATED and still block a release; see docs/RELEASE-GATES.md.";
+            const notEvaluated = "provenance is NOT_EVALUATED by this job and still blocks a release; see docs/RELEASE-GATES.md.";
             if (failures.length) {
               await core.summary
                 .addHeading("Release gate: FAIL")

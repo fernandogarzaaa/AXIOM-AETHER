@@ -13,7 +13,7 @@ mirror is `scripts/release_gate.py`. The two share the gate table in
 definition, but they are not the same verdict. The CI job evaluates
 the CI-provable subset and reports PASS when every evaluated gate
 passed. The local evaluator is the full verdict: it reports BLOCKED
-when `perf-regression` or `provenance` is unevaluated. A green CI
+when `provenance` is unevaluated. A green CI
 aggregate does not mean shippable.
 
 - `PASS` means every evaluated gate passed.
@@ -36,8 +36,8 @@ aggregate does not mean shippable.
 | helm | Helm chart (lint + auth renders) | Lint plus the authenticated and unauthenticated render tests. |
 | docker-build | Docker image build (no push) on every ref; plus Build linux/amd64, Build linux/arm64, Merge into multi-arch manifest when present | The multi-arch checks run only on pushes to main and tags (docker.yml has no pull_request trigger), so they never exist on a PR head. On a PR the gate is proved by the no-push build alone; on main the multi-arch checks must also pass when present. A present red multi-arch check fails the gate. A multi-arch check that concludes skipped or neutral counts as not run, not as a failure. |
 | bot-review | PR reviews API, not a check run | At least one review by `coderabbitai[bot]` or `chatgpt-codex-connector[bot]`, or an APPROVED review by a human. Bot logins verified live against PR #289 (both bots) and PR #295 (CodeRabbit) on 2026-11-11. A review that only comments still counts as present. Addressing its findings is a human decision, not part of this gate. |
-| perf-regression | None yet | Blocked on Phase 3 and Phase 4. See below. |
-| provenance | None yet | Blocked on the Phase 5 enforcement PR. See below. |
+| perf-regression | Performance regression gate | The Phase 3 stress harness and Phase 4 paired bench produce stored baselines in `bench/results/`; the gate compares a run against the baseline and fails beyond tolerance. Wired into the release gate via `needs` (PR #299 merged). |
+| provenance | Release pipeline (release.yml, docker.yml), verified at release time | SBOM plus provenance attestation tooling landed in PR #297 and was proved in the test release. No CI check run proves it per push; the release process verifies the attestation on the release before declaring it shippable. |
 
 Check runs with no mapping (Regenerate proof-loop metrics, the
 CodeRabbit app check) are informational and never affect the verdict.
@@ -46,22 +46,26 @@ multi-arch check that did not run) counts as not run, not as a
 failure. Required checks must be completed with conclusion success;
 anything else fails their gate.
 
-## Gates blocked on Phase 3 and Phase 4 results
+## Gates whose evidence landed in Phase 5
 
-These gates are defined now and evaluated later. They stay
-NOT_EVALUATED until the named work lands. Do not guess their verdicts.
+These gates were defined before their evidence existed. Both have now
+landed; the notes below record what each gate is proved by. Do not
+guess their verdicts.
 
 - **perf-regression.** The Phase 3 stress harness and the Phase 4
   paired bench produce stored baselines in `bench/results/`. The gate
   compares a run against the stored baseline and fails on regression
-  beyond the documented tolerance. Until the harness, the bench, the
-  baselines, and the tolerance exist, this gate is NOT_EVALUATED and
-  blocks the release.
+  beyond the documented tolerance. The harness, the bench, the
+  baselines, and the tolerance exist (PR #299 merged), the
+  `Performance regression gate` check run proves it, and the release
+  gate aggregates it via `needs`.
 - **provenance.** The gate passes only when `release.yml` and
   `docker.yml` run SBOM plus provenance-attestation tooling and
-  attach the outputs to the release. That tooling and wiring is the
-  Phase 5 enforcement PR. Until it lands, this gate is
-  NOT_EVALUATED and blocks the release.
+  attach the outputs to the release. That tooling landed in PR #297
+  and was proved in the test release. No CI check run proves it per
+  push, so the mirror still reports it NOT_EVALUATED and the CI job
+  still names it in the summary; the release process verifies the
+  attestation on the release before declaring it shippable.
 
 ## How the CI job works
 
@@ -99,9 +103,10 @@ The `release-gate` job in `.github/workflows/ci.yml` has three parts.
    per check name, so a stale red run that a re-run already fixed
    cannot fail the gate.
 3. The verdict is written to the job summary. A green verdict means
-   every EVALUATED gate passed. It does not mean shippable: the two
-   NOT_EVALUATED gates are named in the summary and still block a
-   release until their evidence lands.
+   every EVALUATED gate passed. It does not mean shippable: the
+   remaining NOT_EVALUATED gate (provenance) is named in the summary
+   and still blocks a release until its evidence (the release
+   attestation) is verified.
 
 ## Local dry run
 

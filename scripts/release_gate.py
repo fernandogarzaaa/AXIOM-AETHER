@@ -91,18 +91,19 @@ GATES = {
             "Merge into multi-arch manifest",
         ],
     },
-    # Evidence that does not exist yet. These gates are NOT_EVALUATED until
+    # Evidence that does not exist yet. This gate is NOT_EVALUATED until
     # the named work lands. A NOT_EVALUATED gate blocks the release. There
-    # is no silent pass for missing evidence.
+    # is no silent pass for missing evidence. The perf-regression gate
+    # left this block when PR #299 merged: it is now proved by the
+    # "Performance regression gate" check run.
     "perf-regression": {
         "description": "Performance regression vs stored baselines",
-        "checks": [],
-        "blocked_on": "Phase 3 stress harness and Phase 4 paired bench baselines",
+        "checks": ["Performance regression gate"],
     },
     "provenance": {
         "description": "SBOM plus provenance attestation per release artifact",
         "checks": [],
-        "blocked_on": "Phase 5 enforcement PR wiring SBOM/provenance attestation into release.yml and docker.yml",
+        "blocked_on": "Phase 5 enforcement PR landed (#297); no CI check run proves it per push, evidence is the release attestation verified at release time",
     },
 }
 
