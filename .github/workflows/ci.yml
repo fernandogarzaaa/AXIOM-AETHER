@@ -193,9 +193,12 @@ jobs:
       # through the real `axiom solve` loop. The release solver binary
       # already exists by this step (Build (release) above); the results
       # JSON is git-ignored, like the pillars' JSON.
+      # Phase 5 item 3: --fail-on-guardrail makes a guardrail FAIL (or
+      # an arm with zero executed cells) fail the job; without it the
+      # smoke run printed verdicts CI never enforced.
       - name: AxiomBench (paired smoke)
         working-directory: axiom_engine_rs
-        run: cargo run --release --features tools --bin axiombench -- paired --smoke --out ../bench/results/paired-ci-smoke.json
+        run: cargo run --release --features tools --bin axiombench -- paired --smoke --fail-on-guardrail --out ../bench/results/paired-ci-smoke.json
 
       - name: End-to-end smoke (every pillar composes)
         run: ./scripts/demo_end_to_end.sh
@@ -239,6 +242,124 @@ jobs:
       - name: Graded concurrency stress (p95 / RSS / registry bounds)
         working-directory: axiom_engine_rs
         run: cargo test --release --locked --test session_concurrency_stress -- --nocapture
+
+  # ==== Phase 5 item 3: performance regression gate (BEGIN) ====
+  # Delimited section so a sibling PR adding a different job to this file
+  # merges cleanly: keep everything for this gate between the BEGIN/END
+  # markers, including the --fail-on-guardrail flag on the paired smoke
+  # step in the `test` job above (do not move that flag into this job;
+  # it belongs to the smoke step the verdicts file specifies).
+  #
+  # Wires the Phase 3 stress harness (tests/stress.rs and
+  # tests/session_concurrency_stress.rs) and the Phase 4 paired bench
+  # (axiombench paired) into CI as a regression gate. The job:
+  #   1. runs both stress tests (the graded one with --nocapture, saved
+  #      to perf-stress.log for the comparison step),
+  #   2. runs the paired smoke with --fail-on-guardrail, so a guardrail
+  #      FAIL or an arm with zero executed cells fails the job,
+  #   3. runs the demo-regression negative control, which MUST exit
+  #      exactly 1 (guardrail failure, not a usage error or a crash)
+  #      and whose fresh report must show arm D passing and
+  #      D-regressed failing its reliability guardrail; a zero exit,
+  #      any other exit, or a report without that verdict fails the job.
+  #   4. compares the fresh numbers against the stored baseline
+  #      (bench/results/perf-baseline.json) with
+  #      scripts/check_perf_regression.py: exact on success counts,
+  #      unsafe/rollback rates and guardrail verdicts; wide factors
+  #      (3x paired wall time, 2x stress p95 growth capped at 20x)
+  #      on wall-clock time, because CI runners are not a perf lab.
+  #      Stress RSS delta is recorded but not compared across runs
+  #      (allocator retention noise: two back-to-back sandbox runs
+  #      measured a 3.5x spread at level 32); the graded test's own
+  #      per-level RSS bound is the RSS gate. See
+  #      docs/PERF-REGRESSION-GATE.md.
+  # The full 40-cell paired matrix stays a manual release-time run:
+  # the smoke matrix is what fits in a per-PR job.
+  perf-regression:
+    name: Performance regression gate
+    needs: protocol
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            axiom_engine_rs/target
+          key: ci-perf-regression-${{ runner.os }}-${{ hashFiles('axiom_engine_rs/Cargo.lock') }}
+          restore-keys: ci-perf-regression-${{ runner.os }}-
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential
+
+      - name: Build (release, tools)
+        working-directory: axiom_engine_rs
+        run: cargo build --release --locked --features tools
+
+      - name: Stress (128 concurrent sessions)
+        working-directory: axiom_engine_rs
+        run: cargo test --release --locked --test stress
+
+      - name: Graded concurrency stress (baseline log)
+        working-directory: axiom_engine_rs
+        run: |
+          set -o pipefail
+          cargo test --release --locked --test session_concurrency_stress -- --nocapture 2>&1 | tee ../perf-stress.log
+
+      - name: Paired smoke (guardrail enforced)
+        working-directory: axiom_engine_rs
+        run: cargo run --release --features tools --bin axiombench -- paired --smoke --fail-on-guardrail --out ../bench/results/paired-ci-smoke.json
+
+      - name: Demo-regression negative control (must fail the guardrail)
+        working-directory: axiom_engine_rs
+        run: |
+          # A nonzero exit alone cannot pass this step: exit 2 is a
+          # usage error and a crash before the guardrail runs also exits
+          # nonzero, so require exactly exit 1 (guardrail failure) and
+          # validate the fresh report: arm D passes and D-regressed
+          # fails its reliability guardrail. The report is removed first
+          # so a stale file from an earlier run can never stand in for
+          # a fresh one.
+          rm -f ../bench/results/paired-ci-demo.json
+          if cargo run --release --features tools --bin axiombench -- paired --demo-regression --fail-on-guardrail --out ../bench/results/paired-ci-demo.json; then
+            echo "::error::demo-regression exited 0: the regressed arm passed the guardrail, so the gate cannot trip"
+            exit 1
+          else
+            status=$?
+          fi
+          if [ "$status" -ne 1 ]; then
+            echo "::error::demo-regression exited $status, expected 1 (guardrail failure)"
+            exit 1
+          fi
+          python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); g = d["guardrails"]; assert g["D"]["pass"] is True, "arm D must pass in the demo run"; v = g["D-regressed"]; assert v["pass"] is False and any(r.startswith("reliability guardrail failed:") for r in v["reasons"]), "D-regressed must fail the reliability guardrail"' ../bench/results/paired-ci-demo.json
+          echo "demo-regression exited 1 with D passing and D-regressed failing the reliability guardrail: the gate trips"
+
+      - name: Compare against stored baseline
+        run: python3 scripts/check_perf_regression.py --paired bench/results/paired-ci-smoke.json --stress-log perf-stress.log
+
+      - name: Upload gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: perf-regression
+          path: |
+            bench/results/paired-ci-smoke.json
+            bench/results/paired-ci-demo.json
+            perf-stress.log
+          if-no-files-found: warn
+  # ==== Phase 5 item 3: performance regression gate (END) ====
 
   # The `experimental` feature (docs/EXPERIMENTAL.md) gates wired-but-unproven
   # subsystems out of the default build. The `test` job above already covers the
