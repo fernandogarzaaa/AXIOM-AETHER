@@ -43,7 +43,10 @@ import sys
 # fails the gate, matching the CI job. On any other ref a missing
 # conditional check never fails its gate, and a present one that
 # concludes skipped or neutral counts as not run. A present red one
-# fails its gate.
+# fails its gate. The same conditional rule applies to the Agentic
+# eval suite inside full-tests: eval.yml runs on every PR and on
+# pushes to main and claude/**, so the check is required only on
+# those events and refs, never on a standalone dispatch elsewhere.
 GATES = {
     "cp1-source": {
         "description": "CP/1 normative source check",
@@ -148,10 +151,28 @@ def docker_checks_required(event_name, ref):
     return on_docker_ref and event_name != "pull_request"
 
 
+def eval_check_required(event_name, ref):
+    """Whether eval.yml schedules the Agentic eval suite for this event/ref.
+
+    Mirrors the release-gate job in .github/workflows/ci.yml.
+    eval.yml runs on every pull request and on pushes to main and
+    claude/**. A standalone CI dispatch on any other branch never
+    schedules it, so its check must not be required there. A dispatch
+    counts only when its ref is main or claude/**. With no ref given
+    the check stays required, preserving the old local-only behavior.
+    """
+    if event_name == "pull_request":
+        return True
+    if not ref:
+        return True
+    return ref == "refs/heads/main" or ref.startswith("refs/heads/claude/")
+
+
 def evaluate_checks(check_runs, event_name=None, ref=None):
     """Map check runs onto gates. Returns (verdicts, unmapped)."""
     by_name = latest_by_name(check_runs)
     verdicts = {}
+    eval_required = eval_check_required(event_name, ref)
     for gate, spec in GATES.items():
         if not spec["checks"] and not spec.get("checks_if_present"):
             verdicts[gate] = ("NOT_EVALUATED", spec.get("blocked_on", ""))
@@ -159,17 +180,31 @@ def evaluate_checks(check_runs, event_name=None, ref=None):
         problems = []
         notes = []
         for name in spec["checks"]:
+            # The Agentic eval suite is conditionally required: it is
+            # scheduled only on refs where eval.yml runs. Elsewhere a
+            # missing one never fails its gate, and a benign conclusion
+            # is informational. A present red one still fails its gate,
+            # matching the CI job.
+            conditional_eval = name == "Agentic eval suite" and not eval_required
             if name not in by_name:
-                problems.append(f"{name}: missing")
+                if conditional_eval:
+                    notes.append(f"{name}: not run on this ref")
+                else:
+                    problems.append(f"{name}: missing")
             else:
                 status = by_name[name].get("status")
                 conclusion = by_name[name].get("conclusion")
                 if status != "completed" or conclusion != "success":
-                    problems.append(f"{name}: {status}/{conclusion}")
+                    if conditional_eval and conclusion in BENIGN_CONCLUSIONS:
+                        notes.append(f"{name}: {conclusion} (informational)")
+                    else:
+                        problems.append(f"{name}: {status}/{conclusion}")
         # Conditional checks are required only on refs that schedule
         # their workflow (docker.yml: pushes to main and v* tags, and
         # a dispatch on one of those refs). Elsewhere a missing one
-        # never fails its gate, and a benign conclusion is not a pass.
+        # never fails its gate, and a benign conclusion is
+        # informational, not a failure. A required check that
+        # concludes skipped or neutral fails: it did not succeed.
         conditional_required = gate == "docker-build" and docker_checks_required(
             event_name, ref
         )

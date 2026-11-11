@@ -79,8 +79,10 @@ The `release-gate` job in `.github/workflows/ci.yml` has three parts.
    docker.yml multi-arch publish on main) is red or still running,
    and when no bot or approving human review is present on the PR.
    Two rules keep the verdict honest. First, the required
-   cross-workflow check (Agentic eval suite on every ref, plus the
-   docker multi-arch checks on main and tag pushes) must be present:
+   cross-workflow check (Agentic eval suite on refs where eval.yml
+   runs: every PR, pushes to main and claude/**, and a dispatch on
+   one of those refs; plus the docker multi-arch checks on main and
+   tag pushes) must be present:
    absence fails the gate instead of passing silently. Second, the
    script waits a bounded time (20 polls, 30 seconds apart) for
    those required checks to finish, because the other workflows run

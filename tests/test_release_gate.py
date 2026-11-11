@@ -427,3 +427,132 @@ def test_main_event_and_ref_flags_drive_docker_rule(tmp_path, capsys):
     )
     out = capsys.readouterr().out
     assert "VERDICT: BLOCKED" in out
+
+
+def without_eval_check():
+    return [c for c in ALL_CHECKS if c != "Agentic eval suite"]
+
+
+@pytest.mark.parametrize(
+    "event_name,ref,required",
+    [
+        ("pull_request", "refs/pull/296/merge", True),
+        ("push", "refs/heads/main", True),
+        ("push", "refs/heads/claude/work", True),
+        ("push", "refs/heads/feature-x", False),
+        ("push", "refs/tags/v1.0.0", False),
+        ("workflow_dispatch", "refs/heads/main", True),
+        ("workflow_dispatch", "refs/heads/claude/work", True),
+        ("workflow_dispatch", "refs/heads/work", False),
+        ("push", "", True),
+        (None, None, True),
+    ],
+)
+def test_eval_check_required_rule(event_name, ref, required):
+    assert release_gate.eval_check_required(event_name, ref) is required
+
+
+def test_eval_check_missing_fails_gate_on_pr():
+    checks = without_eval_check()
+    verdicts, _ = release_gate.evaluate_checks(
+        [run(n, run_id=i) for i, n in enumerate(checks, start=1)],
+        "pull_request",
+        "refs/pull/296/merge",
+    )
+    verdict, detail = verdicts["full-tests"]
+    assert verdict == "FAIL"
+    assert "Agentic eval suite: missing" in detail
+
+
+def test_eval_check_missing_fails_gate_on_main_push():
+    checks = without_eval_check()
+    verdicts, _ = release_gate.evaluate_checks(
+        [run(n, run_id=i) for i, n in enumerate(checks, start=1)],
+        "push",
+        "refs/heads/main",
+    )
+    assert verdicts["full-tests"][0] == "FAIL"
+
+
+def test_eval_check_missing_passes_gate_on_dispatch_working_branch():
+    checks = without_eval_check()
+    verdicts, _ = release_gate.evaluate_checks(
+        [run(n, run_id=i) for i, n in enumerate(checks, start=1)],
+        "workflow_dispatch",
+        "refs/heads/work",
+    )
+    verdict, detail = verdicts["full-tests"]
+    assert verdict == "PASS"
+    assert "not run on this ref" in detail
+
+
+def test_eval_check_missing_passes_gate_on_feature_push():
+    checks = without_eval_check()
+    verdicts, _ = release_gate.evaluate_checks(
+        [run(n, run_id=i) for i, n in enumerate(checks, start=1)],
+        "push",
+        "refs/heads/feature-x",
+    )
+    assert verdicts["full-tests"][0] == "PASS"
+
+
+def test_eval_check_red_fails_gate_even_when_not_required():
+    checks = [run(n, run_id=i) for i, n in enumerate(ALL_CHECKS, start=1)]
+    for c in checks:
+        if c["name"] == "Agentic eval suite":
+            c["conclusion"] = "failure"
+    verdicts, _ = release_gate.evaluate_checks(
+        checks, "workflow_dispatch", "refs/heads/work"
+    )
+    assert verdicts["full-tests"][0] == "FAIL"
+
+
+def test_eval_check_skipped_passes_gate_when_not_required():
+    checks = [run(n, run_id=i) for i, n in enumerate(ALL_CHECKS, start=1)]
+    for c in checks:
+        if c["name"] == "Agentic eval suite":
+            c["conclusion"] = "skipped"
+    verdicts, _ = release_gate.evaluate_checks(
+        checks, "workflow_dispatch", "refs/heads/work"
+    )
+    verdict, detail = verdicts["full-tests"]
+    assert verdict == "PASS"
+    assert "Agentic eval suite: skipped (informational)" in detail
+
+
+def test_main_event_and_ref_flags_drive_eval_rule(tmp_path, capsys):
+    checks = without_eval_check()
+    checks_file = tmp_path / "check-runs.json"
+    checks_file.write_text(
+        json.dumps(
+            {"check_runs": [run(n, run_id=i) for i, n in enumerate(checks, start=1)]}
+        )
+    )
+    assert (
+        release_gate.main(
+            [
+                "--check-runs",
+                str(checks_file),
+                "--event-name",
+                "workflow_dispatch",
+                "--ref",
+                "refs/heads/work",
+            ]
+        )
+        == 1
+    )
+    assert "VERDICT: BLOCKED" in capsys.readouterr().out
+    assert (
+        release_gate.main(
+            [
+                "--check-runs",
+                str(checks_file),
+                "--event-name",
+                "workflow_dispatch",
+                "--ref",
+                "refs/heads/main",
+            ]
+        )
+        == 1
+    )
+    assert "VERDICT: FAIL" in capsys.readouterr().out

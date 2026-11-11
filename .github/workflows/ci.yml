@@ -629,16 +629,24 @@ jobs:
               "CodeRabbit": null,
             };
             // Required cross-workflow checks: the gate must see them,
-            // not just see no failure. Only "Agentic eval suite" is
-            // required on every ref; the docker multi-arch checks are
-            // required only on refs that schedule docker.yml: pushes
-            // to main and v* tags, and a manual dispatch on one of
-            // those refs. A push to claude/** or a dispatch on a
-            // working branch never schedules docker.yml, so requiring
-            // its checks there waits the bounded 10 minutes and then
-            // fails on checks that were never scheduled. The local
-            // mirror enforces the same rule.
-            const REQUIRED_CROSS = ["Agentic eval suite"];
+            // not just see no failure. "Agentic eval suite" is
+            // required only where eval.yml runs: every pull request,
+            // pushes to main and claude/**, and a manual dispatch on
+            // one of those refs. A standalone CI dispatch on any other
+            // branch never schedules eval.yml, so requiring its check
+            // there waits the bounded 10 minutes and then fails on a
+            // check that was never scheduled. The docker multi-arch
+            // checks are required only on refs that schedule
+            // docker.yml: pushes to main and v* tags, and a manual
+            // dispatch on one of those refs. The local mirror enforces
+            // the same rules.
+            const REQUIRED_CROSS = [];
+            const EVAL_REF =
+              context.ref === "refs/heads/main" ||
+              context.ref.startsWith("refs/heads/claude/");
+            if (context.eventName === "pull_request" || EVAL_REF) {
+              REQUIRED_CROSS.push("Agentic eval suite");
+            }
             const DOCKER_REF =
               context.ref === "refs/heads/main" ||
               context.ref.startsWith("refs/tags/v");
