@@ -104,7 +104,13 @@ overlays. It changes what `/readyz` means.
   10 minutes, check the last CronJob run succeeded. A failing gossip
   job does not block serving, but it blocks calling the fleet
   converged.
-- Metrics access has no auth of its own in the chart. Do not expose
+- `/metrics` is gated by the API key. When `AXIOM_API_KEY` is set, the
+  server requires `X-Axiom-Key` on `/metrics`, and the ServiceMonitor
+  in the chart cannot present that header, so Prometheus scrapes get
+  401. With no key set the guard is a passthrough and scrapes work.
+  Until the scrape path is fixed (see the follow-up in
+  `docs/ROLLBACK-RECOVERY.md`), confirm the target is up only in
+  keyless deploys, and expect 401s in keyed ones. Do not expose
   `/metrics` outside the cluster. If the environment needs it, put it
   behind the same network policy or ingress auth as the data plane.
 

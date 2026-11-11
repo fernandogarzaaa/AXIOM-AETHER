@@ -60,13 +60,22 @@ if [ "$MODE" = "cluster" ]; then
     exit 2
   fi
 
+  # Cluster mode tracks every command it runs. A failed rollback or
+  # post-state check exits non-zero, so a caller cannot mistake an
+  # unsuccessful recovery for a passing drill.
+  CLUSTER_FAIL=0
   run() {
     if [ "$DRY_RUN" -eq 1 ]; then
       echo "[dry-run] $*"
-    else
-      echo "+ $*"
-      "$@"
+      return 0
     fi
+    echo "+ $*"
+    if "$@"; then
+      return 0
+    fi
+    echo "rollback_drill: FAILED: $*" >&2
+    CLUSTER_FAIL=1
+    return 1
   }
 
   started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -100,6 +109,10 @@ if [ "$MODE" = "cluster" ]; then
   finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "rollback drill: finished=$finished"
   echo "Record the outputs above in docs/release-qualification/drills/<date>-$RELEASE-rollback.md"
+  if [ "$CLUSTER_FAIL" -ne 0 ]; then
+    echo "rollback_drill: cluster drill failed (see FAILED lines above)" >&2
+    exit 1
+  fi
   exit 0
 fi
 

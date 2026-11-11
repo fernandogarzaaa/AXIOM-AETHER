@@ -118,7 +118,9 @@ verification, and timings. A drill with an empty evidence template
 did not happen. The drill script `scripts/rollback_drill.sh` runs
 the checks in order and prints the evidence block. It refuses to run
 against a release that does not exist, and `--dry-run` prints the
-commands without running them.
+commands without running them. Cluster mode exits non-zero when the
+rollback or any post-state check fails, so a failed recovery never
+reports as a passing drill.
 
 ## Local drill (no cluster)
 
@@ -174,3 +176,13 @@ item. None of them changed runtime code in this PR.
    503. Operators should read the boot log on a crash loop, not
    wait for a readiness signal that never arrives. The runbook now
    states this in Path 2.
+4. The ServiceMonitor cannot scrape `/metrics` once `AXIOM_API_KEY`
+   is set. The server requires `X-Axiom-Key` on `/metrics`, and the
+   chart's ServiceMonitor has no way to present that header, so
+   scrapes get 401. The overlays enable the ServiceMonitor while
+   the checklist requires the key, so a deploy that follows the
+   guide has no working metrics gating. Fixing it needs either
+   server support for an `Authorization` bearer on `/metrics` or a
+   scrape path that can send the header. It is not a chart-only
+   fix, so it stays a follow-up. The deploy guide no longer claims
+   metrics has no auth.
