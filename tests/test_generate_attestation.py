@@ -177,6 +177,42 @@ def test_real_syft_produces_valid_spdx(artifact):
     assert syft_sbom["spdxVersion"].startswith("SPDX-")
 
 
+@pytest.mark.skipif(shutil.which("syft") is None, reason="syft not installed")
+def test_explicit_syft_cmd_produces_valid_spdx(artifact):
+    syft_path = shutil.which("syft")
+    assert (
+        run_cli(
+            "generate",
+            "--artifact",
+            artifact,
+            "--repo-root",
+            REPO_ROOT,
+            "--syft-required",
+            "--syft-cmd",
+            syft_path,
+        )
+        == 0
+    )
+    syft_sbom = json.loads((Path(str(artifact) + ".sbom.syft.json")).read_text())
+    assert syft_sbom["spdxVersion"].startswith("SPDX-")
+
+
+def test_bad_syft_cmd_fails_when_required(artifact):
+    assert (
+        run_cli(
+            "generate",
+            "--artifact",
+            artifact,
+            "--repo-root",
+            REPO_ROOT,
+            "--syft-required",
+            "--syft-cmd",
+            "/nonexistent/syft",
+        )
+        != 0
+    )
+
+
 def test_attest_image_records_digest(tmp_path):
     out = tmp_path / "image.provenance.json"
     digest = "a" * 64

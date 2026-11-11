@@ -149,8 +149,14 @@ jobs:
           Get-Content "$staging.zip.sha256"
           "ASSET_SHA=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # Syft comes from Anchore's download-syft sub-action (the old
+      # anchore/syft-action repo no longer exists). The binary path is
+      # passed to the script explicitly, so no PATH setup is needed.
       - name: Install syft
-        uses: anchore/syft-action@v0
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: v1.32.0
 
       # Every release archive ships with a source SBOM, a package-level
       # syft SBOM, and a provenance attestation. --syft-required fails
@@ -163,7 +169,8 @@ jobs:
           set -euo pipefail
           PY="$(command -v python3 || command -v python)"
           "$PY" scripts/generate_attestation.py generate \
-            --artifact "${{ env.ASSET }}" --syft-required
+            --artifact "${{ env.ASSET }}" --syft-required \
+            --syft-cmd "${{ steps.syft.outputs.cmd }}"
           "$PY" scripts/generate_attestation.py verify \
             --artifact "${{ env.ASSET }}" \
             --provenance "${{ env.ASSET }}.provenance.json" \
@@ -245,7 +252,10 @@ jobs:
       # Stable, tag-independent asset names so Helm's checkpoint.url can point
       # at releases/latest/download/<file>.
       - name: Install syft
-        uses: anchore/syft-action@v0
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: v1.32.0
 
       # Each checkpoint file gets the same treatment as a release
       # archive: source SBOM, syft SBOM, provenance, then a verify
@@ -257,7 +267,8 @@ jobs:
             [ -f "$f" ] || continue
             case "$f" in *.sbom.json|*.provenance.json|*.sbom.syft.json) continue;; esac
             python3 scripts/generate_attestation.py generate \
-              --artifact "$f" --syft-required
+              --artifact "$f" --syft-required \
+              --syft-cmd "${{ steps.syft.outputs.cmd }}"
             python3 scripts/generate_attestation.py verify \
               --artifact "$f" \
               --provenance "$f.provenance.json" \

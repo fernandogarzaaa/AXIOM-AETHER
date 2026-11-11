@@ -14,6 +14,8 @@ still writes the source SBOM, and exits 0: use --syft-required when a
 missing or failed syft run must fail the build instead. With
 --syft-required the script also verifies the syft output file exists,
 parses as JSON, and carries an SPDX version before reporting success.
+--syft-cmd names the syft binary to run (default: syft on PATH); CI
+passes the download-syft output path there.
 
 Provenance records the source commit, the builder, and the build
 inputs (materials) with their hashes, so a verifier can re-hash the
@@ -189,19 +191,21 @@ def build_provenance(artifact, repo_root, builder):
     }
 
 
-def run_syft(artifact, out_path):
+def run_syft(artifact, out_path, syft_cmd="syft"):
     """Run syft over the artifact and validate its SPDX output.
 
     Returns True only when syft exits 0 AND the output file exists,
     is non-empty, parses as JSON, and carries an SPDX version. A
     zero exit with no usable output is a failure, not a success.
+    `syft_cmd` is the syft binary to run: "syft" on PATH by default,
+    or an explicit path (CI passes the download-syft output here).
     """
-    if shutil.which("syft") is None:
-        print("syft: not installed; package-level SBOM skipped")
+    if shutil.which(syft_cmd) is None:
+        print(f"syft: not found at {syft_cmd}; package-level SBOM skipped")
         return False
     try:
         result = subprocess.run(
-            ["syft", artifact, "-o", f"spdx-json={out_path}"],
+            [syft_cmd, artifact, "-o", f"spdx-json={out_path}"],
             capture_output=True,
             text=True,
             timeout=300,
@@ -262,7 +266,7 @@ def cmd_generate(args):
     print(f"SBOM written: {sbom_path}")
     print(f"provenance written: {prov_path}")
     if args.syft or args.syft_required:
-        ok = run_syft(artifact, artifact + ".sbom.syft.json")
+        ok = run_syft(artifact, artifact + ".sbom.syft.json", args.syft_cmd)
         if args.syft_required and not ok:
             print(
                 "generate: --syft-required and syft failed; failing the build",
@@ -405,6 +409,11 @@ def main(argv=None):
     gen.add_argument("--provenance-out", default=None)
     gen.add_argument(
         "--syft", action="store_true", help="Also run syft for a package-level SBOM."
+    )
+    gen.add_argument(
+        "--syft-cmd",
+        default="syft",
+        help="Syft binary to run (default: syft on PATH).",
     )
     gen.add_argument(
         "--syft-required",

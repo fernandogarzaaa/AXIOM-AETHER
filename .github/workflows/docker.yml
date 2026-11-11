@@ -102,7 +102,9 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [build]
     permissions:
-      contents: read
+      # contents: write is needed by the release-asset upload step on
+      # tag runs (softprops/action-gh-release requires it).
+      contents: write
       packages: write
     steps:
       - name: Checkout
@@ -131,7 +133,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install syft
-        uses: anchore/syft-action@v0
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: v1.32.0
 
       - name: Extract Docker metadata (tags)
         id: meta
@@ -172,7 +177,7 @@ jobs:
           echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
           python3 scripts/generate_attestation.py attest-image \
             --image "$IMAGE" --digest "$DIGEST" --out image.provenance.json
-          syft "$IMAGE" -o "spdx-json=image.sbom.syft.json"
+          "${{ steps.syft.outputs.cmd }}" "$IMAGE" -o "spdx-json=image.sbom.syft.json"
           python3 -c "import json; d=json.load(open('image.sbom.syft.json')); assert d['spdxVersion'].startswith('SPDX-'), 'syft output has no SPDX version'; print(f\"syft SBOM: {d['spdxVersion']}, {len(d.get('packages', []))} packages\")"
 
       - name: Upload image attestation artifacts
