@@ -560,3 +560,215 @@ jobs:
 
       - name: Helm auth renders (apiKey set / unset / existingSecret)
         run: python3 deploy/helm/axiom/tests/test_helm_auth.py
+
+  # ===== BEGIN Phase 5 item 2: release gate (aggregate verdict) =====
+  # One release-blocking verdict over the security and correctness
+  # gates. Keep this whole block together: a sibling PR adding a
+  # different job should append its own delimited block after the
+  # END marker below, so the two PRs merge cleanly.
+  #
+  # Part 1 is `needs`: every other job in this workflow. Part 2 is
+  # the script step: it reads the `needs` results, waits a bounded
+  # time for required cross-workflow checks to finish, queries the
+  # head commit check runs (which covers jobs from other workflows,
+  # e.g. the agentic eval suite and the docker.yml multi-arch
+  # publish), and reads the PR reviews. It fails when any gate is
+  # red, and when a required cross-workflow check never ran.
+  #
+  # `if: ${{ !cancelled() }}` matters: without it, a failing needed
+  # job would SKIP this job instead of failing it, so the PR would
+  # show a skipped gate rather than a red verdict. With it, this job
+  # always renders an explicit PASS or FAIL, except when the run
+  # itself is cancelled.
+  #
+  # Limits, stated plainly. A green verdict here means every
+  # EVALUATED gate passed. One gate has no per-run evidence yet
+  # (provenance: no CI check run proves it on a push or PR; the
+  # evidence is the release attestation, verified at release time)
+  # and still blocks a release; the local mirror
+  # scripts/release_gate.py reports it NOT_EVALUATED and exits 1.
+  # See docs/RELEASE-GATES.md. The script step also writes it into
+  # the job summary so the gap is visible in the PR UI, not buried
+  # in the log.
+  release-gate:
+    name: Release gate (aggregate verdict)
+    needs:
+      - protocol
+      - lossy-invariant-guard
+      - test
+      - session-concurrency-stress
+      - perf-regression
+      - experimental
+      - msrv
+      - docker-build
+      - pinned-images
+      - python-reference
+      - helm
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    steps:
+      - name: Aggregate verdict (needs + cross-workflow checks + reviews)
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const SELF = "Release gate (aggregate verdict)";
+            const REVIEW_BOTS = ["coderabbitai[bot]", "chatgpt-codex-connector[bot]"];
+            // Cross-workflow checks mapped to gates. `null` means
+            // informational: it never fails the gate. Mirrors
+            // scripts/release_gate.py. Checks absent from this ref are
+            // skipped, not failed: docker.yml only runs on pushes to
+            // main and tags, so its three checks never exist on a PR
+            // head. A present red one fails its gate. Checks with no
+            // entry here are skipped, not failed: this workflow's own
+            // jobs are covered by `needs` below, and a sibling run for
+            // the same head must not fail this gate through them.
+            const MAPPED = {
+              "Agentic eval suite": "full-tests",
+              "Build linux/amd64": "docker-build",
+              "Build linux/arm64": "docker-build",
+              "Merge into multi-arch manifest": "docker-build",
+              "Regenerate proof-loop metrics": null,
+              "CodeRabbit": null,
+            };
+            // Required cross-workflow checks: the gate must see them,
+            // not just see no failure. "Agentic eval suite" is
+            // required only where eval.yml runs: every pull request,
+            // pushes to main and claude/**, and a manual dispatch on
+            // one of those refs. A standalone CI dispatch on any other
+            // branch never schedules eval.yml, so requiring its check
+            // there waits the bounded 10 minutes and then fails on a
+            // check that was never scheduled. The docker multi-arch
+            // checks are required only on refs that schedule
+            // docker.yml: pushes to main and v* tags, and a manual
+            // dispatch on one of those refs. The local mirror enforces
+            // the same rules.
+            const REQUIRED_CROSS = [];
+            const EVAL_REF =
+              context.ref === "refs/heads/main" ||
+              context.ref.startsWith("refs/heads/claude/");
+            if (context.eventName === "pull_request" || EVAL_REF) {
+              REQUIRED_CROSS.push("Agentic eval suite");
+            }
+            const DOCKER_REF =
+              context.ref === "refs/heads/main" ||
+              context.ref.startsWith("refs/tags/v");
+            if (DOCKER_REF && context.eventName !== "pull_request") {
+              REQUIRED_CROSS.push("Build linux/amd64", "Build linux/arm64", "Merge into multi-arch manifest");
+            }
+            // Third-party app checks conclude skipped/neutral when the
+            // app takes no action (e.g. CodeRabbit skips a PR). Those
+            // are informational by definition, never a gate failure.
+            // Required checks are exempt: only completed/success
+            // passes for them.
+            const BENIGN = new Set(["skipped", "neutral"]);
+            const failures = [];
+
+            // Part 1: every needed job in this workflow must succeed.
+            // A needed job that failed makes the others skipped, and a
+            // skipped job is an unevaluated gate, not a pass.
+            const needsCtx = ${{ toJSON(needs) }};
+            for (const [job, ctx] of Object.entries(needsCtx)) {
+              if (ctx.result !== "success") {
+                failures.push(`needs.${job}: ${ctx.result}`);
+              }
+            }
+
+            // Part 2: cross-workflow check runs on the head SHA. On a
+            // PR, context.sha is the merge commit; the runs live under
+            // the PR head SHA, so resolve the ref explicitly.
+            const ref = context.eventName === "pull_request"
+              ? context.payload.pull_request.head.sha
+              : context.sha;
+            // The gate runs when the ci.yml jobs finish, but the other
+            // workflows run on their own schedule: a required
+            // cross-workflow check can still be running when this job
+            // first queries it. Wait for it, bounded (20 x 30s), so
+            // the verdict fails on a real red gate, not on timing.
+            // After the wait the verdict still fails closed on a
+            // missing or unfinished required check.
+            let latest = new Map();
+            for (let attempt = 0; attempt < 20; attempt++) {
+              const { data: runs } = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref,
+                per_page: 100,
+              });
+              // listForRef returns every run for the ref, including
+              // superseded re-runs. Keep the newest run per name.
+              latest = new Map();
+              for (const run of runs.check_runs) {
+                if (!latest.has(run.name) || run.id > latest.get(run.name).id) {
+                  latest.set(run.name, run);
+                }
+              }
+              const pending = REQUIRED_CROSS.filter((name) => {
+                const run = latest.get(name);
+                return !run || run.status !== "completed";
+              });
+              if (!pending.length) break;
+              core.info(`Waiting for cross-workflow checks: ${pending.join(", ")} (attempt ${attempt + 1}/20)`);
+              await new Promise((resolve) => setTimeout(resolve, 30000));
+            }
+            for (const name of REQUIRED_CROSS) {
+              if (!latest.has(name)) {
+                failures.push(`${name} [${MAPPED[name]}]: missing (required cross-workflow check never ran on this ref)`);
+              }
+            }
+            for (const run of latest.values()) {
+              if (run.name === SELF) continue;
+              // Only explicitly mapped cross-workflow checks can fail
+              // the gate here. Unmapped checks are skipped: this
+              // workflow's own jobs are already covered by `needs`
+              // above, and a push-triggered sibling run for the same
+              // head schedules the same jobs under a different
+              // concurrency group, so its unfinished runs must not
+              // fail this gate.
+              if (!(run.name in MAPPED)) continue;
+              const mapped = MAPPED[run.name];
+              if (mapped === null) continue;
+              if (!REQUIRED_CROSS.includes(run.name) && BENIGN.has(run.conclusion)) continue;
+              if (run.status !== "completed" || run.conclusion !== "success") {
+                failures.push(`${run.name} [${mapped}]: ${run.status}/${run.conclusion}`);
+              }
+            }
+
+            // Part 3: the review gate bites on pull requests only. A
+            // review that only comments still counts as present.
+            let reviewNote = "Review gate skipped: no PR on this event";
+            if (context.eventName === "pull_request") {
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                per_page: 100,
+              });
+              const botSeen = reviews.some(r => REVIEW_BOTS.includes(r.user.login));
+              const approved = reviews.some(r => r.state === "APPROVED");
+              if (!botSeen && !approved) {
+                failures.push("review gate: no CodeRabbit, Codex, or approving human review on this PR");
+              } else {
+                reviewNote = `Review gate PASS (bot review: ${botSeen}, approved: ${approved})`;
+              }
+            }
+
+            const notEvaluated = "provenance is NOT_EVALUATED by this job and still blocks a release; see docs/RELEASE-GATES.md.";
+            if (failures.length) {
+              await core.summary
+                .addHeading("Release gate: FAIL")
+                .addList(failures)
+                .addRaw(`\n${notEvaluated}`)
+                .write();
+              core.setFailed(`Release gate FAIL: ${failures.join("; ")}`);
+              return;
+            }
+            await core.summary
+              .addHeading("Release gate: PASS (evaluated gates only)")
+              .addRaw(`\n${reviewNote}\n\n${notEvaluated}`)
+              .write();
+            core.info(`Release gate PASS: all evaluated CI gates green. ${reviewNote} ${notEvaluated}`);
+  # ===== END Phase 5 item 2: release gate =====
