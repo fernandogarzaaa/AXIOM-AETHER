@@ -619,7 +619,10 @@ jobs:
             // scripts/release_gate.py. Checks absent from this ref are
             // skipped, not failed: docker.yml only runs on pushes to
             // main and tags, so its three checks never exist on a PR
-            // head. A present red one fails its gate.
+            // head. A present red one fails its gate. Checks with no
+            // entry here are skipped, not failed: this workflow's own
+            // jobs are covered by `needs` below, and a sibling run for
+            // the same head must not fail this gate through them.
             const MAPPED = {
               "Agentic eval suite": "full-tests",
               "Build linux/amd64": "docker-build",
@@ -715,7 +718,15 @@ jobs:
             }
             for (const run of latest.values()) {
               if (run.name === SELF) continue;
-              const mapped = run.name in MAPPED ? MAPPED[run.name] : "ci.yml";
+              // Only explicitly mapped cross-workflow checks can fail
+              // the gate here. Unmapped checks are skipped: this
+              // workflow's own jobs are already covered by `needs`
+              // above, and a push-triggered sibling run for the same
+              // head schedules the same jobs under a different
+              // concurrency group, so its unfinished runs must not
+              // fail this gate.
+              if (!(run.name in MAPPED)) continue;
+              const mapped = MAPPED[run.name];
               if (mapped === null) continue;
               if (!REQUIRED_CROSS.includes(run.name) && BENIGN.has(run.conclusion)) continue;
               if (run.status !== "completed" || run.conclusion !== "success") {

@@ -55,6 +55,31 @@ def test_main_head_all_green_is_blocked_only_on_missing_evidence():
     assert unmapped == ["Regenerate proof-loop metrics"]
 
 
+def test_unmapped_in_progress_sibling_run_check_does_not_fail_gate():
+    # A push-triggered sibling run for the same head schedules the same
+    # jobs under a different concurrency group. Its newest check runs
+    # share the head SHA, so an unmapped one still in progress must not
+    # fail any gate: only explicitly mapped checks affect the verdict.
+    checks = [run(n, run_id=i) for i, n in enumerate(ALL_CHECKS, start=1)]
+    checks.append(
+        run(
+            "Release gate (aggregate verdict)",
+            status="in_progress",
+            conclusion=None,
+            run_id=100,
+        )
+    )
+    checks.append(
+        run("Some new CI job", status="in_progress", conclusion=None, run_id=101)
+    )
+    verdicts, unmapped = release_gate.evaluate_checks(checks)
+    assert verdicts["docker-build"][0] == "PASS"
+    assert verdicts["full-tests"][0] == "PASS"
+    assert verdicts["fmt-clippy"][0] == "PASS"
+    assert "Release gate (aggregate verdict)" in unmapped
+    assert "Some new CI job" in unmapped
+
+
 def test_pr_head_without_multi_arch_checks_still_passes_docker_build():
     pr_checks = [
         c
