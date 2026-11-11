@@ -30,7 +30,7 @@
 //!    `verified_count` records how many independent nodes have confirmed a fix
 //!    green: a ranking signal, never an authorization.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -116,10 +116,11 @@ impl PatchDiff {
 /// [`repo_scope`] identically when a fix is recorded and when one is tried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoScope {
-    /// Repository identity. `git:<root commit>` for a git checkout (the same
-    /// across clones of one repository, different between unrelated projects),
-    /// otherwise `path:<sha256 of the canonical root directory>` (this
-    /// directory on this machine only).
+    /// Repository identity. `git:<root commit>` for a git checkout with full
+    /// history (the same across clones of one repository, different between
+    /// unrelated projects), otherwise `path:<sha256 of the canonical root
+    /// directory>` (this directory on this machine only). A shallow checkout
+    /// is the second kind: it does not hold its root commit.
     pub repo: String,
     /// Path of the file relative to the repository root, `/`-separated.
     pub rel_path: String,
@@ -181,20 +182,34 @@ fn git_root(file: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The root commit of the checkout at `root` (the lexicographically smallest
-/// when history has several roots), or `None` when git is unavailable, the
-/// repository has no commits, or git refuses to read it.
-fn git_root_commit(root: &Path) -> Option<String> {
+/// Run `git -C root <args>` with a time bound; its stdout on success.
+fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(root)
-        .args(["rev-list", "--max-parents=0", "HEAD"]);
+    cmd.arg("-C").arg(root).args(args);
     let out = crate::proc_bound::output_bounded(&mut cmd, Some(std::time::Duration::from_secs(20)))
         .ok()?;
-    if !out.status.success() {
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The root commit of the checkout at `root` (the lexicographically smallest
+/// when history has several roots), or `None` when git is unavailable, the
+/// repository has no commits, git refuses to read it, or its history is
+/// shallow.
+///
+/// A shallow checkout (`git clone --depth N`) does not hold its root commit.
+/// Git reports the commits at the shallow boundary as parentless instead, and
+/// that boundary moves whenever more history is fetched, so it is not an
+/// identity. Such a checkout is identified by its directory, like one without
+/// git, until its history is complete. A git too old to answer the shallow
+/// question is treated the same way.
+fn git_root_commit(root: &Path) -> Option<String> {
+    let shallow = git_stdout(root, &["rev-parse", "--is-shallow-repository"])?;
+    if shallow.trim() != "false" {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout)
+    git_stdout(root, &["rev-list", "--max-parents=0", "HEAD"])?
         .lines()
         .map(str::trim)
         .filter(|line| is_sha_hex(line, 40) || is_sha_hex(line, 64))
@@ -591,6 +606,10 @@ impl PatchMemory {
             let mut local = self.by_fingerprint.remove(&fp).unwrap_or_default();
             let known = local.len();
             let mut new_this_fp = 0usize;
+            // Already-known fixes this export has reinforced. An export is one
+            // peer's word, so each fix in it counts once however often the
+            // export repeats it.
+            let mut reinforced_here: HashSet<usize> = HashSet::new();
             for mut pc in peer_list {
                 // Drop candidates that cannot be applied safely (no repository
                 // or pre-image: the whole-file format of older versions) and
@@ -607,14 +626,15 @@ impl PatchMemory {
                     // Already known before this export: reinforce, bounded. One
                     // export should count as at most a few independent
                     // confirmations.
-                    Some(i) if i < known => {
+                    Some(i) if i < known && reinforced_here.insert(i) => {
                         let bump = pc
                             .verified_count
                             .min(policy.max_verified_bump_per_candidate);
                         local[i].verified_count = local[i].verified_count.saturating_add(bump);
                         report.reinforced += 1;
                     }
-                    // The same new fix repeated inside one export counts once.
+                    // The same fix repeated inside one export counts once,
+                    // whether it was new to this node or already known.
                     Some(_) => report.byzantine_rejected += 1,
                     None => {
                         // Flood cap: reject excess brand-new candidates per fingerprint.
@@ -1105,6 +1125,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn repo_scope_of_a_shallow_checkout_does_not_move_when_history_is_deepened() {
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=axiom-test",
+                    "-c",
+                    "user.email=axiom-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let base = tmp_dir("gitshallow");
+        let origin = base.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        assert!(git(&origin, &["init", "-q"]), "this test needs git on PATH");
+        for n in 1..=3 {
+            std::fs::write(origin.join("calc.py"), format!("x = {n}\n")).unwrap();
+            assert!(git(&origin, &["add", "calc.py"]));
+            assert!(git(&origin, &["commit", "-q", "-m", "change"]));
+        }
+        let full = repo_scope(&origin.join("calc.py"), None).unwrap();
+        assert!(full.repo.starts_with("git:"), "{}", full.repo);
+
+        // `file://` so that git honours `--depth` for a local clone.
+        let shallow = base.join("shallow");
+        let url = format!("file://{}", origin.display());
+        assert!(git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &url,
+                shallow.to_str().unwrap()
+            ]
+        ));
+        let before = repo_scope(&shallow.join("calc.py"), None).unwrap();
+        // Git reports the shallow boundary commit as parentless. It is not the
+        // root commit and it moves, so it must not be used as the identity.
+        assert!(
+            before.repo.starts_with("path:"),
+            "a shallow checkout is identified by its directory: {}",
+            before.repo
+        );
+
+        // Fetch one more commit of history: the boundary moves, the file does not.
+        assert!(git(&shallow, &["fetch", "-q", "--deepen", "1"]));
+        let after = repo_scope(&shallow.join("calc.py"), None).unwrap();
+        assert_eq!(
+            before, after,
+            "deepening a shallow checkout must not change its identity"
+        );
+
+        // A fix recorded before deepening is still found afterwards.
+        let mut pm = PatchMemory::new();
+        pm.record_verified("fp", &before, "x = 3\n", "x = 4\n");
+        assert_eq!(pm.candidates_reranked("fp", &after).len(), 1);
+
+        // With its history complete the checkout holds the root commit, and
+        // is identified like any other clone of the repository.
+        assert!(git(&shallow, &["fetch", "-q", "--unshallow"]));
+        let complete = repo_scope(&shallow.join("calc.py"), None).unwrap();
+        assert_eq!(complete, full);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // --- fleet merge ----------------------------------------------------------
 
     /// A well-formed candidate as a peer would export it.
@@ -1269,6 +1364,32 @@ mod tests {
         assert_eq!(rep.reinforced, 0);
         assert_eq!(rep.byzantine_rejected, 49);
         assert_eq!(local.candidates("fp")[0].verified_count, 1);
+    }
+
+    #[test]
+    fn a_known_fix_repeated_inside_one_export_reinforces_once() {
+        // The node already holds the fix (count 1). A key-holder repeats it 50
+        // times in one export: that is one peer's confirmation, not fifty.
+        let key: &[u8] = b"fleet";
+        let mut peer = PatchMemory::new();
+        peer.by_fingerprint.insert(
+            "fp".into(),
+            vec![peer_candidate("a.rs", "BAD\n", "FIX\n", 1); 50],
+        );
+        let export = peer.export_signed(Some(key));
+        let mut local = PatchMemory::new();
+        local.record_verified("fp", &scope("a.rs"), "BAD\n", "FIX\n");
+        let rep = local
+            .merge_signed_guarded(&export, Some(key), FleetTrustPolicy::robust())
+            .unwrap();
+        assert_eq!(rep.new_candidates, 0);
+        assert_eq!(rep.reinforced, 1);
+        assert_eq!(rep.byzantine_rejected, 49);
+        assert_eq!(
+            local.candidates("fp")[0].verified_count,
+            2,
+            "one export adds at most one capped bump per fix, however often it repeats it"
+        );
     }
 
     #[test]

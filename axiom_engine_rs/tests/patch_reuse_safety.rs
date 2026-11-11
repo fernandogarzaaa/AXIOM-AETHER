@@ -62,9 +62,44 @@ fn write_project(dir: &Path, calc: &str) {
     std::fs::write(dir.join("test.sh"), TEST_SH).unwrap();
 }
 
+/// Keeps a solve away from any LLM backend the developer has configured.
+///
+/// `solve` asks `AXIOM_BACKEND` for a repair backend once its deterministic
+/// phases and the patch store have failed. These tests are about the patch
+/// store alone: with a live backend selected, the cases that expect a file to
+/// stay untouched would send it to a real API and fail whenever the model
+/// repaired it. The variable is process-wide, so the guard also serializes the
+/// solves in this file; it puts the variable back when dropped.
+struct OfflineSolve {
+    saved: Option<std::ffi::OsString>,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+impl OfflineSolve {
+    fn enter() -> Self {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("AXIOM_BACKEND");
+        std::env::remove_var("AXIOM_BACKEND");
+        Self {
+            saved,
+            _serial: serial,
+        }
+    }
+}
+
+impl Drop for OfflineSolve {
+    fn drop(&mut self) {
+        if let Some(value) = self.saved.take() {
+            std::env::set_var("AXIOM_BACKEND", value);
+        }
+    }
+}
+
 /// Run `axiom solve -- sh test.sh` in `project`, with an isolated patch store
-/// and heal memory under `state`.
+/// and heal memory under `state`, and no LLM backend.
 fn solve_in(project: &Path, state: &Path) -> SolveReport {
+    let _offline = OfflineSolve::enter();
     let opts = SolveOptions {
         max_rounds: 1,
         max_restarts: 1,
