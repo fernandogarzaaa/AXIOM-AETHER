@@ -4,6 +4,92 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_trivial_is_opt_in() {
+        // Unset, empty, "off" and unrecognised values all mean "not asked for".
+        for raw in [None, Some(""), Some("  "), Some("off"), Some("0"), Some("false"), Some("no"), Some("auto")] {
+            assert!(!local_trivial_requested(raw), "{raw:?} must not opt in");
+        }
+        for raw in ["on", "ON", " on ", "1", "true", "True", "yes"] {
+            assert!(local_trivial_requested(Some(raw)), "{raw:?} must opt in");
+        }
+    }
+
+    #[test]
+    fn local_trivial_startup_guard_requires_a_verified_checkpoint() {
+        let every_status = [
+            CheckpointStatus::Verified,
+            CheckpointStatus::Absent,
+            CheckpointStatus::Mismatched,
+            CheckpointStatus::Unverified,
+        ];
+        // Not asked for: off, whatever the checkpoint, and never an error.
+        for status in every_status {
+            assert_eq!(resolve_local_trivial(false, status), Ok(false), "{status:?}");
+        }
+        // Asked for with a verified checkpoint: on.
+        assert_eq!(
+            resolve_local_trivial(true, CheckpointStatus::Verified),
+            Ok(true)
+        );
+        // Asked for without one: startup is refused, and the message names the
+        // flag, the checkpoint state and both ways out.
+        for status in [
+            CheckpointStatus::Absent,
+            CheckpointStatus::Mismatched,
+            CheckpointStatus::Unverified,
+        ] {
+            let err = resolve_local_trivial(true, status).unwrap_err();
+            assert!(err.contains("AXIOM_LOCAL_TRIVIAL"), "{err}");
+            assert!(err.contains(status.as_str()), "{err}");
+            assert!(err.contains("AXIOM_CHECKPOINT_SHA256"), "{err}");
+            assert!(err.contains("unset AXIOM_LOCAL_TRIVIAL"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_trivial_is_active_only_when_opted_in_and_verified() {
+        let state = make_test_state().await;
+        let pipeline_arc = state.pipeline.clone();
+        // The default state: not opted in, checkpoint not verified.
+        assert!(!state.local_trivial_enabled);
+        assert!(!state.local_trivial_active());
+        // Opting in is not enough...
+        let opted_in = state.clone().with_local_trivial(true);
+        assert!(!opted_in.local_trivial_active());
+        for status in [
+            CheckpointStatus::Absent,
+            CheckpointStatus::Mismatched,
+            CheckpointStatus::Unverified,
+        ] {
+            assert!(
+                !opted_in
+                    .clone()
+                    .with_checkpoint_gate(false, status)
+                    .local_trivial_active(),
+                "{status:?}"
+            );
+        }
+        // ...a verified checkpoint alone is not enough either...
+        assert!(!state
+            .clone()
+            .with_checkpoint_gate(false, CheckpointStatus::Verified)
+            .local_trivial_active());
+        // ...both together are, in either builder order.
+        assert!(opted_in
+            .clone()
+            .with_checkpoint_gate(false, CheckpointStatus::Verified)
+            .local_trivial_active());
+        assert!(state
+            .clone()
+            .with_checkpoint_gate(false, CheckpointStatus::Verified)
+            .with_local_trivial(true)
+            .local_trivial_active());
+        drop(opted_in);
+        drop(state);
+        safe_drop(pipeline_arc).await;
+    }
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use candle_core::{DType, Device};

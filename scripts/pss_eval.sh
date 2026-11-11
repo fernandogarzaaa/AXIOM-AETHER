@@ -13,6 +13,9 @@
 #   2. all PSS flags ON:
 #      AXIOM_TOOL_DEFER=on AXIOM_LOCAL_TRIVIAL=on AXIOM_REBASE_ON_BREAK=on
 #      AXIOM_ADAPTIVE_TTL=on AXIOM_MODEL_ROUTE=auto
+#      AXIOM_LOCAL_TRIVIAL=on needs a verified checkpoint: export
+#      AXIOM_CHECKPOINT_SHA256 for the checkpoint under test before running,
+#      or the PSS-on proxy refuses to start.
 #
 # It is the ONLY authority for flipping those five flags to defaults. This
 # script only MEASURES and REPORTS -- flipping the defaults is a SEPARATE PR

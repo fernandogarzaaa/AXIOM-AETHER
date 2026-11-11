@@ -5,7 +5,7 @@ use axiom_engine::anthropic_forwarder::AnthropicForwarder;
 use axiom_engine::config::AxiomConfig;
 use axiom_engine::context_compressor::CompressorConfig;
 use axiom_engine::inference::InferencePipeline;
-use axiom_engine::server::{create_router, AppState};
+use axiom_engine::server::{create_router, run_server, AppState, CheckpointStatus};
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{Method, Request, StatusCode};
@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
 use tower::ServiceExt;
 
-/// `AXIOM_LOCAL_TRIVIAL` / `AXIOM_DRIFT_THRESHOLD` are process-global env vars
-/// read in the request path; serialize the tests that set them.
+/// `AXIOM_DRIFT_THRESHOLD` is a process-global env var read in the request
+/// path, and `AXIOM_LOCAL_TRIVIAL` one read at startup; serialize the tests
+/// that set them.
 fn env_lock() -> &'static AsyncMutex<()> {
     static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| AsyncMutex::new(()))
@@ -90,6 +91,8 @@ async fn start_capturing_upstream() -> (String, Capture, tokio::task::JoinHandle
     (format!("http://{address}"), capture, task)
 }
 
+/// A server as it comes up by default: the short-circuit not asked for, and
+/// (as in every test here) no verified checkpoint behind the tiny model.
 async fn build_state(upstream: String) -> AppState {
     let pipeline = tokio::task::spawn_blocking(tiny_pipeline).await.unwrap();
     AppState::new(pipeline, "axiom-ttt-test".to_string())
@@ -99,6 +102,15 @@ async fn build_state(upstream: String) -> AppState {
             recall_top_k: 8,
             enabled: true,
         })
+}
+
+/// A server whose operator opted in to the short-circuit and whose checkpoint
+/// verified at startup: the only configuration in which it may run.
+async fn build_opted_in_state(upstream: String) -> AppState {
+    build_state(upstream)
+        .await
+        .with_checkpoint_gate(false, CheckpointStatus::Verified)
+        .with_local_trivial(true)
 }
 
 async fn post_messages(app: &Router, body: Value) -> (StatusCode, Value) {
@@ -173,13 +185,12 @@ fn error_bearing(session_id: &str) -> Value {
 #[tokio::test]
 async fn clean_mechanical_turn_is_answered_locally_without_upstream() {
     let _guard = env_lock().lock().await;
-    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "on");
     // Huge gate: any finite surprisal passes, so triviality reduces to the
     // deterministic structural checks (tool_result-only, error-free, small).
     let _c2 = EnvVarGuard::set("AXIOM_DRIFT_THRESHOLD", "1000000");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
-    let state = build_state(upstream).await;
+    let state = build_opted_in_state(upstream).await;
     let app = create_router(state);
 
     let (status, body) = post_messages(&app, clean_mechanical("lb-clean")).await;
@@ -196,11 +207,10 @@ async fn clean_mechanical_turn_is_answered_locally_without_upstream() {
 #[tokio::test]
 async fn streaming_trivial_turn_gets_a_local_sse_stream() {
     let _guard = env_lock().lock().await;
-    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "on");
     let _c2 = EnvVarGuard::set("AXIOM_DRIFT_THRESHOLD", "1000000");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
-    let state = build_state(upstream).await;
+    let state = build_opted_in_state(upstream).await;
     let app = create_router(state);
 
     let mut body = clean_mechanical("lb-stream");
@@ -227,11 +237,10 @@ async fn streaming_trivial_turn_gets_a_local_sse_stream() {
 #[tokio::test]
 async fn error_bearing_turn_is_forwarded_upstream() {
     let _guard = env_lock().lock().await;
-    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "on");
     let _c2 = EnvVarGuard::set("AXIOM_DRIFT_THRESHOLD", "1000000");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
-    let state = build_state(upstream).await;
+    let state = build_opted_in_state(upstream).await;
     let app = create_router(state);
 
     let (status, body) = post_messages(&app, error_bearing("lb-error")).await;
@@ -249,14 +258,16 @@ async fn error_bearing_turn_is_forwarded_upstream() {
 }
 
 #[tokio::test]
-async fn flag_off_always_forwards() {
+async fn not_opted_in_always_forwards_even_with_a_verified_checkpoint() {
     let _guard = env_lock().lock().await;
-    // Default is ON since the 2026-07-16 flip -- opting out now takes an
-    // explicit "off".
-    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "off");
+    // A gate so wide every finite surprisal passes: only the opt-in is left
+    // to stop the short-circuit.
+    let _c1 = EnvVarGuard::set("AXIOM_DRIFT_THRESHOLD", "1000000");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
-    let state = build_state(upstream).await;
+    let state = build_state(upstream)
+        .await
+        .with_checkpoint_gate(false, CheckpointStatus::Verified);
     let app = create_router(state);
 
     let (status, body) = post_messages(&app, clean_mechanical("lb-off")).await;
@@ -264,11 +275,141 @@ async fn flag_off_always_forwards() {
     assert_ne!(
         body["model"],
         json!("axiom-local"),
-        "flag off -> never local"
+        "not opted in -> never local"
     );
     assert_eq!(
         capture.requests.lock().unwrap().len(),
         1,
-        "flag off -> even a trivial turn is forwarded"
+        "without the opt-in every turn is forwarded"
+    );
+}
+
+#[tokio::test]
+async fn opted_in_without_a_verified_checkpoint_still_forwards() {
+    // The opt-in alone must not be enough: with an absent, unverified or
+    // mismatched checkpoint the surprisal gate is computed by weights nobody
+    // vouched for, so the turn goes to the model.
+    let _guard = env_lock().lock().await;
+    let _c1 = EnvVarGuard::set("AXIOM_DRIFT_THRESHOLD", "1000000");
+
+    for status in [
+        CheckpointStatus::Absent,
+        CheckpointStatus::Unverified,
+        CheckpointStatus::Mismatched,
+    ] {
+        let (upstream, capture, _task) = start_capturing_upstream().await;
+        let state = build_state(upstream)
+            .await
+            .with_local_trivial(true)
+            .with_checkpoint_gate(false, status);
+        assert!(!state.local_trivial_active(), "{status:?}");
+        let app = create_router(state);
+
+        let (http, body) = post_messages(&app, clean_mechanical("lb-unverified")).await;
+        assert_eq!(http, StatusCode::OK);
+        assert_ne!(
+            body["model"],
+            json!("axiom-local"),
+            "checkpoint {status:?}: never local"
+        );
+        assert_eq!(
+            capture.requests.lock().unwrap().len(),
+            1,
+            "checkpoint {status:?}: the turn must reach the model"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_server_refuses_to_start_with_the_flag_on_and_no_verified_checkpoint() {
+    // The startup guard, end to end: AXIOM_LOCAL_TRIVIAL=on with a checkpoint
+    // that is not there. `run_server` must return the error before it binds
+    // (a server that started would never return from this call).
+    let _guard = env_lock().lock().await;
+    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "on");
+    let _c2 = EnvVarGuard::unset("AXIOM_CHECKPOINT_SHA256");
+
+    let missing = std::env::temp_dir().join("axiom_local_trivial_no_such_checkpoint.safetensors");
+    let _ = std::fs::remove_file(&missing);
+    let config = AxiomConfig {
+        d_model: 16,
+        n_layers: 1,
+        vocab_size: 64,
+        lr_inner: 1e-3,
+        norm_eps: 1e-6,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        run_server(
+            "127.0.0.1",
+            0,
+            config,
+            missing.to_str().unwrap(),
+            Device::Cpu,
+        ),
+    )
+    .await
+    .expect("run_server must refuse to start, not serve");
+    let err = result.expect_err("starting with the flag on and no checkpoint is an error");
+    let message = err.to_string();
+    assert!(message.contains("AXIOM_LOCAL_TRIVIAL"), "{message}");
+    assert!(
+        message.contains("absent"),
+        "names the checkpoint state: {message}"
+    );
+}
+
+/// The proxy must not end an agent's turn on its own under default settings.
+/// With `AXIOM_LOCAL_TRIVIAL` unset and nothing else configured, a small clean
+/// `tool_result` (a build finished, a file listing) has to reach the model:
+/// the agent loop is waiting for the model's next step, and a locally invented
+/// "Acknowledged" with `stop_reason: end_turn` stops it mid-task.
+#[tokio::test]
+async fn default_settings_forward_a_small_clean_tool_result_to_the_model() {
+    let _guard = env_lock().lock().await;
+    let _c1 = EnvVarGuard::unset("AXIOM_LOCAL_TRIVIAL");
+    let _c2 = EnvVarGuard::unset("AXIOM_DRIFT_THRESHOLD");
+
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream).await;
+    let app = create_router(state);
+
+    let (status, body) = post_messages(&app, clean_mechanical("lb-default")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        capture.requests.lock().unwrap().len(),
+        1,
+        "with default settings the turn must reach the model"
+    );
+    assert_eq!(
+        body["content"][0]["text"],
+        json!("from upstream"),
+        "the client gets the model's answer, not a local acknowledgement"
+    );
+    assert_ne!(body["model"], json!("axiom-local"));
+}
+
+/// Same for a streaming client, which is how agent CLIs talk to the proxy.
+#[tokio::test]
+async fn default_settings_forward_a_streaming_tool_result_to_the_model() {
+    let _guard = env_lock().lock().await;
+    let _c1 = EnvVarGuard::unset("AXIOM_LOCAL_TRIVIAL");
+    let _c2 = EnvVarGuard::unset("AXIOM_DRIFT_THRESHOLD");
+
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream).await;
+    let app = create_router(state);
+
+    let mut body = clean_mechanical("lb-default-stream");
+    body["stream"] = json!(true);
+    let (_status, _content_type, text) = post_messages_raw(&app, body).await;
+    assert_eq!(
+        capture.requests.lock().unwrap().len(),
+        1,
+        "with default settings a streaming turn must reach the model"
+    );
+    assert!(
+        !text.contains("axiom-local") && !text.contains("answered locally"),
+        "no local acknowledgement may be sent: {text}"
     );
 }
