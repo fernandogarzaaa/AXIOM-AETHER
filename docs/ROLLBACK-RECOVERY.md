@@ -85,8 +85,19 @@ re-apply.
 git revert <config commit>
 helm upgrade <release> deploy/helm/axiom -n <namespace> \
   -f deploy/helm/axiom/values-<staging|prod>.yaml --reuse-values \
+  --set checkpoint.sha256=<deployed checkpoint sha256> \
+  --set checkpoint.tokenizerSha256=<deployed tokenizer sha256> \
   --wait --timeout 10m
 ```
+
+The `--set` hashes are not optional. The overlay files carry
+placeholder hashes, and values from `-f` take priority over
+`--reuse-values`, so a revert without them replaces the deployed
+hashes with placeholders. The entrypoint then rejects the checkpoint
+download and the replacement pods never start. Capture the deployed
+hashes first with `helm get values <release> -n <namespace>` and
+pass them on the upgrade command. A config-only override file that
+does not mention checkpoint settings works too.
 
 Config changes roll the pods because the Deployment carries a
 `checksum/config` annotation. What it must prove: the reverted commit,
@@ -186,3 +197,8 @@ item. None of them changed runtime code in this PR.
    scrape path that can send the header. It is not a chart-only
    fix, so it stays a follow-up. The deploy guide no longer claims
    metrics has no auth.
+5. The Path 3 revert command as first written would have replaced
+   the deployed checkpoint hashes with the overlay placeholders,
+   because `-f` values take priority over `--reuse-values`. Found
+   by Codex review, fixed in this PR: the command now re-applies
+   the deployed hashes, and the runbook says how to capture them.

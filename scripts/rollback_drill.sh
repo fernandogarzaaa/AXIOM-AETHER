@@ -402,11 +402,11 @@ for _ in $(seq 1 45); do
   fi
   sleep 2
 done
-if [ "$CORRUPT_RC" != "unknown" ]; then
+if [ "$CORRUPT_RC" != "unknown" ] && [ "$CORRUPT_RC" -ne 0 ]; then
   SERVER_PID=""
   note ok "corrupt checkpoint fails boot (exit $CORRUPT_RC, no listener)"
 else
-  note bad "corrupt checkpoint fails boot (server still running after 90s)"; stop_server
+  note bad "corrupt checkpoint fails boot (exit ${CORRUPT_RC:-still running}, no listener)"; stop_server
 fi
 run_entry "$BASE/v1.bin" "$V1_SHA"
 echo "v1 restored after corrupt-boot check: rc=$?"
