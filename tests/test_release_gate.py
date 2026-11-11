@@ -89,6 +89,27 @@ def test_red_multi_arch_check_fails_docker_build_when_present():
     assert verdicts["docker-build"][0] == "FAIL"
 
 
+def test_conditional_check_skipped_or_neutral_is_informational():
+    for conclusion in ("skipped", "neutral"):
+        checks = [run(n, run_id=i) for i, n in enumerate(ALL_CHECKS, start=1)]
+        for c in checks:
+            if c["name"] == "Build linux/arm64":
+                c["conclusion"] = conclusion
+        verdict, detail = release_gate.evaluate_checks(checks)[0]["docker-build"]
+        assert verdict == "PASS"
+        assert f"Build linux/arm64: {conclusion} (informational)" in detail
+
+
+def test_required_check_skipped_fails_its_gate():
+    checks = [run(n, run_id=i) for i, n in enumerate(ALL_CHECKS, start=1)]
+    for c in checks:
+        if c["name"] == "Build & test (Rust)":
+            c["conclusion"] = "skipped"
+    verdicts, _ = release_gate.evaluate_checks(checks)
+    assert verdicts["fmt-clippy"][0] == "FAIL"
+    assert verdicts["full-tests"][0] == "FAIL"
+
+
 def test_latest_by_name_equal_ids_keeps_first():
     checks = [
         run("Build & test (Rust)", conclusion="failure", run_id=5),

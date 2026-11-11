@@ -39,7 +39,8 @@ import sys
 # so they are absent from every PR head SHA. On a PR the docker-build
 # gate is proved by the ci.yml no-push build alone; on main the
 # multi-arch checks must also pass when present. A missing conditional
-# check never fails its gate, but a present red one does.
+# check never fails its gate, and a present one that concludes skipped
+# or neutral counts as not run. A present red one fails its gate.
 GATES = {
     "cp1-source": {
         "description": "CP/1 normative source check",
@@ -105,6 +106,12 @@ GATES = {
 # also satisfies it.
 REVIEW_BOTS = {"coderabbitai[bot]", "chatgpt-codex-connector[bot]"}
 
+# Conclusions that mean "did not run" rather than "failed". A
+# conditional check that concludes skipped or neutral counts as not
+# run, matching the CI job. Required checks stay strict: anything
+# other than completed/success fails their gate.
+BENIGN_CONCLUSIONS = {"skipped", "neutral"}
+
 
 def latest_by_name(check_runs):
     """Keep the newest check run per name (greatest id wins).
@@ -145,7 +152,9 @@ def evaluate_checks(check_runs):
             else:
                 status = by_name[name].get("status")
                 conclusion = by_name[name].get("conclusion")
-                if status != "completed" or conclusion != "success":
+                if conclusion in BENIGN_CONCLUSIONS:
+                    notes.append(f"{name}: {conclusion} (informational)")
+                elif status != "completed" or conclusion != "success":
                     problems.append(f"{name}: {status}/{conclusion}")
         if problems:
             verdicts[gate] = ("FAIL", "; ".join(problems))
@@ -179,6 +188,10 @@ def evaluate_reviews(reviews):
 
 
 def main(argv=None):
+    """Parse arguments, evaluate the gate, print the verdict.
+
+    Returns 0 on PASS, 1 on FAIL or BLOCKED, 2 on a usage error.
+    """
     parser = argparse.ArgumentParser(description="Evaluate the release gate.")
     parser.add_argument(
         "--check-runs", required=True, help="check-runs JSON from the GitHub API"

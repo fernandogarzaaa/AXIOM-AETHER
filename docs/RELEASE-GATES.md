@@ -9,9 +9,14 @@ never evaluated.
 
 The release gate is one verdict computed from the gates below. The CI
 job `release-gate` in `.github/workflows/ci.yml` enforces it. The local
-mirror is `scripts/release_gate.py`. Both read the same gate table.
+mirror is `scripts/release_gate.py`. The two share the gate table in
+definition, but they are not the same verdict. The CI job evaluates
+the CI-provable subset and reports PASS when every evaluated gate
+passed. The local evaluator is the full verdict: it reports BLOCKED
+when `perf-regression` or `provenance` is unevaluated. A green CI
+aggregate does not mean shippable.
 
-- `PASS` means every gate passed.
+- `PASS` means every evaluated gate passed.
 - `FAIL` means at least one gate failed.
 - `BLOCKED` means at least one gate has no evidence yet. A blocked
   release does not ship until the evidence exists or a waiver is
@@ -29,15 +34,17 @@ mirror is `scripts/release_gate.py`. Both read the same gate table.
 | session-concurrency-stress | Session concurrency stress | The graded Phase 3 stress harness bounds (p95 latency, RSS delta, registry size per concurrency level). The full `test` job also runs this suite, but the standalone job keeps its measured baseline visible in its own log. |
 | pinned-images | Pinned container images | Every deployable image reference carries a sha256 digest pin. |
 | helm | Helm chart (lint + auth renders) | Lint plus the authenticated and unauthenticated render tests. |
-| docker-build | Docker image build (no push) on every ref; plus Build linux/amd64, Build linux/arm64, Merge into multi-arch manifest when present | The multi-arch checks run only on pushes to main and tags (docker.yml has no pull_request trigger), so they never exist on a PR head. On a PR the gate is proved by the no-push build alone; on main the multi-arch checks must also pass when present. A present red multi-arch check fails the gate. |
+| docker-build | Docker image build (no push) on every ref; plus Build linux/amd64, Build linux/arm64, Merge into multi-arch manifest when present | The multi-arch checks run only on pushes to main and tags (docker.yml has no pull_request trigger), so they never exist on a PR head. On a PR the gate is proved by the no-push build alone; on main the multi-arch checks must also pass when present. A present red multi-arch check fails the gate. A multi-arch check that concludes skipped or neutral counts as not run, not as a failure. |
 | bot-review | PR reviews API, not a check run | At least one review by `coderabbitai[bot]` or `chatgpt-codex-connector[bot]`, or an APPROVED review by a human. Bot logins verified live against PR #289 (both bots) and PR #295 (CodeRabbit) on 2026-11-11. A review that only comments still counts as present. Addressing its findings is a human decision, not part of this gate. |
 | perf-regression | None yet | Blocked on Phase 3 and Phase 4. See below. |
 | provenance | None yet | Blocked on the Phase 5 enforcement PR. See below. |
 
 Check runs with no mapping (Regenerate proof-loop metrics, the
 CodeRabbit app check) are informational and never affect the verdict.
-A check run that concludes skipped or neutral (CodeRabbit skips a PR
-it does not review) is informational by definition, never a failure.
+A conditional check that concludes skipped or neutral (a docker
+multi-arch check that did not run) counts as not run, not as a
+failure. Required checks must be completed with conclusion success;
+anything else fails their gate.
 
 ## Gates blocked on Phase 3 and Phase 4 results
 
@@ -71,13 +78,24 @@ The `release-gate` job in `.github/workflows/ci.yml` has three parts.
    another workflow (for example the agentic eval suite, or the
    docker.yml multi-arch publish on main) is red or still running,
    and when no bot or approving human review is present on the PR.
-   On pushes to main there is no PR, so the review check reports
-   skipped. The review gate only bites on pull requests, which is
-   where reviews happen. The query resolves the ref explicitly: on a
-   PR it uses the PR head SHA, because `context.sha` is the merge
-   commit there and the runs live under the head SHA. It keeps only
-   the newest run per check name, so a stale red run that a re-run
-   already fixed cannot fail the gate.
+   Two rules keep the verdict honest. First, the required
+   cross-workflow check (Agentic eval suite on every ref, plus the
+   docker multi-arch checks on main and tag pushes) must be present:
+   absence fails the gate instead of passing silently. Second, the
+   script waits a bounded time (20 polls, 30 seconds apart) for
+   those required checks to finish, because the other workflows run
+   on their own schedule and the gate must fail on a real red gate,
+   not on timing. After the wait the verdict still fails closed on
+   a missing or unfinished required check. On pushes to main there
+   is no PR, so the review check reports skipped. The review gate
+   only bites on pull requests, which is where reviews happen. A
+   review that lands after the gate ran needs a gate rerun: reviews
+   have no running state to wait on, so no bounded wait can cover
+   them. The query resolves the ref explicitly: on a PR it uses the
+   PR head SHA, because `context.sha` is the merge commit there and
+   the runs live under the head SHA. It keeps only the newest run
+   per check name, so a stale red run that a re-run already fixed
+   cannot fail the gate.
 3. The verdict is written to the job summary. A green verdict means
    every EVALUATED gate passed. It does not mean shippable: the two
    NOT_EVALUATED gates are named in the summary and still block a
