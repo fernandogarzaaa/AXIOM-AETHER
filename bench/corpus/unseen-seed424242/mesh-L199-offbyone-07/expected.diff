@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -196,7 +196,7 @@
+     /// Add a node to the mesh (topology reconfiguration is cheap and
+     /// expected at runtime).
+     pub fn add_node(&mut self, node: WorkerNode) -> Result<NodeId, MeshError> {
+-        if node.affinity.len() + 1 != self.config.dim {
++        if node.affinity.len() != self.config.dim {
+             return Err(MeshError::NodeDimMismatch {
+                 node: node.affinity.len(),
+                 mesh: self.config.dim,

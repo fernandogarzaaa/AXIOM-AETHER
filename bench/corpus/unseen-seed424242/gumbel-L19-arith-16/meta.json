@@ -1,0 +1,22 @@
+{
+  "lang": "rust",
+  "verify": [
+    "sh",
+    "-c",
+    "CARGO_TARGET_DIR=\"${TMPDIR:-$HOME/.cache}/axiom_seeded_target\" cargo test --lib -q"
+  ],
+  "kind": "single",
+  "source": "seeded fault, seed=424244, src/gumbel.rs:19, class=arith",
+  "pinned": [],
+  "test_region": {
+    "file": "src/gumbel.rs",
+    "from_line": 102
+  },
+  "fault": {
+    "file": "src/gumbel.rs",
+    "line": 19,
+    "class": "arith",
+    "before": "-",
+    "after": "+"
+  }
+}

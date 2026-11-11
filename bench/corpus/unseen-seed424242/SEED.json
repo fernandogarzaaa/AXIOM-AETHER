@@ -2,24 +2,19 @@
   "crate": "axiom_mesh_core",
   "seed": 424242,
   "emitted": 36,
-  "attempted": 48,
-  "survived_excluded": 12,
+  "attempted": 77,
+  "survived_excluded": 23,
   "by_class": {
-    "argswap": 2,
-    "arith": 3,
-    "bool": 3,
-    "cast": 3,
-    "cmp": 1,
-    "const": 1,
-    "deref": 2,
-    "flow": 1,
-    "idswap": 3,
-    "logic": 3,
-    "minmax": 4,
-    "neg": 1,
-    "offbyone": 2,
-    "range": 3,
-    "ret": 3,
+    "arith": 5,
+    "cast": 4,
+    "cmp": 2,
+    "const": 2,
+    "deref": 5,
+    "idswap": 6,
+    "minmax": 1,
+    "neg": 2,
+    "offbyone": 4,
+    "ret": 4,
     "shift": 1
   },
   "files": [
@@ -117,6 +112,102 @@
           "compile": "compile-error"
         }
       }
+    },
+    {
+      "seed": 424244,
+      "emitted": 18,
+      "attempted": 29,
+      "survived_excluded": 11,
+      "by_class": {
+        "arith": 3,
+        "deref": 3,
+        "idswap": 3,
+        "offbyone": 4,
+        "cast": 1,
+        "cmp": 1,
+        "const": 1,
+        "neg": 1,
+        "ret": 1
+      },
+      "compile_split": {
+        "compiles": 10,
+        "compile-error": 8
+      },
+      "compile_by_fixture": {
+        "gumbel-L19-arith-16": {
+          "class": "arith",
+          "compile": "compiles"
+        },
+        "idc-L111-deref-02": {
+          "class": "deref",
+          "compile": "compile-error"
+        },
+        "idc-L162-cmp-09": {
+          "class": "cmp",
+          "compile": "compiles"
+        },
+        "idc-L184-arith-05": {
+          "class": "arith",
+          "compile": "compiles"
+        },
+        "idc-L81-arith-01": {
+          "class": "arith",
+          "compile": "compiles"
+        },
+        "mesh-L113-const-10": {
+          "class": "const",
+          "compile": "compiles"
+        },
+        "mesh-L199-offbyone-07": {
+          "class": "offbyone",
+          "compile": "compiles"
+        },
+        "mesh-L207-idswap-03": {
+          "class": "idswap",
+          "compile": "compile-error"
+        },
+        "mesh-L214-offbyone-14": {
+          "class": "offbyone",
+          "compile": "compiles"
+        },
+        "mesh-L257-deref-06": {
+          "class": "deref",
+          "compile": "compile-error"
+        },
+        "mesh-L266-cast-08": {
+          "class": "cast",
+          "compile": "compile-error"
+        },
+        "mesh-L276-idswap-12": {
+          "class": "idswap",
+          "compile": "compile-error"
+        },
+        "mesh-L276-offbyone-18": {
+          "class": "offbyone",
+          "compile": "compiles"
+        },
+        "mesh-L347-offbyone-04": {
+          "class": "offbyone",
+          "compile": "compiles"
+        },
+        "mesh-L353-idswap-17": {
+          "class": "idswap",
+          "compile": "compile-error"
+        },
+        "mesh-L409-ret-15": {
+          "class": "ret",
+          "compile": "compile-error"
+        },
+        "mesh-L481-deref-11": {
+          "class": "deref",
+          "compile": "compile-error"
+        },
+        "mesh-L499-neg-13": {
+          "class": "neg",
+          "compile": "compiles"
+        }
+      },
+      "note": "Regeneration (Codex P1, PR #294): replaced the 18 batch-1/2 fixtures sharing a (file, line, class) triple with the repair-seeded-mesh-core tuning tables. Fresh sites only; see EXCLUDED-TRIPLES.txt (56 tuning triples + 18 retained triples + 18 batch-3 triples)."
     }
   ]
 }

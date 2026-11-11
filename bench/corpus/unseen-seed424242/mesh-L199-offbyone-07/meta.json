@@ -1,0 +1,22 @@
+{
+  "lang": "rust",
+  "verify": [
+    "sh",
+    "-c",
+    "CARGO_TARGET_DIR=\"${TMPDIR:-$HOME/.cache}/axiom_seeded_target\" cargo test --lib -q"
+  ],
+  "kind": "single",
+  "source": "seeded fault, seed=424244, src/mesh.rs:199, class=offbyone",
+  "pinned": [],
+  "test_region": {
+    "file": "src/mesh.rs",
+    "from_line": 522
+  },
+  "fault": {
+    "file": "src/mesh.rs",
+    "line": 199,
+    "class": "offbyone",
+    "before": ".len()",
+    "after": ".len() + 1"
+  }
+}

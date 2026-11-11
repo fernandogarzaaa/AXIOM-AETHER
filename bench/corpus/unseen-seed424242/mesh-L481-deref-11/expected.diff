@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -478,7 +478,7 @@
+                 scored.push((score, p_idx, n_idx));
+             }
+         }
+-        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(b.1)).then(a.2.cmp(&b.2)));
++        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+ 
+         let mut node_slots = vec![0usize; self.nodes.len()];
+         let mut payload_claimed = vec![false; payloads.len()];

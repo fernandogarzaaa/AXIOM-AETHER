@@ -1,0 +1,11 @@
+--- a/src/idc.rs
++++ b/src/idc.rs
+@@ -181,7 +181,7 @@
+     pub fn update(&mut self, raw: StateVector) -> StateVector {
+         let smoothed = match &self.estimate {
+             None => raw,
+-            Some(prev) => StateVector(&prev.0 + (1.0 - self.alpha) + &raw.0 * self.alpha),
++            Some(prev) => StateVector(&prev.0 * (1.0 - self.alpha) + &raw.0 * self.alpha),
+         };
+         self.estimate = Some(smoothed.clone());
+         smoothed

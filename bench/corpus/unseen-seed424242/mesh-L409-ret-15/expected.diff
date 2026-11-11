@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -406,7 +406,7 @@
+             .filter_map(|id| self.nodes.iter().position(|n| n.id == *id))
+             .collect();
+         if eligible_idx.is_empty() {
+-            Err(MeshError::Empty);
++            return Err(MeshError::Empty);
+         }
+ 
+         let mut field = self.field(payload, residual);

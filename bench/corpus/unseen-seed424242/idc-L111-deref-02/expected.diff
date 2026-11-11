@@ -1,0 +1,11 @@
+--- a/src/idc.rs
++++ b/src/idc.rs
+@@ -108,7 +108,7 @@
+                 lines_added,
+                 lines_removed,
+             } => {
+-                hash_feature(&mut state, format!("diff:{path}"), 1.0);
++                hash_feature(&mut state, &format!("diff:{path}"), 1.0);
+                 hash_feature(
+                     &mut state,
+                     "diff:churn",

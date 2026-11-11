@@ -79,7 +79,12 @@ def run_heldout(prog: Path, data: Path, work: Path) -> tuple[int, int, list[str]
             want = expected.read_text(errors="replace").splitlines()
             want = [line.rstrip() for line in want]
             got = [line.rstrip() for line in got]
-            if got == want:
+            # Exit status is judged separately from stdout (Codex P2,
+            # PR #294): a program that prints the expected output and
+            # then aborts must fail, not validate.
+            if out.returncode != 0:
+                failed.append(inp.name + f" (exit {out.returncode})")
+            elif got == want:
                 passed += 1
             else:
                 failed.append(inp.name)

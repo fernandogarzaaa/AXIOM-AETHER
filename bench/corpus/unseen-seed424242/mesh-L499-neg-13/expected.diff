@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -496,7 +496,7 @@
+         let assignments = per_node
+             .into_iter()
+             .enumerate()
+-            .filter(|(_, ps)| ps.is_empty())
++            .filter(|(_, ps)| !ps.is_empty())
+             .map(|(n_idx, ps)| (self.nodes[n_idx].id, ps))
+             .collect();
+         let dropped = (0..payloads.len())

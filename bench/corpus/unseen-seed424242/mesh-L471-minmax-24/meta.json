@@ -3,7 +3,7 @@
   "verify": [
     "sh",
     "-c",
-    "CARGO_TARGET_DIR=\"/home/hatch/workspace/axiom-aether-audit-p1/.seed-tmp/axiom_seeded_target\" cargo test --lib -q"
+    "CARGO_TARGET_DIR=\"${TMPDIR:-$HOME/.cache}/axiom_seeded_target\" cargo test --lib -q"
   ],
   "kind": "single",
   "source": "seeded fault, seed=424242, src/mesh.rs:471, class=minmax",

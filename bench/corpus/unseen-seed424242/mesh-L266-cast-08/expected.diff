@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -263,7 +263,7 @@
+         }
+         if self.config.capacity_penalty != 0.0 {
+             for (i, &n) in self.in_flight.iter().enumerate() {
+-                logits[i] -= self.config.capacity_penalty * n as f64;
++                logits[i] -= self.config.capacity_penalty * n as f32;
+             }
+         }
+         if self.config.bandit_gain != 0.0 || self.config.bandit_exploration != 0.0 {

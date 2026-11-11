@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -110,7 +110,7 @@
+             dim: 64,
+             tau: 0.5,
+             hard: true,
+-            fan_out: 2,
++            fan_out: 1,
+             residual_gain: 1.0,
+             tau_gain: 0.0,
+             tau_min: 0.05,

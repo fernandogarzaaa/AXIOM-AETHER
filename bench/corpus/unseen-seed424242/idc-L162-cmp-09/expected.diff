@@ -1,0 +1,11 @@
+--- a/src/idc.rs
++++ b/src/idc.rs
+@@ -159,7 +159,7 @@
+     /// Panics if `alpha` isn't in `(0.0, 1.0]`.
+     pub fn new(alpha: f32) -> Self {
+         assert!(
+-            alpha > 0.0 && alpha < 1.0,
++            alpha > 0.0 && alpha <= 1.0,
+             "StateSmoother: alpha must be in (0.0, 1.0], got {alpha}"
+         );
+         Self {

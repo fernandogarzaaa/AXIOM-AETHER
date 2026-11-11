@@ -1,0 +1,11 @@
+--- a/src/mesh.rs
++++ b/src/mesh.rs
+@@ -344,7 +344,7 @@
+         tau: f32,
+         rng: &mut impl Rng,
+     ) -> (Array1<f32>, Vec<NodeId>) {
+-        let mut weights: Array1<f32> = Array1::zeros(self.nodes.len() + 1);
++        let mut weights: Array1<f32> = Array1::zeros(self.nodes.len());
+         let mut active: Vec<NodeId> = Vec::with_capacity(fan_out);
+         let mut masked = field.clone();
+         for _ in 0..fan_out {

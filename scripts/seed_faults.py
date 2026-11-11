@@ -48,6 +48,16 @@ MissingReturn, ShellTest, ApiSwap, ArgShift, IdentSwap, ImportPath):
 OUTSIDE it, by construction. A `deref`/`cast` fault may fail to compile
 rather than fail a test; the oracle is `cargo test --lib`, which fails
 either way, and the corpus records the split per fixture in SEED.json.
+
+Regenerated batch (2026-11-11, batch 3, seed 424244): Codex review of
+the 36-fixture suite found 18 fixtures share a (file, line, class)
+triple with the prior repair-seeded-mesh-core tuning tables, so the
+suite was not genuinely unseen. Batch 3 replaces those 18 at fresh
+sites, using `--exclude-triples` (never emit a site whose
+(file, line, class) appears in a triples file: the tuning tables plus
+the 18 retained fixtures), so the regenerated suite has zero triple
+overlap with any tuning table. One fixture per triple per run is
+enforced inside the generator as well.
 """
 
 from __future__ import annotations
@@ -55,7 +65,6 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
-import os
 import random
 import re
 import shutil
@@ -485,6 +494,17 @@ def main() -> int:
         "a candidate site whose (file, line, class, before, after) matches an "
         "existing fixture's meta.json fault is skipped. Repeatable.",
     )
+    ap.add_argument(
+        "--exclude-triples",
+        action="append",
+        default=[],
+        help="file listing (file, line, class) triples, one per line as "
+        "FILE:LINE:CLASS (e.g. src/mesh.rs:489:flow), whose sites must never "
+        "be emitted: a candidate sharing a triple with the file is skipped. "
+        "Used to keep a regenerated suite disjoint from prior tuning tables. "
+        "Repeatable. Triples emitted in this run are excluded the same way, "
+        "so a suite never holds two fixtures at one (file, line, class).",
+    )
     args = ap.parse_args()
 
     wanted = None
@@ -503,11 +523,17 @@ def main() -> int:
     crate = (REPO / args.crate).resolve()
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    target_dir = Path(os.environ.get("TMPDIR", "/tmp")) / "axiom_seeded_target"
     # Debug profile on purpose: it builds incrementally, so each of the up to
     # 64 repair candidates costs ~1-2 s to verify instead of a full release
     # recompile (~10 s+), which makes a 40-fixture run ~1 h instead of ~8 h.
-    verify_sh = args.verify or f'CARGO_TARGET_DIR="{target_dir}" cargo test --lib -q'
+    # Portable target dir (Codex P1, PR #294): resolve the shared target
+    # directory from the runtime environment at VERIFY time, never embed
+    # the generation machine's absolute path in a committed fixture.
+    # `${TMPDIR:-$HOME/.cache}` honours a caller-chosen scratch dir when
+    # one is set, else the user's cache dir (on a real disk: /tmp is a
+    # small tmpfs in this sandbox, so a bare /tmp default would strand
+    # the build there). $HOME is safe to rely on: cargo/rustup need it.
+    verify_sh = args.verify or 'CARGO_TARGET_DIR="${TMPDIR:-$HOME/.cache}/axiom_seeded_target" cargo test --lib -q'
     verify = ["sh", "-c", verify_sh]
 
     # Confirm the pristine crate is green with this verifier.
@@ -534,6 +560,20 @@ def main() -> int:
                 )
     if excluded:
         print(f"excluding {len(excluded)} already-emitted fault(s) from {args.exclude_dir}", file=sys.stderr)
+    excluded_triples: set[tuple[str, int, str]] = set()
+    for triples_path in args.exclude_triples:
+        for raw in Path(triples_path).read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                f, ln, cls = line.rsplit(":", 2)
+            except ValueError:
+                print(f"bad triples line (want FILE:LINE:CLASS): {line!r}", file=sys.stderr)
+                return 2
+            excluded_triples.add((f, int(ln), cls))
+    if excluded_triples:
+        print(f"excluding {len(excluded_triples)} (file, line, class) triple(s) from {args.exclude_triples}", file=sys.stderr)
     all_sites: list[tuple[str, list[str], Site]] = []
     for rel in files:
         lines = (crate / rel).read_text().splitlines(keepends=True)
@@ -579,6 +619,9 @@ def main() -> int:
         seen.add(key)
         if (rel, site.line_no + 1, site.cls, site.before, site.after) in excluded:
             continue
+        triple = (rel, site.line_no + 1, site.cls)
+        if triple in excluded_triples:
+            continue
         attempts += 1
         mutated = list(lines)
         mutated[site.line_no] = new_line + "\n"
@@ -610,6 +653,7 @@ def main() -> int:
         )
         (fixture / "expected.diff").write_text("".join(diff))
         emitted += 1
+        excluded_triples.add(triple)
         by_class[site.cls] = by_class.get(site.cls, 0) + 1
         print(f"  [{emitted:02d}] {name}: {site.before!r} -> {site.after!r}", file=sys.stderr)
 
