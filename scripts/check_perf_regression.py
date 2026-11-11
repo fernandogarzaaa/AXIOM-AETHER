@@ -66,9 +66,9 @@ LEVEL_LINE = re.compile(
     r" p95=(?P<p95_ms>[\d.]+)ms"
     r" mean=[\d.]+ms"
     r" p95_growth=(?P<growth>[\d.]+)x"
-    r" rss_before=(?P<rss_before>\d+)KiB"
+    r"(?: rss_before=(?P<rss_before>\d+)KiB"
     r" rss_after=(?P<rss_after>\d+)KiB"
-    r" rss_delta=(?P<rss_delta>-?\d+)KiB"
+    r" rss_delta=(?P<rss_delta>-?\d+)KiB)?"
 )
 
 
@@ -77,6 +77,7 @@ class GateFailure(Exception):
 
 
 def load_json(path: Path) -> dict:
+    """Load a JSON file, failing the gate on a missing or invalid file."""
     try:
         return json.loads(path.read_text())
     except FileNotFoundError:
@@ -85,17 +86,24 @@ def load_json(path: Path) -> dict:
         raise GateFailure(f"invalid JSON in {path}: {exc}")
 
 
-def parse_stress_log(text: str) -> dict[int, dict[str, float]]:
-    """Parse [graded-stress] level lines into {level: {p95_ms, growth, rss_delta}}."""
-    levels: dict[int, dict[str, float]] = {}
+def parse_stress_log(text: str) -> dict[int, dict[str, float | None]]:
+    """Parse [graded-stress] level lines into {level: {p95_ms, growth, rss_delta}}.
+
+    The RSS fields are optional: on non-Linux the test prints
+    `rss=unmeasured (non-Linux)` instead of numeric RSS fields, and the
+    level still parses with rss_delta None. RSS is recorded, not gated,
+    so an unmeasured RSS changes nothing about the verdict.
+    """
+    levels: dict[int, dict[str, float | None]] = {}
     for line in text.splitlines():
         match = LEVEL_LINE.search(line)
         if match:
             level = int(match.group("level"))
+            rss_delta = match.group("rss_delta")
             levels[level] = {
                 "p95_ms": float(match.group("p95_ms")),
                 "growth": float(match.group("growth")),
-                "rss_delta_kib": float(match.group("rss_delta")),
+                "rss_delta_kib": float(rss_delta) if rss_delta is not None else None,
             }
     return levels
 
@@ -122,6 +130,14 @@ def check_paired(
     base_arms = baseline.get("paired", {}).get("arm_summaries", {})
     if not base_arms:
         raise GateFailure("baseline has no paired arm_summaries; cannot compare")
+    # A baseline that omits a configured arm would silently skip that
+    # arm's exact-count checks below, so the summary keys must match
+    # the configured arms exactly before any comparison runs.
+    if set(base_arms) != set(base_cfg.get("arms", [])):
+        raise GateFailure(
+            f"baseline arm_summaries keys {sorted(base_arms)} do not match "
+            f"configured arms {base_cfg.get('arms')}; re-baseline"
+        )
     for arm, base in base_arms.items():
         got = fresh_arms.get(arm)
         if got is None:
@@ -168,7 +184,7 @@ def check_paired(
 
 
 def check_stress(
-    fresh_levels: dict[int, dict[str, float]],
+    fresh_levels: dict[int, dict[str, float | None]],
     baseline: dict,
     tolerances: dict,
     failures: list[str],
@@ -179,12 +195,18 @@ def check_stress(
         raise GateFailure("baseline has no stress levels; cannot compare")
     if not fresh_levels:
         raise GateFailure("no [graded-stress] level lines found in stress log")
+    # A harness that adds or drops a level must not silently pass: the
+    # level sets must match exactly, or the baseline no longer describes
+    # the run and needs a re-baseline.
+    base_set = {int(level) for level in base_levels}
+    if set(fresh_levels) != base_set:
+        raise GateFailure(
+            f"stress level sets differ: fresh {sorted(fresh_levels)} vs "
+            f"baseline {sorted(base_set)}; re-baseline"
+        )
     for level_str, base in base_levels.items():
         level = int(level_str)
-        got = fresh_levels.get(level)
-        if got is None:
-            failures.append(f"stress level {level}: missing from fresh log")
-            continue
+        got = fresh_levels[level]
         growth_factor = tolerances["p95_growth_factor"]
         growth_max = tolerances["p95_growth_max"]
         allowed_growth = min(base["growth"] * growth_factor, growth_max)
@@ -206,6 +228,7 @@ def check_stress(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the gate from the command line; exit 0 pass, 1 fail, 2 usage error."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--paired", required=True, help="fresh paired smoke JSON")
     parser.add_argument(

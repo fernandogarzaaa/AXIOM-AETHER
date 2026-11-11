@@ -217,12 +217,39 @@ def test_stress_rss_spread_does_not_fail():
     assert failures == []
 
 
-def test_missing_stress_level_fails():
-    failures: list[str] = []
+def test_missing_stress_level_raises():
+    # A dropped level now fails as a level-set mismatch (re-baseline),
+    # not as a per-level failure.
     levels = mod.parse_stress_log(stress_log())
     del levels[32]
-    mod.check_stress(levels, BASELINE, BASELINE["tolerances"], failures)
-    assert any("level 32: missing" in f for f in failures)
+    with pytest.raises(mod.GateFailure, match="level sets differ"):
+        mod.check_stress(levels, BASELINE, BASELINE["tolerances"], [])
+
+
+def test_stress_extra_level_raises():
+    levels = mod.parse_stress_log(stress_log())
+    levels[64] = {"p95_ms": 100.0, "growth": 1.0, "rss_delta_kib": 100.0}
+    with pytest.raises(mod.GateFailure, match="level sets differ"):
+        mod.check_stress(levels, BASELINE, BASELINE["tolerances"], [])
+
+
+def test_stress_unmeasured_rss_parses():
+    # Non-Linux prints `rss=unmeasured (non-Linux)` instead of numeric
+    # RSS fields; the level still parses and the growth check still runs.
+    line = (
+        "[graded-stress] level=1 p95=116.6ms mean=116.6ms p95_growth=0.7x "
+        "rss=unmeasured (non-Linux) rss_after_clear=NoneKiB registry=1"
+    )
+    levels = mod.parse_stress_log(stress_log() + "\n" + line)
+    assert levels[1]["rss_delta_kib"] is None
+    failures: list[str] = []
+    mod.check_stress(
+        {1: levels[1], 4: levels[4], 16: levels[16], 32: levels[32]},
+        BASELINE,
+        BASELINE["tolerances"],
+        failures,
+    )
+    assert failures == []
 
 
 def test_main_missing_paired_file_exits_1(tmp_path):
@@ -268,6 +295,24 @@ def test_paired_empty_baseline_arms_raises():
     baseline = copy.deepcopy(BASELINE)
     baseline["paired"]["arm_summaries"] = {}
     with pytest.raises(mod.GateFailure, match="no paired arm_summaries"):
+        mod.check_paired(fresh_paired(), baseline, BASELINE["tolerances"], [])
+
+
+def test_paired_baseline_missing_arm_raises():
+    import copy
+
+    baseline = copy.deepcopy(BASELINE)
+    del baseline["paired"]["arm_summaries"]["D"]
+    with pytest.raises(mod.GateFailure, match="do not match configured arms"):
+        mod.check_paired(fresh_paired(), baseline, BASELINE["tolerances"], [])
+
+
+def test_paired_baseline_extra_arm_raises():
+    import copy
+
+    baseline = copy.deepcopy(BASELINE)
+    baseline["paired"]["arm_summaries"]["Z"] = baseline["paired"]["arm_summaries"]["D"]
+    with pytest.raises(mod.GateFailure, match="do not match configured arms"):
         mod.check_paired(fresh_paired(), baseline, BASELINE["tolerances"], [])
 
 

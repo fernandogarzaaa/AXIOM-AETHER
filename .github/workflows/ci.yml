@@ -258,8 +258,10 @@ jobs:
   #   2. runs the paired smoke with --fail-on-guardrail, so a guardrail
   #      FAIL or an arm with zero executed cells fails the job,
   #   3. runs the demo-regression negative control, which MUST exit
-  #      nonzero (the deliberately regressed arm must fail the
-  #      reliability guardrail; a zero exit means the gate cannot trip),
+  #      exactly 1 (guardrail failure, not a usage error or a crash)
+  #      and whose fresh report must show arm D passing and
+  #      D-regressed failing its reliability guardrail; a zero exit,
+  #      any other exit, or a report without that verdict fails the job.
   #   4. compares the fresh numbers against the stored baseline
   #      (bench/results/perf-baseline.json) with
   #      scripts/check_perf_regression.py: exact on success counts,
@@ -323,11 +325,26 @@ jobs:
       - name: Demo-regression negative control (must fail the guardrail)
         working-directory: axiom_engine_rs
         run: |
+          # A nonzero exit alone cannot pass this step: exit 2 is a
+          # usage error and a crash before the guardrail runs also exits
+          # nonzero, so require exactly exit 1 (guardrail failure) and
+          # validate the fresh report: arm D passes and D-regressed
+          # fails its reliability guardrail. The report is removed first
+          # so a stale file from an earlier run can never stand in for
+          # a fresh one.
+          rm -f ../bench/results/paired-ci-demo.json
           if cargo run --release --features tools --bin axiombench -- paired --demo-regression --fail-on-guardrail --out ../bench/results/paired-ci-demo.json; then
             echo "::error::demo-regression exited 0: the regressed arm passed the guardrail, so the gate cannot trip"
             exit 1
+          else
+            status=$?
           fi
-          echo "demo-regression exited nonzero as required: the gate trips"
+          if [ "$status" -ne 1 ]; then
+            echo "::error::demo-regression exited $status, expected 1 (guardrail failure)"
+            exit 1
+          fi
+          python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); g = d["guardrails"]; assert g["D"]["pass"] is True, "arm D must pass in the demo run"; v = g["D-regressed"]; assert v["pass"] is False and any(r.startswith("reliability guardrail failed:") for r in v["reasons"]), "D-regressed must fail the reliability guardrail"' ../bench/results/paired-ci-demo.json
+          echo "demo-regression exited 1 with D passing and D-regressed failing the reliability guardrail: the gate trips"
 
       - name: Compare against stored baseline
         run: python3 scripts/check_perf_regression.py --paired bench/results/paired-ci-smoke.json --stress-log perf-stress.log

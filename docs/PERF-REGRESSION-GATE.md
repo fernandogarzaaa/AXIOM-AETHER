@@ -22,10 +22,12 @@ like the other CI jobs.
    guardrail failure there would not have failed CI.
 3. **Demo-regression negative control.**
    `axiombench paired --demo-regression --fail-on-guardrail` must exit
-   nonzero: the deliberately regressed arm (solver sabotaged to edit a
-   pinned file and skip rollback) must fail the reliability guardrail.
-   The job fails if the demo exits zero, which proves the gate trips
-   when it should. This is the same demonstration recorded in
+   exactly 1, and its fresh report must show arm D passing and
+   D-regressed failing the reliability guardrail. A nonzero exit alone
+   is not enough: exit 2 is a usage error, and a crash before the
+   guardrail runs also exits nonzero, so the job requires the exit
+   status and the verdict, not just a failure. This is the same
+   demonstration recorded in
    `bench/results/PAIRED-SMOKE-2026-11-10.md`.
 4. **Baseline comparison.** `scripts/check_perf_regression.py` compares
    the fresh paired JSON and stress log against
@@ -133,15 +135,21 @@ the old baseline no longer applies.
 ## Reproduce locally
 
 ```bash
-cargo build --release --locked --features tools   # in axiom_engine_rs/
+# From the repository root. The cargo commands run in axiom_engine_rs/;
+# the checker runs from the root, with the stress log at the root.
+cd axiom_engine_rs
+cargo build --release --locked --features tools
 cargo test --release --locked --test stress
 cargo test --release --locked --test session_concurrency_stress -- --nocapture \
-  2>&1 | tee perf-stress.log
+  2>&1 | tee ../perf-stress.log
 cargo run --release --features tools --bin axiombench -- paired --smoke \
   --fail-on-guardrail --out ../bench/results/paired-ci-smoke.json
 cargo run --release --features tools --bin axiombench -- paired \
   --demo-regression --fail-on-guardrail --out ../bench/results/paired-ci-demo.json
-# The demo run must exit nonzero; the shell check is `if <demo>; then exit 1; fi`.
+# The demo run must exit exactly 1 (guardrail failure, not a usage
+# error or a crash), and its report must show D passing and D-regressed
+# failing the reliability guardrail; CI checks both, not just the exit.
+cd ..
 python3 scripts/check_perf_regression.py \
   --paired bench/results/paired-ci-smoke.json \
   --stress-log perf-stress.log
