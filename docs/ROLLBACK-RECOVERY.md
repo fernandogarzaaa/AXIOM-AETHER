@@ -99,12 +99,34 @@ hashes first with `helm get values <release> -n <namespace>` and
 pass them on the upgrade command. A config-only override file that
 does not mention checkpoint settings works too.
 
+`--reuse-values` merges. It does not delete. When the reverted
+commit added a setting the baseline overlay omits, the revert
+keeps the bad setting. Reset each removed key explicitly with
+`--set <key>=null`, which deletes it from the release values
+(verified: `--set config.groundCorrect=null` renders exactly like
+the baseline that omits the key). Or rebuild the full values file
+from the known-good revision instead of reusing values.
+
+Secrets are reverted the same way, but through the out-of-band
+Secret, never through a values file. A secret revert must not
+commit the old secret value to git. Restoring a Secret does not
+restart the pods: the Deployment checksum covers only the
+ConfigMap, and the server reads `AXIOM_API_KEY` at startup, so
+serving pods keep the bad credentials until they restart. After
+restoring the Secret, restart them explicitly and verify the new
+credentials work before calling the revert done.
+
+```sh
+kubectl -n <namespace> rollout restart deploy/<release>
+kubectl -n <namespace> rollout status deploy/<release>
+kubectl -n <namespace> exec deploy/<release> -- curl -fsS localhost:8080/readyz
+```
+
 Config changes roll the pods because the Deployment carries a
 `checksum/config` annotation. What it must prove: the reverted commit,
-the rendered ConfigMap diff, all pods ready, `/readyz` 200. Secrets
-are reverted the same way, but through the out-of-band Secret, never
-through a values file. A secret revert must not commit the old secret
-value to git.
+the rendered ConfigMap diff, all pods ready, `/readyz` 200. A secret
+revert must prove the same, plus the explicit pod restart and a
+successful credential check after it.
 
 ## Recovery after a crash
 
@@ -202,3 +224,13 @@ item. None of them changed runtime code in this PR.
    because `-f` values take priority over `--reuse-values`. Found
    by Codex review, fixed in this PR: the command now re-applies
    the deployed hashes, and the runbook says how to capture them.
+6. `--reuse-values` merges and never deletes, so reverting a commit
+   that added a setting would have kept the bad setting. Found by
+   Codex review, fixed in this PR: the runbook now says to reset
+   each removed key with `--set <key>=null`, verified to render
+   exactly like the baseline.
+7. Restoring an out-of-band Secret does not restart the pods, so
+   serving pods would have kept the bad credentials: the Deployment
+   checksum covers only the ConfigMap. Found by Codex review, fixed
+   in this PR: the runbook now requires an explicit rollout restart
+   and credential verification after a Secret restore.
