@@ -417,13 +417,17 @@ plus an explicit reliability guardrail):
   harness spends $0. A real cost verdict needs a live-agent run with
   billed-token accounting; wall-clock time is not a substitute.
 
-Open item: the demo-regression FAIL is not wired into CI yet. Main's
-CI runs only `paired --smoke`, without `--fail-on-guardrail` and
-without a `--demo-regression` step. That wiring is unblocked now that
-#293 has merged (the `paired` subcommand exists on main) and is
-specified in the verdicts file. The live gate today is the unit test
-`regressed_arm_fails_the_guardrail_it_is_built_to_trip`, which runs
-under `cargo test` on main.
+Open item (closed by Phase 5 item 3): the demo-regression FAIL is now
+wired into CI. The `perf-regression` job in `.github/workflows/ci.yml`
+runs `paired --smoke --fail-on-guardrail`, runs `paired
+--demo-regression --fail-on-guardrail` as a negative control that must
+exit nonzero, and compares the fresh numbers against the stored
+baseline in `bench/results/perf-baseline.json` with
+`scripts/check_perf_regression.py`. The smoke step in the `test` job
+also carries `--fail-on-guardrail` now. See
+`docs/PERF-REGRESSION-GATE.md`. The unit test
+`regressed_arm_fails_the_guardrail_it_is_built_to_trip` remains the
+in-suite live gate under `cargo test`.
 
 ## Reproduce what exists today
 

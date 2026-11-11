@@ -24,6 +24,10 @@ axiom_master_vibe.bin
 # Deployed release tag recorded by scripts/update_axiom.ps1 (runtime state)
 .axiom_release_version
 bench/results/*.json
+# The perf-regression baseline is the one committed exception: the gate
+# compares fresh runs against it (Phase 5 item 3). Per-run paired JSONs
+# stay ignored.
+!bench/results/perf-baseline.json
 
 # Temp files from CI debugging
 tmp_*.txt
