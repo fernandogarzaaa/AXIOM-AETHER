@@ -26,9 +26,22 @@ image, config, and values.
 
 ```sh
 helm history <release> -n <namespace>
+DEPLOYMENT="$(kubectl -n <namespace> get deploy -l app.kubernetes.io/instance=<release> -o jsonpath='{.items[*].metadata.name}')"
+case "$DEPLOYMENT" in
+  ""|*" "*) echo "no unique Deployment found for release <release>" >&2; exit 1 ;;
+esac
 helm rollback <release> <revision> -n <namespace> --wait --timeout 10m
-kubectl -n <namespace> rollout status deploy/<release>
+kubectl -n <namespace> rollout status "deploy/$DEPLOYMENT"
 ```
+
+The Deployment name is not the release name. The chart names it
+`axiom.fullname`: release plus `-axiom`, or the release name alone
+when it already contains `axiom`, and a `fullnameOverride` replaces
+it entirely. Resolve it from the release label
+`app.kubernetes.io/instance` and fail closed when it resolves to
+zero or more than one Deployment, or a successful rollback fails
+verification with NotFound. Resolve it before the rollback so a
+missing Deployment stops the drill before anything is mutated.
 
 What it must prove: the previous revision number, the image digest
 the pods run after rollback, all pods ready, `/readyz` 200 on every
@@ -117,10 +130,18 @@ restoring the Secret, restart them explicitly and verify the new
 credentials work before calling the revert done.
 
 ```sh
-kubectl -n <namespace> rollout restart deploy/<release>
-kubectl -n <namespace> rollout status deploy/<release>
-kubectl -n <namespace> exec deploy/<release> -- curl -fsS localhost:8080/readyz
+DEPLOYMENT="$(kubectl -n <namespace> get deploy -l app.kubernetes.io/instance=<release> -o jsonpath='{.items[*].metadata.name}')"
+case "$DEPLOYMENT" in
+  ""|*" "*) echo "no unique Deployment found for release <release>" >&2; exit 1 ;;
+esac
+kubectl -n <namespace> rollout restart "deploy/$DEPLOYMENT"
+kubectl -n <namespace> rollout status "deploy/$DEPLOYMENT"
+kubectl -n <namespace> exec "deploy/$DEPLOYMENT" -- curl -fsS localhost:8080/readyz
 ```
+
+The Deployment name comes from the release label, as in Path 1.
+`deploy/<release>` is wrong here for the same reason: the chart
+names the Deployment `axiom.fullname`, not the release name.
 
 Config changes roll the pods because the Deployment carries a
 `checksum/config` annotation. What it must prove: the reverted commit,
@@ -234,3 +255,11 @@ item. None of them changed runtime code in this PR.
    checksum covers only the ConfigMap. Found by Codex review, fixed
    in this PR: the runbook now requires an explicit rollout restart
    and credential verification after a Secret restore.
+8. `kubectl rollout status deploy/<release>` and the readiness exec
+   assumed the Deployment name equals the release name, but the
+   chart names it `axiom.fullname` (release plus `-axiom`, or a
+   `fullnameOverride`). A successful rollback could then fail
+   verification with NotFound. Found by Codex review, fixed in this
+   PR: the drill script and the runbook now resolve the Deployment
+   name from the release label `app.kubernetes.io/instance` and fail
+   closed when it resolves to zero or more than one Deployment.

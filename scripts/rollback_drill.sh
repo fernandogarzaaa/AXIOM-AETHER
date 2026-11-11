@@ -88,6 +88,42 @@ if [ "$MODE" = "cluster" ]; then
       || { echo "rollback_drill: release $RELEASE not found in namespace $NAMESPACE; refusing to run" >&2; exit 1; }
   fi
 
+  # Resolve the Deployment name from the release label, not from the
+  # release name. The chart names the Deployment axiom.fullname
+  # (release + "-axiom", or the release name alone when it already
+  # contains "axiom"), and a fullnameOverride replaces it entirely,
+  # so deploy/"$RELEASE" can be a name that does not exist and a
+  # successful rollback would fail verification with NotFound.
+  # Resolve once, before the rollback, and fail closed on zero or
+  # more than one match.
+  DEPLOYMENT=""
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] kubectl -n \"$NAMESPACE\" get deploy -l app.kubernetes.io/instance=\"$RELEASE\" -o jsonpath='{.items[*].metadata.name}'"
+    # No cluster exists in dry-run, so the label query cannot run.
+    # Use the chart-default fullname for display only: the release
+    # name alone when it already contains "axiom", else release-axiom.
+    # A fullnameOverride cannot be known here; the live run resolves
+    # it through the label selector below.
+    case "$RELEASE" in
+      *axiom*) DEPLOYMENT="$RELEASE" ;;
+      *) DEPLOYMENT="$RELEASE-axiom" ;;
+    esac
+  else
+    DEPLOYMENT_NAMES="$(kubectl -n "$NAMESPACE" get deploy -l "app.kubernetes.io/instance=$RELEASE" -o 'jsonpath={.items[*].metadata.name}')" \
+      || { echo "rollback_drill: could not list Deployments for release $RELEASE in namespace $NAMESPACE" >&2; exit 1; }
+    set -- $DEPLOYMENT_NAMES
+    if [ "$#" -eq 0 ]; then
+      echo "rollback_drill: no Deployment found for release $RELEASE in namespace $NAMESPACE; refusing to run" >&2
+      exit 1
+    fi
+    if [ "$#" -gt 1 ]; then
+      echo "rollback_drill: more than one Deployment found for release $RELEASE in namespace $NAMESPACE ($DEPLOYMENT_NAMES); refusing to run" >&2
+      exit 1
+    fi
+    DEPLOYMENT="$1"
+  fi
+  echo "deployment: $DEPLOYMENT"
+
   echo "--- pre-state ---"
   run helm history "$RELEASE" -n "$NAMESPACE"
   run kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/name=axiom
@@ -99,11 +135,11 @@ if [ "$MODE" = "cluster" ]; then
   else
     run helm rollback "$RELEASE" -n "$NAMESPACE" --wait --timeout 10m
   fi
-  run kubectl -n "$NAMESPACE" rollout status deploy/"$RELEASE"
+  run kubectl -n "$NAMESPACE" rollout status deploy/"$DEPLOYMENT"
 
   echo "--- post-state verification ---"
   run kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/name=axiom
-  run kubectl -n "$NAMESPACE" exec deploy/"$RELEASE" -- curl -fsS localhost:8080/readyz
+  run kubectl -n "$NAMESPACE" exec deploy/"$DEPLOYMENT" -- curl -fsS localhost:8080/readyz
   run helm test "$RELEASE" -n "$NAMESPACE"
 
   finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
