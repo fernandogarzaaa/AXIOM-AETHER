@@ -6,8 +6,9 @@
 //!
 //!   * **Verified fix contents** — the positive examples — come from
 //!     [`crate::patch_memory::PatchMemory`], where each [`PatchCandidate`] stores
-//!     the full file contents that made verify pass, plus a `verified_count`
-//!     confidence weight (how many fleet nodes independently confirmed it green).
+//!     the fix as a diff: the lines that made verify pass, as they read after
+//!     the fix (not the whole file), plus a `verified_count` confidence weight
+//!     (how many fleet nodes independently confirmed it green).
 //!   * **Failure-tension context** — which commands have been hard, and how
 //!     surprising their failures were — comes from
 //!     [`crate::heal_memory::HealMemory`] (`ce_mean` per program). `HealMemory`
@@ -39,7 +40,8 @@ pub struct TrainingExample {
     pub fingerprint: String,
     /// Repo-relative path the fix targeted.
     pub rel_path: String,
-    /// Full verified file contents — the positive target.
+    /// The verified fix: the changed lines as they read after the fix
+    /// (`PatchCandidate::diff.replacement`) — the positive target.
     pub content: String,
     /// Confidence weight = `verified_count` (independent green confirmations).
     pub weight: u32,
@@ -77,7 +79,7 @@ pub fn collect_from_patch_memory(pm: &PatchMemory, min_verified: u32) -> Vec<Tra
                 out.push(TrainingExample {
                     fingerprint: fingerprint.clone(),
                     rel_path: c.rel_path.clone(),
-                    content: c.content.clone(),
+                    content: c.diff.replacement.clone(),
                     weight: c.verified_count,
                 });
             }
@@ -240,14 +242,20 @@ mod tests {
         s
     }
 
+    /// Every fix in these tests creates its file from nothing, so the stored
+    /// span is the whole fixed content.
+    fn test_scope(rel_path: &str) -> crate::patch_memory::RepoScope {
+        crate::patch_memory::RepoScope::new("path:hindsight-test", rel_path)
+    }
+
     #[test]
     fn collect_filters_by_min_verified_and_sorts_by_weight() {
         let mut pm = PatchMemory::new();
-        pm.record_verified("fpA", "src/a.rs", "fn a() {}");
+        pm.record_verified("fpA", &test_scope("src/a.rs"), "", "fn a() {}");
         // Reinforce fpA's candidate to verified_count = 3.
-        pm.record_verified("fpA", "src/a.rs", "fn a() {}");
-        pm.record_verified("fpA", "src/a.rs", "fn a() {}");
-        pm.record_verified("fpB", "src/b.rs", "fn b() {}"); // verified_count = 1
+        pm.record_verified("fpA", &test_scope("src/a.rs"), "", "fn a() {}");
+        pm.record_verified("fpA", &test_scope("src/a.rs"), "", "fn a() {}");
+        pm.record_verified("fpB", &test_scope("src/b.rs"), "", "fn b() {}"); // verified_count = 1
 
         let all = collect_from_patch_memory(&pm, 1);
         assert_eq!(all.len(), 2);
@@ -341,8 +349,8 @@ mod tests {
     fn fine_tune_trains_end_to_end_on_verified_fixes() {
         // Full wiring: record verified fixes → corpus → MetaTrainer → checkpoint.
         let mut pm = PatchMemory::new();
-        pm.record_verified("fp1", "src/one.rs", &long_fix("one"));
-        pm.record_verified("fp2", "src/two.rs", &long_fix("two"));
+        pm.record_verified("fp1", &test_scope("src/one.rs"), "", &long_fix("one"));
+        pm.record_verified("fp2", &test_scope("src/two.rs"), "", &long_fix("two"));
 
         let dir = tmp("train");
         let ckpt = dir.join("ckpt.safetensors").to_string_lossy().to_string();

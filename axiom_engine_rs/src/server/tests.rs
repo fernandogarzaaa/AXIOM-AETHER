@@ -1561,7 +1561,12 @@ mod tests {
         // Seed this node's verified-patch store with one candidate.
         {
             let mut pm = crate::patch_memory::PatchMemory::new();
-            pm.record_verified("fp1", "src/a.rs", "FIXED");
+            pm.record_verified(
+                "fp1",
+                &crate::patch_memory::RepoScope::new("path:test-repo", "src/a.rs"),
+                "BROKEN\n",
+                "FIXED\n",
+            );
             pm.save(&patch_path).unwrap();
         }
 
@@ -1631,9 +1636,16 @@ mod tests {
         let heal_path = dir.join("axiom_heal_memory.json");
         let patch_path = dir.join("axiom_patch_memory.json");
         {
-            let big = "X".repeat(3 * 1024 * 1024); // ~3 MB > the 2 MB default
+            // A fix that rewrites ~3 MB of one file: its diff alone exceeds
+            // the 2 MB default.
+            let big = "X".repeat(3 * 1024 * 1024);
             let mut pm = crate::patch_memory::PatchMemory::new();
-            pm.record_verified("fp-big", "src/big.rs", &big);
+            pm.record_verified(
+                "fp-big",
+                &crate::patch_memory::RepoScope::new("path:test-repo", "src/big.rs"),
+                "small\n",
+                &big,
+            );
             pm.save(&patch_path).unwrap();
         }
 

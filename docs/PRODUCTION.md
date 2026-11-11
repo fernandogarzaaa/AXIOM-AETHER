@@ -154,10 +154,15 @@ Set `AXIOM_FLEET_KEY` identically on all nodes and configure peers via
 
 ## 5. Safety invariants (do not regress)
 
-1. **Re-verify before trust.** A peer's patch is never applied on trust — only
-   through `PatchMemory::try_candidates`, which writes it, runs *this node's*
-   verifier, and keeps it only if it passes locally, else rolls back
-   byte-for-byte. `verified_count` is a ranking signal, never authorization.
+1. **Pre-image match, then re-verify.** A stored fix is a diff against one
+   exact file: it records the repository identity, the file's path, and the
+   SHA-256 of the file before the fix. `PatchMemory::try_candidates` considers
+   a fix only when the current file hashes to that pre-image in the same
+   repository, so a file that has changed since (newer or uncommitted work, or
+   another project's same-named file) is never written to. A matching fix is
+   then written, *this node's* verifier is run, and the fix is kept only if it
+   passes locally, else rolled back byte-for-byte. `verified_count` is a
+   ranking signal, never authorization.
 2. **Provenance gates ingestion.** A merge is accepted only when this node
    has `AXIOM_FLEET_KEY` and the export's HMAC verifies under it (SHA-256
    integrity is checked too). A node with no fleet key answers 401 to every
