@@ -1630,13 +1630,20 @@ mod tests {
         // Seed this node's verified-patch store with one candidate.
         {
             let mut pm = crate::patch_memory::PatchMemory::new();
-            pm.record_verified("fp1", "src/a.rs", "FIXED");
+            pm.record_verified(
+                "fp1",
+                &crate::patch_memory::RepoScope::new("path:test-repo", "src/a.rs"),
+                "BROKEN\n",
+                "FIXED\n",
+            );
             pm.save(&patch_path).unwrap();
         }
 
+        // The merge route requires a fleet key (and signs exports with it).
         let state = make_test_state()
             .await
-            .with_heal_memory_path(Some(heal_path));
+            .with_heal_memory_path(Some(heal_path))
+            .with_fleet_key(Some(b"test-fleet-key".to_vec()));
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
 
@@ -1664,6 +1671,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri("/v1/patches/merge")
+                    .header("host", "127.0.0.1:8080")
                     .header("content-type", "application/json")
                     .body(Body::from(export.to_vec()))
                     .unwrap(),
@@ -1697,15 +1705,24 @@ mod tests {
         let heal_path = dir.join("axiom_heal_memory.json");
         let patch_path = dir.join("axiom_patch_memory.json");
         {
-            let big = "X".repeat(3 * 1024 * 1024); // ~3 MB > the 2 MB default
+            // A fix that rewrites ~3 MB of one file: its diff alone exceeds
+            // the 2 MB default.
+            let big = "X".repeat(3 * 1024 * 1024);
             let mut pm = crate::patch_memory::PatchMemory::new();
-            pm.record_verified("fp-big", "src/big.rs", &big);
+            pm.record_verified(
+                "fp-big",
+                &crate::patch_memory::RepoScope::new("path:test-repo", "src/big.rs"),
+                "small\n",
+                &big,
+            );
             pm.save(&patch_path).unwrap();
         }
 
+        // The merge route requires a fleet key (and signs exports with it).
         let state = make_test_state()
             .await
-            .with_heal_memory_path(Some(heal_path));
+            .with_heal_memory_path(Some(heal_path))
+            .with_fleet_key(Some(b"test-fleet-key".to_vec()));
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
 
@@ -1734,6 +1751,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri("/v1/patches/merge")
+                    .header("host", "127.0.0.1:8080")
                     .header("content-type", "application/json")
                     .body(Body::from(export.to_vec()))
                     .unwrap(),

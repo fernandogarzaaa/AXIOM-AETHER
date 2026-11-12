@@ -4,8 +4,9 @@
 # ---------------------------------------------------------------------------
 # Immunity gossip — propagates each node's learned heal-memory across the fleet.
 # Pulls every Ready pod's signed /v1/immunity export and folds it into the
-# others via /v1/immunity/merge. Exports are HMAC-signed when AXIOM_FLEET_KEY
-# is set, so a receiver verifies provenance before trusting a peer.
+# others via /v1/immunity/merge. Exports are HMAC-signed with AXIOM_FLEET_KEY
+# and a receiver merges only an export whose HMAC verifies under the same key;
+# with no fleet key every merge is refused (401) and nothing propagates.
 # ---------------------------------------------------------------------------
 apiVersion: v1
 kind: ServiceAccount
