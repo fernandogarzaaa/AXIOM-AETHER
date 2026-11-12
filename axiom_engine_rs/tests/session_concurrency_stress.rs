@@ -96,13 +96,23 @@ const BASELINE_REQUESTS: usize = 4;
 const MAX_P95_GROWTH: f64 = 20.0;
 
 /// Max RSS growth of one level over the RSS measured just before it:
-/// 25% relative plus 16 MiB of slack for allocator retention and the
+/// 25% relative plus 24 MiB of slack for allocator retention and the
 /// mock-upstream bookkeeping. Session tensors here are tiny (d_model 16,
 /// 1 layer), so a real per-session leak shows up as growth far above this.
-/// Measured per-level deltas: +3-4 MiB (level 1), +9-10 MiB (level 4),
-/// +18-20 MiB (level 16), +4-10 MiB (level 32).
+/// Measured per-level deltas on the calibration sandbox: +3-4 MiB (level 1),
+/// +9-10 MiB (level 4), +18-20 MiB (level 16), +4-10 MiB (level 32).
+///
+/// Re-calibrated 2026-11-12 from 16 MiB. On GitHub's hosted runners level 16
+/// grew by 20.7 MiB in a passing job and by 24.0, 24.2 and 24.6 MiB in three
+/// jobs of one CI round (2026-11-11, PRs #300 and #302, neither of which
+/// touches sessions), against a budget of about 23.5 MiB: the old slack sat
+/// inside the run-to-run spread of level 16. With 24 MiB the level-16 budget
+/// is about 31.5 MiB, a quarter above the largest growth seen. It still
+/// catches what the bound is for: sessions that are not released keep their
+/// roughly 1.4 MiB each, so level 32 would then need about 45 MiB of new
+/// memory against a budget of about 38 MiB.
 const MAX_RSS_GROWTH_RATIO: f64 = 1.25;
-const MAX_RSS_GROWTH_SLACK_KIB: u64 = 16 * 1024;
+const MAX_RSS_GROWTH_SLACK_KIB: u64 = 24 * 1024;
 
 type Captured = Arc<Mutex<Vec<Value>>>;
 
