@@ -611,6 +611,20 @@ pub struct AppState {
     /// Path to the persistent heal memory served/merged by the swarm-immunity
     /// endpoints (`/v1/immunity`). `None` disables those routes.
     pub heal_memory_path: Arc<Option<std::path::PathBuf>>,
+    /// The shared fleet secret (`AXIOM_FLEET_KEY`). The fleet merge routes
+    /// (`POST /v1/immunity/merge`, `POST /v1/patches/merge`) refuse every
+    /// request while this is `None`, and with a key they accept only exports
+    /// whose HMAC verifies under it. The matching export routes sign with it.
+    /// `None` by default: a node that was never given a key merges nothing.
+    pub fleet_key: Arc<Option<Vec<u8>>>,
+    /// Extra `Host` names the fleet merge routes accept, beyond `localhost`
+    /// and IP literals (`AXIOM_MERGE_ALLOWED_HOSTS`, comma-separated, stored
+    /// lowercase). See [`merge_host_allowed`].
+    pub merge_allowed_hosts: Arc<Vec<String>>,
+    /// `Origin` values the fleet merge routes accept when a request carries an
+    /// `Origin` header at all (the `AXIOM_CORS_ORIGINS` allowlist). Empty by
+    /// default: every browser-originated merge is refused.
+    pub merge_allowed_origins: Arc<Vec<HeaderValue>>,
     /// Per-session token-awareness and self-awareness state. Tracks budget,
     /// token costs of Axiom responses, and compression metrics so Axiom can
     /// adapt autonomously. Populated via `POST /v1/budget`.
@@ -674,6 +688,9 @@ impl AppState {
             dwe_bus: Arc::new(DweBus::from_env()),
             swarm_matrix: Arc::new(LocalSwarmRouteMatrix::new()),
             heal_memory_path: Arc::new(None),
+            fleet_key: Arc::new(None),
+            merge_allowed_hosts: Arc::new(Vec::new()),
+            merge_allowed_origins: Arc::new(Vec::new()),
             awareness: AwarenessStore::new(),
             cvm_store: Arc::new(Self::open_cvm_store()),
             keepalive: crate::keepalive::KeepaliveManager::disabled(),
@@ -736,6 +753,35 @@ impl AppState {
     /// Enable the swarm-immunity endpoints against this heal-memory file.
     pub fn with_heal_memory_path(mut self, path: Option<std::path::PathBuf>) -> Self {
         self.heal_memory_path = Arc::new(path);
+        self
+    }
+
+    /// Set the shared fleet secret (normally `AXIOM_FLEET_KEY`). Without one
+    /// the fleet merge routes answer 401 to everything; an empty key counts as
+    /// no key.
+    pub fn with_fleet_key(mut self, key: Option<Vec<u8>>) -> Self {
+        self.fleet_key = Arc::new(key.filter(|k| !k.is_empty()));
+        self
+    }
+
+    /// Extra `Host` names accepted on the fleet merge routes (normally
+    /// `AXIOM_MERGE_ALLOWED_HOSTS`). `localhost` and IP literals are always
+    /// accepted; anything else must be listed here.
+    pub fn with_merge_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.merge_allowed_hosts = Arc::new(
+            hosts
+                .into_iter()
+                .map(|h| normalize_host_name(&h))
+                .filter(|h| !h.is_empty())
+                .collect(),
+        );
+        self
+    }
+
+    /// `Origin` values accepted on the fleet merge routes (normally the
+    /// `AXIOM_CORS_ORIGINS` allowlist).
+    pub fn with_merge_allowed_origins(mut self, origins: Vec<HeaderValue>) -> Self {
+        self.merge_allowed_origins = Arc::new(origins);
         self
     }
 

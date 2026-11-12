@@ -251,7 +251,12 @@ pub async fn run_server(
         .with_swarm_router(swarm_router)
         .with_compressor_config(compressor_config)
         .with_master_vibe(master_vibe)
-        .with_heal_memory_path(heal_memory_path);
+        .with_heal_memory_path(heal_memory_path)
+        // Fleet merge trust: without AXIOM_FLEET_KEY the merge routes refuse
+        // everything; Host/Origin allowlists stop browser-borne requests.
+        .with_fleet_key(fleet_key())
+        .with_merge_allowed_hosts(merge_allowed_hosts_from_env())
+        .with_merge_allowed_origins(cors_origins_from_env());
     // S6 (CVM cost stack): actuarial keepalive, AXIOM_KEEPALIVE=1 opt-in
     // only (KeepaliveManager::from_env prints the required security boot
     // banner when enabled; a no-op manager otherwise).
