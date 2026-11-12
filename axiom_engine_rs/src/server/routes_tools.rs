@@ -5,9 +5,9 @@ fn patch_store_path(state: &AppState) -> Option<PathBuf> {
 }
 
 /// `GET /v1/patches` — this node's verified-patch store, provenance-signed
-/// (SHA-256 + optional HMAC via `AXIOM_FLEET_KEY`) so a peer can verify before
-/// trusting. The payload only carries candidates; a peer never applies them
-/// without re-verifying locally (see `POST /v1/patches/merge`).
+/// (SHA-256, plus an HMAC when a fleet key is configured). A peer merges the
+/// export only if that HMAC verifies under the shared fleet key (see
+/// `POST /v1/patches/merge`), so an export from a keyless node merges nowhere.
 async fn get_patches(State(state): State<AppState>) -> Response {
     let Some(path) = patch_store_path(&state) else {
         return (
@@ -17,17 +17,24 @@ async fn get_patches(State(state): State<AppState>) -> Response {
             .into_response();
     };
     let memory = crate::patch_memory::PatchMemory::load(&path);
-    let signed = memory.export_signed(fleet_key().as_deref());
+    let signed = memory.export_signed(state.fleet_key.as_deref());
     Json(signed).into_response()
 }
 
 /// `POST /v1/patches/merge` — fold a peer's signed patch export (its
-/// `GET /v1/patches` payload) into this node's store. Provenance is enforced:
-/// `merge_signed` verifies the signature/hash and recomputes content hashes, and
-/// a fleet key (if configured) is required. SAFETY: merging only *records*
-/// candidates — a peer's fix is never executed or written until the autonomous
-/// repair loop re-verifies it green locally, so an incorrect or malicious peer
-/// patch is inert.
+/// `GET /v1/patches` payload) into this node's store.
+///
+/// A fleet key is required: the route sits behind
+/// [`require_fleet_merge_trust`] (allowlisted `Host`, no foreign `Origin`, and
+/// a 401 for every request while this node has no `AXIOM_FLEET_KEY`), and
+/// `merge_signed_guarded` then accepts the export only if its HMAC verifies
+/// under that key, recomputing content hashes as it folds candidates in.
+///
+/// A merged candidate is NOT inert. Merging only records it, but the repair
+/// loop "re-verifies" a recorded candidate by writing its content into the
+/// blamed source file and running the verify command, so whoever can put a
+/// candidate in this store can run code as the user on the next `axiom solve`.
+/// That is why an unauthenticated or unsigned export must never be stored.
 async fn post_patches_merge(State(state): State<AppState>, body: String) -> Response {
     let Some(path) = patch_store_path(&state) else {
         return (
@@ -49,12 +56,13 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
         }
     };
     let mut memory = crate::patch_memory::PatchMemory::load(&path);
-    // Byzantine-robust: a peer holding the fleet key still cannot inflate trust
-    // or flood the store — the robust policy bounds per-peer contribution. Local
-    // re-verification still gates any application.
+    // Authenticated: the export's HMAC must verify under this node's fleet key
+    // (no key → `NoFleetKey`, refused). Byzantine-robust: a peer holding the
+    // key still cannot inflate trust or flood the store — the robust policy
+    // bounds per-peer contribution.
     match memory.merge_signed_guarded(
         &export,
-        fleet_key().as_deref(),
+        state.fleet_key.as_deref(),
         crate::patch_memory::FleetTrustPolicy::robust(),
     ) {
         Ok(report) => {

@@ -98,7 +98,8 @@ unset. When you add a variable, add it here.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `AXIOM_FLEET_KEY` / `AXIOM_FLEET_KEY_PREV` | unset | HMAC key (and rotation predecessor) for immunity exchange and DWE fragments. |
+| `AXIOM_FLEET_KEY` / `AXIOM_FLEET_KEY_PREV` | unset | `AXIOM_FLEET_KEY` is the HMAC key for immunity/patch exchange and DWE fragments. It is required to merge: with no key, `POST /v1/immunity/merge` and `POST /v1/patches/merge` answer 401 to every request, and with a key they accept only exports whose HMAC verifies under `AXIOM_FLEET_KEY`. `AXIOM_FLEET_KEY_PREV` (the rotation predecessor) is accepted for DWE fragments only; the merge routes never verify against it, so during a rolling key rotation nodes holding different current keys refuse each other's exports until every node has the new key. |
+| `AXIOM_MERGE_ALLOWED_HOSTS` | unset | Extra `Host` names (comma-separated) accepted on the two merge routes. `localhost` and IP literals are always accepted; any other name is refused with 403 unless listed (DNS-rebinding guard). A request carrying an `Origin` header is accepted only if that origin is in `AXIOM_CORS_ORIGINS`. |
 | `AXIOM_DWE_LISTEN` / `AXIOM_DWE_PEERS` | unset | Enable DWE and list comma-separated peers. |
 
 ## Grounding

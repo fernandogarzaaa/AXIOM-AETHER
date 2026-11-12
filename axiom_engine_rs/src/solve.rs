@@ -64,13 +64,16 @@ pub struct SolveReport {
     pub rounds: usize,
     /// Environment heals applied across all rounds (human-readable).
     pub env_heals: Vec<String>,
-    /// True if a Poly JIT source patch ultimately made the target pass.
+    /// True if the solve left a source file changed by a deterministic phase:
+    /// a Poly JIT patch, a mutation repair, or a stored fix (in which case
+    /// `fleet_patched` is set too).
     pub source_patched: bool,
     /// True if an LLM-proposed, *verifier-gated* source patch made the target
     /// pass (only kept when the verify command independently went green).
     pub llm_patched: bool,
-    /// True if a patch from the verified-patch store (incl. peer-merged fleet
-    /// patches) was re-verified green locally and applied.
+    /// True if a fix from the verified-patch store (incl. peer-merged fleet
+    /// patches) matched this file's exact content, was applied, and was
+    /// re-verified green locally. Implies `source_patched`.
     pub fleet_patched: bool,
     /// Non-correctable diagnostics surfaced (missing env var, disk full, …).
     pub diagnostics: Vec<String>,
@@ -202,9 +205,16 @@ fn attempt_source_repair(
     src: &Path,
     report: &mut SolveReport,
 ) -> CResult<bool> {
-    // Single portable patch key, shared by fleet-reuse (try) and record, so a
-    // patch is only ever re-applied to the file it was learned for.
-    let rel = rel_path_for(src, opts.anchor.as_deref());
+    // Where this file lives: repository identity + repository-relative path.
+    // Shared by record and reuse below, so a stored fix is only ever tried on
+    // the file it was learned for, in the repository it was learned in. `None`
+    // (the file is under no identifiable root) disables both for this file.
+    let scope = crate::patch_memory::repo_scope(src, opts.anchor.as_deref());
+    // Name used in log lines only.
+    let rel = scope
+        .as_ref()
+        .map(|s| s.rel_path.clone())
+        .unwrap_or_else(|| src.display().to_string());
     let backup = std::fs::read_to_string(src).ok();
     let engine = PolyJitEngine::default();
     let run_req = PolyJitRunRequest {
@@ -294,38 +304,36 @@ fn attempt_source_repair(
                         applied.as_deref().unwrap_or("?"),
                         rel
                     );
-                    if let Some(pm_path) = opts.patch_memory_path.as_deref() {
-                        if let Ok(content) = std::fs::read_to_string(src) {
-                            let fp = crate::heal_memory::fingerprint(command, args);
-                            let mut pm = crate::patch_memory::PatchMemory::load(pm_path);
-                            pm.record_verified(&fp, &rel, &content);
-                            let _ = pm.save(pm_path);
-                        }
-                    }
+                    record_verified_fix(opts, scope.as_ref(), command, args, &original, src);
                     return Ok(true);
                 }
             }
         }
     }
 
-    // --- Phase 2.5: fleet patch reuse (re-verified locally) -----------------
-    // Before spending an LLM call, try patches the verified-patch store already
-    // knows for this failure (including peer-merged fleet patches). SAFETY: each
-    // candidate is applied through PatchMemory::try_candidates, which re-runs
-    // THIS node's verify and keeps it only if green — a peer's patch is never
-    // trusted blindly.
-    if let Some(pm_path) = opts.patch_memory_path.as_deref() {
+    // --- Phase 2.5: stored-fix reuse (pre-image matched, re-verified) -------
+    // Before spending an LLM call, try fixes the verified-patch store already
+    // knows for this failure (including peer-merged fleet patches). SAFETY:
+    // PatchMemory::try_candidates only considers a fix recorded against the
+    // exact bytes this file holds now, in this repository — so a file that has
+    // changed since (newer or uncommitted work, another project's same-named
+    // file) is never written to — and then re-runs THIS node's verify, keeping
+    // the fix only if green.
+    if let (Some(pm_path), Some(scope)) = (opts.patch_memory_path.as_deref(), scope.as_ref()) {
         let fp = crate::heal_memory::fingerprint(command, args);
         let pm = crate::patch_memory::PatchMemory::load(pm_path);
         let working_dir = opts.anchor.as_deref();
         if let Some(sha) =
-            pm.try_candidates(&fp, &rel, src, || run_verify(command, args, working_dir))
+            pm.try_candidates(&fp, scope, src, || run_verify(command, args, working_dir))
         {
+            // The source file was changed: say so, alongside where the fix
+            // came from.
+            report.source_patched = true;
             report.fleet_patched = true;
             report.solved = true;
             report.final_exit = Some(0);
             println!(
-                "[axiom-solve] round {round}: fleet patch {} verified green locally",
+                "[axiom-solve] round {round}: stored fix {} applied to {rel} and verified green locally",
                 &sha[..sha.len().min(12)]
             );
             return Ok(true);
@@ -363,6 +371,8 @@ fn attempt_source_repair(
         } else {
             trace
         };
+        // The pre-image a verified LLM fix is recorded against.
+        let before_llm = std::fs::read_to_string(src).ok();
         let solved = llm_repair_round(
             backend.as_ref(),
             command,
@@ -379,13 +389,8 @@ fn attempt_source_repair(
             // Record the verified fix so this node — and, via signed gossip, the
             // fleet — can reuse it next time this failure signature recurs
             // (always re-verified before trust).
-            if let Some(pm_path) = opts.patch_memory_path.as_deref() {
-                if let Ok(content) = std::fs::read_to_string(src) {
-                    let fp = crate::heal_memory::fingerprint(command, args);
-                    let mut pm = crate::patch_memory::PatchMemory::load(pm_path);
-                    pm.record_verified(&fp, &rel, &content);
-                    let _ = pm.save(pm_path);
-                }
+            if let Some(original) = before_llm.as_deref() {
+                record_verified_fix(opts, scope.as_ref(), command, args, original, src);
             }
             return Ok(true);
         }
@@ -572,23 +577,31 @@ fn verify_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
-/// Portable key for a patched source file: anchor-relative when the source lives
-/// under the working dir (so the same logical file matches across checkouts and
-/// on different nodes), else the bare file name, else the full display path. This
-/// MUST be computed identically at record time and at try time so a patch is only
-/// ever re-applied to the file it was learned for.
-fn rel_path_for(src: &Path, anchor: Option<&Path>) -> String {
-    if let Some(a) = anchor {
-        if let Ok(stripped) = src.strip_prefix(a) {
-            let s = stripped.to_string_lossy();
-            if !s.is_empty() {
-                return s.into_owned();
-            }
-        }
+/// Record a fix that just verified green in the patch store: `src` read
+/// `original` before the fix and holds the fixed content now. Stored as a diff
+/// keyed by `scope` (repository + path) and the hash of `original`, so it can
+/// later be applied only to that exact file state. A no-op when there is no
+/// patch store or no repository scope for this file.
+fn record_verified_fix(
+    opts: &SolveOptions,
+    scope: Option<&crate::patch_memory::RepoScope>,
+    command: &str,
+    args: &[String],
+    original: &str,
+    src: &Path,
+) {
+    let (Some(pm_path), Some(scope)) = (opts.patch_memory_path.as_deref(), scope) else {
+        return;
+    };
+    let Ok(fixed) = std::fs::read_to_string(src) else {
+        return;
+    };
+    let fp = crate::heal_memory::fingerprint(command, args);
+    let mut pm = crate::patch_memory::PatchMemory::load(pm_path);
+    pm.record_verified(&fp, scope, original, &fixed);
+    if let Err(e) = pm.save(pm_path) {
+        eprintln!("[axiom-solve] could not save the patch store: {e}");
     }
-    src.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| src.display().to_string())
 }
 
 /// Resolves a POSIX-compatible shell for running the `sh`/`sh -c "..."`
