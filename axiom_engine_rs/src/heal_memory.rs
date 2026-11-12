@@ -183,12 +183,6 @@ const STRUCTURAL_COROBORATION_THRESHOLD: usize = 2;
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct MemoryFile {
     programs: HashMap<String, ProgramRecord>,
-    /// SHA-256 digests of the exports already merged into this memory, and of
-    /// the exports it handed out itself, oldest first (bounded). Merging one
-    /// of them again changes nothing: see [`HealMemory::merge_json`]. Local
-    /// bookkeeping, never part of an export.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    seen_exports: Vec<String>,
 }
 
 /// What a swarm-immunity merge changed locally.
@@ -205,8 +199,9 @@ pub struct MergeReport {
     pub belief_conflicts: usize,
     /// Peer records rejected as byzantine (implausible belief parameters).
     pub byzantine_rejected: usize,
-    /// This exact export was merged before, or is one this memory handed out
-    /// itself. Nothing was changed and the other counts are zero.
+    /// Set by [`HealMemory::merge_json_once`] when this exact export was
+    /// merged before, or is one this node handed out itself. Nothing was
+    /// changed and the other counts are zero.
     pub already_merged: bool,
 }
 
@@ -789,10 +784,11 @@ impl HealMemory {
         before - self.data.programs.len()
     }
 
-    /// Serialize the memory for transfer to a swarm peer: the program records
-    /// only, in fingerprint order. The same memory always exports the same
-    /// bytes, so an export's digest changes only when a record does. The
-    /// record of exports already seen is local bookkeeping and stays out.
+    /// Serialize the whole memory for transfer to a swarm peer, with the
+    /// program records in fingerprint order. The records live in a hash map,
+    /// whose order differs from one load to the next; written in order, the
+    /// same memory always exports the same bytes, so an export can be known
+    /// by its digest ([`crate::export_ledger`]).
     pub fn to_json(&self) -> String {
         #[derive(Serialize)]
         struct Export<'a> {
@@ -804,25 +800,31 @@ impl HealMemory {
         .unwrap_or_else(|_| "{}".into())
     }
 
-    /// Has this exact export payload been merged here, or handed out by this
-    /// memory, already?
-    pub fn has_seen_export(&self, payload: &str) -> bool {
-        let digest = crate::provenance::sha256_hex(payload.as_bytes());
-        self.data.seen_exports.contains(&digest)
-    }
-
-    /// Record `payload` as an export this memory handed out, so that it
-    /// changes nothing if it is sent back to this node's merge route. Returns
-    /// `true` when the memory changed and needs saving.
+    /// [`Self::merge_json`], counting an export once.
     ///
-    /// Without this, anyone who can read a node's export can post it back:
-    /// every record merges with itself (evidence compounds, counts double),
-    /// the export then differs, and the loop repeats.
-    pub fn note_own_export(&mut self, payload: &str) -> bool {
-        crate::patch_memory::remember_export(
-            &mut self.data.seen_exports,
-            &crate::provenance::sha256_hex(payload.as_bytes()),
-        )
+    /// An export is one statement by one peer. Merging the same bytes again
+    /// (a retry, a sync job on a timer, a repeated pull of a peer that has
+    /// not changed, a replay, or this node's own export sent back) must add
+    /// nothing, or evidence compounds without anything new having been
+    /// observed. `ledger` is this memory's [`crate::export_ledger::ExportLedger`]:
+    /// a payload already in it is reported as
+    /// [`MergeReport::already_merged`] and the memory is left untouched; a
+    /// new one is merged and recorded. The caller saves the memory, then the
+    /// ledger. A *different* export from the same peer still merges.
+    pub fn merge_json_once(
+        &mut self,
+        peer_json: &str,
+        ledger: &mut crate::export_ledger::ExportLedger,
+    ) -> Result<MergeReport, String> {
+        if ledger.contains(peer_json) {
+            return Ok(MergeReport {
+                already_merged: true,
+                ..MergeReport::default()
+            });
+        }
+        let report = self.merge_json(peer_json)?;
+        ledger.remember(peer_json);
+        Ok(report)
     }
 
     /// Merge a peer's exported memory into this one (swarm immunity), with
@@ -839,21 +841,10 @@ impl HealMemory {
     /// * Directory lists are unioned; failure-tension is count-weighted-mean.
     ///
     /// A malformed peer payload is rejected without touching local state.
-    ///
-    /// Merging is idempotent per export. An export is one statement by one
-    /// peer, so merging the same bytes again (a retry, a repeated pull of a
-    /// peer that has not changed, a replay, or this memory's own export sent
-    /// back) adds nothing: the report says [`MergeReport::already_merged`] and
-    /// the memory is untouched. The digests of merged exports are saved with
-    /// the memory. A *different* export from the same peer still merges.
     pub fn merge_json(&mut self, peer_json: &str) -> Result<MergeReport, String> {
         let peer: MemoryFile =
             serde_json::from_str(peer_json).map_err(|e| format!("invalid peer memory: {e}"))?;
         let mut report = MergeReport::default();
-        if !self.note_own_export(peer_json) {
-            report.already_merged = true;
-            return Ok(report);
-        }
         let reliability = peer_reliability();
         for (fp, theirs) in peer.programs {
             // Byzantine gate: a peer cannot inject malformed/fabricated beliefs.
@@ -1045,22 +1036,32 @@ mod tests {
 
     #[test]
     fn merging_the_same_export_again_changes_nothing() {
+        use crate::export_ledger::ExportLedger;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("heal_memory.json");
         let fp = fingerprint("prog", &[]);
-        let mut ours = HealMemory::load(tmp("idem_ours"));
+        let mut ours = HealMemory::load(&store);
         ours.remember_dirs(&fp, "prog", &[PathBuf::from("/a")]);
         ours.reinforce_immunity(&fp, 1_000_000_000);
-        let mut theirs = HealMemory::load(tmp("idem_theirs"));
+        let mut theirs = HealMemory::load(dir.path().join("peer.json"));
         theirs.remember_dirs(&fp, "prog", &[PathBuf::from("/b")]);
         theirs.reinforce_immunity(&fp, 1_000_000_000);
         let export = theirs.to_json();
 
-        let first = ours.merge_json(&export).unwrap();
+        let first = ExportLedger::with(&store, |ledger| {
+            let report = ours.merge_json_once(&export, ledger).unwrap();
+            ledger.save().unwrap();
+            report
+        });
         assert!(!first.already_merged);
         assert_eq!((first.programs_merged, first.dirs_added), (1, 1));
         let after_first = ours.to_json();
 
+        // The ledger is read from disk each time, as after a restart.
         for _ in 0..3 {
-            let again = ours.merge_json(&export).unwrap();
+            let again = ExportLedger::with(&store, |ledger| {
+                ours.merge_json_once(&export, ledger).unwrap()
+            });
             assert_eq!(
                 again,
                 MergeReport {
@@ -1075,40 +1076,16 @@ mod tests {
             "a repeated export must not compound evidence or counts"
         );
 
-        // The record survives a save and a load.
-        ours.save().unwrap();
-        let mut reloaded = HealMemory::load(&ours.path);
-        let _ = std::fs::remove_file(&ours.path);
-        assert!(reloaded.merge_json(&export).unwrap().already_merged);
-        assert_eq!(reloaded.to_json(), after_first);
-
-        // A different export from the peer still merges.
+        // A different export from the peer still merges. A malformed one is
+        // rejected and not recorded.
         theirs.remember_dirs(&fp, "prog", &[PathBuf::from("/c")]);
-        let next = reloaded.merge_json(&theirs.to_json()).unwrap();
-        assert!(!next.already_merged);
-        assert_eq!(next.dirs_added, 1);
-    }
-
-    #[test]
-    fn a_memorys_own_export_sent_back_to_it_changes_nothing() {
-        let fp = fingerprint("prog", &[]);
-        let mut node = HealMemory::load(tmp("own_export"));
-        node.remember_dirs(&fp, "prog", &[PathBuf::from("/a")]);
-        node.reinforce_immunity(&fp, 1_000_000_000);
-
-        // What `GET /v1/immunity` does: export, and note the export.
-        let export = node.to_json();
-        assert!(!node.has_seen_export(&export));
-        assert!(node.note_own_export(&export), "first time: memory changed");
-        assert!(!node.note_own_export(&export), "same export: nothing new");
-        assert!(node.has_seen_export(&export));
-        // Noting it does not change what is exported.
-        assert_eq!(node.to_json(), export);
-        assert!(!export.contains("seen_exports"));
-
-        let report = node.merge_json(&export).unwrap();
-        assert!(report.already_merged);
-        assert_eq!(node.to_json(), export);
+        ExportLedger::with(&store, |ledger| {
+            let next = ours.merge_json_once(&theirs.to_json(), ledger).unwrap();
+            assert!(!next.already_merged);
+            assert_eq!(next.dirs_added, 1);
+            assert!(ours.merge_json_once("{broken", ledger).is_err());
+            assert!(!ledger.contains("{broken"));
+        });
     }
 
     #[test]
@@ -1127,9 +1104,10 @@ mod tests {
             assert_eq!(HealMemory::load(&path).to_json(), export);
         }
         let _ = std::fs::remove_file(&path);
-        // A malformed payload is not remembered.
-        assert!(mem.merge_json("{broken").is_err());
-        assert!(!mem.has_seen_export("{broken"));
+        // The export still reads back as the memory it came from.
+        let mut copy = HealMemory::load(tmp("stable_export_copy"));
+        assert_eq!(copy.merge_json(&export).unwrap().programs_added, 24);
+        assert_eq!(copy.to_json(), export);
     }
 
     #[test]

@@ -1392,13 +1392,20 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     }
                     Err(_) => fetched, // back-compat: unsigned peer
                 };
-                let mut memory = heal_memory::HealMemory::load(&local);
-                let report = memory
-                    .merge_json(&peer_json)
-                    .map_err(candle_core::Error::Msg)?;
-                memory
-                    .save()
-                    .map_err(|e| candle_core::Error::Msg(format!("memory save failed: {e}")))?;
+                // An export counts once: pulling a peer that has not changed
+                // since the last pull must not compound its evidence.
+                let report = crate::export_ledger::ExportLedger::with(&local, |ledger| {
+                    let mut memory = heal_memory::HealMemory::load(&local);
+                    let report = memory
+                        .merge_json_once(&peer_json, ledger)
+                        .map_err(candle_core::Error::Msg)?;
+                    if !report.already_merged {
+                        memory.save().and_then(|()| ledger.save()).map_err(|e| {
+                            candle_core::Error::Msg(format!("memory save failed: {e}"))
+                        })?;
+                    }
+                    Ok::<_, candle_core::Error>(report)
+                })?;
                 if report.already_merged {
                     println!(
                         "[axiom] swarm immunity from {url}: this export was merged before; nothing changed"

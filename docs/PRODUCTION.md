@@ -150,7 +150,9 @@ Set `AXIOM_FLEET_KEY` identically on all nodes and configure peers via
 Both merge routes count an export once. Delivering the same export again (a
 retry, a sync job that runs on a timer, a replay, or a node's own export posted
 back to it) answers `"already_merged": true` and changes nothing. Each store
-keeps the digests of the last 1024 exports it merged or handed out. A
+has a ledger file beside it (`heal_memory.exports.json`,
+`axiom_patch_memory.exports.json`) with the digests of the last 1024 exports
+it merged or handed out; reading an export never rewrites the store itself. A
 different export from a peer is new information and merges as before, so how
 often a peer's *changed* store counts is still bounded only by who holds the
 fleet key.

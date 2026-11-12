@@ -17,7 +17,10 @@
 //!   and the response says `"already_merged": true`;
 //! * a node's own export, read from its `GET` route and posted back to its
 //!   merge route, changes nothing, however many round trips are made;
-//! * a different export from the peer still merges.
+//! * a different export from the peer still merges;
+//! * reading an export never rewrites the store: the record of what was
+//!   handed out lives in a ledger file beside it, so a polled export route
+//!   cannot drop a fix that a solve or a merge saved in between.
 
 use std::path::{Path, PathBuf};
 
@@ -188,9 +191,15 @@ async fn a_nodes_own_patch_export_posted_back_changes_nothing() {
 
     // Read the export, post it back, read the (possibly changed) export, post
     // that back. No key and no peer is needed for any of it.
+    let store_before = std::fs::read(&patches).unwrap();
     let mut exports = Vec::new();
     for round in 1..=4 {
         let export = get_export(&node, "/v1/patches").await;
+        assert_eq!(
+            std::fs::read(&patches).unwrap(),
+            store_before,
+            "round {round}: reading the export rewrote the store"
+        );
         let answer = post_merge(&node, "/v1/patches/merge", &export).await;
         assert_eq!(
             confirmations(&patches),
@@ -204,8 +213,10 @@ async fn a_nodes_own_patch_export_posted_back_changes_nothing() {
         exports.iter().all(|e| e == &exports[0]),
         "the export must not change when nothing was learned"
     );
-    // The bookkeeping is not part of what peers receive.
-    assert!(!exports[0].contains("seen_exports"), "{}", exports[0]);
+    // Nothing was written to the store at any point; what was handed out is
+    // on record beside it.
+    assert_eq!(std::fs::read(&patches).unwrap(), store_before);
+    assert!(dir.join("axiom_patch_memory.exports.json").is_file());
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -261,11 +272,17 @@ async fn a_nodes_own_immunity_export_posted_back_changes_nothing() {
     let (local, fp) = seeded_heal_memory(&heal, "/local/dir");
     local.save().unwrap();
     let before = record_text(&heal, &fp);
+    let store_before = std::fs::read(&heal).unwrap();
     let node = keyed_node(&heal).await;
 
     let mut exports = Vec::new();
     for round in 1..=4 {
         let export = get_export(&node, "/v1/immunity").await;
+        assert_eq!(
+            std::fs::read(&heal).unwrap(),
+            store_before,
+            "round {round}: reading the export rewrote the memory"
+        );
         let answer = post_merge(&node, "/v1/immunity/merge", &export).await;
         assert_eq!(
             record_text(&heal, &fp),
@@ -279,7 +296,8 @@ async fn a_nodes_own_immunity_export_posted_back_changes_nothing() {
         exports.iter().all(|e| e == &exports[0]),
         "the export must not change when nothing was learned"
     );
-    assert!(!exports[0].contains("seen_exports"), "{}", exports[0]);
+    assert_eq!(std::fs::read(&heal).unwrap(), store_before);
+    assert!(dir.join("heal_memory.exports.json").is_file());
 
     let _ = std::fs::remove_dir_all(dir);
 }
