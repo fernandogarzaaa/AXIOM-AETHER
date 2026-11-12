@@ -122,7 +122,9 @@ impl ExportLedger {
             seen: self.seen.clone(),
         })
         .map_err(|e| io::Error::other(e.to_string()))?;
-        crate::atomic_write::write_replacing(&self.path, json.as_bytes())?;
+        // Never in place: a ledger cut short reads as empty, and every export
+        // it recorded could then be handed out again.
+        crate::atomic_write::write_replacing_or_fail(&self.path, json.as_bytes())?;
         self.changed = false;
         Ok(())
     }

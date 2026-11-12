@@ -39,11 +39,13 @@ releases are described on the GitHub Releases page.
   written in place. A save that is interrupted, or read while it is in
   progress, used to leave or show a partly written file, and a store that
   does not parse loads as empty. The old file now stays whole until the new
-  one is complete. The file keeps its permissions; a store that is a
-  symbolic link stays a link; a store marked read-only is refused. Where a
-  file cannot be replaced at all (a single file mounted into a container, a
-  directory the process may not create files in) it is written in place, as
-  before.
+  one is complete. The file keeps its permissions, owner and group; a store
+  that is a symbolic link stays a link; a store the process could not have
+  written in place is refused. Where a file cannot be replaced (a single
+  file mounted into a container, a directory the process may not create
+  files in), or could only be replaced by a file with a different owner or
+  group, it is written in place, as before. Access control lists and other
+  extended attributes on a store are not carried over to the new file.
 
 ### Changed
 
