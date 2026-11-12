@@ -16,8 +16,9 @@ Checkpoint seed: {{ if .Values.checkpoint.url }}{{ .Values.checkpoint.url }}{{ e
 {{- if not .Values.secrets.fleetKey }}
 {{- if not .Values.secrets.existingSecret }}
 
-WARNING: secrets.fleetKey is empty. Immunity gossip will exchange UNSIGNED
-payloads. Set a shared key in production:
+WARNING: secrets.fleetKey is empty. Every node refuses merges without a fleet
+key (POST /v1/immunity/merge returns 401), so immunity gossip will not
+propagate anything. Set a shared key:
    helm upgrade {{ .Release.Name }} ... --set secrets.fleetKey=$(openssl rand -hex 32)
 {{- end }}
 {{- end }}

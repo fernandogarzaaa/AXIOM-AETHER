@@ -1565,9 +1565,11 @@ mod tests {
             pm.save(&patch_path).unwrap();
         }
 
+        // The merge route requires a fleet key (and signs exports with it).
         let state = make_test_state()
             .await
-            .with_heal_memory_path(Some(heal_path));
+            .with_heal_memory_path(Some(heal_path))
+            .with_fleet_key(Some(b"test-fleet-key".to_vec()));
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
 
@@ -1595,6 +1597,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri("/v1/patches/merge")
+                    .header("host", "127.0.0.1:8080")
                     .header("content-type", "application/json")
                     .body(Body::from(export.to_vec()))
                     .unwrap(),
@@ -1634,9 +1637,11 @@ mod tests {
             pm.save(&patch_path).unwrap();
         }
 
+        // The merge route requires a fleet key (and signs exports with it).
         let state = make_test_state()
             .await
-            .with_heal_memory_path(Some(heal_path));
+            .with_heal_memory_path(Some(heal_path))
+            .with_fleet_key(Some(b"test-fleet-key".to_vec()));
         let pipeline_arc = state.pipeline.clone();
         let app = create_router(state.clone());
 
@@ -1665,6 +1670,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri("/v1/patches/merge")
+                    .header("host", "127.0.0.1:8080")
                     .header("content-type", "application/json")
                     .body(Body::from(export.to_vec()))
                     .unwrap(),
