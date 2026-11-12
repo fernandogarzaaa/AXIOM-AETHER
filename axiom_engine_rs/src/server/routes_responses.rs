@@ -286,6 +286,19 @@ async fn responses_run_fingerprint(
         let session = store
             .get_or_create(&session_for_task, &pipeline)
             .map_err(|error| ApiError::Internal(format!("session allocation failed: {error}")))?;
+        // The check above and the create are two steps, and the cancellation
+        // can land between them: the guard then set the flag and removed every
+        // sub-session before this one existed. Look again now that it does.
+        // The guard sets the flag before it removes, so either its removal
+        // came after this create and took the session, or the flag was
+        // already set here: no order leaves a session behind for the length
+        // of an adaptation nobody is waiting for.
+        if is_transient && cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = store.take_session(&session_for_task);
+            return Err(ApiError::Internal(
+                "Responses fingerprint cancelled".into(),
+            ));
+        }
         let mut states = session.blocking_lock();
         let context_ids = pipeline.encode_text(&context);
         // Capture the outcome instead of `?`-ing out: the cancellation
