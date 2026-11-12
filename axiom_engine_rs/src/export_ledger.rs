@@ -260,4 +260,33 @@ mod tests {
             stores.iter().map(|s| ExportLedger::path_for(s)).collect();
         assert_eq!(ledgers.len(), 3, "{ledgers:?}");
     }
+
+    #[test]
+    fn concurrent_transactions_lose_no_record() {
+        let (_dir, store) = store_path("concurrent");
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20 {
+                        ExportLedger::with(&store, |ledger| {
+                            assert!(ledger.remember(&format!("export {t}-{i}")));
+                            ledger.save().unwrap();
+                        });
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        ExportLedger::with(&store, |ledger| {
+            assert_eq!(ledger.seen.len(), 160);
+            for t in 0..8 {
+                for i in 0..20 {
+                    assert!(ledger.contains(&format!("export {t}-{i}")));
+                }
+            }
+        });
+    }
 }
