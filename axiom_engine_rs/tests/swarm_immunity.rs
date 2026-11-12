@@ -25,6 +25,10 @@ fn tiny_pipeline() -> InferencePipeline {
     InferencePipeline::new(cfg, Device::Cpu).expect("tiny pipeline must build")
 }
 
+/// The fleet merge route refuses everything on a node with no fleet key and
+/// accepts only exports signed with it, so both test nodes share this one.
+const FLEET_KEY: &[u8] = b"swarm-immunity-test-fleet-key";
+
 fn unique_tmp(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -75,7 +79,8 @@ async fn immunity_endpoints_export_and_merge() {
             tokio::task::spawn_blocking(tiny_pipeline).await.unwrap(),
             "node-a".into(),
         )
-        .with_heal_memory_path(Some(mem_a.clone())),
+        .with_heal_memory_path(Some(mem_a.clone()))
+        .with_fleet_key(Some(FLEET_KEY.to_vec())),
     );
 
     // Export from A.
@@ -104,13 +109,15 @@ async fn immunity_endpoints_export_and_merge() {
             tokio::task::spawn_blocking(tiny_pipeline).await.unwrap(),
             "node-b".into(),
         )
-        .with_heal_memory_path(Some(mem_b.clone())),
+        .with_heal_memory_path(Some(mem_b.clone()))
+        .with_fleet_key(Some(FLEET_KEY.to_vec())),
     );
     let resp = app_b
         .oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/immunity/merge")
+                .header("host", "127.0.0.1:8080")
                 .header("content-type", "application/json")
                 .body(Body::from(exported))
                 .unwrap(),
@@ -143,7 +150,8 @@ async fn merge_rejects_tampered_signed_export() {
             tokio::task::spawn_blocking(tiny_pipeline).await.unwrap(),
             "node".into(),
         )
-        .with_heal_memory_path(Some(mem_a.clone())),
+        .with_heal_memory_path(Some(mem_a.clone()))
+        .with_fleet_key(Some(FLEET_KEY.to_vec())),
     );
     let exported = {
         let r = app
@@ -168,6 +176,7 @@ async fn merge_rejects_tampered_signed_export() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/immunity/merge")
+                .header("host", "127.0.0.1:8080")
                 .header("content-type", "application/json")
                 .body(Body::from(tampered))
                 .unwrap(),
