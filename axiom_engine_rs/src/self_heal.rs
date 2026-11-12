@@ -19,7 +19,7 @@
 //!    the failure history keeps compounding in W̃) until it exits cleanly, no
 //!    new heal applies, or the restart budget is exhausted.
 //!
-//! Honesty notes: source-artifact patching stays in `poly_jit`; this module
+//! Honesty notes: source-artifact patching stays in `solve`; this module
 //! heals the *environment*. Restarting a process is not literally resuming a
 //! suspended thread — v1 targets batch/idempotent programs. The TTT absorption
 //! is real (the weights move; the CE numbers are measured), but with an unbaked

@@ -21,14 +21,15 @@ Deterministic, offline, no model required, so the score is reproducible in CI.
 
 ```bash
 cargo run --release --bin axiom -- eval-agentic --require-all
-# → [PASS] shell-exit-flip … score: 32/32 = 100%   (exit 0; non-zero on any regression)
+# → [PASS] sh-self-naming-frame … score: 32/32 = 100%   (exit 0; non-zero on any regression)
 ```
 
-The repair itself comes from two deterministic layers in `solve.rs`:
+The repair itself comes from one deterministic layer in `solve.rs`. (An
+earlier layer of fixture-shaped patches — `exit 1` → `exit 0`, a `FAIL` marker,
+one `assert_eq!` — ran first until 2026-11-12. It made failing checks pass
+without fixing anything, so `solve` no longer runs it.)
 
-1. **Poly-JIT flips** (`poly_jit.rs`) — the original fixture-shaped patches
-   (`exit 1` → `exit 0`, a `FAIL` marker, one `assert_eq!`).
-2. **Mutation repair** (`mutation_repair.rs`, 2026-11-05) — the general layer.
+1. **Mutation repair** (`mutation_repair.rs`, 2026-11-05).
    `fault_locate::repair_targets` ranks the blamed files, **demotes test
    files** and hops through their imports (`from x import`, `require('./x')`,
    `require_relative`, `. ./lib.sh`, `#include "x.h"` → `x.c`, Go package
@@ -47,8 +48,8 @@ The repair itself comes from two deterministic layers in `solve.rs`:
 
 | # | Fixture | Verifier | Exercises |
 |---|---|---|---|
-| 1–3 | `shell-exit-flip`, `fixture-marker`, `multi-file-pick-failing` | scripted `sh` | exit-code / marker repair; pick the failing file |
-| 4–12 | `rust-assert-flip`, `python-frame-localize`, `js-stack-localize`, `go-frame-localize`, `c-compiler-localize`, `ts-frame-localize`, `java-frame-localize`, `ruby-frame-localize`, `nested-path-localize` | scripted `sh` | one trace dialect each → file (+ nested path) |
+| 1–3 | `sh-self-naming-frame`, `sh-wrong-arith`, `multi-file-pick-failing` | `sh`, check in the verify command | a loop bound, an arithmetic operator; pick the failing file and leave the helper alone |
+| 4–12 | `rust-arrow-frame`, `python-frame-localize`, `js-stack-localize`, `go-frame-localize`, `c-compiler-localize`, `ts-frame-localize`, `java-frame-localize`, `ruby-frame-localize`, `nested-path-localize` | `sh`, check in the verify command | a real one-token bug in a shell library, reported in one trace dialect each → file (+ nested path) |
 | 13–14 | `agentic-multi-file-both-broken`, `agentic-holdout-split` | scripted `sh` | atomic multi-file transaction; train **and** held-out gate |
 | 15 | `py-off-by-one-range` | `python3 test_total.py` | `range(len(xs) - 1)`; import hop; test pinned |
 | 16 | `py-wrong-comparison` | `python3` | `>` → `>=` |

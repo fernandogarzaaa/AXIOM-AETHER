@@ -90,7 +90,7 @@ This is the spearhead metric — see [`BENCH-REPAIR.md`](BENCH-REPAIR.md).
 
 If a checkpoint is present it is loaded (`[+] Loaded checkpoint …`); if not, the
 loop still runs — the built-in fixtures are repaired by the deterministic
-Poly-JIT layer with no model required.
+mutation layer with no model required.
 
 ---
 

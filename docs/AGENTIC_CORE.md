@@ -14,7 +14,7 @@ rather than a claim.
 ```text
 broken repo ──▶ detect language ──▶ self-select verify command
             ──▶ localize faulty file(s) across languages
-            ──▶ propose an edit-set (deterministic Poly-JIT · fleet-shared patch · LLM)
+            ──▶ propose an edit-set (deterministic mutation · fleet-shared patch · LLM)
             ──▶ apply atomically, run the verifier
             ──▶ keep ONLY if green, else roll back byte-for-byte and retry
             ──▶ remember what worked (and what failed) · share across the fleet
@@ -70,7 +70,7 @@ the score is reproducible in CI with **no model or network**:
 
 ```text
 [axiom-eval-agentic] autonomous repair capability:
-  [PASS] shell-exit-flip
+  [PASS] sh-self-naming-frame
   …
   [PASS] agentic-holdout-split
   [PASS] py-off-by-one-range

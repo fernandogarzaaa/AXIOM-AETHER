@@ -5,6 +5,30 @@ releases are described on the GitHub Releases page.
 
 ## [Unreleased]
 
+### Fixed
+
+- `axiom solve` no longer "repairs" a failing check by editing it. The first
+  source-repair phase only knew fixture-shaped rewrites (`exit 1` → `exit 0`,
+  a marker rename, replacing the file with a script that exits 0) and reported
+  SOLVED when one made the command pass. It is removed from the solve loop;
+  source repair starts at the mutation layer.
+- A source file longer than 4096 characters is no longer cut while a patch is
+  being tried (`axiom solve`, and `POST /v1/hypervisor/jit_run`).
+- `axiom solve` no longer leaves a candidate fix in your file when it is
+  interrupted. The original of every file it writes to is saved to disk first
+  (`~/.axiom/journal`, or `AXIOM_JOURNAL_DIR`) and restored on failure, on
+  Ctrl-C / SIGTERM / SIGHUP (exit status 130 / 143 / 129), and by the next
+  `axiom solve` after a kill. A file you edited after the kill is left alone
+  and the saved original's path is printed.
+
+### Changed
+
+- `axiom eval-agentic`: the 12 fixtures that were solved by the removed
+  rewrites are now shell programs with a real one-token bug, checked by
+  behaviour. Fixture names changed (`shell-exit-flip` → `sh-self-naming-frame`,
+  `fixture-marker` → `sh-wrong-arith`, `rust-assert-flip` → `rust-arrow-frame`).
+  The suite is still 32 cases.
+
 ## [0.7.0] - 2026-11-08
 
 Headline: the deterministic repair engine (no LLM) now repairs **39/40**

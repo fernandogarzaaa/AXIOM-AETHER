@@ -85,6 +85,7 @@ unset. When you add a variable, add it here.
 | Variable | Default | Effect |
 |---|---|---|
 | `AXIOM_HEAL_MEMORY` | `~/.axiom/...` | Learned immunity JSON path, or `0`/`off`. |
+| `AXIOM_JOURNAL_DIR` | `~/.axiom/journal` | Where `axiom solve` saves the original of each source file before writing to it, so the file can be restored on failure, interrupt, or after a kill. |
 | `AXIOM_PEER_RELIABILITY` | `0.8` | Weight given to a peer's immunity claims (clamped to [0, 1]). |
 | `AXIOM_SOLVE_LLM_ATTEMPTS` | `3` | LLM repair attempts per `axiom solve` round. |
 | `AXIOM_SOLVE_VERIFY_TIMEOUT_SECS` | `120` | Verifier timeout; a hung verifier is killed and the candidate rolled back. |

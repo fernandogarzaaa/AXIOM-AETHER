@@ -3,11 +3,11 @@
 //! The point of this whole pillar is that AXIOM's coding ability should be
 //! reported, not asserted. [`run_eval`] materializes a set of seeded broken-repo
 //! fixtures, runs the real autonomous [`crate::solve`] loop on each (localize →
-//! deterministic Poly-JIT repair → verify, all reversible), and reports the
+//! deterministic mutation repair → verify, all reversible), and reports the
 //! fraction it drives green.
 //!
 //! The built-in fixtures ([`builtin_cases`]) are deliberately **deterministic
-//! and offline**: each failure is one the Poly-JIT layer can repair without any
+//! and offline**: each failure is one the mutation layer can repair without any
 //! model or network, so the score is reproducible in CI and means exactly what
 //! it says — "the autonomous loop fixed N of M broken repos end-to-end."
 
@@ -1025,17 +1025,26 @@ mod tests {
 
     #[test]
     fn a_fix_that_edits_a_pinned_file_is_scored_as_overfit() {
-        // The only file is the "test" and it is pinned: the legacy exit flip
-        // makes the verifier green, but the case must still score FAIL.
-        let case = EvalCase::new(
-            "pinned-oracle",
-            &[("run.sh", "#!/bin/sh\necho 'run.sh:2:1: boom' >&2\nexit 1\n")],
-            &posix_shell(),
-            &["run.sh"],
-        )
-        .unchanged(&["run.sh"]);
-        let report = run_eval(&tiny_pipeline(), &[case]);
-        assert_eq!(report.total(), 1);
-        assert_eq!(report.solved(), 0, "{}", report.summary());
+        // A repair the verifier accepts is still a failure when it lands in a
+        // pinned file. The same case solves when nothing is pinned, so it is
+        // the pin, not the repair, that scores it FAIL.
+        let case = || {
+            EvalCase::new(
+                "pinned-file",
+                &[("limits.sh", "is_adult() {\n  [ \"$1\" -gt 18 ]\n}\n")],
+                &posix_shell(),
+                &[
+                    "-c",
+                    ". ./limits.sh; { is_adult 18 && ! is_adult 17; } || \
+                     { echo 'limits.sh:2:3: is_adult is wrong'; exit 1; }",
+                ],
+            )
+        };
+        let free = run_eval(&tiny_pipeline(), &[case()]);
+        assert_eq!(free.solved(), 1, "{}", free.summary());
+
+        let pinned = run_eval(&tiny_pipeline(), &[case().unchanged(&["limits.sh"])]);
+        assert_eq!(pinned.total(), 1);
+        assert_eq!(pinned.solved(), 0, "{}", pinned.summary());
     }
 }

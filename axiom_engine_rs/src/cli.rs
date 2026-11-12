@@ -79,7 +79,7 @@ pub enum AxiomCommand {
         diagnostic: bool,
     },
     /// Autonomy (Pillar 3): drive a failing verify command to green by chaining
-    /// environment self-healing and Poly JIT / LLM source repair, then
+    /// environment self-healing and mutation / LLM source repair, then
     /// remembering what worked. With no --source, the faulty file is localized
     /// automatically from the verify command's own output (works across Rust,
     /// Python, JS/TS, Go, C/C++, …). `axiom solve [--source PATH] -- <cmd>`.
