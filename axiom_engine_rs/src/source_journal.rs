@@ -16,21 +16,28 @@
 //! * at the start of the next solve, by [`recover`], when the previous one was
 //!   killed outright and none of the above could run.
 //!
-//! A journal entry is three files in the journal directory, named after a hash
-//! of the source path plus this process's id:
+//! A journal entry is a few owner-only files in the journal directory, named
+//! after a hash of the source path plus this process's id:
 //!
 //! * `<id>.lock` — held under an exclusive lock for as long as the owning
 //!   process lives. [`recover`] treats an entry as abandoned only if it can
 //!   take that lock, so it never touches the entry of a solve that is still
 //!   running, in this process or another.
 //! * `<id>.orig` — the original bytes.
-//! * `<id>.json` — the source path, the hash of the original, and the hash of
-//!   the last candidate written over the file.
+//! * `<id>.json` — the source path and the hash of the original.
+//! * `<id>.cand` — the last content written over the file through [`write`].
 //!
-//! The last one is what lets [`recover`] tell "still holding our candidate"
-//! from "somebody edited the file since". Only the first is restored. In the
-//! second case the file is left alone and the saved original is kept, so
-//! recovery never overwrites work done after the crash.
+//! The last one is what lets [`recover`] tell "still holding what we wrote"
+//! from "somebody edited the file since". A file is restored only if it holds
+//! the recorded content, or the beginning of it or of the original (a write
+//! that was cut short). Anything else was edited after the crash: the file is
+//! left alone and the saved original is kept, so recovery never overwrites
+//! newer work.
+//!
+//! One more file, `<hash of the source path>.target`, is locked for as long as
+//! a file is protected. Two solves must not repair the same file at once: the
+//! second would journal the first one's candidate as "the original". The
+//! second [`protect`] fails instead, and that solve leaves the file alone.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
@@ -48,9 +55,6 @@ struct Meta {
     path: String,
     /// SHA-256 of the original bytes (the `.orig` file).
     original_sha256: String,
-    /// SHA-256 of the last content written over the file through [`write`],
-    /// or `None` if nothing has been written yet.
-    written_sha256: Option<String>,
 }
 
 /// One protected file of this process.
@@ -61,19 +65,13 @@ struct Entry {
     stem: PathBuf,
     /// Holds the exclusive lock on `<id>.lock` until the entry is dropped.
     lock: File,
+    /// The per-target guard file and the exclusive lock held on it.
+    target_guard: (PathBuf, File),
 }
 
 impl Entry {
     fn file(&self, ext: &str) -> PathBuf {
         self.stem.with_extension(ext)
-    }
-
-    fn meta(&self, written: Option<&[u8]>) -> Meta {
-        Meta {
-            path: self.target.to_string_lossy().into_owned(),
-            original_sha256: sha256_hex(&self.original),
-            written_sha256: written.map(sha256_hex),
-        }
     }
 
     /// Put the original back if the file holds anything else.
@@ -84,12 +82,19 @@ impl Entry {
         fs::write(&self.target, &self.original)
     }
 
+    /// Remove the entry's files and the per-target guard. The guard is
+    /// removed while its lock is still held, so nobody can be waiting on it.
     fn remove_files(&self) {
-        for ext in ["orig", "json", "lock"] {
+        for ext in ENTRY_EXTENSIONS {
             let _ = fs::remove_file(self.file(ext));
         }
+        let _ = fs::remove_file(&self.target_guard.0);
     }
 }
+
+/// Extensions of the files one entry may own. `lock` goes last: an entry
+/// without its lock file must have nothing else left to find.
+const ENTRY_EXTENSIONS: [&str; 6] = ["orig", "json", "json.tmp", "cand", "cand.tmp", "lock"];
 
 /// Entries of this process. The mutex also serializes every journaled write
 /// with [`restore_all`], so an interrupt cannot interleave with a candidate
@@ -106,6 +111,11 @@ fn active() -> MutexGuard<'static, Vec<Arc<Entry>>> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The part of a journal file name that identifies the source file.
+fn target_hash(target: &Path) -> String {
+    sha256_hex(target.to_string_lossy().as_bytes())[..16].to_string()
 }
 
 fn interrupted_error() -> io::Error {
@@ -134,26 +144,70 @@ pub fn default_dir() -> PathBuf {
     }
 }
 
-/// Create the journal directory if it is missing, readable by its owner
-/// only: it will hold copies of source files. An existing directory is left
-/// as it is.
-fn create_journal_dir(dir: &Path) -> io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
+/// Make sure `dir` exists and belongs to this user alone. It holds copies of
+/// source files, and [`recover`] writes what it finds there back over source
+/// files, so nobody else may read it or put files in it.
+///
+/// A missing directory is created owner-only. An existing one that this user
+/// owns is tightened to owner-only if it is not already. One owned by
+/// somebody else is refused.
+fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    if !dir.is_dir() {
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(dir) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
+        }
+        if !dir.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("journal path {} is not a directory", dir.display()),
+            ));
+        }
     }
-    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    let mut builder = fs::DirBuilder::new();
+    check_private_dir(dir, true)
+}
+
+/// Is `dir` owned by this user and closed to everyone else? With `tighten`,
+/// a directory this user owns is made owner-only first. Always `Ok` off Unix,
+/// where there are no mode bits to check.
+fn check_private_dir(dir: &Path, tighten: bool) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let refuse = |why: &str| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "journal directory {} {why}; make it yours and private (chmod 700), \
+                     or point AXIOM_JOURNAL_DIR at a directory that is",
+                    dir.display()
+                ),
+            ))
+        };
+        let meta = fs::metadata(dir)?;
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return refuse("belongs to another user");
+        }
+        if meta.mode() & 0o077 != 0 {
+            if !tighten {
+                return refuse("can be read or written by other users");
+            }
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
     }
-    match builder.create(dir) {
-        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => Err(e),
-        _ => Ok(()),
-    }
+    #[cfg(not(unix))]
+    let _ = (dir, tighten);
+    Ok(())
 }
 
 /// Options for creating a journal file: owner-only on Unix, whatever the
@@ -176,12 +230,12 @@ fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Replace an entry's `.json` atomically (write a sibling, sync, rename).
-fn write_meta(stem: &Path, meta: &Meta) -> io::Result<()> {
-    let json = serde_json::to_vec(meta).map_err(io::Error::other)?;
-    let tmp = stem.with_extension("json.tmp");
-    write_durable(&tmp, &json)?;
-    fs::rename(&tmp, stem.with_extension("json"))
+/// Replace `<stem>.<ext>` atomically: write a sibling, sync it, rename it into
+/// place. The file is always either its old content or the complete new one.
+fn replace_durable(stem: &Path, ext: &str, bytes: &[u8]) -> io::Result<()> {
+    let tmp = stem.with_extension(format!("{ext}.tmp"));
+    write_durable(&tmp, bytes)?;
+    fs::rename(&tmp, stem.with_extension(ext))
 }
 
 /// Sync a directory so a freshly created entry survives power loss. Best
@@ -189,6 +243,58 @@ fn write_meta(stem: &Path, meta: &Meta) -> io::Result<()> {
 fn sync_dir(dir: &Path) {
     if let Ok(handle) = File::open(dir) {
         let _ = handle.sync_all();
+    }
+}
+
+/// Take the exclusive per-target lock for `target`, or fail if another solve
+/// (in this process or any other) holds it.
+///
+/// The guard file is deleted when its holder is done. A deleted file can
+/// still be open elsewhere, so after locking, check that the locked handle is
+/// the file the path names now; if it is not, somebody removed it in between
+/// and the lock is on a file nobody else will ever look at. Try again.
+fn lock_target(dir: &Path, target: &Path) -> io::Result<(PathBuf, File)> {
+    let path = dir.join(format!("{}.target", target_hash(target)));
+    for _ in 0..8 {
+        let guard = private_file().create(true).truncate(false).open(&path)?;
+        match guard.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} is being repaired by another axiom solve",
+                        target.display()
+                    ),
+                ))
+            }
+            Err(TryLockError::Error(e)) => return Err(e),
+        }
+        if same_file(&guard, &path) {
+            return Ok((path, guard));
+        }
+    }
+    Err(io::Error::other(format!(
+        "could not take the repair lock for {}",
+        target.display()
+    )))
+}
+
+/// Does the open `handle` refer to the file `path` names right now?
+fn same_file(handle: &File, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (handle.metadata(), fs::metadata(path)) {
+            (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // A locked, open file cannot be deleted from under its handle here.
+        let _ = handle;
+        path.exists()
     }
 }
 
@@ -231,14 +337,14 @@ impl Protected {
         entries.remove(at);
         if restore {
             if let Err(e) = self.entry.restore() {
-                // Keep the saved original: it is the only good copy left.
+                // Keep the whole entry: the saved original is the only good
+                // copy left, and the next `recover` will try again.
                 eprintln!(
                     "[axiom-journal] could not restore {} ({e}); its original is saved at {}",
                     self.entry.target.display(),
                     self.entry.file("orig").display()
                 );
-                let _ = fs::remove_file(self.entry.file("json"));
-                let _ = fs::remove_file(self.entry.file("lock"));
+                let _ = fs::remove_file(&self.entry.target_guard.0);
                 return;
             }
         }
@@ -246,7 +352,7 @@ impl Protected {
     }
 
     /// Test hook: forget the entry as a killed process would, leaving its
-    /// files on disk and releasing the lock.
+    /// files on disk and releasing its locks.
     #[cfg(test)]
     fn abandon(mut self) {
         self.finished = true;
@@ -271,31 +377,56 @@ pub fn protect(path: &Path) -> io::Result<Protected> {
 
 /// Save `path`'s current content under `dir`, synced to disk, and return the
 /// guard that restores it. Fails, without touching `path`, if the original
-/// cannot be journaled; callers must then not write to the file.
+/// cannot be journaled or another solve is repairing the same file; callers
+/// must then not write to the file.
 pub fn protect_in(dir: &Path, path: &Path) -> io::Result<Protected> {
     if INTERRUPTED.load(Ordering::SeqCst) {
         return Err(interrupted_error());
     }
     let target = fs::canonicalize(path)?;
-    let original = fs::read(&target)?;
-    create_journal_dir(dir)?;
+    ensure_private_dir(dir)?;
+    // From here until the guard is dropped, no other solve may protect this
+    // file: it would read whatever candidate is on disk as "the original".
+    let target_guard = lock_target(dir, &target)?;
+    // A solve that died while repairing this file may have left its candidate
+    // in it. Put that right before reading the "original".
+    for recovery in recover_in(dir) {
+        if let Some(message) = recovery.describe() {
+            println!("[axiom-journal] {message}");
+        }
+    }
+    let original = match fs::read(&target) {
+        Ok(original) => original,
+        Err(e) => {
+            let _ = fs::remove_file(&target_guard.0);
+            return Err(e);
+        }
+    };
     let id = format!(
         "{}-{}-{}",
-        &sha256_hex(target.to_string_lossy().as_bytes())[..16],
+        target_hash(&target),
         std::process::id(),
         SEQ.fetch_add(1, Ordering::SeqCst)
     );
     let stem = dir.join(id);
     // The lock comes first: an entry without one would look abandoned to a
     // concurrent `recover`.
-    let lock = private_file()
+    let lock = match private_file()
         .create_new(true)
-        .open(stem.with_extension("lock"))?;
+        .open(stem.with_extension("lock"))
+    {
+        Ok(lock) => lock,
+        Err(e) => {
+            let _ = fs::remove_file(&target_guard.0);
+            return Err(e);
+        }
+    };
     let entry = Entry {
         target,
         original,
         stem,
         lock,
+        target_guard,
     };
     let journaled = (|| {
         match entry.lock.try_lock() {
@@ -308,7 +439,12 @@ pub fn protect_in(dir: &Path, path: &Path) -> io::Result<Protected> {
             Err(TryLockError::Error(e)) => return Err(e),
         }
         write_durable(&entry.file("orig"), &entry.original)?;
-        write_meta(&entry.stem, &entry.meta(None))
+        let meta = Meta {
+            path: entry.target.to_string_lossy().into_owned(),
+            original_sha256: sha256_hex(&entry.original),
+        };
+        let json = serde_json::to_vec(&meta).map_err(io::Error::other)?;
+        replace_durable(&entry.stem, "json", &json)
     })();
     if let Err(e) = journaled {
         entry.remove_files();
@@ -332,8 +468,8 @@ pub fn protect_in(dir: &Path, path: &Path) -> io::Result<Protected> {
 
 /// Write `contents` over the source file `path`. If the file is protected,
 /// the journal first records what is about to be written, so that a later
-/// [`recover`] can recognise the file as still holding this candidate. An
-/// unprotected file is written as by [`std::fs::write`].
+/// [`recover`] can recognise the file as still holding it, in full or cut
+/// short. An unprotected file is written as by [`std::fs::write`].
 ///
 /// Refused once [`restore_all`] has run.
 pub fn write(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -343,7 +479,7 @@ pub fn write(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
     if let Ok(target) = fs::canonicalize(path) {
         for entry in entries.iter().filter(|e| e.target == target) {
-            write_meta(&entry.stem, &entry.meta(Some(contents)))?;
+            replace_durable(&entry.stem, "cand", contents)?;
         }
     }
     fs::write(path, contents)
@@ -375,14 +511,13 @@ pub fn restore_all() -> usize {
 /// What [`recover`] did with an entry left behind by a process that died.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
-    /// The file still held the dead process's last candidate; the original
-    /// was put back.
+    /// The file still held what the dead process last wrote (in full, or cut
+    /// short by the crash); the original was put back.
     Restored,
     /// The file already held the original; nothing to do.
     AlreadyOriginal,
-    /// The file holds neither the original nor the last candidate: it was
-    /// edited after the crash. It was left alone, and the original is kept at
-    /// `saved_original`.
+    /// The file holds something else: it was edited after the crash. It was
+    /// left alone, and the original is kept at `saved_original`.
     LeftChanged { saved_original: PathBuf },
     /// The file no longer exists; nothing was recreated.
     TargetMissing,
@@ -400,19 +535,58 @@ pub struct Recovery {
     pub outcome: RecoveryOutcome,
 }
 
+impl Recovery {
+    /// What to tell the user, if anything.
+    pub fn describe(&self) -> Option<String> {
+        let target = self.target.display();
+        match &self.outcome {
+            RecoveryOutcome::Restored => Some(format!(
+                "an earlier solve was killed mid-repair: restored {target} to its original content"
+            )),
+            RecoveryOutcome::LeftChanged { saved_original } => Some(format!(
+                "an earlier solve was killed mid-repair, and {target} has changed since; it was \
+                 left as it is, and its content from before that solve is saved at {}",
+                saved_original.display()
+            )),
+            RecoveryOutcome::Deferred { saved_original } => Some(format!(
+                "an earlier solve was killed mid-repair, and {target} cannot be read or written \
+                 right now; nothing was changed, and its content from before that solve is saved \
+                 at {}",
+                saved_original.display()
+            )),
+            RecoveryOutcome::AlreadyOriginal | RecoveryOutcome::TargetMissing => None,
+        }
+    }
+}
+
 /// Handle entries abandoned in the default journal directory. See
 /// [`recover_in`].
 pub fn recover() -> Vec<Recovery> {
     recover_in(&default_dir())
 }
 
+/// Was `current` left by the dead process? Yes if it is exactly what the
+/// process last wrote, or a write that the crash cut short: `fs::write`
+/// truncates and then writes from the start, so a cut-short write leaves the
+/// beginning of what was being written (a candidate, or the original during
+/// a rollback).
+fn left_by_the_dead_process(current: &[u8], original: &[u8], last_written: Option<&[u8]>) -> bool {
+    last_written.is_some_and(|written| written.starts_with(current))
+        || original.starts_with(current)
+}
+
 /// Find entries under `dir` whose owning process is gone and restore their
 /// files where that is safe (see [`RecoveryOutcome`]). Entries whose owner is
-/// alive are skipped.
+/// alive are skipped. A directory that other users can reach is not trusted
+/// and nothing in it is used.
 pub fn recover_in(dir: &Path) -> Vec<Recovery> {
     let Ok(listing) = fs::read_dir(dir) else {
         return Vec::new();
     };
+    if let Err(e) = check_private_dir(dir, false) {
+        eprintln!("[axiom-journal] not recovering anything: {e}");
+        return Vec::new();
+    }
     let mut done = Vec::new();
     for lock_path in listing
         .flatten()
@@ -428,11 +602,11 @@ pub fn recover_in(dir: &Path) -> Vec<Recovery> {
         }
         let stem = lock_path.with_extension("");
         let orig_path = stem.with_extension("orig");
-        let json_path = stem.with_extension("json");
-        let meta = fs::read(&json_path)
+        let meta = fs::read(stem.with_extension("json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Meta>(&bytes).ok());
         let original = fs::read(&orig_path).ok();
+        let last_written = fs::read(stem.with_extension("cand")).ok();
         let mut keep_original = false;
         // An entry cut short before both files were written protected a file
         // that had not been written to yet: nothing to restore.
@@ -448,7 +622,13 @@ pub fn recover_in(dir: &Path) -> Vec<Recovery> {
                     // candidate, so the original must not be thrown away.
                     Err(_) => deferred(),
                     Ok(current) if current == original => RecoveryOutcome::AlreadyOriginal,
-                    Ok(current) if Some(sha256_hex(&current)) == meta.written_sha256 => {
+                    Ok(current)
+                        if left_by_the_dead_process(
+                            &current,
+                            &original,
+                            last_written.as_deref(),
+                        ) =>
+                    {
                         match fs::write(&target, &original) {
                             Ok(()) => RecoveryOutcome::Restored,
                             Err(_) => deferred(),
@@ -462,6 +642,13 @@ pub fn recover_in(dir: &Path) -> Vec<Recovery> {
                     }
                 };
                 let retry_later = matches!(outcome, RecoveryOutcome::Deferred { .. });
+                // The dead process's per-target guard, unless somebody holds it.
+                let guard_path = dir.join(format!("{}.target", target_hash(&target)));
+                if let Ok(guard) = OpenOptions::new().write(true).open(&guard_path) {
+                    if guard.try_lock().is_ok() && same_file(&guard, &guard_path) {
+                        let _ = fs::remove_file(&guard_path);
+                    }
+                }
                 done.push(Recovery { target, outcome });
                 if retry_later {
                     // Leave every file of the entry; dropping `lock` releases it.
@@ -469,11 +656,12 @@ pub fn recover_in(dir: &Path) -> Vec<Recovery> {
                 }
             }
         }
-        if !keep_original {
-            let _ = fs::remove_file(&orig_path);
+        for ext in ENTRY_EXTENSIONS {
+            if ext == "lock" || (ext == "orig" && keep_original) {
+                continue;
+            }
+            let _ = fs::remove_file(stem.with_extension(ext));
         }
-        let _ = fs::remove_file(&json_path);
-        let _ = fs::remove_file(stem.with_extension("json.tmp"));
         drop(lock);
         let _ = fs::remove_file(&lock_path);
     }
@@ -756,11 +944,111 @@ mod tests {
             .flatten()
             .map(|e| e.path())
             .collect();
-        assert_eq!(files.len(), 3, "{files:?}");
+        // The lock, the original, the metadata, the last write, and the
+        // per-target guard.
+        assert_eq!(files.len(), 5, "{files:?}");
         for file in &files {
             assert_eq!(mode(file), 0o600, "{}", file.display());
         }
         drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_directory_open_to_others_is_closed_or_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, journal, source) = fixture("original\n");
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        // An entry is abandoned, and then the directory is opened up.
+        let guard = protect_in(&journal, &source).unwrap();
+        write(&source, b"unverified candidate\n").unwrap();
+        guard.abandon();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Recovery does not act on files in a directory others can reach.
+        assert!(recover_in(&journal).is_empty());
+        assert_eq!(fs::read(&source).unwrap(), b"unverified candidate\n");
+
+        // Protecting a file closes a directory this user owns, after which
+        // the abandoned entry is recovered before the original is read.
+        let guard = protect_in(&journal, &source).unwrap();
+        assert_eq!(mode(&journal), 0o700);
+        assert_eq!(guard.original(), b"original\n");
+        drop(guard);
+
+        // A directory that belongs to somebody else is never used. Only root
+        // can give a directory away, so this part runs only as root.
+        if std::os::unix::fs::chown(&journal, Some(54321), None).is_ok() {
+            let err = protect_in(&journal, &source).err().expect("refused");
+            assert!(err.to_string().contains("belongs to another user"), "{err}");
+            assert_eq!(fs::read(&source).unwrap(), b"original\n");
+        }
+    }
+
+    #[test]
+    fn a_second_protect_of_the_same_file_is_refused() {
+        let (_tmp, journal, source) = fixture("original\n");
+        let first = protect_in(&journal, &source).unwrap();
+        write(&source, b"first solve's candidate\n").unwrap();
+
+        // A second solve reaches the same file. If it were let in, it would
+        // journal the first one's candidate as "the original".
+        let err = protect_in(&journal, &source).err().expect("refused");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        assert!(err.to_string().contains("another axiom solve"), "{err}");
+        assert_eq!(fs::read(&source).unwrap(), b"first solve's candidate\n");
+
+        drop(first);
+        assert_eq!(fs::read(&source).unwrap(), b"original\n");
+        // Free again once the first solve is done with it.
+        let again = protect_in(&journal, &source).unwrap();
+        assert_eq!(again.original(), b"original\n");
+        drop(again);
+        assert_eq!(entry_files(&journal), 0);
+    }
+
+    #[test]
+    fn protect_first_puts_right_a_file_left_by_a_dead_solve() {
+        let (_tmp, journal, source) = fixture("original\n");
+        let dead = protect_in(&journal, &source).unwrap();
+        write(&source, b"dead solve's candidate\n").unwrap();
+        dead.abandon();
+
+        // A solve that was already running reaches the file without having
+        // run recovery since. The original it journals must be the real one.
+        let live = protect_in(&journal, &source).unwrap();
+        assert_eq!(live.original(), b"original\n");
+        assert_eq!(fs::read(&source).unwrap(), b"original\n");
+        drop(live);
+        assert_eq!(entry_files(&journal), 0);
+    }
+
+    #[test]
+    fn recovery_restores_a_write_that_the_crash_cut_short() {
+        let candidate = b"a candidate that is long enough to be cut in the middle\n";
+        // The crash came while the candidate was being written: the file
+        // holds its first half, or nothing at all.
+        for torn in [&candidate[..candidate.len() / 2], &candidate[..0]] {
+            let (_tmp, journal, source) = fixture("original\n");
+            let guard = protect_in(&journal, &source).unwrap();
+            write(&source, candidate).unwrap();
+            fs::write(&source, torn).unwrap();
+            guard.abandon();
+            assert_eq!(recover_in(&journal)[0].outcome, RecoveryOutcome::Restored);
+            assert_eq!(fs::read(&source).unwrap(), b"original\n");
+        }
+        // The crash came during a rollback: the file holds the beginning of
+        // the original.
+        let (_tmp, journal, source) = fixture("original\n");
+        let guard = protect_in(&journal, &source).unwrap();
+        write(&source, candidate).unwrap();
+        write(&source, b"original\n").unwrap();
+        fs::write(&source, b"orig").unwrap();
+        guard.abandon();
+        assert_eq!(recover_in(&journal)[0].outcome, RecoveryOutcome::Restored);
+        assert_eq!(fs::read(&source).unwrap(), b"original\n");
+        assert_eq!(entry_files(&journal), 0);
     }
 
     #[test]

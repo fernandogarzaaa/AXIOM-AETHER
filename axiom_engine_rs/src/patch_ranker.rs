@@ -19,6 +19,11 @@ use crate::branch_weights::{
 };
 
 pub const MAX_RANKED_CANDIDATES: usize = 8;
+/// Longest source (in characters) that a candidate may replace wholesale.
+/// The fixture rewrites below swap the entire file for a two-line script;
+/// that is only ever right for the tiny scripts they were written for, so a
+/// longer file gets targeted edits or nothing.
+pub const WHOLE_FILE_REPLACEMENT_MAX_CHARS: usize = 4096;
 pub const MAX_RANK_ITERATIONS: usize = 12;
 
 #[derive(Debug, Clone)]
@@ -147,7 +152,12 @@ pub fn generate_candidates(source: &str) -> Vec<RankedCandidate> {
         prior_cost: 4.0,
     }];
 
-    if source.contains("AXIOM_POLYJIT_FIXTURE_FAIL") && source.contains("Write-Error") {
+    let replaceable = replaceable_wholesale(source);
+
+    if replaceable
+        && source.contains("AXIOM_POLYJIT_FIXTURE_FAIL")
+        && source.contains("Write-Error")
+    {
         candidates.push(RankedCandidate {
             label: "powershell_fixture_collapse".into(),
             source: "Write-Output \"AXIOM_POLYJIT_FIXTURE_PASS\"\nexit 0\n".into(),
@@ -155,7 +165,9 @@ pub fn generate_candidates(source: &str) -> Vec<RankedCandidate> {
         });
     }
 
-    if source.contains("AXIOM_QTTT_MULTI_FAULT") || source.contains("QTTT_MULTI_FAULT") {
+    if replaceable
+        && (source.contains("AXIOM_QTTT_MULTI_FAULT") || source.contains("QTTT_MULTI_FAULT"))
+    {
         candidates.push(RankedCandidate {
             label: "multi_fault_ground_state".into(),
             source: "Write-Output \"AXIOM_QTTT_FIXTURE_PASS\"\nexit 0\n".into(),
@@ -163,7 +175,7 @@ pub fn generate_candidates(source: &str) -> Vec<RankedCandidate> {
         });
     }
 
-    if source.contains("throw ") || source.contains("Write-Error") {
+    if replaceable && (source.contains("throw ") || source.contains("Write-Error")) {
         candidates.push(RankedCandidate {
             label: "powershell_exception_ground_state".into(),
             source: "Write-Output \"axiom repaired\"\nexit 0\n".into(),
@@ -199,6 +211,12 @@ pub fn generate_candidates(source: &str) -> Vec<RankedCandidate> {
         .into_iter()
         .take(MAX_RANKED_CANDIDATES)
         .collect()
+}
+
+/// May a candidate replace the whole of `source`? See
+/// [`WHOLE_FILE_REPLACEMENT_MAX_CHARS`].
+pub fn replaceable_wholesale(source: &str) -> bool {
+    source.chars().count() <= WHOLE_FILE_REPLACEMENT_MAX_CHARS
 }
 
 fn candidate_energy(candidate: &RankedCandidate, fault: &FaultContext) -> f32 {
@@ -276,6 +294,31 @@ mod tests {
             .selected_patch
             .unwrap()
             .contains("AXIOM_QTTT_FIXTURE_PASS"));
+    }
+
+    #[test]
+    fn a_long_source_is_never_replaced_wholesale() {
+        // Every marker the wholesale rewrites look for, at the end of a file
+        // far longer than the scripts they were written for.
+        let mut source = "a line of ordinary code\n".repeat(400);
+        source.push_str(
+            "Write-Error 'AXIOM_QTTT_MULTI_FAULT AXIOM_POLYJIT_FIXTURE_FAIL'; throw 'x'\n",
+        );
+        assert!(!replaceable_wholesale(&source));
+        for candidate in generate_candidates(&source) {
+            assert!(
+                candidate.source.len() > source.len() / 2,
+                "`{}` would replace a {}-character file with {} characters",
+                candidate.label,
+                source.len(),
+                candidate.source.len()
+            );
+        }
+        // The same markers in a short script still get the rewrite.
+        let short = "Write-Error 'AXIOM_QTTT_MULTI_FAULT'; throw 'bad'; exit 1";
+        assert!(generate_candidates(short)
+            .iter()
+            .any(|c| c.label == "multi_fault_ground_state"));
     }
 
     #[test]

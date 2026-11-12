@@ -407,7 +407,13 @@ fn excerpt(source: &str) -> String {
 }
 
 pub fn synthesize_patch(source: &str) -> Option<String> {
-    if source.contains("AXIOM_POLYJIT_FIXTURE_FAIL") && source.contains("Write-Error") {
+    // Whole-file rewrites are for the tiny fixture scripts only; see
+    // `patch_ranker::WHOLE_FILE_REPLACEMENT_MAX_CHARS`.
+    let replaceable = crate::patch_ranker::replaceable_wholesale(source);
+    if replaceable
+        && source.contains("AXIOM_POLYJIT_FIXTURE_FAIL")
+        && source.contains("Write-Error")
+    {
         return Some("Write-Output \"AXIOM_POLYJIT_FIXTURE_PASS\"\nexit 0\n".to_string());
     }
     if source.contains("AXIOM_POLYJIT_FIXTURE_FAIL") {
@@ -416,7 +422,7 @@ pub fn synthesize_patch(source: &str) -> Option<String> {
     if source.contains("exit 1") {
         return Some(source.replace("exit 1", "exit 0"));
     }
-    if source.contains("throw ") {
+    if replaceable && source.contains("throw ") {
         return Some("Write-Output \"axiom polyjit repaired\"\nexit 0\n".to_string());
     }
     if source.contains("assert_eq!(1, 2)") {
@@ -437,12 +443,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_source_longer_than_the_excerpt_is_never_cut() {
-        // No patch in the set applies to this file, so the run cannot repair
-        // it. It used to write the 4096-character excerpt over the file
-        // anyway while it tried.
+        // Nothing in the patch set can repair this file. The run used to
+        // write the 4096-character excerpt over it anyway while it tried.
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("notes.txt");
-        let original = "a line of ordinary text\n".repeat(400);
+        // The `throw ` at the very end is past the excerpt. Now that the
+        // whole file is read, it must not trigger the fixture rewrite that
+        // replaces a file with a two-line script.
+        let original = "a line of ordinary text\n".repeat(400) + "throw 'not a fixture'\n";
         assert!(original.len() > 2 * SOURCE_EXCERPT_CHARS);
         std::fs::write(&source, &original).unwrap();
         let sizes = dir.path().join("sizes.log");

@@ -97,26 +97,8 @@ pub fn solve(
     // A previous solve that was killed with a candidate on disk left its
     // original in the journal: put those files right before doing anything.
     for recovery in crate::source_journal::recover() {
-        use crate::source_journal::RecoveryOutcome;
-        match recovery.outcome {
-            RecoveryOutcome::Restored => println!(
-                "[axiom-solve] an earlier solve was killed mid-repair: restored {} to its original content",
-                recovery.target.display()
-            ),
-            RecoveryOutcome::LeftChanged { saved_original } => println!(
-                "[axiom-solve] an earlier solve was killed mid-repair, and {} has changed since; \
-                 it was left as it is, and its content from before that solve is saved at {}",
-                recovery.target.display(),
-                saved_original.display()
-            ),
-            RecoveryOutcome::Deferred { saved_original } => println!(
-                "[axiom-solve] an earlier solve was killed mid-repair, and {} cannot be read or \
-                 written right now; nothing was changed, and its content from before that solve \
-                 is saved at {}",
-                recovery.target.display(),
-                saved_original.display()
-            ),
-            RecoveryOutcome::AlreadyOriginal | RecoveryOutcome::TargetMissing => {}
+        if let Some(message) = recovery.describe() {
+            println!("[axiom-solve] {message}");
         }
     }
 
