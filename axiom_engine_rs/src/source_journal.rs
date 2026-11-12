@@ -43,8 +43,9 @@
 //! itself, so it is shared by every solve on the machine whatever journal
 //! directory each one uses, and the kernel drops it if the holder dies.
 //! Elsewhere, where a lock on the file would stop the verify command reading
-//! it, the lock is on a `<hash of the source path>.target` file in the
-//! journal directory and only covers solves that share that directory.
+//! it, the lock is on a `<hash of the source path>.target` file in one
+//! per-user directory under the system temp dir, which does not depend on
+//! the journal directory either.
 //!
 //! Entries are only ever recovered from the journal directory in use. A file
 //! left by a solve that used a different directory is not put right until a
@@ -227,80 +228,84 @@ fn close_to_others(dir: &Path) -> io::Result<()> {
 /// * A missing directory is created owner-only.
 /// * One owned by somebody else is refused.
 /// * One this user owns that others could read is closed to them.
-/// * One this user owns that others could write to is closed, and whatever
-///   is already in it is moved aside first ([`quarantine`]): anybody could
-///   have planted an entry there, and recovery would write its "original"
-///   over the file it names.
+/// * One this user owns that others could write to is never used again.
+///   Anybody could have planted an entry there, and recovery would write its
+///   "original" over the file it names. The whole directory is renamed aside
+///   ([`set_aside`]) and a fresh one is created in its place.
 fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    if !dir.is_dir() {
-        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
-        }
-        match create_private_dir(dir) {
-            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
-            _ => {}
-        }
-        if !dir.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotADirectory,
-                format!("journal path {} is not a directory", dir.display()),
-            ));
+    if dir.is_dir() {
+        match exposure(dir)? {
+            Exposure::Private => return Ok(()),
+            Exposure::Readable => return close_to_others(dir),
+            Exposure::Writable => set_aside(dir)?,
         }
     }
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    match create_private_dir(dir) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    if !dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("journal path {} is not a directory", dir.display()),
+        ));
+    }
+    // Somebody may have created it between the two steps above: only a
+    // directory that is ours and closed is used.
     match exposure(dir)? {
         Exposure::Private => Ok(()),
-        Exposure::Readable => close_to_others(dir),
-        Exposure::Writable => {
-            close_to_others(dir)?;
-            quarantine(dir)
-        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "journal directory {} can be reached by other users; point AXIOM_JOURNAL_DIR \
+                 at a directory of your own",
+                dir.display()
+            ),
+        )),
     }
 }
 
-/// Move everything in `dir` into a fresh owner-only subdirectory, where
-/// recovery never looks. Nothing is deleted: a genuine backup among the files
-/// can still be restored by hand.
-fn quarantine(dir: &Path) -> io::Result<()> {
-    let found: Vec<PathBuf> = fs::read_dir(dir)?.flatten().map(|e| e.path()).collect();
-    if found.is_empty() {
-        return Ok(());
-    }
+/// Rename `dir`, with everything in it, to a sibling name. One atomic step:
+/// afterwards nothing that was in the directory can be found at its path, so
+/// stopping right after cannot leave an untrusted entry where recovery looks.
+/// Nothing is deleted: a genuine backup in there can still be restored by
+/// hand.
+fn set_aside(dir: &Path) -> io::Result<()> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut aside = None;
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "journal".to_string());
     for n in 0..64 {
-        let candidate = dir.join(format!("untrusted-{stamp}-{}-{n}", std::process::id()));
-        match create_private_dir(&candidate) {
-            Ok(()) => {
-                aside = Some(candidate);
-                break;
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
+        let aside = dir.with_file_name(format!(
+            "{name}.untrusted-{stamp}-{}-{n}",
+            std::process::id()
+        ));
+        if aside.exists() {
+            continue;
         }
+        fs::rename(dir, &aside)?;
+        // Best effort: it is ours, and nobody else needs to get in any more.
+        let _ = close_to_others(&aside);
+        eprintln!(
+            "[axiom-journal] {} could be written to by other users, so nothing in it can be \
+             trusted. It was moved to {} and a new journal directory is used; nothing from \
+             the old one is restored automatically.",
+            dir.display(),
+            aside.display()
+        );
+        return Ok(());
     }
-    let Some(aside) = aside else {
-        return Err(io::Error::other(format!(
-            "could not set aside the untrusted files in {}",
-            dir.display()
-        )));
-    };
-    for path in &found {
-        if let Some(name) = path.file_name() {
-            // `rename` moves a symlink itself, never what it points at.
-            fs::rename(path, aside.join(name))?;
-        }
-    }
-    eprintln!(
-        "[axiom-journal] {} could be written to by other users, so the {} item(s) in it cannot \
-         be trusted. They were moved to {} and are not restored automatically.",
-        dir.display(),
-        found.len(),
-        aside.display()
-    );
-    Ok(())
+    Err(io::Error::other(format!(
+        "could not set aside the untrusted journal directory {}",
+        dir.display()
+    )))
 }
 
 /// Options for creating a journal file: owner-only on Unix, whatever the
@@ -367,12 +372,13 @@ fn target_busy(target: &Path) -> io::Error {
 }
 
 /// Take the exclusive lock on `target`, or fail with `WouldBlock` if another
-/// solve or recovery (in this process or any other) holds it.
-fn lock_target(dir: &Path, target: &Path) -> io::Result<TargetLock> {
+/// solve or recovery (in this process or any other) holds it. The lock does
+/// not depend on the journal directory, so solves configured with different
+/// ones still exclude each other.
+fn lock_target(target: &Path) -> io::Result<TargetLock> {
     if cfg!(unix) {
         // An advisory lock on the file itself. Every solve that touches the
-        // file meets on it, whichever journal directory it uses; reading and
-        // writing the file are unaffected.
+        // file meets on it; reading and writing the file are unaffected.
         let handle = File::open(target)?;
         return match handle.try_lock() {
             Ok(()) => Ok(TargetLock {
@@ -384,13 +390,20 @@ fn lock_target(dir: &Path, target: &Path) -> io::Result<TargetLock> {
         };
     }
     // A lock on the file itself would be mandatory here and stop the verify
-    // command reading it, so lock a guard file in the journal directory.
-    //
-    // The guard file is deleted when its holder is done. A deleted file can
-    // still be open elsewhere, so after locking, check that the locked handle
-    // is the file the path names now; if it is not, somebody removed it in
-    // between and the lock is on a file nobody else will look at. Try again.
-    let path = dir.join(format!("{}.target", target_hash(target)));
+    // command reading it, so lock a guard file named after the file, in one
+    // place all of this user's solves share.
+    lock_guard_file(&std::env::temp_dir().join("axiom-solve-locks"), target)
+}
+
+/// Lock `<guard_dir>/<hash of target>.target`.
+///
+/// The guard file is deleted when its holder is done. A deleted file can
+/// still be open elsewhere, so after locking, check that the locked handle is
+/// the file the path names now; if it is not, somebody removed it in between
+/// and the lock is on a file nobody else will look at. Try again.
+fn lock_guard_file(guard_dir: &Path, target: &Path) -> io::Result<TargetLock> {
+    fs::create_dir_all(guard_dir)?;
+    let path = guard_dir.join(format!("{}.target", target_hash(target)));
     for _ in 0..8 {
         let guard = private_file().create(true).truncate(false).open(&path)?;
         match guard.try_lock() {
@@ -523,7 +536,7 @@ pub fn protect_in(dir: &Path, path: &Path) -> io::Result<Protected> {
     ensure_private_dir(dir)?;
     // From here until the guard is dropped, no other solve may protect this
     // file: it would read whatever candidate is on disk as "the original".
-    let target_lock = lock_target(dir, &target)?;
+    let target_lock = lock_target(&target)?;
     // A solve that died while repairing this file may have left its candidate
     // in it. Put that right before reading the "original". If a recovery
     // elsewhere is holding that entry right now, it will let go as soon as it
@@ -749,9 +762,9 @@ pub fn recover_in(dir: &Path) -> Vec<Recovery> {
 /// somebody else. The caller holds that file's lock, so it cannot be a live
 /// solve's entry: another process is in the middle of recovering it.
 fn recover_entries(dir: &Path, held: Option<&Path>) -> (Vec<Recovery>, bool) {
-    let Ok(listing) = fs::read_dir(dir) else {
+    if !dir.is_dir() {
         return (Vec::new(), false);
-    };
+    }
     match exposure(dir) {
         Ok(Exposure::Private) => {}
         Ok(_) => {
@@ -767,6 +780,9 @@ fn recover_entries(dir: &Path, held: Option<&Path>) -> (Vec<Recovery>, bool) {
             return (Vec::new(), false);
         }
     }
+    let Ok(listing) = fs::read_dir(dir) else {
+        return (Vec::new(), false);
+    };
     let held_prefix = held.map(|target| format!("{}-", target_hash(target)));
     let mut done = Vec::new();
     let mut held_entry_in_use = false;
@@ -800,50 +816,59 @@ fn recover_entries(dir: &Path, held: Option<&Path>) -> (Vec<Recovery>, bool) {
         if let (Some(meta), Some(original)) = (meta, original) {
             if sha256_hex(&original) == meta.original_sha256 {
                 let target = PathBuf::from(&meta.path);
-                // Nobody else may be repairing the file while it is put back.
-                let target_lock = if held == Some(target.as_path()) {
-                    None
-                } else {
-                    match lock_target(dir, &target) {
-                        Ok(lock) => Some(lock),
-                        // A live solve has the file. It recovers this entry
-                        // itself, under its lock; leave everything for it.
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                        // Missing or unreadable: the read below says which.
-                        Err(_) => None,
-                    }
-                };
                 let deferred = || RecoveryOutcome::Deferred {
                     saved_original: orig_path.clone(),
                 };
-                let outcome = match fs::read(&target) {
+                // Nobody else may be repairing the file while it is put back,
+                // so it is only read or written with its lock held: by the
+                // caller for `held`, taken here for any other file.
+                let lock_taken = if held == Some(target.as_path()) {
+                    Ok(None)
+                } else {
+                    lock_target(&target).map(Some)
+                };
+                let outcome = match lock_taken {
+                    // A live solve has the file. It recovers this entry
+                    // itself, under its lock; leave everything for it.
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => RecoveryOutcome::TargetMissing,
-                    // Unreadable is not gone: the file may still hold the
-                    // candidate, so the original must not be thrown away.
+                    // The lock could not be taken for some other reason (the
+                    // file is unreadable, say). Without it nothing is touched.
                     Err(_) => deferred(),
-                    Ok(current) if current == original => RecoveryOutcome::AlreadyOriginal,
-                    Ok(current)
-                        if left_by_the_dead_process(
-                            &current,
-                            &original,
-                            last_written.as_deref(),
-                        ) =>
-                    {
-                        match fs::write(&target, &original) {
-                            Ok(()) => RecoveryOutcome::Restored,
+                    Ok(target_lock) => {
+                        let outcome = match fs::read(&target) {
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                                RecoveryOutcome::TargetMissing
+                            }
+                            // Unreadable is not gone: the file may still hold
+                            // the candidate, so the original is kept.
                             Err(_) => deferred(),
+                            Ok(current) if current == original => RecoveryOutcome::AlreadyOriginal,
+                            Ok(current)
+                                if left_by_the_dead_process(
+                                    &current,
+                                    &original,
+                                    last_written.as_deref(),
+                                ) =>
+                            {
+                                match fs::write(&target, &original) {
+                                    Ok(()) => RecoveryOutcome::Restored,
+                                    Err(_) => deferred(),
+                                }
+                            }
+                            Ok(_) => {
+                                keep_original = true;
+                                RecoveryOutcome::LeftChanged {
+                                    saved_original: orig_path.clone(),
+                                }
+                            }
+                        };
+                        if let Some(lock) = &target_lock {
+                            lock.remove_guard_file();
                         }
-                    }
-                    Ok(_) => {
-                        keep_original = true;
-                        RecoveryOutcome::LeftChanged {
-                            saved_original: orig_path.clone(),
-                        }
+                        outcome
                     }
                 };
-                if let Some(lock) = &target_lock {
-                    lock.remove_guard_file();
-                }
                 let retry_later = matches!(outcome, RecoveryOutcome::Deferred { .. });
                 done.push(Recovery { target, outcome });
                 if retry_later {
@@ -1216,8 +1241,8 @@ mod tests {
         assert!(recover_in(&journal).is_empty());
         assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
 
-        // Protecting a file closes the directory. The entry found in it is
-        // set aside, not recovered.
+        // Protecting a file never uses that directory again: it is moved
+        // aside whole, and a fresh private one takes its place.
         let guard = protect_in(&journal, &source).unwrap();
         assert_eq!(
             fs::metadata(&journal).unwrap().permissions().mode() & 0o777,
@@ -1225,22 +1250,25 @@ mod tests {
         );
         assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
         drop(guard);
+        assert_eq!(entry_files(&journal), 0, "the new directory starts empty");
         assert!(recover_in(&journal).is_empty());
         assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
 
-        // Nothing was deleted: the files are in one owner-only subdirectory,
-        // where a genuine backup could still be restored by hand.
-        let aside: Vec<PathBuf> = fs::read_dir(&journal)
+        // Nothing was deleted: the old directory, planted files included, is
+        // beside the new one and closed to others, where a genuine backup
+        // could still be restored by hand.
+        let aside: Vec<PathBuf> = fs::read_dir(tmp.path())
             .unwrap()
             .flatten()
             .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("journal.untrusted-")
+            })
             .collect();
         assert_eq!(aside.len(), 1, "{aside:?}");
-        assert!(aside[0]
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("untrusted-"));
         assert_eq!(
             fs::metadata(&aside[0]).unwrap().permissions().mode() & 0o777,
             0o700
@@ -1249,6 +1277,65 @@ mod tests {
             fs::read(aside[0].join("0123456789abcdef-1-0.orig")).unwrap(),
             forged
         );
+    }
+
+    #[test]
+    fn recovery_touches_nothing_when_the_files_lock_cannot_be_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal = tmp.path().join("journal");
+        let project = tmp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let source = project.join("lib.sh");
+        fs::write(&source, "original\n").unwrap();
+        let guard = protect_in(&journal, &source).unwrap();
+        write(&source, b"unverified candidate\n").unwrap();
+        guard.abandon();
+
+        // The file cannot even be opened now, and not because it is gone: a
+        // regular file sits where its directory was.
+        let moved = tmp.path().join("project.moved");
+        fs::rename(&project, &moved).unwrap();
+        fs::write(&project, "not a directory").unwrap();
+        let recovered = recover_in(&journal);
+        assert_eq!(recovered.len(), 1);
+        assert!(
+            matches!(recovered[0].outcome, RecoveryOutcome::Deferred { .. }),
+            "{:?}",
+            recovered[0].outcome
+        );
+        assert_eq!(
+            fs::read(moved.join("lib.sh")).unwrap(),
+            b"unverified candidate\n"
+        );
+
+        // Back in place: the entry was kept, and the file is restored.
+        fs::remove_file(&project).unwrap();
+        fs::rename(&moved, &project).unwrap();
+        assert_eq!(recover_in(&journal)[0].outcome, RecoveryOutcome::Restored);
+        assert_eq!(fs::read(&source).unwrap(), b"original\n");
+    }
+
+    #[test]
+    fn the_guard_file_lock_does_not_depend_on_the_journal_directory() {
+        // The lock used where the source file itself cannot be locked.
+        let (tmp, _journal, source) = fixture("original\n");
+        let guards = tmp.path().join("locks");
+        let first = lock_guard_file(&guards, &source).unwrap();
+        let err = lock_guard_file(&guards, &source).err().expect("held");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        // Another file is not affected.
+        let other = tmp.path().join("other.sh");
+        fs::write(&other, "x\n").unwrap();
+        let second = lock_guard_file(&guards, &other).unwrap();
+        second.remove_guard_file();
+        drop(second);
+        // Released and removed: free again, and nothing is left behind.
+        first.remove_guard_file();
+        drop(first);
+        let again = lock_guard_file(&guards, &source).unwrap();
+        again.remove_guard_file();
+        drop(again);
+        assert_eq!(fs::read_dir(&guards).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
