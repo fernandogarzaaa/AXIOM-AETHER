@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::export_ledger::{has_digest, remember_digest, ExportLedger};
 use crate::provenance::{
     sha256_hex, sign_export, verify_export_authenticated, ProvenanceError, SignedExport,
 };
@@ -282,6 +283,13 @@ impl PatchCandidate {
 pub struct PatchMemory {
     #[serde(default)]
     pub by_fingerprint: BTreeMap<String, Vec<PatchCandidate>>,
+    /// SHA-256 digests of the export payloads merged into this store by
+    /// [`PatchMemory::merge_signed_once`], oldest first, bounded
+    /// ([`crate::export_ledger::MAX_SEEN_EXPORTS`]). Kept in the store so
+    /// that a merge and the record of it are saved by one write. Local
+    /// bookkeeping: never part of an export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_exports: Vec<String>,
 }
 
 /// Summary of a peer merge.
@@ -289,6 +297,10 @@ pub struct PatchMemory {
 pub struct PatchMergeReport {
     pub new_candidates: usize,
     pub reinforced: usize,
+    /// Set by [`PatchMemory::merge_signed_once`] when this exact export was
+    /// merged before, or is one this node handed out itself. Nothing was
+    /// changed and the other counts are zero.
+    pub already_merged: bool,
     /// Candidates dropped during the merge: rejected by the
     /// [`FleetTrustPolicy`] (oversized span, per-fingerprint flood cap),
     /// repeated inside the export, or not [`PatchCandidate::is_well_formed`]
@@ -548,8 +560,18 @@ impl PatchMemory {
             .collect()
     }
 
+    /// The export payload: the candidates only. [`Self::merged_exports`] is
+    /// this node's own bookkeeping and stays out, so the payload (and its
+    /// digest) changes only when the candidates do.
     fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("serialize patch memory")
+        #[derive(Serialize)]
+        struct Export<'a> {
+            by_fingerprint: &'a BTreeMap<String, Vec<PatchCandidate>>,
+        }
+        serde_json::to_string(&Export {
+            by_fingerprint: &self.by_fingerprint,
+        })
+        .expect("serialize patch memory")
     }
 
     /// Export this store as a provenance-signed payload (SHA-256 + optional HMAC
@@ -593,11 +615,58 @@ impl PatchMemory {
         policy: FleetTrustPolicy,
     ) -> Result<PatchMergeReport, ProvenanceError> {
         let payload = verify_export_authenticated(export, fleet_key)?;
+        self.fold_in(payload, policy)
+    }
+
+    /// [`Self::merge_signed_guarded`], counting an export once.
+    ///
+    /// An export is one statement by one peer. Delivering it again (a retry,
+    /// a sync job on a timer, a replay by anyone who captured it, or this
+    /// node's own export sent back) must add nothing, or a count that is
+    /// meant to reflect independent confirmations can be raised at will.
+    ///
+    /// An authenticated export that this store merged before
+    /// ([`Self::merged_exports`]), or that this node handed out itself
+    /// (`handed_out`, the store's [`ExportLedger`]), is reported as
+    /// [`PatchMergeReport::already_merged`] and the store is left untouched.
+    /// A new one is merged and its digest recorded in the store, so that the
+    /// caller's one save of the store persists the merge and the record of
+    /// it together. A *different* export from a key-holder still counts.
+    pub fn merge_signed_once(
+        &mut self,
+        export: &SignedExport,
+        fleet_key: Option<&[u8]>,
+        policy: FleetTrustPolicy,
+        handed_out: &ExportLedger,
+    ) -> Result<PatchMergeReport, ProvenanceError> {
+        // Authenticate first: nothing is answered about an export this node
+        // would refuse. The digest is taken from the payload.
+        let payload = verify_export_authenticated(export, fleet_key)?;
+        if has_digest(&self.merged_exports, payload) || handed_out.contains(payload) {
+            return Ok(PatchMergeReport {
+                new_candidates: 0,
+                reinforced: 0,
+                already_merged: true,
+                byzantine_rejected: 0,
+            });
+        }
+        let report = self.fold_in(payload, policy)?;
+        remember_digest(&mut self.merged_exports, payload);
+        Ok(report)
+    }
+
+    /// Fold an authenticated export payload in, subject to `policy`.
+    fn fold_in(
+        &mut self,
+        payload: &str,
+        policy: FleetTrustPolicy,
+    ) -> Result<PatchMergeReport, ProvenanceError> {
         let peer: PatchMemory =
             serde_json::from_str(payload).map_err(|_| ProvenanceError::BadSchema)?;
         let mut report = PatchMergeReport {
             new_candidates: 0,
             reinforced: 0,
+            already_merged: false,
             byzantine_rejected: 0,
         };
         for (fp, peer_list) in peer.by_fingerprint {
@@ -1440,6 +1509,163 @@ mod tests {
         assert_eq!(rep.byzantine_rejected, 1);
         assert!(local.candidates("fp").is_empty());
         assert!(local.by_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn merging_the_same_export_again_changes_nothing() {
+        let key: &[u8] = b"fleet";
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("axiom_patch_memory.json");
+        let mut peer = PatchMemory::new();
+        peer.record_verified("fp", &scope("a.rs"), "BAD\n", "FIX\n");
+        peer.record_verified("fp-new", &scope("b.rs"), "BAD\n", "OTHER\n");
+        let export = peer.export_signed(Some(key));
+
+        let mut local = PatchMemory::new();
+        local.record_verified("fp", &scope("a.rs"), "BAD\n", "FIX\n");
+        let first = ExportLedger::with(&store, |handed_out| {
+            local
+                .merge_signed_once(&export, Some(key), FleetTrustPolicy::robust(), handed_out)
+                .unwrap()
+        });
+        assert!(!first.already_merged);
+        assert_eq!((first.reinforced, first.new_candidates), (1, 1));
+        assert_eq!(local.candidates("fp")[0].verified_count, 2);
+        assert_eq!(local.merged_exports.len(), 1);
+
+        // The merge and the record of it are one file, saved by one write.
+        // Reload it, as after a restart.
+        local.save(&store).unwrap();
+        let mut local = PatchMemory::load(&store);
+        let after_first = serde_json::to_value(&local).unwrap();
+
+        // Delivered again, any number of times, under either policy.
+        for policy in [FleetTrustPolicy::robust(), FleetTrustPolicy::permissive()] {
+            for _ in 0..3 {
+                let again = ExportLedger::with(&store, |handed_out| {
+                    local
+                        .merge_signed_once(&export, Some(key), policy, handed_out)
+                        .unwrap()
+                });
+                assert_eq!(
+                    again,
+                    PatchMergeReport {
+                        new_candidates: 0,
+                        reinforced: 0,
+                        already_merged: true,
+                        byzantine_rejected: 0,
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&local).unwrap(),
+            after_first,
+            "a repeated export must not move any count"
+        );
+
+        // A different export from the peer still counts.
+        peer.record_verified("fp-later", &scope("c.rs"), "BAD\n", "LATER\n");
+        let next = ExportLedger::with(&store, |handed_out| {
+            local
+                .merge_signed_once(
+                    &peer.export_signed(Some(key)),
+                    Some(key),
+                    FleetTrustPolicy::robust(),
+                    handed_out,
+                )
+                .unwrap()
+        });
+        assert!(!next.already_merged);
+        assert_eq!(next.new_candidates, 1);
+        assert_eq!(local.candidates("fp")[0].verified_count, 3);
+        assert_eq!(local.merged_exports.len(), 2);
+    }
+
+    #[test]
+    fn an_export_this_node_handed_out_is_not_merged_back_into_it() {
+        let key: &[u8] = b"fleet";
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("axiom_patch_memory.json");
+        let mut node = PatchMemory::new();
+        node.record_verified("fp", &scope("a.rs"), "BAD\n", "FIX\n");
+        let export = node.export_signed(Some(key));
+
+        ExportLedger::with(&store, |handed_out| {
+            // What `GET /v1/patches` does.
+            assert!(handed_out.remember(&export.payload));
+            let report = node
+                .merge_signed_once(&export, Some(key), FleetTrustPolicy::robust(), handed_out)
+                .unwrap();
+            assert!(report.already_merged);
+        });
+        assert_eq!(node.candidates("fp")[0].verified_count, 1);
+        assert!(node.merged_exports.is_empty());
+    }
+
+    #[test]
+    fn the_export_payload_holds_candidates_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("axiom_patch_memory.json");
+        let mut node = PatchMemory::new();
+        node.record_verified("fp", &scope("a.rs"), "BAD\n", "FIX\n");
+        let before = node.export_signed(None).payload;
+        // Merging something records a digest in the store...
+        let mut peer = PatchMemory::new();
+        peer.record_verified("fp", &scope("a.rs"), "BAD\n", "FIX\n");
+        ExportLedger::with(&store, |handed_out| {
+            node.merge_signed_once(
+                &peer.export_signed(Some(b"fleet")),
+                Some(b"fleet"),
+                FleetTrustPolicy::robust(),
+                handed_out,
+            )
+            .unwrap();
+        });
+        assert_eq!(node.merged_exports.len(), 1);
+        // ...which is saved with the store but never exported.
+        node.save(&store).unwrap();
+        assert!(std::fs::read_to_string(&store)
+            .unwrap()
+            .contains("merged_exports"));
+        let after = node.export_signed(None).payload;
+        assert!(!after.contains("merged_exports"), "{after}");
+        // A store written by an older version (no record) still loads, and an
+        // export still reads back as a store.
+        let old: PatchMemory = serde_json::from_str(&before).unwrap();
+        assert!(old.merged_exports.is_empty());
+        assert_eq!(old.candidates("fp").len(), 1);
+    }
+
+    #[test]
+    fn an_export_this_node_would_refuse_is_neither_merged_nor_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("axiom_patch_memory.json");
+        let mut peer = PatchMemory::new();
+        peer.record_verified("fp", &scope("a.rs"), "BAD\n", "FIX\n");
+        let foreign = peer.export_signed(Some(b"other-fleet"));
+        let mut local = PatchMemory::new();
+        ExportLedger::with(&store, |handed_out| {
+            // Wrong key, and no key at all.
+            for key in [Some(&b"fleet"[..]), None] {
+                assert!(local
+                    .merge_signed_once(&foreign, key, FleetTrustPolicy::robust(), handed_out)
+                    .is_err());
+            }
+            // Even recorded as handed out, it is refused, not "already
+            // merged": the records are consulted only after authentication.
+            handed_out.remember(&foreign.payload);
+            assert!(local
+                .merge_signed_once(
+                    &foreign,
+                    Some(b"fleet"),
+                    FleetTrustPolicy::robust(),
+                    handed_out
+                )
+                .is_err());
+        });
+        assert!(local.is_empty());
+        assert!(local.merged_exports.is_empty());
     }
 
     #[test]

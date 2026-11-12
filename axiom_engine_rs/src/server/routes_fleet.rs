@@ -33,6 +33,17 @@ async fn get_immunity(State(state): State<AppState>) -> Response {
     // readable but will not merge anywhere.
     let signed =
         crate::provenance::sign_export(&memory.to_json(), state.fleet_key.as_deref());
+    // Record a signed export in the memory's export ledger as this node's
+    // own, so that posting it back to this node's merge route changes nothing
+    // (otherwise every record would merge with itself, once per round trip).
+    // An empty memory has nothing to compound and an unsigned export merges
+    // nowhere. The ledger is a file of its own: this route never writes the
+    // memory.
+    if signed.hmac.is_some() && !memory.all_records().is_empty() {
+        if let Err(e) = record_own_export(path, &signed.payload) {
+            return own_export_not_recorded(e);
+        }
+    }
     Json(signed).into_response()
 }
 
@@ -226,6 +237,10 @@ async fn require_fleet_merge_trust(
 /// sits behind [`require_fleet_merge_trust`]). Returns the merge report.
 /// Local learning is never weakened: dirs are unioned and tension histories
 /// are count-weighted.
+///
+/// An export counts once. One that was merged before, or that this node
+/// handed out itself, is answered with `"already_merged": true` and changes
+/// nothing, however often it is delivered (see [`crate::export_ledger`]).
 async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Response {
     let Some(path) = state.heal_memory_path.as_ref() else {
         return (
@@ -258,9 +273,23 @@ async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Res
                 .into_response();
         }
     };
-    let mut memory = crate::heal_memory::HealMemory::load(path);
-    match memory.merge_json(&payload) {
-        Ok(report) => {
+    // Once only: the whole step runs as one transaction in this process, so
+    // the same export arriving twice at once is still merged once.
+    crate::export_ledger::ExportLedger::with(path, |handed_out| {
+        let mut memory = crate::heal_memory::HealMemory::load(path);
+        let report = match memory.merge_json_once(&payload, handed_out) {
+            Ok(report) => report,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e})),
+                )
+                    .into_response();
+            }
+        };
+        if !report.already_merged {
+            // One write: the memory carries the record that it merged this
+            // export, so the two cannot come apart.
             if let Err(e) = memory.save() {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -268,22 +297,18 @@ async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Res
                 )
                     .into_response();
             }
-            Json(serde_json::json!({
-                "merged": true,
-                "programs_added": report.programs_added,
-                "programs_merged": report.programs_merged,
-                "dirs_added": report.dirs_added,
-                "belief_conflicts": report.belief_conflicts,
-                "byzantine_rejected": report.byzantine_rejected,
-            }))
-            .into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
-    }
+        Json(serde_json::json!({
+            "merged": true,
+            "already_merged": report.already_merged,
+            "programs_added": report.programs_added,
+            "programs_merged": report.programs_merged,
+            "dirs_added": report.dirs_added,
+            "belief_conflicts": report.belief_conflicts,
+            "byzantine_rejected": report.byzantine_rejected,
+        }))
+        .into_response()
+    })
 }
 
 /// Spawn the background task that consumes inbound DWE fragments, verifies

@@ -183,6 +183,13 @@ const STRUCTURAL_COROBORATION_THRESHOLD: usize = 2;
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct MemoryFile {
     programs: HashMap<String, ProgramRecord>,
+    /// SHA-256 digests of the export payloads merged into this memory by
+    /// [`HealMemory::merge_json_once`], oldest first, bounded
+    /// ([`crate::export_ledger::MAX_SEEN_EXPORTS`]). Kept in the memory so
+    /// that a merge and the record of it are saved by one write. Local
+    /// bookkeeping: never part of an export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    merged_exports: Vec<String>,
 }
 
 /// What a swarm-immunity merge changed locally.
@@ -199,6 +206,10 @@ pub struct MergeReport {
     pub belief_conflicts: usize,
     /// Peer records rejected as byzantine (implausible belief parameters).
     pub byzantine_rejected: usize,
+    /// Set by [`HealMemory::merge_json_once`] when this exact export was
+    /// merged before, or is one this node handed out itself. Nothing was
+    /// changed and the other counts are zero.
+    pub already_merged: bool,
 }
 
 /// Persistent heal memory, loaded eagerly and saved explicitly.
@@ -780,9 +791,52 @@ impl HealMemory {
         before - self.data.programs.len()
     }
 
-    /// Serialize the whole memory for transfer to a swarm peer.
+    /// Serialize the whole memory for transfer to a swarm peer, with the
+    /// program records in fingerprint order. The records live in a hash map,
+    /// whose order differs from one load to the next; written in order, the
+    /// same memory always exports the same bytes, so an export can be known
+    /// by its digest ([`crate::export_ledger`]).
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(&self.data).unwrap_or_else(|_| "{}".into())
+        #[derive(Serialize)]
+        struct Export<'a> {
+            programs: std::collections::BTreeMap<&'a String, &'a ProgramRecord>,
+        }
+        serde_json::to_string_pretty(&Export {
+            programs: self.data.programs.iter().collect(),
+        })
+        .unwrap_or_else(|_| "{}".into())
+    }
+
+    /// [`Self::merge_json`], counting an export once.
+    ///
+    /// An export is one statement by one peer. Merging the same bytes again
+    /// (a retry, a sync job on a timer, a repeated pull of a peer that has
+    /// not changed, a replay, or this node's own export sent back) must add
+    /// nothing, or evidence compounds without anything new having been
+    /// observed.
+    ///
+    /// A payload that this memory merged before, or that this node handed
+    /// out itself (`handed_out`, the memory's
+    /// [`crate::export_ledger::ExportLedger`]), is reported as
+    /// [`MergeReport::already_merged`] and the memory is left untouched. A
+    /// new one is merged and its digest recorded in the memory, so that the
+    /// caller's one [`Self::save`] persists the merge and the record of it
+    /// together. A *different* export from the same peer still merges.
+    pub fn merge_json_once(
+        &mut self,
+        peer_json: &str,
+        handed_out: &crate::export_ledger::ExportLedger,
+    ) -> Result<MergeReport, String> {
+        use crate::export_ledger::{has_digest, remember_digest};
+        if has_digest(&self.data.merged_exports, peer_json) || handed_out.contains(peer_json) {
+            return Ok(MergeReport {
+                already_merged: true,
+                ..MergeReport::default()
+            });
+        }
+        let report = self.merge_json(peer_json)?;
+        remember_digest(&mut self.data.merged_exports, peer_json);
+        Ok(report)
     }
 
     /// Merge a peer's exported memory into this one (swarm immunity), with
@@ -990,6 +1044,109 @@ mod tests {
         assert!(ours.merge_json("{broken").is_err());
         // Local state untouched.
         assert_eq!(ours.record(&fp).unwrap().dirs, vec![PathBuf::from("/keep")]);
+    }
+
+    #[test]
+    fn merging_the_same_export_again_changes_nothing() {
+        use crate::export_ledger::ExportLedger;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("heal_memory.json");
+        let fp = fingerprint("prog", &[]);
+        let mut ours = HealMemory::load(&store);
+        ours.remember_dirs(&fp, "prog", &[PathBuf::from("/a")]);
+        ours.reinforce_immunity(&fp, 1_000_000_000);
+        let mut theirs = HealMemory::load(dir.path().join("peer.json"));
+        theirs.remember_dirs(&fp, "prog", &[PathBuf::from("/b")]);
+        theirs.reinforce_immunity(&fp, 1_000_000_000);
+        let export = theirs.to_json();
+
+        let first = ExportLedger::with(&store, |handed_out| {
+            ours.merge_json_once(&export, handed_out).unwrap()
+        });
+        assert!(!first.already_merged);
+        assert_eq!((first.programs_merged, first.dirs_added), (1, 1));
+
+        // The merge and the record of it are one file, saved by one write.
+        // Reload it, as after a restart.
+        ours.save().unwrap();
+        assert!(std::fs::read_to_string(&store)
+            .unwrap()
+            .contains("merged_exports"));
+        let mut ours = HealMemory::load(&store);
+        let after_first = ours.to_json();
+        assert!(!after_first.contains("merged_exports"), "never exported");
+
+        for _ in 0..3 {
+            let again = ExportLedger::with(&store, |handed_out| {
+                ours.merge_json_once(&export, handed_out).unwrap()
+            });
+            assert_eq!(
+                again,
+                MergeReport {
+                    already_merged: true,
+                    ..MergeReport::default()
+                }
+            );
+        }
+        assert_eq!(
+            ours.to_json(),
+            after_first,
+            "a repeated export must not compound evidence or counts"
+        );
+
+        // A different export from the peer still merges. A malformed one is
+        // rejected and not recorded.
+        theirs.remember_dirs(&fp, "prog", &[PathBuf::from("/c")]);
+        ExportLedger::with(&store, |handed_out| {
+            let next = ours.merge_json_once(&theirs.to_json(), handed_out).unwrap();
+            assert!(!next.already_merged);
+            assert_eq!(next.dirs_added, 1);
+            assert!(ours.merge_json_once("{broken", handed_out).is_err());
+        });
+        assert_eq!(ours.data.merged_exports.len(), 2);
+    }
+
+    #[test]
+    fn an_export_this_node_handed_out_is_not_merged_back_into_it() {
+        use crate::export_ledger::ExportLedger;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("heal_memory.json");
+        let fp = fingerprint("prog", &[]);
+        let mut node = HealMemory::load(&store);
+        node.remember_dirs(&fp, "prog", &[PathBuf::from("/a")]);
+        node.reinforce_immunity(&fp, 1_000_000_000);
+        let export = node.to_json();
+
+        ExportLedger::with(&store, |handed_out| {
+            // What `GET /v1/immunity` does.
+            assert!(handed_out.remember(&export));
+            let report = node.merge_json_once(&export, handed_out).unwrap();
+            assert!(report.already_merged);
+        });
+        assert_eq!(node.to_json(), export);
+        assert!(node.data.merged_exports.is_empty());
+    }
+
+    #[test]
+    fn the_export_is_the_same_bytes_however_the_memory_was_loaded() {
+        // Records live in a hash map, whose order differs from one load to the
+        // next. The export must not: its digest is what a replay is known by.
+        let path = tmp("stable_export");
+        let mut mem = HealMemory::load(&path);
+        for i in 0..24 {
+            let fp = fingerprint(&format!("prog{i}"), &[]);
+            mem.remember_dirs(&fp, &format!("prog{i}"), &[PathBuf::from("/x")]);
+        }
+        mem.save().unwrap();
+        let export = mem.to_json();
+        for _ in 0..8 {
+            assert_eq!(HealMemory::load(&path).to_json(), export);
+        }
+        let _ = std::fs::remove_file(&path);
+        // The export still reads back as the memory it came from.
+        let mut copy = HealMemory::load(tmp("stable_export_copy"));
+        assert_eq!(copy.merge_json(&export).unwrap().programs_added, 24);
+        assert_eq!(copy.to_json(), export);
     }
 
     #[test]

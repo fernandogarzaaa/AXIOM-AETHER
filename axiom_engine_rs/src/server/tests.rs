@@ -1722,8 +1722,8 @@ mod tests {
             .await
             .unwrap();
 
-        // POST it back to /v1/patches/merge → the identical candidate reinforces,
-        // exercising provenance verification + content-hash recompute over HTTP.
+        // POST it back to /v1/patches/merge. Provenance verifies, and the node
+        // recognises its own export: a store must not confirm its own fixes.
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1742,10 +1742,51 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["merged"], true);
-        assert_eq!(v["reinforced"], 1);
+        assert_eq!(v["already_merged"], true);
+        assert_eq!(v["reinforced"], 0);
         assert_eq!(v["new_candidates"], 0);
 
-        // The store now records the candidate as verified by two nodes.
+        // Still verified by one node: this one.
+        let pm = crate::patch_memory::PatchMemory::load(&patch_path);
+        assert_eq!(pm.candidates("fp1")[0].verified_count, 1);
+
+        // A peer's export of the same fix is a second, independent
+        // confirmation, exercising the merge itself over HTTP.
+        let mut peer = crate::patch_memory::PatchMemory::new();
+        peer.record_verified(
+            "fp1",
+            &crate::patch_memory::RepoScope::new("path:test-repo", "src/a.rs"),
+            "BROKEN\n",
+            "FIXED\n",
+        );
+        peer.record_verified(
+            "fp2",
+            &crate::patch_memory::RepoScope::new("path:test-repo", "src/b.rs"),
+            "BROKEN\n",
+            "ALSO FIXED\n",
+        );
+        let peer_export =
+            serde_json::to_vec(&peer.export_signed(Some(b"test-fleet-key"))).unwrap();
+        let resp = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/patches/merge")
+                    .header("host", "127.0.0.1:8080")
+                    .header("content-type", "application/json")
+                    .body(Body::from(peer_export))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["already_merged"], false);
+        assert_eq!(v["reinforced"], 1);
+        assert_eq!(v["new_candidates"], 1);
         let pm = crate::patch_memory::PatchMemory::load(&patch_path);
         assert_eq!(pm.candidates("fp1")[0].verified_count, 2);
 

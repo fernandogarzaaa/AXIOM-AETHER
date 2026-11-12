@@ -8,6 +8,11 @@ fn patch_store_path(state: &AppState) -> Option<PathBuf> {
 /// (SHA-256, plus an HMAC when a fleet key is configured). A peer merges the
 /// export only if that HMAC verifies under the shared fleet key (see
 /// `POST /v1/patches/merge`), so an export from a keyless node merges nowhere.
+///
+/// A signed export is also recorded in the store's export ledger as this
+/// node's own, so that posting it back to this node's merge route changes
+/// nothing (otherwise every candidate would confirm itself, once per round
+/// trip). The ledger is a file of its own: this route never writes the store.
 async fn get_patches(State(state): State<AppState>) -> Response {
     let Some(path) = patch_store_path(&state) else {
         return (
@@ -18,7 +23,36 @@ async fn get_patches(State(state): State<AppState>) -> Response {
     };
     let memory = crate::patch_memory::PatchMemory::load(&path);
     let signed = memory.export_signed(state.fleet_key.as_deref());
+    // Only a signed export of a non-empty store can be merged anywhere and
+    // move a count, so only that one needs recording.
+    if signed.hmac.is_some() && !memory.is_empty() {
+        if let Err(e) = record_own_export(&path, &signed.payload) {
+            return own_export_not_recorded(e);
+        }
+    }
     Json(signed).into_response()
+}
+
+/// Record `payload` in the export ledger of the store at `store` as an export
+/// this node handed out. Writes only when the export is new, that is when the
+/// store changed since it was last read.
+fn record_own_export(store: &std::path::Path, payload: &str) -> std::io::Result<()> {
+    crate::export_ledger::ExportLedger::with(store, |ledger| {
+        ledger.remember(payload);
+        ledger.save()
+    })
+}
+
+/// An export that is not on record could be replayed to this node, so it is
+/// not handed out.
+fn own_export_not_recorded(e: std::io::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": format!("could not record the export in the export ledger: {e}")
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /v1/patches/merge` — fold a peer's signed patch export (its
@@ -29,6 +63,10 @@ async fn get_patches(State(state): State<AppState>) -> Response {
 /// a 401 for every request while this node has no `AXIOM_FLEET_KEY`), and
 /// `merge_signed_guarded` then accepts the export only if its HMAC verifies
 /// under that key, recomputing content hashes as it folds candidates in.
+///
+/// An export counts once. One that was merged before, or that this node
+/// handed out itself, is answered with `"already_merged": true` and changes
+/// nothing, however often it is delivered (see [`crate::export_ledger`]).
 ///
 /// A merged candidate is NOT inert. Merging only records it, but the repair
 /// loop "re-verifies" a recorded candidate by writing its content into the
@@ -55,17 +93,32 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
                 .into_response();
         }
     };
-    let mut memory = crate::patch_memory::PatchMemory::load(&path);
     // Authenticated: the export's HMAC must verify under this node's fleet key
     // (no key → `NoFleetKey`, refused). Byzantine-robust: a peer holding the
     // key still cannot inflate trust or flood the store — the robust policy
-    // bounds per-peer contribution.
-    match memory.merge_signed_guarded(
-        &export,
-        state.fleet_key.as_deref(),
-        crate::patch_memory::FleetTrustPolicy::robust(),
-    ) {
-        Ok(report) => {
+    // bounds per-peer contribution. Once only: the whole step runs as one
+    // transaction in this process, so the same export arriving twice at once
+    // is still merged once.
+    crate::export_ledger::ExportLedger::with(&path, |handed_out| {
+        let mut memory = crate::patch_memory::PatchMemory::load(&path);
+        let report = match memory.merge_signed_once(
+            &export,
+            state.fleet_key.as_deref(),
+            crate::patch_memory::FleetTrustPolicy::robust(),
+            handed_out,
+        ) {
+            Ok(report) => report,
+            Err(e) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": format!("provenance rejected: {e}")})),
+                )
+                    .into_response();
+            }
+        };
+        if !report.already_merged {
+            // One write: the store carries the record that it merged this
+            // export, so the two cannot come apart.
             if let Err(e) = memory.save(&path) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -75,20 +128,16 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
                 )
                     .into_response();
             }
-            Json(serde_json::json!({
-                "merged": true,
-                "new_candidates": report.new_candidates,
-                "reinforced": report.reinforced,
-                "byzantine_rejected": report.byzantine_rejected,
-            }))
-            .into_response()
         }
-        Err(e) => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": format!("provenance rejected: {e}")})),
-        )
-            .into_response(),
-    }
+        Json(serde_json::json!({
+            "merged": true,
+            "already_merged": report.already_merged,
+            "new_candidates": report.new_candidates,
+            "reinforced": report.reinforced,
+            "byzantine_rejected": report.byzantine_rejected,
+        }))
+        .into_response()
+    })
 }
 
 /// `POST /v1/chimera/run` — execute a ChimeraLang program with AXIOM's in-tree

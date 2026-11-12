@@ -1392,21 +1392,36 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     }
                     Err(_) => fetched, // back-compat: unsigned peer
                 };
-                let mut memory = heal_memory::HealMemory::load(&local);
-                let report = memory
-                    .merge_json(&peer_json)
-                    .map_err(candle_core::Error::Msg)?;
-                memory
-                    .save()
-                    .map_err(|e| candle_core::Error::Msg(format!("memory save failed: {e}")))?;
-                println!(
-                    "[axiom] swarm immunity merged from {url}: +{} new program(s), {} merged, +{} dir(s), {} conflict(s), {} byzantine-rejected",
-                    report.programs_added,
-                    report.programs_merged,
-                    report.dirs_added,
-                    report.belief_conflicts,
-                    report.byzantine_rejected
-                );
+                // An export counts once: pulling a peer that has not changed
+                // since the last pull must not compound its evidence.
+                let report = crate::export_ledger::ExportLedger::with(&local, |handed_out| {
+                    let mut memory = heal_memory::HealMemory::load(&local);
+                    let report = memory
+                        .merge_json_once(&peer_json, handed_out)
+                        .map_err(candle_core::Error::Msg)?;
+                    if !report.already_merged {
+                        // One write: the memory carries the record that it
+                        // merged this export.
+                        memory.save().map_err(|e| {
+                            candle_core::Error::Msg(format!("memory save failed: {e}"))
+                        })?;
+                    }
+                    Ok::<_, candle_core::Error>(report)
+                })?;
+                if report.already_merged {
+                    println!(
+                        "[axiom] swarm immunity from {url}: this export was merged before; nothing changed"
+                    );
+                } else {
+                    println!(
+                        "[axiom] swarm immunity merged from {url}: +{} new program(s), {} merged, +{} dir(s), {} conflict(s), {} byzantine-rejected",
+                        report.programs_added,
+                        report.programs_merged,
+                        report.dirs_added,
+                        report.belief_conflicts,
+                        report.byzantine_rejected
+                    );
+                }
                 println!("[axiom] local memory: {}", local.display());
             }
         },

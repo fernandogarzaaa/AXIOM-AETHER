@@ -147,6 +147,20 @@ Set `AXIOM_FLEET_KEY` identically on all nodes and configure peers via
 | `GET /v1/patches` · `POST /v1/patches/merge` | Verified-patch store as a provenance-signed export; merge is Byzantine-robust, 32 MiB body limit. |
 | `GET /v1/immunity` · `POST /v1/immunity/merge` | Environment-immunity gossip (Dempster–Shafer, Byzantine-resistant). |
 
+Both merge routes count an export once. Delivering the same export again (a
+retry, a sync job that runs on a timer, a replay, or a node's own export posted
+back to it) answers `"already_merged": true` and changes nothing. Each store
+keeps the digests of the last 1024 exports it merged in its own file, written
+by the same save as the merge, and the digests of the last 1024 exports it
+handed out in a ledger file beside it (`heal_memory.json.exports.json`,
+`axiom_patch_memory.json.exports.json`); reading an export never rewrites the
+store itself. An export counts once for as long as its digest is among those:
+after 1024 newer exports have displaced it, the same export would merge once
+more. A
+different export from a peer is new information and merges as before, so how
+often a peer's *changed* store counts is still bounded only by who holds the
+fleet key.
+
 `GET /metrics` also exports `axiom_dwe_{sent,received,applied,rejected}`. Use
 `axiom fleet status` for the live view, or `--offline` for local wiring only.
 
