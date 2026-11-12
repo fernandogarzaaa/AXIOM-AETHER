@@ -892,9 +892,24 @@ fn recover_entries(dir: &Path, held: Option<&Path>) -> (Vec<Recovery>, bool) {
             .iter()
             .any(|ext| others_could_have_changed(&stem.with_extension(ext)))
         {
-            for ext in ["lock", "json", "cand", "orig"] {
+            // A name nothing has yet: an entry refused earlier may have had
+            // the same stem (process ids come round again), and its saved
+            // original must not be replaced by this one.
+            let parts = ["lock", "json", "cand", "orig"];
+            let suffix = (0u32..)
+                .map(|n| match n {
+                    0 => ENTRY_SET_ASIDE.to_string(),
+                    n => format!("{ENTRY_SET_ASIDE}-{n}"),
+                })
+                .find(|suffix| {
+                    parts
+                        .iter()
+                        .all(|ext| !stem.with_extension(format!("{ext}{suffix}")).exists())
+                })
+                .unwrap_or_else(|| format!("{ENTRY_SET_ASIDE}-{}", std::process::id()));
+            for ext in parts {
                 let file = stem.with_extension(ext);
-                let aside = stem.with_extension(format!("{ext}{ENTRY_SET_ASIDE}"));
+                let aside = stem.with_extension(format!("{ext}{suffix}"));
                 if let Err(e) = fs::rename(&file, &aside) {
                     if e.kind() != io::ErrorKind::NotFound {
                         eprintln!(
@@ -909,7 +924,7 @@ fn recover_entries(dir: &Path, held: Option<&Path>) -> (Vec<Recovery>, bool) {
                  other users. No source file was touched. The entry was renamed to *{} and \
                  will not be used; check the saved original by hand.",
                 orig_path.display(),
-                ENTRY_SET_ASIDE
+                suffix
             );
             continue;
         }
@@ -1325,6 +1340,14 @@ mod tests {
         fs::create_dir(journal).unwrap();
         fs::set_permissions(journal, fs::Permissions::from_mode(0o777)).unwrap();
         let forged = b"attacker content\n";
+        write_forged_entry(journal, victim, forged);
+        forged
+    }
+
+    /// Write the files of one complete entry, always under the same stem,
+    /// whose saved "original" is `forged` and which names `victim`.
+    #[cfg(unix)]
+    fn write_forged_entry(journal: &Path, victim: &Path, forged: &[u8]) {
         let stem = journal.join("0123456789abcdef-1-0");
         fs::write(stem.with_extension("lock"), b"").unwrap();
         fs::write(stem.with_extension("orig"), forged).unwrap();
@@ -1338,7 +1361,6 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        forged
     }
 
     /// The directories [`set_aside`] left next to `<parent>/<name>`.
@@ -1473,6 +1495,47 @@ mod tests {
         assert!(recover_in(&journal).is_empty());
         let guard = protect_in(&journal, &source).unwrap();
         drop(guard);
+        assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_refused_entry_of_the_same_name_does_not_replace_the_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let open_to_all = |journal: &Path| {
+            for ext in ["orig", "json", "cand", "lock"] {
+                let file = journal.join(format!("0123456789abcdef-1-0.{ext}"));
+                fs::set_permissions(file, fs::Permissions::from_mode(0o666)).unwrap();
+            }
+        };
+        let (tmp, journal, _source) = fixture("original\n");
+        let victim = tmp.path().join("victim.sh");
+        fs::write(&victim, "the user's real file\n").unwrap();
+        let victim = fs::canonicalize(&victim).unwrap();
+
+        // One entry is refused and renamed.
+        let first = plant_forged_entry(&journal, &victim);
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o700)).unwrap();
+        open_to_all(&journal);
+        assert!(recover_in(&journal).is_empty());
+
+        // Later another one turns up under the very same name (process ids
+        // come round again), with a different saved original.
+        let second = b"a different saved original\n";
+        write_forged_entry(&journal, &victim, second);
+        open_to_all(&journal);
+        assert!(recover_in(&journal).is_empty());
+
+        // Both saved originals are still there.
+        assert_eq!(
+            fs::read(journal.join("0123456789abcdef-1-0.orig.untrusted")).unwrap(),
+            first
+        );
+        assert_eq!(
+            fs::read(journal.join("0123456789abcdef-1-0.orig.untrusted-1")).unwrap(),
+            second
+        );
+        assert_eq!(entry_files(&journal), 8);
         assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
     }
 
