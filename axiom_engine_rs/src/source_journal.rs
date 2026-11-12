@@ -223,6 +223,11 @@ fn close_to_others(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// What is appended to the name of each file of an entry that recovery
+/// refused because others could have changed it. With it, the files are no
+/// longer an entry.
+const ENTRY_SET_ASIDE: &str = ".untrusted";
+
 /// Could somebody other than this user have changed the journal file at
 /// `path`? True for one that belongs to another user, that group or others
 /// may write to, or that is not a regular file (a link could point anywhere).
@@ -878,16 +883,33 @@ fn recover_entries(dir: &Path, held: Option<&Path>) -> (Vec<Recovery>, bool) {
         let stem = lock_path.with_extension("");
         let orig_path = stem.with_extension("orig");
         // What an entry says is written over a source file, so an entry
-        // somebody else could have edited is not acted on. It is left where
-        // it is: the saved original may still be wanted.
+        // somebody else could have edited is never acted on, now or later.
+        // Its files are renamed so that they stop being an entry: closing
+        // them afterwards does not undo a change already made. The lock goes
+        // first, since an entry is found by its lock. Nothing is deleted: the
+        // saved original may still be wanted.
         if ["orig", "json", "cand"]
             .iter()
             .any(|ext| others_could_have_changed(&stem.with_extension(ext)))
         {
+            for ext in ["lock", "json", "cand", "orig"] {
+                let file = stem.with_extension(ext);
+                let aside = stem.with_extension(format!("{ext}{ENTRY_SET_ASIDE}"));
+                if let Err(e) = fs::rename(&file, &aside) {
+                    if e.kind() != io::ErrorKind::NotFound {
+                        eprintln!(
+                            "[axiom-journal] could not set {} aside: {e}",
+                            file.display()
+                        );
+                    }
+                }
+            }
             eprintln!(
                 "[axiom-journal] not restoring from {}: its files could have been changed by \
-                 other users. Nothing was touched; check the saved original by hand.",
-                orig_path.display()
+                 other users. No source file was touched. The entry was renamed to *{} and \
+                 will not be used; check the saved original by hand.",
+                orig_path.display(),
+                ENTRY_SET_ASIDE
             );
             continue;
         }
@@ -1410,7 +1432,7 @@ mod tests {
         set_modes(&journal, 0o666);
 
         // A solve closes the directory and keeps it, and uses nothing from
-        // that entry. The entry stays, for a look by hand.
+        // that entry.
         let guard = protect_in(&journal, &source).unwrap();
         drop(guard);
         assert_eq!(
@@ -1419,20 +1441,66 @@ mod tests {
         );
         assert!(recover_in(&journal).is_empty());
         assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
-        assert_eq!(entry_files(&journal), 4);
-        assert_eq!(
-            fs::read(journal.join("0123456789abcdef-1-0.orig")).unwrap(),
-            forged
-        );
         assert!(set_aside_dirs(tmp.path(), "journal").is_empty());
 
-        // It is the files' openness that is refused, nothing else about the
-        // entry: with the same files closed, recovery acts on it.
-        set_modes(&journal, 0o600);
+        // The entry's files are kept, for a look by hand, under names that
+        // are not an entry's.
+        let mut names: Vec<String> = fs::read_dir(&journal)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "0123456789abcdef-1-0.cand.untrusted",
+                "0123456789abcdef-1-0.json.untrusted",
+                "0123456789abcdef-1-0.lock.untrusted",
+                "0123456789abcdef-1-0.orig.untrusted",
+            ]
+        );
+        assert_eq!(
+            fs::read(journal.join("0123456789abcdef-1-0.orig.untrusted")).unwrap(),
+            forged
+        );
+
+        // Closing the files afterwards does not undo a change already made,
+        // and does not make the entry usable.
+        for name in &names {
+            fs::set_permissions(journal.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(recover_in(&journal).is_empty());
+        let guard = protect_in(&journal, &source).unwrap();
+        drop(guard);
+        assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_whose_files_only_its_owner_could_write_is_still_recovered() {
+        // The counterpart of the test above: the same directory and the same
+        // kind of entry, but its files were never open to writing by others,
+        // so nobody else could have altered them. It is recovered.
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, journal, _source) = fixture("original\n");
+        let target = tmp.path().join("target.sh");
+        fs::write(&target, "abandoned candidate\n").unwrap();
+        let target = fs::canonicalize(&target).unwrap();
+        let saved = plant_forged_entry(&journal, &target);
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o755)).unwrap();
+        for ext in ["orig", "json", "cand", "lock"] {
+            let file = journal.join(format!("0123456789abcdef-1-0.{ext}"));
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        // A directory others can read is not used for recovery as it stands.
+        assert!(recover_in(&journal).is_empty());
+        // Once a solve has closed it, the entry is recovered.
+        ensure_private_dir(&journal).unwrap();
         let recovered = recover_in(&journal);
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].outcome, RecoveryOutcome::Restored);
-        assert_eq!(fs::read(&victim).unwrap(), forged);
+        assert_eq!(fs::read(&target).unwrap(), saved);
     }
 
     #[cfg(unix)]
