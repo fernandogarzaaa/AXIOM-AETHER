@@ -693,7 +693,6 @@ mod tests {
     #[cfg(unix)]
     mod with_fake_cli {
         use super::*;
-        use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
 
         const OK_JSON: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"canned answer","num_turns":1}"#;
@@ -715,9 +714,82 @@ mod tests {
                 argv = argv_file.display(),
                 stdin = stdin_file.display(),
             );
-            std::fs::write(&path, script).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            write_executable(&path, &script);
             path
+        }
+
+        /// Write `script` to `path` and make it executable, without this
+        /// process ever having the file open for writing.
+        ///
+        /// A file that any process has open for writing cannot be executed
+        /// ("Text file busy"). Writing it here with `std::fs::write` holds it
+        /// open only for a moment, but a process another thread starts in that
+        /// moment begins as a copy of this one and keeps the file open until
+        /// it has turned into its own program. Run before then, the script is
+        /// refused. So a child writes the file: nothing this process starts
+        /// can inherit a file this process never opened, and the child has
+        /// exited, with everything it started, before this returns.
+        fn write_executable(path: &Path, script: &str) {
+            use std::io::Write;
+            let mut writer = Command::new("sh")
+                .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+                .arg(path)
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("start sh to write the script");
+            writer
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(script.as_bytes())
+                .expect("send the script to sh");
+            let status = writer.wait().expect("wait for sh");
+            assert!(status.success(), "writing {} failed", path.display());
+        }
+
+        /// A script `fake_cli` returns can be run at once, whatever the rest
+        /// of the test binary is doing. Tests run on many threads and most of
+        /// them start processes; a script that this process had open for
+        /// writing while another thread started one could not be run until
+        /// that other process got going ("Text file busy"), which failed
+        /// whichever test owned the script.
+        #[test]
+        fn a_fake_cli_can_be_run_while_other_threads_start_processes() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+
+            const SCRIPTS: usize = 150;
+            let dir = tempfile::tempdir().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let others: Vec<_> = (0..8)
+                .map(|_| {
+                    let stop = stop.clone();
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            let _ = Command::new("true").status();
+                        }
+                    })
+                })
+                .collect();
+
+            let mut refused = Vec::new();
+            for n in 0..SCRIPTS {
+                let cli = fake_cli(dir.path(), &format!("cli{n}"), "9.9.9 (Fake)", "exit 0");
+                match Command::new(&cli).arg("--version").output() {
+                    Ok(out) => assert_eq!(out.stdout, b"9.9.9 (Fake)\n"),
+                    Err(e) => refused.push(e.to_string()),
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            for other in others {
+                other.join().unwrap();
+            }
+            assert!(
+                refused.is_empty(),
+                "{} of {SCRIPTS} scripts could not be run; the first: {}",
+                refused.len(),
+                refused[0]
+            );
         }
 
         fn backend(path: &Path, timeout: Duration) -> Result<CliBackend, CliBackendError> {
