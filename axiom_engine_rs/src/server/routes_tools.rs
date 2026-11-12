@@ -8,6 +8,12 @@ fn patch_store_path(state: &AppState) -> Option<PathBuf> {
 /// (SHA-256, plus an HMAC when a fleet key is configured). A peer merges the
 /// export only if that HMAC verifies under the shared fleet key (see
 /// `POST /v1/patches/merge`), so an export from a keyless node merges nowhere.
+///
+/// A signed export is also noted in the store as this node's own, so that
+/// posting it back to this node's merge route changes nothing (otherwise every
+/// candidate would confirm itself, once per round trip). The note is written
+/// only when the export is new, that is when the candidates changed since the
+/// last read.
 async fn get_patches(State(state): State<AppState>) -> Response {
     let Some(path) = patch_store_path(&state) else {
         return (
@@ -16,8 +22,22 @@ async fn get_patches(State(state): State<AppState>) -> Response {
         )
             .into_response();
     };
-    let memory = crate::patch_memory::PatchMemory::load(&path);
+    let mut memory = crate::patch_memory::PatchMemory::load(&path);
     let signed = memory.export_signed(state.fleet_key.as_deref());
+    // Only a signed export of a non-empty store can be merged anywhere and
+    // move a count, so only that one needs noting.
+    if signed.hmac.is_some() && !memory.is_empty() && memory.note_own_export(&signed) {
+        if let Err(e) = memory.save(&path) {
+            // An export that is not on record could be replayed to this node.
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("could not record the export in the patch store: {e}")
+                })),
+            )
+                .into_response();
+        }
+    }
     Json(signed).into_response()
 }
 
@@ -29,6 +49,10 @@ async fn get_patches(State(state): State<AppState>) -> Response {
 /// a 401 for every request while this node has no `AXIOM_FLEET_KEY`), and
 /// `merge_signed_guarded` then accepts the export only if its HMAC verifies
 /// under that key, recomputing content hashes as it folds candidates in.
+///
+/// An export counts once. One that was merged before, or that this node
+/// handed out itself, is answered with `"already_merged": true` and changes
+/// nothing, however often it is delivered.
 ///
 /// A merged candidate is NOT inert. Merging only records it, but the repair
 /// loop "re-verifies" a recorded candidate by writing its content into the
@@ -77,6 +101,7 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
             }
             Json(serde_json::json!({
                 "merged": true,
+                "already_merged": report.already_merged,
                 "new_candidates": report.new_candidates,
                 "reinforced": report.reinforced,
                 "byzantine_rejected": report.byzantine_rejected,

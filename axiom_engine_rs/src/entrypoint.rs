@@ -1399,14 +1399,20 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 memory
                     .save()
                     .map_err(|e| candle_core::Error::Msg(format!("memory save failed: {e}")))?;
-                println!(
-                    "[axiom] swarm immunity merged from {url}: +{} new program(s), {} merged, +{} dir(s), {} conflict(s), {} byzantine-rejected",
-                    report.programs_added,
-                    report.programs_merged,
-                    report.dirs_added,
-                    report.belief_conflicts,
-                    report.byzantine_rejected
-                );
+                if report.already_merged {
+                    println!(
+                        "[axiom] swarm immunity from {url}: this export was merged before; nothing changed"
+                    );
+                } else {
+                    println!(
+                        "[axiom] swarm immunity merged from {url}: +{} new program(s), {} merged, +{} dir(s), {} conflict(s), {} byzantine-rejected",
+                        report.programs_added,
+                        report.programs_merged,
+                        report.dirs_added,
+                        report.belief_conflicts,
+                        report.byzantine_rejected
+                    );
+                }
                 println!("[axiom] local memory: {}", local.display());
             }
         },

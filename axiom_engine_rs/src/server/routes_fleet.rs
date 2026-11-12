@@ -31,8 +31,32 @@ async fn get_immunity(State(state): State<AppState>) -> Response {
     // when a fleet key is configured). A peer only merges an export whose HMAC
     // verifies under the shared key, so an export from a keyless node is
     // readable but will not merge anywhere.
-    let signed =
-        crate::provenance::sign_export(&memory.to_json(), state.fleet_key.as_deref());
+    let mut payload = memory.to_json();
+    // Note a signed export as this node's own, so that posting it back to this
+    // node's merge route changes nothing (otherwise every record would merge
+    // with itself, once per round trip). Written only when the export is new,
+    // that is when a record changed since the last read; an empty memory has
+    // nothing to compound, and an unsigned export merges nowhere.
+    if state.fleet_key.is_some()
+        && !memory.all_records().is_empty()
+        && !memory.has_seen_export(&payload)
+    {
+        let mut on_disk = crate::heal_memory::HealMemory::load(path);
+        payload = on_disk.to_json();
+        if on_disk.note_own_export(&payload) {
+            if let Err(e) = on_disk.save() {
+                // An export that is not on record could be replayed to this node.
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("could not record the export in the heal memory: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let signed = crate::provenance::sign_export(&payload, state.fleet_key.as_deref());
     Json(signed).into_response()
 }
 
@@ -226,6 +250,10 @@ async fn require_fleet_merge_trust(
 /// sits behind [`require_fleet_merge_trust`]). Returns the merge report.
 /// Local learning is never weakened: dirs are unioned and tension histories
 /// are count-weighted.
+///
+/// An export counts once. One that was merged before, or that this node
+/// handed out itself, is answered with `"already_merged": true` and changes
+/// nothing, however often it is delivered.
 async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Response {
     let Some(path) = state.heal_memory_path.as_ref() else {
         return (
@@ -270,6 +298,7 @@ async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Res
             }
             Json(serde_json::json!({
                 "merged": true,
+                "already_merged": report.already_merged,
                 "programs_added": report.programs_added,
                 "programs_merged": report.programs_merged,
                 "dirs_added": report.dirs_added,
