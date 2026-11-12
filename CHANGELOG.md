@@ -20,8 +20,9 @@ releases are described on the GitHub Releases page.
   Ctrl-C / SIGTERM / SIGHUP (exit status 130 / 143 / 129), and by the next
   `axiom solve` after a kill. A file you edited after the kill is left alone
   and the saved original's path is printed. The journal directory and its
-  files are owner-only. Two solves never repair the same file at once: the
-  second one leaves that file alone.
+  files are owner-only; a directory other users could write to has its
+  existing contents set aside, never restored. Two solves never repair the
+  same file at once: the second one leaves that file alone.
 - `POST /v1/hypervisor/jit_run` no longer replaces a file longer than 4096
   characters with a two-line script when the file contains `throw `,
   `Write-Error` or a fixture marker.
