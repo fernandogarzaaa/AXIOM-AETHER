@@ -212,6 +212,7 @@ pub async fn run_server(
                 .map(FsPath::new),
             pipeline.has_real_tokenizer(),
             trained_with.as_deref(),
+            std::env::var("AXIOM_TOKENIZER_SHA256").is_ok_and(|pin| !pin.trim().is_empty()),
         )?;
         println!(
             "[+] Local trivial-turn short-circuit ON (AXIOM_LOCAL_TRIVIAL): small clean \
