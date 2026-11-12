@@ -96,7 +96,7 @@ read-only cwd), `search`, `fetch`; plus, only with `--features experimental`,
 | `AXIOM_CVM_RETAIN` | `1` keeps a session's CVM store file after session drop (default: deleted). |
 | `AXIOM_KEEPALIVE` | CVM actuarial cache-refresh pings; `1` enables. Default `0` forever unless explicitly opted in — replays your own credentials on a timer. |
 | `AXIOM_TOOL_DEFER` | PSS L-A tool deferral via `defer_loading` (default `on`; `off` disables). |
-| `AXIOM_LOCAL_TRIVIAL` | PSS L-B local trivial-turn short-circuit (default `on`; `off` disables). |
+| `AXIOM_LOCAL_TRIVIAL` | PSS L-B local trivial-turn short-circuit (default `off`; `on` enables, and requires a verified checkpoint read through the tokenizer it was trained with, or the server refuses to start). |
 | `AXIOM_REBASE_ON_BREAK` | PSS R2 free-window rebasing at genuine cache breaks (default `on`; `off` disables). |
 | `AXIOM_ADAPTIVE_TTL` | PSS R3 1-hour cache TTL election after repeated long gaps (default `on`; `off` disables). |
 | `AXIOM_MODEL_ROUTE` | PSS R1 high-tier routing: `off` / `auto` (default — Opus/Fable only) / `on` (all Claude tiers). |

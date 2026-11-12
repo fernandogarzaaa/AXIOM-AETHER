@@ -273,13 +273,16 @@ async fn invariant_local_ack_labels_synthetic_answer() {
     // Replacing a model turn with a synthetic ACK (lossy) requires the client
     // to be able to tell it is synthetic: the ACK text must carry the label.
     let _guard = env_lock().lock().await;
-    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "on");
     let _c2 = EnvVarGuard::set("AXIOM_DRIFT_THRESHOLD", "1000000");
     let _c3 = EnvVarGuard::set("AXIOM_CVM_DIGEST", "off");
     let _c4 = EnvVarGuard::set("AXIOM_MODEL_ROUTE", "off");
 
     let (upstream, capture, _task) = start_capturing_upstream().await;
-    let state = build_state(upstream).await;
+    // The short-circuit is opt-in and only runs behind a verified checkpoint.
+    let state = build_state(upstream)
+        .await
+        .with_checkpoint_gate(false, axiom_engine::server::CheckpointStatus::Verified)
+        .with_local_trivial(true);
     let app = create_router(state);
 
     let body = json!({

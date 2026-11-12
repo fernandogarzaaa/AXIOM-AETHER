@@ -192,6 +192,32 @@ pub async fn run_server(
         std::env::var("AXIOM_CHECKPOINT_SHA256").ok().as_deref(),
         std::env::var("AXIOM_TOKENIZER_SHA256").ok().as_deref(),
     );
+    // L-B local trivial-turn short-circuit: opt-in, and refused here, before
+    // anything else starts, when asked for without a verified checkpoint (it
+    // would end agent turns on the say-so of an untrained model).
+    let local_trivial = resolve_local_trivial(
+        local_trivial_requested(std::env::var("AXIOM_LOCAL_TRIVIAL").ok().as_deref()),
+        checkpoint_status,
+    )?;
+    if local_trivial {
+        // A verified checkpoint read through the wrong tokenizer is no better
+        // a judge than an untrained one: refuse that too.
+        let trained_with = crate::model_meta::ModelMeta::load_checked(checkpoint_path)?
+            .map(|meta| meta.tokenizer);
+        check_local_trivial_tokenizer(
+            std::env::var("AXIOM_TOKENIZER")
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+                .as_deref()
+                .map(FsPath::new),
+            pipeline.has_real_tokenizer(),
+            trained_with.as_deref(),
+        )?;
+        println!(
+            "[+] Local trivial-turn short-circuit ON (AXIOM_LOCAL_TRIVIAL): small clean \
+             tool results may be acknowledged locally without an upstream call"
+        );
+    }
     if require_verified_checkpoint {
         match checkpoint_status {
             CheckpointStatus::Verified => {
@@ -218,6 +244,7 @@ pub async fn run_server(
 
     let state = AppState::new(pipeline, model_id)
         .with_checkpoint_gate(require_verified_checkpoint, checkpoint_status)
+        .with_local_trivial(local_trivial)
         .with_claude_backend(claude_backend)
         .with_anthropic_forwarder(anthropic_forwarder)
         .with_openai_forwarder(openai_forwarder)

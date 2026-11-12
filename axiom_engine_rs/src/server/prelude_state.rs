@@ -277,6 +277,98 @@ impl CheckpointStatus {
     }
 }
 
+/// Did the operator ask for the L-B local trivial-turn short-circuit?
+/// `AXIOM_LOCAL_TRIVIAL` must be set to `1`, `true`, `yes` or `on`
+/// (case-insensitive). Unset, empty, `off` and anything unrecognised mean no:
+/// the short-circuit is opt-in.
+pub fn local_trivial_requested(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Startup guard for the L-B local trivial-turn short-circuit. Returns whether
+/// to enable it, or an error that must stop the server from starting.
+///
+/// * not requested → `Ok(false)` (the default);
+/// * requested with a [`CheckpointStatus::Verified`] checkpoint → `Ok(true)`;
+/// * requested with anything else → `Err`. The short-circuit ends a client's
+///   turn with a locally invented acknowledgement whenever the local model's
+///   surprisal is under the gate. Without a verified checkpoint that model is
+///   untrained or unvouched-for and the gate passes every small clean tool
+///   result, so an agent stops after its first tool call. Starting anyway,
+///   with the flag silently ignored, would hide the misconfiguration; the
+///   operator is told to pin a checkpoint or drop the flag.
+pub fn resolve_local_trivial(
+    requested: bool,
+    checkpoint_status: CheckpointStatus,
+) -> std::result::Result<bool, String> {
+    if !requested {
+        return Ok(false);
+    }
+    if checkpoint_status == CheckpointStatus::Verified {
+        return Ok(true);
+    }
+    Err(format!(
+        "AXIOM_LOCAL_TRIVIAL is on but the checkpoint is {} ({}). The local trivial-turn \
+         short-circuit answers turns without calling the model and needs a verified \
+         checkpoint to gate on: pin AXIOM_CHECKPOINT_SHA256 to the checkpoint you \
+         trust, or unset AXIOM_LOCAL_TRIVIAL",
+        checkpoint_status.as_str(),
+        checkpoint_status.reason()
+    ))
+}
+
+/// Second half of the startup guard for the local trivial-turn short-circuit:
+/// the tokenizer in use must be the one the checkpoint was trained with.
+///
+/// A verified checkpoint vouches for the weights only. Read through a
+/// different tokenizer, the model's surprisal is noise, and the short-circuit
+/// would end turns on it. The easy way to get there is a checkpoint trained
+/// with a tokenizer file and `AXIOM_TOKENIZER` left unset, or pointing at a
+/// file that does not parse: the pipeline then falls back to the hash
+/// tokenizer and says so only in a startup warning.
+///
+/// * `configured`: `AXIOM_TOKENIZER`, when set.
+/// * `loaded`: whether the pipeline is encoding with a tokenizer file (false
+///   means the hash tokenizer).
+/// * `trained_with`: the tokenizer file recorded in the checkpoint's sidecar
+///   (`<checkpoint>.meta.json`), when it has one.
+///
+/// A checkpoint without a sidecar records nothing about its tokenizer (the
+/// hash-tokenizer checkpoints that predate sidecars are of this kind), so it
+/// is accepted as long as a configured tokenizer did load.
+pub fn check_local_trivial_tokenizer(
+    configured: Option<&FsPath>,
+    loaded: bool,
+    trained_with: Option<&str>,
+) -> std::result::Result<(), String> {
+    const WAYS_OUT: &str = "or unset AXIOM_LOCAL_TRIVIAL";
+    if let Some(path) = configured.filter(|_| !loaded) {
+        return Err(format!(
+            "AXIOM_LOCAL_TRIVIAL is on but the tokenizer at {} did not load, so the model              is running on the hash tokenizer and its surprisal cannot gate local answers:              fix AXIOM_TOKENIZER, {WAYS_OUT}",
+            path.display()
+        ));
+    }
+    let Some(recorded) = trained_with
+        .and_then(|name| FsPath::new(name.trim()).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return Ok(());
+    };
+    match configured.and_then(|path| path.file_name()) {
+        None => Err(format!(
+            "AXIOM_LOCAL_TRIVIAL is on and the checkpoint was trained with the tokenizer              {recorded}, but AXIOM_TOKENIZER is not set, so the model is running on the hash              tokenizer and its surprisal cannot gate local answers: set AXIOM_TOKENIZER to              that tokenizer, {WAYS_OUT}"
+        )),
+        Some(installed) if installed.to_string_lossy() != recorded.as_str() => Err(format!(
+            "AXIOM_LOCAL_TRIVIAL is on and the checkpoint was trained with the tokenizer              {recorded}, but AXIOM_TOKENIZER points at {}: set AXIOM_TOKENIZER to the              tokenizer the checkpoint was trained with, {WAYS_OUT}",
+            installed.to_string_lossy()
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Resolve the startup checkpoint status from the files on disk. Pure over
 /// the filesystem (no env reads): callers pass the already-resolved paths
 /// and pinned hashes. A file that cannot be opened or read counts as
@@ -376,6 +468,14 @@ pub struct AppState {
     /// [`resolve_checkpoint_status`]. Reported in `/readyz` responses even
     /// when the gate is off, so operators can see what would gate.
     pub checkpoint_status: CheckpointStatus,
+    /// Whether the operator asked for the L-B local trivial-turn short-circuit
+    /// (`AXIOM_LOCAL_TRIVIAL=on`). Off by default. The request path consults
+    /// [`AppState::local_trivial_active`], never this field alone: the
+    /// short-circuit replaces a model turn with a fixed acknowledgement and
+    /// `stop_reason: end_turn`, and its gate is the local model's surprisal,
+    /// which is a constant for an untrained model. So it only ever runs with a
+    /// verified checkpoint behind it.
+    pub local_trivial_enabled: bool,
     /// Optional Anthropic Claude backend. When `Some`, generation is
     /// routed through Claude instead of the local Axiom-TTT pipeline.
     pub claude_backend: Arc<Option<ClaudeBackend>>,
@@ -554,6 +654,7 @@ impl AppState {
             model_id,
             require_verified_checkpoint: false,
             checkpoint_status: CheckpointStatus::Unverified,
+            local_trivial_enabled: false,
             claude_backend: Arc::new(None),
             router: Arc::new(None),
             mcp: Arc::new(None),
@@ -630,6 +731,23 @@ impl AppState {
         self.require_verified_checkpoint = require_verified;
         self.checkpoint_status = status;
         self
+    }
+
+    /// Opt in to the L-B local trivial-turn short-circuit (normally from
+    /// `AXIOM_LOCAL_TRIVIAL`, through [`resolve_local_trivial`]). Asking for
+    /// it is not enough to turn it on: see [`Self::local_trivial_active`].
+    pub fn with_local_trivial(mut self, enabled: bool) -> Self {
+        self.local_trivial_enabled = enabled;
+        self
+    }
+
+    /// May this server answer a "trivial" turn locally instead of forwarding
+    /// it? Only when the operator opted in AND the checkpoint is verified. An
+    /// absent, unverified or mismatched checkpoint means the surprisal gate is
+    /// computed by weights nobody vouched for (random weights score every text
+    /// as ln(vocab), below any useful threshold), so the answer is always no.
+    pub fn local_trivial_active(&self) -> bool {
+        self.local_trivial_enabled && self.checkpoint_status == CheckpointStatus::Verified
     }
 
     /// Enable the swarm-immunity endpoints against this heal-memory file.

@@ -233,9 +233,16 @@ async fn compressed_messages_path(
     // anything ambiguous falls through and is forwarded. A client retry of the
     // same inbound within a cooldown means it did not accept our ack -> forward.
     // Runs before any rebase/partition work so a trivial turn skips all of it.
-    // Default ON since the 2026-07-16 live eval (correctness parity 12/13 =
-    // 12/13, 0% faults); opt out with AXIOM_LOCAL_TRIVIAL=off.
-    if std::env::var("AXIOM_LOCAL_TRIVIAL").as_deref() != Ok("off") {
+    //
+    // OFF by default, and never on without a verified checkpoint
+    // (`AppState::local_trivial_active`): the acknowledgement ends the
+    // client's turn (`stop_reason: end_turn`), and the surprisal gate is only
+    // meaningful when a trained, verified model computes it. An untrained
+    // model scores every text the same, under the gate, which would stop an
+    // agent after its first clean tool result. Opt in with
+    // AXIOM_LOCAL_TRIVIAL=on; the server refuses to start with it set and no
+    // verified checkpoint (`resolve_local_trivial`).
+    if state.local_trivial_active() {
         let newest_text = mutable_messages
             .last()
             .and_then(|m| m.get("content"))
