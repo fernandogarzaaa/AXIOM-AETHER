@@ -943,6 +943,9 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             };
             let pipeline =
                 InferencePipeline::with_checkpoint_and_options(cfg, device, ckpt, runtime)?;
+            // Ctrl-C or `kill` while a candidate fix is on disk must not leave
+            // the user's file holding it: restore from the journal, then exit.
+            crate::source_journal::restore_on_interrupt();
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
                 .spawn(move || solve::solve(&pipeline, &program, &args, &opts))

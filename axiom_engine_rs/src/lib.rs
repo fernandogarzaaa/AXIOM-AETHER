@@ -85,6 +85,7 @@ pub mod session_awareness;
 pub mod session_recorder;
 pub mod skeleton;
 pub mod solve;
+pub mod source_journal;
 #[cfg(feature = "experimental")]
 pub mod state_predictor;
 pub mod surprisal;
