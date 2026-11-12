@@ -15,7 +15,7 @@ is research (see [`UPGRADES.md`](UPGRADES.md)) or experimental (see
 ### 1. Autonomous repair — the spearhead
 
 **What:** fraction of seeded broken-repo fixtures the real
-localize → deterministic Poly-JIT repair → verify loop drives to green,
+localize → deterministic mutation repair → verify loop drives to green,
 end-to-end, reversibly. Deterministic; no LLM or network.
 
 **Command:**
@@ -76,7 +76,7 @@ it. Update **both** on every release.
 
 | Metric | Value | Config | Measured | Release |
 |---|---|---|---|---|
-| Autonomous repair | **32/32 = 100%** | 14 localization + 18 real-interpreter fixtures, CPU, no LLM, ~15 s wall clock | 2026-11-08 | v0.7.0 |
+| Autonomous repair | **32/32 = 100%** | 12 localization + 2 multi-file + 18 real-interpreter fixtures, CPU, no LLM, ~15 s wall clock | 2026-11-08 | v0.7.0 |
 | Compression | **84.5% savings, 3085/3085 = 100% round-trip** | `AXIOM_PRODUCTION_BPE=0`, `axiom_engine_rs/src` (now 260,383 tokens) | 2026-11-08 | v0.7.0 |
 | Autonomous repair, **developer bugs** | **9/40 = 22.5%** held out on QuixBugs, all 9 correct (14/40 in-sample after operators chosen from its failures); 0 rollback violations; 0 test edits | 40 Python programs with one human-written bug each, QuixBugs @ `4257f44`, no operator tuned on them, no LLM ([write-up](../bench/results/QUIXBUGS-2026-11-07.md)) | 2026-11-07 | v0.7.0 |
 | Autonomous repair, **held-out** | **38/40 = 95%** on seed 7 (scored after the change; 15/17 on its faults outside the tuning set) and 39/40 on seed 2026 (tuning set); 32/40 and 33/40 verified correct against a strengthened test suite (0.6.0: 16/40 each); 0 rollback violations | `scripts/seed_faults.py --seed {7,2026} --balance` on `axiom_mesh_core`, no LLM; the 0.6.0 binary scores 20/40 on the same seed-7 corpus ([write-up](../bench/results/SEEDED-HELDOUT-v2-2026-11-06.md)) | 2026-11-06 | v0.7.0 |

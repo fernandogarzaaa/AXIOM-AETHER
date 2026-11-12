@@ -1,7 +1,7 @@
 //! AXIOM Agentic Core — the autonomy capstone.
 //!
 //! The `solve` loop (Pillar 3) already repairs a failing check: localize the
-//! faulty file(s) across languages, propose a fix (deterministic Poly-JIT,
+//! faulty file(s) across languages, propose a fix (deterministic mutation,
 //! fleet-shared patch, or LLM), and keep it **only if the verifier goes green**.
 //! This module generalizes that from *repair* to *goal-directed coding* and adds
 //! the machinery a self-improving coding agent needs:

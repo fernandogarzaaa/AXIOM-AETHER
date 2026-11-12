@@ -3,11 +3,11 @@
 //! The point of this whole pillar is that AXIOM's coding ability should be
 //! reported, not asserted. [`run_eval`] materializes a set of seeded broken-repo
 //! fixtures, runs the real autonomous [`crate::solve`] loop on each (localize →
-//! deterministic Poly-JIT repair → verify, all reversible), and reports the
+//! deterministic mutation repair → verify, all reversible), and reports the
 //! fraction it drives green.
 //!
 //! The built-in fixtures ([`builtin_cases`]) are deliberately **deterministic
-//! and offline**: each failure is one the Poly-JIT layer can repair without any
+//! and offline**: each failure is one the mutation layer can repair without any
 //! model or network, so the score is reproducible in CI and means exactly what
 //! it says — "the autonomous loop fixed N of M broken repos end-to-end."
 
@@ -190,166 +190,195 @@ impl EvalReport {
 
 /// The built-in deterministic fixture suite — offline, reproducible, no LLM.
 ///
-/// Cases 1–14 are **localization and loop fixtures**: the verifier is a tiny
-/// shell script that prints a compiler/test-runner-shaped trace, and the repair
-/// is one of the legacy Poly-JIT flips or a scripted multi-file transaction.
-/// Cases 15+ are **real-interpreter fixtures**: a genuinely buggy module, a
-/// genuine test, and the actual toolchain as the verifier; the fix comes from
-/// the general mutation layer (`crate::mutation_repair`) and the test file is
-/// pinned so an overfit "fix" scores as a failure. Cases that need a toolchain
-/// not on `PATH` are reported as skipped, never as failed.
+/// Cases 1–12 are **localization fixtures**: a shell program with a real
+/// one-token bug, checked by its behaviour, where the verify command reports
+/// the failure in one trace dialect each (rustc, Python, JS, Go, C, TypeScript,
+/// javac, Ruby, a nested path). They need nothing but a POSIX shell, so they
+/// run everywhere. The check lives in the verify command itself, which cannot
+/// be edited, and the fix comes from the mutation layer
+/// (`crate::mutation_repair`). Cases 13–14 are scripted multi-file
+/// transactions. Cases 15+ are **real-interpreter fixtures**: a genuinely
+/// buggy module, a genuine test, and the actual toolchain as the verifier; the
+/// test file is pinned so an overfit "fix" scores as a failure. Cases that
+/// need a toolchain not on `PATH` are reported as skipped, never as failed.
 pub fn builtin_cases() -> Vec<EvalCase> {
     vec![
-        // 1. A script that fails with a self-naming frame; Poly-JIT flips exit 1.
+        // 1. A program blamed by a frame that names it (`file:line:col`): the
+        //    loop stops one short, so 1..5 sums to 10. The check is in the
+        //    verify command, so there is no test file to edit.
         EvalCase::new(
-            "shell-exit-flip",
-            &[("run.sh", "#!/bin/sh\necho 'run.sh:2:1: boom' >&2\nexit 1\n")],
-            &posix_shell(),
-            &["run.sh"],
-        ),
-        // 2. Poly-JIT fixture marker repair.
-        EvalCase::new(
-            "fixture-marker",
+            "sh-self-naming-frame",
             &[(
-                "check.sh",
-                "#!/bin/sh\necho 'check.sh:1:1: AXIOM_POLYJIT_FIXTURE_FAIL'\nexit 1\n",
+                "run.sh",
+                "#!/bin/sh\ntotal=0\ni=1\nwhile [ \"$i\" -lt 5 ]; do\n  total=$((total + i))\n  i=$((i + 1))\ndone\necho \"$total\"\n",
             )],
             &posix_shell(),
-            &["check.sh"],
+            &[
+                "-c",
+                "out=$(sh run.sh); [ \"$out\" = 15 ] || \
+                 { echo \"run.sh:4:1: expected 15 got $out\" >&2; exit 1; }",
+            ],
         ),
-        // 3. Multi-file: a passing helper cited first, the failing file second;
-        //    the loop must localize both and repair the right one.
+        // 2. A wrong arithmetic operator: an area computed with `+`.
+        EvalCase::new(
+            "sh-wrong-arith",
+            &[("area.sh", "#!/bin/sh\necho $(( $1 + $2 ))\n")],
+            &posix_shell(),
+            &[
+                "-c",
+                "a=$(sh area.sh 3 4); b=$(sh area.sh 5 1); \
+                 { [ \"$a\" = 12 ] && [ \"$b\" = 5 ]; } || \
+                 { echo \"area.sh:2:1: expected 12 and 5 got $a and $b\" >&2; exit 1; }",
+            ],
+        ),
+        // 3. Multi-file: a correct helper is cited first, the failing file
+        //    second; the loop must leave the helper alone and repair the
+        //    right one (`- 2` where `+ 2` was meant).
         EvalCase::new(
             "multi-file-pick-failing",
             &[
-                (
-                    "helper.sh",
-                    "#!/bin/sh\necho 'helper.sh:1:1: note'\nexit 0\n",
-                ),
+                ("helper.sh", "double() {\n  echo $(( $1 * 2 ))\n}\n"),
                 (
                     "main.sh",
-                    "#!/bin/sh\necho 'main.sh:3:1: boom' >&2\nexit 1\n",
+                    "#!/bin/sh\n. ./helper.sh\necho $(( $(double 3) - 2 ))\n",
                 ),
             ],
             &posix_shell(),
-            &["-c", "sh helper.sh; sh main.sh"],
-        ),
-        // 4. Rust-format localization (`--> file:line`) + a second deterministic
-        //    repair pattern (the `assert_eq!(1, 2)` -> `(1, 1)` flip). The grep
-        //    guard fails while the bad assert is present and passes once flipped.
+            &[
+                "-c",
+                "echo 'helper.sh:1:1: note: sourced by main.sh'; out=$(sh main.sh); \
+                 [ \"$out\" = 8 ] || { echo \"main.sh:3:1: expected 8 got $out\" >&2; exit 1; }",
+            ],
+        )
+        .unchanged(&["helper.sh"]),
+        // 4. rustc-shaped diagnostic (`error[..]` then `  --> file:line:col`):
+        //    the lower clamp tests `-gt 0` where `-lt 0` was meant.
         EvalCase::new(
-            "rust-assert-flip",
-            &[("widget.rs", "pub fn f() { assert_eq!(1, 2); }\n")],
+            "rust-arrow-frame",
+            &[(
+                "clamp.sh",
+                "clamp() {\n  if [ \"$1\" -gt 10 ]; then\n    echo 10\n  elif [ \"$1\" -gt 0 ]; then\n    echo 0\n  else\n    echo \"$1\"\n  fi\n}\n",
+            )],
             &posix_shell(),
             &[
                 "-c",
-                "if grep -q 'assert_eq!(1, 2)' widget.rs; then \
-                 echo 'error[E0001]'; echo '  --> widget.rs:1:14'; exit 1; else exit 0; fi",
+                ". ./clamp.sh; \
+                 { [ \"$(clamp 5)\" = 5 ] && [ \"$(clamp 12)\" = 10 ] && [ \"$(clamp -3)\" = 0 ]; } || \
+                 { echo 'error[E0308]: clamp returned the wrong bound'; echo '  --> clamp.sh:4:8'; exit 1; }",
             ],
         ),
-        // 5. Python-traceback localization (`File \"x.py\", line N`) + fixture
-        //    marker repair (FAIL -> PASS).
+        // 5. Python-traceback-shaped frame (`File \"x\", line N, in fn`):
+        //    `-gt` where `-ge` was meant.
         EvalCase::new(
             "python-frame-localize",
-            &[("core.py", "# AXIOM_POLYJIT_FIXTURE_FAIL\n")],
+            &[("limits.sh", "is_adult() {\n  [ \"$1\" -gt 18 ]\n}\n")],
             &posix_shell(),
             &[
                 "-c",
-                "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL core.py; then \
-                 echo '  File \"core.py\", line 1, in <module>'; exit 1; else exit 0; fi",
+                ". ./limits.sh; \
+                 { is_adult 18 && is_adult 40 && ! is_adult 17; } || \
+                 { echo 'Traceback (most recent call last):'; \
+                 echo '  File \"limits.sh\", line 2, in is_adult'; exit 1; }",
             ],
         ),
-        // 6. JS stack-frame localization (`at fn (file:line:col)`) + exit flip.
+        // 6. JS-stack-shaped frame (`at fn (file:line:col)`): the last index
+        //    of n items computed as `n + 1`.
         EvalCase::new(
             "js-stack-localize",
-            &[("index.js", "// index.js\nprocess.exit 1\n")],
+            &[("index.sh", "last_index() {\n  echo $(( $1 + 1 ))\n}\n")],
             &posix_shell(),
             &[
                 "-c",
-                "if grep -q 'exit 1' index.js; then \
-                 echo '    at Object.<anonymous> (index.js:2:9)'; exit 1; else exit 0; fi",
+                ". ./index.sh; \
+                 { [ \"$(last_index 5)\" = 4 ] && [ \"$(last_index 1)\" = 0 ]; } || \
+                 { echo 'AssertionError: wrong last index'; \
+                 echo '    at last_index (index.sh:2:9)'; exit 1; }",
             ],
         ),
-        // 7. Go-format localization (`./pkg/file.go:line:col:`) + exit flip.
+        // 7. Go-shaped diagnostic (`./file:line:col:`): a range check joined
+        //    with `||` where `&&` was meant.
         EvalCase::new(
             "go-frame-localize",
-            &[("server.go", "package main\n// exit 1 placeholder\n")],
+            &[(
+                "server.sh",
+                "in_range() {\n  [ \"$1\" -ge 1 ] || [ \"$1\" -le 9 ]\n}\n",
+            )],
             &posix_shell(),
             &[
                 "-c",
-                "if grep -q 'exit 1' server.go; then \
-                 echo './server.go:2:4: build failed'; exit 1; else exit 0; fi",
+                ". ./server.sh; \
+                 { in_range 5 && ! in_range 0 && ! in_range 12; } || \
+                 { echo './server.sh:2:18: in_range accepts a value outside 1..9'; exit 1; }",
             ],
         ),
-        // 8. C/C++ compiler diagnostic format (`file.c:line:col: error:`) +
-        //    fixture-marker repair. Exercises the inline `path.ext:line:col`
-        //    localizer against a `.c` extension.
+        // 8. C-compiler-shaped diagnostic (`file:line:col: error:`): `-ne`
+        //    where `-eq` was meant.
         EvalCase::new(
             "c-compiler-localize",
-            &[(
-                "calc.c",
-                "/* AXIOM_POLYJIT_FIXTURE_FAIL */\nint calc(void) { return 0; }\n",
-            )],
+            &[("calc.sh", "is_zero() {\n  [ \"$1\" -ne 0 ]\n}\n")],
             &posix_shell(),
             &[
                 "-c",
-                "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL calc.c; then \
-                 echo 'calc.c:1:4: error: build gate failed'; exit 1; else exit 0; fi",
+                ". ./calc.sh; \
+                 { is_zero 0 && ! is_zero 3; } || \
+                 { echo 'calc.sh:2:10: error: is_zero has the wrong sense'; exit 1; }",
             ],
         ),
-        // 9. TypeScript diagnostic format (`file.ts:line:col - error TSxxxx`) +
-        //    marker repair. Exercises the `.ts` extension through the same
-        //    inline `path.ext:line:col` localizer.
+        // 9. TypeScript-shaped diagnostic in the paren form
+        //    (`file(line,col): error TSxxxx`): `-z` where `-n` was meant.
         EvalCase::new(
             "ts-frame-localize",
-            &[(
-                "api.ts",
-                "// AXIOM_POLYJIT_FIXTURE_FAIL\nexport const ok = true;\n",
-            )],
+            &[("api.sh", "has_token() {\n  [ -z \"$1\" ]\n}\n")],
             &posix_shell(),
             &[
                 "-c",
-                "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL api.ts; then \
-                 echo 'api.ts:1:4: error TS0001: gate failed'; exit 1; else exit 0; fi",
+                ". ./api.sh; \
+                 { has_token abc && ! has_token ''; } || \
+                 { echo 'api.sh(2,5): error TS2322: has_token has the wrong sense'; exit 1; }",
             ],
         ),
-        // 10. Java-flavoured `File.java:line:` frame + marker repair.
+        // 10. javac-shaped diagnostic (`File:line: error:`, no column): a
+        //     string compared with `!=` where `=` was meant.
         EvalCase::new(
             "java-frame-localize",
+            &[("Gate.sh", "is_admin() {\n  [ \"$1\" != admin ]\n}\n")],
+            &posix_shell(),
+            &[
+                "-c",
+                ". ./Gate.sh; \
+                 { is_admin admin && ! is_admin guest; } || \
+                 { echo 'Gate.sh:2: error: is_admin has the wrong sense'; exit 1; }",
+            ],
+        ),
+        // 11. Ruby-shaped error (`file:line:in ... (RuntimeError)`): a half
+        //     computed with `*`.
+        EvalCase::new(
+            "ruby-frame-localize",
+            &[("task.sh", "half() {\n  echo $(( $1 * 2 ))\n}\n")],
+            &posix_shell(),
+            &[
+                "-c",
+                ". ./task.sh; \
+                 { [ \"$(half 10)\" = 5 ] && [ \"$(half 4)\" = 2 ]; } || \
+                 { echo \"task.sh:2:in 'half': wrong result (RuntimeError)\"; exit 1; }",
+            ],
+        ),
+        // 12. Nested-path resolution (`src/util/file:line:col`): the fault is
+        //     in a subdirectory, so the localizer must resolve a relative
+        //     multi-segment path under the sandbox root. The next port is
+        //     computed as `+ 2`.
+        EvalCase::new(
+            "nested-path-localize",
             &[(
-                "Gate.java",
-                "// AXIOM_POLYJIT_FIXTURE_FAIL\nclass Gate {}\n",
+                "src/util/ports.sh",
+                "next_port() {\n  echo $(( $1 + 2 ))\n}\n",
             )],
             &posix_shell(),
             &[
                 "-c",
-                "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL Gate.java; then \
-                 echo 'Gate.java:1: error: gate failed'; exit 1; else exit 0; fi",
-            ],
-        ),
-        // 11. Ruby error format (`file.rb:line: ... (RuntimeError)`) + marker repair.
-        EvalCase::new(
-            "ruby-frame-localize",
-            &[("task.rb", "# AXIOM_POLYJIT_FIXTURE_FAIL\nputs 'ok'\n")],
-            &posix_shell(),
-            &[
-                "-c",
-                "if grep -q AXIOM_POLYJIT_FIXTURE_FAIL task.rb; then \
-                 echo 'task.rb:1: gate failed (RuntimeError)'; exit 1; else exit 0; fi",
-            ],
-        ),
-        // 12. Nested-path resolution (`src/util/gate.sh:line`) + exit-1 flip.
-        //     The fault is in a subdirectory, so the localizer must resolve a
-        //     relative multi-segment path under the sandbox root, not just a
-        //     root-level file.
-        EvalCase::new(
-            "nested-path-localize",
-            &[("src/util/gate.sh", "#!/bin/sh\necho placeholder\nexit 1\n")],
-            &posix_shell(),
-            &[
-                "-c",
-                "if grep -q 'exit 1' src/util/gate.sh; then \
-                 echo 'src/util/gate.sh:3:1: nonzero exit'; exit 1; else exit 0; fi",
+                ". ./src/util/ports.sh; \
+                 { [ \"$(next_port 8080)\" = 8081 ] && [ \"$(next_port 1)\" = 2 ]; } || \
+                 { echo 'src/util/ports.sh:2:8: next_port skips a port'; exit 1; }",
             ],
         ),
         // 13. Coordinated multi-file: the verifier requires BOTH scripts to exit
@@ -996,17 +1025,26 @@ mod tests {
 
     #[test]
     fn a_fix_that_edits_a_pinned_file_is_scored_as_overfit() {
-        // The only file is the "test" and it is pinned: the legacy exit flip
-        // makes the verifier green, but the case must still score FAIL.
-        let case = EvalCase::new(
-            "pinned-oracle",
-            &[("run.sh", "#!/bin/sh\necho 'run.sh:2:1: boom' >&2\nexit 1\n")],
-            &posix_shell(),
-            &["run.sh"],
-        )
-        .unchanged(&["run.sh"]);
-        let report = run_eval(&tiny_pipeline(), &[case]);
-        assert_eq!(report.total(), 1);
-        assert_eq!(report.solved(), 0, "{}", report.summary());
+        // A repair the verifier accepts is still a failure when it lands in a
+        // pinned file. The same case solves when nothing is pinned, so it is
+        // the pin, not the repair, that scores it FAIL.
+        let case = || {
+            EvalCase::new(
+                "pinned-file",
+                &[("limits.sh", "is_adult() {\n  [ \"$1\" -gt 18 ]\n}\n")],
+                &posix_shell(),
+                &[
+                    "-c",
+                    ". ./limits.sh; { is_adult 18 && ! is_adult 17; } || \
+                     { echo 'limits.sh:2:3: is_adult is wrong'; exit 1; }",
+                ],
+            )
+        };
+        let free = run_eval(&tiny_pipeline(), &[case()]);
+        assert_eq!(free.solved(), 1, "{}", free.summary());
+
+        let pinned = run_eval(&tiny_pipeline(), &[case().unchanged(&["limits.sh"])]);
+        assert_eq!(pinned.total(), 1);
+        assert_eq!(pinned.solved(), 0, "{}", pinned.summary());
     }
 }

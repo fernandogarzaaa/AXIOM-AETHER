@@ -517,15 +517,15 @@ impl PatchMemory {
 
         for &i in &order {
             let (c, post) = &matching[i];
-            if std::fs::write(source_path, post).is_err() {
-                let _ = std::fs::write(source_path, &original);
+            if crate::source_journal::write(source_path, post.as_bytes()).is_err() {
+                let _ = crate::source_journal::write(source_path, original.as_bytes());
                 continue;
             }
             if verify() {
                 return Some(c.sha256.clone());
             }
             // Rejected locally → roll back byte-for-byte; never trust unverified.
-            if std::fs::write(source_path, &original).is_err() {
+            if crate::source_journal::write(source_path, original.as_bytes()).is_err() {
                 eprintln!(
                     "[axiom-patch] WARNING: failed to restore original after rejected candidate"
                 );

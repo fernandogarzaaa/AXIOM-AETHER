@@ -166,7 +166,11 @@ impl PolyJitEngine {
                 });
                 return Ok(report);
             }
-            let source_excerpt = read_source_excerpt(request.source_path.as_deref()).await;
+            // The whole file is what gets patched; only the diagnostic carries
+            // an excerpt. Patching the excerpt and writing it back would cut
+            // every file longer than the excerpt.
+            let source = read_source(request.source_path.as_deref()).await;
+            let source_excerpt = source.as_deref().map(excerpt);
             let diagnostic = PolyJitDiagnostic {
                 session_id: request.session_id.clone(),
                 step,
@@ -184,10 +188,10 @@ impl PolyJitEngine {
                 break;
             }
             if let Some(source_path) = request.source_path.as_deref() {
-                let patched = source_excerpt
+                let patched = source
                     .as_deref()
                     .and_then(|source| self.ranked_patch(&diagnostic, source))
-                    .or_else(|| synthesize_patch(source_excerpt.as_deref().unwrap_or("")));
+                    .or_else(|| synthesize_patch(source.as_deref().unwrap_or("")));
                 if let Some(patched) = patched {
                     tokio::fs::write(source_path, patched)
                         .await
@@ -390,14 +394,26 @@ impl Drop for AbortReadersOnDrop {
     }
 }
 
-async fn read_source_excerpt(path: Option<&str>) -> Option<String> {
-    let path = PathBuf::from(path?);
-    let text = tokio::fs::read_to_string(path).await.ok()?;
-    Some(text.chars().take(4096).collect())
+/// Characters of the source artifact carried in a diagnostic.
+const SOURCE_EXCERPT_CHARS: usize = 4096;
+
+async fn read_source(path: Option<&str>) -> Option<String> {
+    tokio::fs::read_to_string(PathBuf::from(path?)).await.ok()
+}
+
+/// The head of `source` shown in a diagnostic. Never written back to a file.
+fn excerpt(source: &str) -> String {
+    source.chars().take(SOURCE_EXCERPT_CHARS).collect()
 }
 
 pub fn synthesize_patch(source: &str) -> Option<String> {
-    if source.contains("AXIOM_POLYJIT_FIXTURE_FAIL") && source.contains("Write-Error") {
+    // Whole-file rewrites are for the tiny fixture scripts only; see
+    // `patch_ranker::WHOLE_FILE_REPLACEMENT_MAX_CHARS`.
+    let replaceable = crate::patch_ranker::replaceable_wholesale(source);
+    if replaceable
+        && source.contains("AXIOM_POLYJIT_FIXTURE_FAIL")
+        && source.contains("Write-Error")
+    {
         return Some("Write-Output \"AXIOM_POLYJIT_FIXTURE_PASS\"\nexit 0\n".to_string());
     }
     if source.contains("AXIOM_POLYJIT_FIXTURE_FAIL") {
@@ -406,7 +422,7 @@ pub fn synthesize_patch(source: &str) -> Option<String> {
     if source.contains("exit 1") {
         return Some(source.replace("exit 1", "exit 0"));
     }
-    if source.contains("throw ") {
+    if replaceable && source.contains("throw ") {
         return Some("Write-Output \"axiom polyjit repaired\"\nexit 0\n".to_string());
     }
     if source.contains("assert_eq!(1, 2)") {
@@ -423,6 +439,63 @@ mod tests {
     fn deterministic_patch_handles_fixture_marker() {
         let patched = synthesize_patch("AXIOM_POLYJIT_FIXTURE_FAIL").unwrap();
         assert!(patched.contains("AXIOM_POLYJIT_FIXTURE_PASS"));
+    }
+
+    #[tokio::test]
+    async fn a_source_longer_than_the_excerpt_is_never_cut() {
+        // Nothing in the patch set can repair this file. The run used to
+        // write the 4096-character excerpt over it anyway while it tried.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("notes.txt");
+        // The `throw ` at the very end is past the excerpt. Now that the
+        // whole file is read, it must not trigger the fixture rewrite that
+        // replaces a file with a two-line script.
+        let original = "a line of ordinary text\n".repeat(400) + "throw 'not a fixture'\n";
+        assert!(original.len() > 2 * SOURCE_EXCERPT_CHARS);
+        std::fs::write(&source, &original).unwrap();
+        let sizes = dir.path().join("sizes.log");
+
+        let engine = PolyJitEngine::new(Duration::from_secs(30));
+        let report = engine
+            .run_with_feedback(
+                PolyJitRunRequest {
+                    session_id: "long".to_string(),
+                    command: "sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        format!(
+                            "wc -c < '{}' >> '{}'; false",
+                            source.display(),
+                            sizes.display()
+                        ),
+                    ],
+                    working_dir: None,
+                    source_path: Some(source.display().to_string()),
+                },
+                |_diag| async { Ok(()) },
+            )
+            .await
+            .unwrap();
+        assert!(!report.passed);
+        // The diagnostic still carries only an excerpt.
+        assert_eq!(
+            report.diagnostics[0]
+                .source_excerpt
+                .as_deref()
+                .map(|e| e.chars().count()),
+            Some(SOURCE_EXCERPT_CHARS)
+        );
+        let seen: Vec<usize> = std::fs::read_to_string(&sizes)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().parse().unwrap())
+            .collect();
+        assert!(seen.len() >= 2, "{seen:?}");
+        assert!(
+            seen.iter().all(|&n| n == original.len()),
+            "the file was cut during a run: {seen:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
     }
 
     #[tokio::test]

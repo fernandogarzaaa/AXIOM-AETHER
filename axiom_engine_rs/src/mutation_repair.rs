@@ -2,8 +2,8 @@
 //!
 //! The legacy Poly-JIT patch set ([`crate::poly_jit::synthesize_patch`]) knows a
 //! handful of fixture-shaped string flips (`exit 1` → `exit 0`, a marker
-//! rename, one hard-coded `assert_eq!`). This module is its general,
-//! language-aware successor. Given the failing verifier's output and the file
+//! rename, one hard-coded `assert_eq!`) and is no longer part of the solve
+//! loop. This module is its general, language-aware successor. Given the failing verifier's output and the file
 //! blamed by [`crate::fault_locate`], it enumerates a **bounded, ranked set of
 //! single-edit source mutations** of the kinds that account for a large share of
 //! real one-line bugs — comparison-operator and off-by-one slips, inverted or

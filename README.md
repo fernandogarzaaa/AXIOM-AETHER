@@ -27,7 +27,7 @@ general answer-quality claims that are not proven by the repository.
 | Session recording & receipts | Opt-in scrubbed per-session request/response JSONL (`AXIOM_SESSION_RECORD=1`, `~/.axiom/sessions/`), plus always-on token-savings receipts: `axiom_savings_*` counters on `/metrics` and a one-line receipt when a session drops. | `session_recorder.rs`, `server/routes_responses.rs`, `server/routes_hypervisor.rs` |
 | MCP server | Exposes Axiom as 17 stdio/HTTP JSON-RPC tools (20 with `--features experimental`, which adds the untrained predictive-reasoning tools): compression, drift, expansion, memory, grounding, epistemic validation, immunity, status, a multi-agent task board, ChatGPT connector `search`/`fetch`. | `mcp_stdio.rs`, `predictive_tools.rs` |
 | Self-healing runner | Runs a command, detects supported environment failures, applies bounded heals, and records learned immunity. | `self_heal.rs`, `heal_memory.rs`, `entrypoint.rs` |
-| Autonomous solve loop | Uses the runner plus source repair attempts to drive a verifier command toward green: localize the blamed file (demoting test files and hopping through their imports to the module under test), enumerate a bounded, ranked set of single-edit mutations (comparison, off-by-one, boolean, logic, arithmetic, swapped args, missing `return`, shell `test` operators, misspelled import paths) focused on the blamed lines, and keep only what the real verifier accepts — never editing an assertion line. | `solve.rs`, `mutation_repair.rs`, `fault_locate.rs`, `poly_jit.rs`, `compile_verify.rs` |
+| Autonomous solve loop | Uses the runner plus source repair attempts to drive a verifier command toward green: localize the blamed file (demoting test files and hopping through their imports to the module under test), enumerate a bounded, ranked set of single-edit mutations (comparison, off-by-one, boolean, logic, arithmetic, swapped args, missing `return`, shell `test` operators, misspelled import paths) focused on the blamed lines, and keep only what the real verifier accepts — never editing an assertion line. The original of every file it writes to is journaled to disk first and restored on failure, on Ctrl-C, and after a kill. | `solve.rs`, `mutation_repair.rs`, `fault_locate.rs`, `source_journal.rs`, `compile_verify.rs` |
 | Grounding verification | Checks whether response claims are supported by supplied evidence and can expand dropped symbols when a session digest is available. | `hallucination.rs`, `/v1/verify` in `server/routes_verify.rs` |
 | Provenance & belief | Signed immunity export/merge verification and `BetaBelief` conflict-aware peer confidence; DARE/TIES checkpoint + peer weight merge. | `belief.rs`, `provenance.rs`, `weight_merge.rs`, `patch_memory.rs` |
 | Calibrated trust gate | `/v1/verify` ships a data-calibrated conformal threshold (calibrated on `bench/trust/claims.jsonl` at δ=0.10 for ≥90% coverage of genuinely supported claims), plus a neural contradiction-catch-rate benchmark. A `calibrate` request mode retunes it for your own labeled data. | `hallucination.rs`, `bench/trust/`, `server/routes_verify.rs` |
@@ -80,7 +80,7 @@ regenerates them on every push and fails if the repair gate regresses.
 
 | Metric | Value | Config | Measured |
 |---|---|---|---|
-| **Autonomous repair** — `axiom eval-agentic` | 32/32 = 100% | 14 localization fixtures + 18 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, ~15 s | 2026-11-08 |
+| **Autonomous repair** — `axiom eval-agentic` | 32/32 = 100% | 12 localization + 2 multi-file + 18 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, ~15 s | 2026-11-08 |
 | **Autonomous repair, held-out** — `scripts/bench_repair.sh` | 38/40 = 95% on a fresh seed (15/17 on faults outside the tuning set; 0.6.0: 20/40, 6/17); 39/40 on the tuning seed; 32/40 and 33/40 verified correct against a strengthened suite (0.6.0: 16/40); 0 rollback violations | random single-token faults seeded into `axiom_mesh_core`, which the engine was never shown; no LLM ([write-up](bench/results/SEEDED-HELDOUT-v2-2026-11-06.md)) | 2026-11-06 |
 | **Autonomous repair, developer bugs** — QuixBugs via `scripts/bench_repair.sh` | 9/40 = 22.5% held out, all 9 verified correct against the reference fixes (14/40 in-sample after three operator families chosen from its failures); 0 rollback violations, 0 test edits | 40 Python programs with one human-written bug each (QuixBugs @ 4257f44); no operator tuned on them; no LLM ([write-up](bench/results/QUIXBUGS-2026-11-07.md)) | 2026-11-07 |
 | **Compression** — `axiom bench axiom_engine_rs/src` | 86.7% savings, 2229/2229 = 100% round-trip | `AXIOM_PRODUCTION_BPE=1` | 2026-08-09 |
@@ -824,7 +824,8 @@ axiom_engine_rs/src/
   model.rs                 model layers
   model_meta.rs            checkpoint sidecar metadata (schema-versioned)
   openai_forwarder.rs      OpenAI-compatible forwarding
-  poly_jit.rs              source repair loop support
+  poly_jit.rs              fixture patch runner behind /v1/hypervisor/jit_run (not used by solve)
+  source_journal.rs        on-disk originals for files the repair loop writes to
   provenance.rs            signed export verification
   search_ingest.rs         live search ingestion into TTT
   search_scrape.rs         Rust web scraping helper

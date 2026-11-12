@@ -12,20 +12,20 @@
 //!   2. **Source repair** — if the environment heal did not suffice, localize
 //!      the blamed files (`fault_locate::repair_targets`: non-test files first,
 //!      then the modules a blamed test imports, then the test itself) and, per
-//!      file, run the Poly JIT closed loop (bounded, Q-TTT-ranked legacy
-//!      patches) and then the general deterministic mutation layer
-//!      (`mutation_repair`: comparison / off-by-one / boolean / logic /
-//!      arithmetic / swapped-args / missing-return / shell-test candidates,
-//!      blamed lines first, never an assertion line). Every candidate is
-//!      *reversible*: the source is restored byte-for-byte unless the verify
-//!      command goes green.
+//!      file, run the deterministic mutation layer (`mutation_repair`:
+//!      comparison / off-by-one / boolean / logic / arithmetic / swapped-args /
+//!      missing-return / shell-test candidates, blamed lines first, never an
+//!      assertion line), then stored fixes, then the LLM. Every candidate is
+//!      *reversible*: the original is journaled to disk before the first write
+//!      (`source_journal`) and restored byte-for-byte unless the verify command
+//!      goes green — also when the solve is interrupted or killed.
 //!   3. **Verify + remember** — success persists what was learned (heal memory
 //!      via the supervisor); the round's provenance is reported.
 //!
 //! The loop runs up to `max_rounds`, stopping early when a round makes no
 //! progress (no new environment heal and no successful source patch) so it can
 //! never spin. Honest scope: environment heals are corrective; source repair is
-//! the bounded deterministic patch set; Pillar-1 whole-project priming remains
+//! the bounded deterministic mutation set; Pillar-1 whole-project priming remains
 //! the separate `axiom prime` path (the supervisor already absorbs each fault
 //! trace into W̃ here).
 
@@ -35,7 +35,6 @@ use candle_core::Result as CResult;
 
 use crate::backend_router::ChatBackend;
 use crate::inference::InferencePipeline;
-use crate::poly_jit::{PolyJitEngine, PolyJitRunRequest};
 use crate::self_heal::{run_supervised, SupervisorOptions};
 
 /// Knobs for an autonomous solve run.
@@ -49,7 +48,8 @@ pub struct SolveOptions {
     pub heal_memory_path: Option<PathBuf>,
     /// Working directory for the verify command and the immunity anchor.
     pub anchor: Option<PathBuf>,
-    /// When set, enables Poly JIT source repair against this artifact.
+    /// When set, source repair targets this file instead of localizing one
+    /// from the verify command's output.
     pub source_path: Option<PathBuf>,
     /// Verified-patch store for fleet patch sharing. When set, the loop tries
     /// stored (incl. peer-merged) candidates — re-verified locally — before the
@@ -65,8 +65,8 @@ pub struct SolveReport {
     /// Environment heals applied across all rounds (human-readable).
     pub env_heals: Vec<String>,
     /// True if the solve left a source file changed by a deterministic phase:
-    /// a Poly JIT patch, a mutation repair, or a stored fix (in which case
-    /// `fleet_patched` is set too).
+    /// a mutation repair, or a stored fix (in which case `fleet_patched` is
+    /// set too).
     pub source_patched: bool,
     /// True if an LLM-proposed, *verifier-gated* source patch made the target
     /// pass (only kept when the verify command independently went green).
@@ -93,6 +93,14 @@ pub fn solve(
 ) -> CResult<SolveReport> {
     let mut report = SolveReport::default();
     let max_rounds = opts.max_rounds.max(1);
+
+    // A previous solve that was killed with a candidate on disk left its
+    // original in the journal: put those files right before doing anything.
+    for recovery in crate::source_journal::recover() {
+        if let Some(message) = recovery.describe() {
+            println!("[axiom-solve] {message}");
+        }
+    }
 
     for round in 1..=max_rounds {
         report.rounds = round;
@@ -187,16 +195,55 @@ pub fn solve(
     Ok(report)
 }
 
-/// Run the reversible repair phases against ONE target file:
-/// Phase 2 (Poly-JIT deterministic patches) → Phase 2.1 (general mutation
-/// repair, `crate::mutation_repair`) → Phase 2.5 (fleet patch reuse,
-/// re-verified locally) → Phase 3 (verifier-gated LLM repair). Returns
-/// `Ok(true)` and sets the matching `report` flags if some phase made the verify
-/// command pass; `Ok(false)` if none did — each phase rolls its own candidate
-/// back byte-for-byte, so a non-fixing attempt leaves the file untouched and the
-/// caller can safely try the next candidate.
+/// Run the reversible repair phases against ONE target file, with its
+/// original journaled to disk first ([`crate::source_journal`]). Returns
+/// `Ok(true)` and sets the matching `report` flags if some phase made the
+/// verify command pass; the fix is then kept. In every other case — no phase
+/// fixed it, a phase returned an error, the thread panicked, the process was
+/// interrupted — the file is put back byte-for-byte, so the caller can safely
+/// try the next candidate file.
 #[allow(clippy::too_many_arguments)]
 fn attempt_source_repair(
+    command: &str,
+    args: &[String],
+    opts: &SolveOptions,
+    round: usize,
+    env_diagnostics: &[String],
+    src: &Path,
+    report: &mut SolveReport,
+) -> CResult<bool> {
+    // No journal, no writes: a file whose original cannot be saved to disk
+    // first is not touched.
+    let journal = match crate::source_journal::protect(src) {
+        Ok(journal) => journal,
+        Err(e) => {
+            println!(
+                "[axiom-solve] round {round}: not repairing {} (its original could not be journaled: {e})",
+                src.display()
+            );
+            return Ok(false);
+        }
+    };
+    let solved = run_repair_phases(command, args, opts, round, env_diagnostics, src, report)?;
+    if solved {
+        journal.commit();
+    }
+    // Otherwise dropping `journal` restores the original.
+    Ok(solved)
+}
+
+/// The repair phases for one journaled file: Phase 2.1 (deterministic mutation
+/// repair, `crate::mutation_repair`) → Phase 2.5 (stored-fix reuse, re-verified
+/// locally) → Phase 3 (verifier-gated LLM repair). Each phase rolls its own
+/// rejected candidates back; [`attempt_source_repair`] is the backstop.
+///
+/// There is no phase before 2.1 any more. The Poly-JIT patch set that used to
+/// run first only knew fixture-shaped rewrites — `exit 1` → `exit 0`, a marker
+/// rename, replacing the whole file with a script that exits 0 — and it wrote
+/// a 4096-character excerpt over the file to try them. On real code that
+/// turned a failing check into a passing one without fixing anything.
+#[allow(clippy::too_many_arguments)]
+fn run_repair_phases(
     command: &str,
     args: &[String],
     opts: &SolveOptions,
@@ -215,44 +262,9 @@ fn attempt_source_repair(
         .as_ref()
         .map(|s| s.rel_path.clone())
         .unwrap_or_else(|| src.display().to_string());
-    let backup = std::fs::read_to_string(src).ok();
-    let engine = PolyJitEngine::default();
-    let run_req = PolyJitRunRequest {
-        session_id: format!("solve-{round}"),
-        command: command.to_string(),
-        args: args.to_vec(),
-        working_dir: opts.anchor.as_ref().map(|p| p.display().to_string()),
-        source_path: Some(src.display().to_string()),
-    };
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| candle_core::Error::Msg(format!("solve runtime: {e}")))?;
-    // A Poly-JIT error (most often its verify run timing out on a fault that
-    // loops forever) means this phase did not fix it, not that the solve
-    // failed: fall through to the later phases.
-    match rt.block_on(engine.run_with_feedback(run_req, |_diag| async { Ok(()) })) {
-        Ok(poly) if poly.passed => {
-            report.source_patched = poly.patched;
-            report.solved = true;
-            report.final_exit = Some(0);
-            println!(
-                "[axiom-solve] round {round}: source repair solved it (patched={})",
-                poly.patched
-            );
-            return Ok(true);
-        }
-        Ok(_) => {}
-        Err(e) => println!("[axiom-solve] round {round}: poly-jit phase skipped ({e})"),
-    }
-    // Failed repair → restore the artifact byte-for-byte.
-    if let Some(b) = backup {
-        let _ = std::fs::write(src, b);
-    }
 
     // --- Phase 2.1: deterministic mutation repair (verifier-gated) ----------
-    // The general successor to the fixture-shaped Poly-JIT flips above: a
-    // bounded, ranked set of single-edit mutations (comparison / off-by-one /
+    // A bounded, ranked set of single-edit mutations (comparison / off-by-one /
     // boolean / logic / arithmetic / swapped args / missing return / shell
     // test operators), focused on the lines the failure blames and never on an
     // assertion line. Each candidate is one verifier run under the same
@@ -341,7 +353,7 @@ fn attempt_source_repair(
     }
 
     // --- Phase 3: autonomous LLM repair (verifier-gated, reversible) --------
-    // When the deterministic Poly-JIT patches don't fix it, ask the LLM backend
+    // When neither a mutation nor a stored fix repairs it, ask the LLM backend
     // for a patch — but keep it ONLY if the verify command then goes green. The
     // model never gets to "fix" anything that isn't independently verified; a
     // rejected patch is rolled back byte-for-byte.
@@ -528,10 +540,10 @@ where
         let before = std::fs::metadata(source_path)
             .and_then(|m| m.modified())
             .ok();
-        if let Err(e) = std::fs::write(source_path, &candidate) {
+        if let Err(e) = crate::source_journal::write(source_path, candidate.as_bytes()) {
             // A failed write may have already truncated the file — restore first.
             eprintln!("[axiom-solve] patch write failed; restoring original ({e})");
-            let _ = std::fs::write(source_path, &original);
+            let _ = crate::source_journal::write(source_path, original.as_bytes());
             break;
         }
         // Same-size candidate in the same second: without this, Python's
@@ -549,7 +561,7 @@ where
         let candidate_mtime = std::fs::metadata(source_path)
             .and_then(|m| m.modified())
             .ok();
-        if let Err(e) = std::fs::write(source_path, &original) {
+        if let Err(e) = crate::source_journal::write(source_path, original.as_bytes()) {
             eprintln!(
                 "[axiom-solve] WARNING: failed to restore original after rejected patch: {e}"
             );
