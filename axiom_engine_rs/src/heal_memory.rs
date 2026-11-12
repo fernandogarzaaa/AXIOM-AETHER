@@ -912,12 +912,11 @@ impl HealMemory {
 
     /// Persist to disk (pretty JSON so the memory stays human-auditable).
     pub fn save(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_string_pretty(&self.data)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        std::fs::write(&self.path, json)
+        // Replaced by rename: a reader, or a save that is cut short, finds
+        // the whole old memory or the whole new one, never part of one.
+        crate::atomic_write::write_replacing(&self.path, json.as_bytes())
     }
 }
 
@@ -1147,6 +1146,41 @@ mod tests {
         let mut copy = HealMemory::load(tmp("stable_export_copy"));
         assert_eq!(copy.merge_json(&export).unwrap().programs_added, 24);
         assert_eq!(copy.to_json(), export);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_never_overwrites_the_memory_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("heal_memory.json");
+        let fp = fingerprint("prog", &[]);
+        let mut mem = HealMemory::load(&store);
+        mem.remember_dirs(&fp, "prog", &[PathBuf::from("/a")]);
+        mem.save().unwrap();
+        let as_it_was = std::fs::read(&store).unwrap();
+
+        // A second name for the same file on disk. If the next save writes
+        // into that file, this name shows the new bytes, and a save cut short
+        // would have left the only copy half written.
+        let kept = dir.path().join("as-it-was");
+        std::fs::hard_link(&store, &kept).unwrap();
+
+        mem.remember_dirs(&fp, "prog", &[PathBuf::from("/b")]);
+        mem.save().unwrap();
+        assert!(
+            std::fs::read(&kept).unwrap() == as_it_was,
+            "the save wrote into the existing memory file instead of replacing it"
+        );
+        assert_eq!(HealMemory::load(&store).record(&fp).unwrap().dirs.len(), 2);
+
+        // Nothing is left beside the memory.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["as-it-was", "heal_memory.json"]);
     }
 
     #[test]

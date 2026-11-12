@@ -5,6 +5,7 @@ pub mod agentic_eval;
 #[cfg(feature = "experimental")]
 pub mod alignment_loop;
 pub mod anthropic_forwarder;
+pub mod atomic_write;
 pub mod backend_live;
 pub mod backend_router;
 pub mod belief;

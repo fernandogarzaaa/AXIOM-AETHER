@@ -16,14 +16,9 @@
 //!   and the record of it cannot come apart: no state of the file holds one
 //!   without the other. A save that fails outright leaves neither, and a
 //!   retry merges the export once.
-//!
-//!   That is not the same as an all-or-nothing save. Both stores are saved
-//!   with a plain truncating write, as they were before this module existed.
-//!   A write cut short can leave a file that does not parse, and such a
-//!   store loads as empty: the candidates or records are lost together with
-//!   the record of what was merged, so nothing is counted twice, but what
-//!   was in the store is gone. Saving the stores by rename is a separate
-//!   change to how every writer of them replaces the file.
+//!   The stores themselves are saved by rename
+//!   ([`crate::atomic_write::write_replacing`]), so a save that is cut short
+//!   leaves the whole old store in place.
 //! * **Handed-out exports** are remembered in a ledger beside the store,
 //!   `<store file name>.exports.json` ([`ExportLedger`]). The export routes
 //!   are polled, and they must not rewrite the store on a read: a fix saved
@@ -123,19 +118,11 @@ impl ExportLedger {
         if !self.changed {
             return Ok(());
         }
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_string(&LedgerFile {
             seen: self.seen.clone(),
         })
         .map_err(|e| io::Error::other(e.to_string()))?;
-        let scratch = with_suffix(&self.path, &format!(".tmp-{}", std::process::id()));
-        std::fs::write(&scratch, json)?;
-        if let Err(e) = std::fs::rename(&scratch, &self.path) {
-            let _ = std::fs::remove_file(&scratch);
-            return Err(e);
-        }
+        crate::atomic_write::write_replacing(&self.path, json.as_bytes())?;
         self.changed = false;
         Ok(())
     }
