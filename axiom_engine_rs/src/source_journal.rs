@@ -115,11 +115,18 @@ fn interrupted_error() -> io::Error {
     )
 }
 
-/// Where journal entries live: `AXIOM_JOURNAL_DIR`, else `~/.axiom/journal`,
-/// else a directory under the system temp dir.
+/// Where journal entries live: `AXIOM_JOURNAL_DIR` if set; otherwise a
+/// `journal` directory beside the heal memory (so `AXIOM_HEAL_MEMORY` moves
+/// it along with the rest of the solve state); otherwise `~/.axiom/journal`;
+/// otherwise a directory under the system temp dir.
 pub fn default_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("AXIOM_JOURNAL_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(dir);
+    }
+    let beside_heal_memory = crate::heal_memory::HealMemory::default_path()
+        .and_then(|path| path.parent().map(|dir| dir.join("journal")));
+    if let Some(dir) = beside_heal_memory {
+        return dir;
     }
     match dirs::home_dir() {
         Some(home) => home.join(".axiom").join("journal"),
@@ -127,9 +134,44 @@ pub fn default_dir() -> PathBuf {
     }
 }
 
+/// Create the journal directory if it is missing, readable by its owner
+/// only: it will hold copies of source files. An existing directory is left
+/// as it is.
+fn create_journal_dir(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Options for creating a journal file: owner-only on Unix, whatever the
+/// umask. A journal file can hold the full content of a private source file.
+fn private_file() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
 /// Write `bytes` to `path` and sync them to disk before returning.
 fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path)?;
+    let mut file = private_file().create(true).truncate(true).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
@@ -236,7 +278,7 @@ pub fn protect_in(dir: &Path, path: &Path) -> io::Result<Protected> {
     }
     let target = fs::canonicalize(path)?;
     let original = fs::read(&target)?;
-    fs::create_dir_all(dir)?;
+    create_journal_dir(dir)?;
     let id = format!(
         "{}-{}-{}",
         &sha256_hex(target.to_string_lossy().as_bytes())[..16],
@@ -246,9 +288,8 @@ pub fn protect_in(dir: &Path, path: &Path) -> io::Result<Protected> {
     let stem = dir.join(id);
     // The lock comes first: an entry without one would look abandoned to a
     // concurrent `recover`.
-    let lock = OpenOptions::new()
+    let lock = private_file()
         .create_new(true)
-        .write(true)
         .open(stem.with_extension("lock"))?;
     let entry = Entry {
         target,
@@ -345,6 +386,11 @@ pub enum RecoveryOutcome {
     LeftChanged { saved_original: PathBuf },
     /// The file no longer exists; nothing was recreated.
     TargetMissing,
+    /// The file could not be read, or the original could not be written back
+    /// (a permission change, say). Nothing was touched: the entry and the
+    /// original at `saved_original` are kept, and the next recovery tries
+    /// again.
+    Deferred { saved_original: PathBuf },
 }
 
 /// One entry handled by [`recover`].
@@ -393,18 +439,19 @@ pub fn recover_in(dir: &Path) -> Vec<Recovery> {
         if let (Some(meta), Some(original)) = (meta, original) {
             if sha256_hex(&original) == meta.original_sha256 {
                 let target = PathBuf::from(&meta.path);
+                let deferred = || RecoveryOutcome::Deferred {
+                    saved_original: orig_path.clone(),
+                };
                 let outcome = match fs::read(&target) {
-                    Err(_) => RecoveryOutcome::TargetMissing,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => RecoveryOutcome::TargetMissing,
+                    // Unreadable is not gone: the file may still hold the
+                    // candidate, so the original must not be thrown away.
+                    Err(_) => deferred(),
                     Ok(current) if current == original => RecoveryOutcome::AlreadyOriginal,
                     Ok(current) if Some(sha256_hex(&current)) == meta.written_sha256 => {
                         match fs::write(&target, &original) {
                             Ok(()) => RecoveryOutcome::Restored,
-                            Err(_) => {
-                                keep_original = true;
-                                RecoveryOutcome::LeftChanged {
-                                    saved_original: orig_path.clone(),
-                                }
-                            }
+                            Err(_) => deferred(),
                         }
                     }
                     Ok(_) => {
@@ -414,7 +461,12 @@ pub fn recover_in(dir: &Path) -> Vec<Recovery> {
                         }
                     }
                 };
+                let retry_later = matches!(outcome, RecoveryOutcome::Deferred { .. });
                 done.push(Recovery { target, outcome });
+                if retry_later {
+                    // Leave every file of the entry; dropping `lock` releases it.
+                    continue;
+                }
             }
         }
         if !keep_original {
@@ -660,6 +712,55 @@ mod tests {
         );
         assert!(!source.exists());
         assert_eq!(entry_files(&journal), 0);
+    }
+
+    #[test]
+    fn recovery_keeps_the_original_when_the_file_cannot_be_read() {
+        let (_tmp, journal, source) = fixture("original\n");
+        let guard = protect_in(&journal, &source).unwrap();
+        write(&source, b"unverified candidate\n").unwrap();
+        guard.abandon();
+        // The file cannot be read right now (here: a directory sits at its
+        // path; in the field, a permission change). That is not "gone".
+        let aside = source.with_extension("aside");
+        fs::rename(&source, &aside).unwrap();
+        fs::create_dir(&source).unwrap();
+
+        let recovered = recover_in(&journal);
+        assert_eq!(recovered.len(), 1);
+        let RecoveryOutcome::Deferred { saved_original } = &recovered[0].outcome else {
+            panic!("expected Deferred, got {:?}", recovered[0].outcome);
+        };
+        assert_eq!(fs::read(saved_original).unwrap(), b"original\n");
+
+        // Readable again, still holding the candidate: the next recovery
+        // restores it from the entry that was kept.
+        fs::remove_dir(&source).unwrap();
+        fs::rename(&aside, &source).unwrap();
+        assert_eq!(recover_in(&journal)[0].outcome, RecoveryOutcome::Restored);
+        assert_eq!(fs::read(&source).unwrap(), b"original\n");
+        assert_eq!(entry_files(&journal), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_files_are_readable_by_their_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, journal, source) = fixture("a private source file\n");
+        let guard = protect_in(&journal, &source).unwrap();
+        write(&source, b"candidate\n").unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&journal), 0o700, "the journal directory");
+        let files: Vec<PathBuf> = fs::read_dir(&journal)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(files.len(), 3, "{files:?}");
+        for file in &files {
+            assert_eq!(mode(file), 0o600, "{}", file.display());
+        }
+        drop(guard);
     }
 
     #[test]

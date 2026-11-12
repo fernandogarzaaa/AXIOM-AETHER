@@ -109,6 +109,13 @@ pub fn solve(
                 recovery.target.display(),
                 saved_original.display()
             ),
+            RecoveryOutcome::Deferred { saved_original } => println!(
+                "[axiom-solve] an earlier solve was killed mid-repair, and {} cannot be read or \
+                 written right now; nothing was changed, and its content from before that solve \
+                 is saved at {}",
+                recovery.target.display(),
+                saved_original.display()
+            ),
             RecoveryOutcome::AlreadyOriginal | RecoveryOutcome::TargetMissing => {}
         }
     }

@@ -59,10 +59,20 @@ step "acquired immunity report + adaptive Beta-belief confidence"
 "$BIN" immunity 2>&1 | grep -q "confidence:" && ok "immunity report shows Beta confidence ±uncertainty" || bad "no confidence in report"
 
 step "Pillar 3 — autonomy (axiom solve drives a failing verify to green)"
-printf '#!/bin/sh\necho fail >&2\nexit 1\n' > "$TMP/verify.sh"
-"$BIN" solve --source "$TMP/verify.sh" -- sh "$TMP/verify.sh" 2>&1 | grep -E "axiom-solve\] (round|result)" | sed 's/^/    /'
-"$BIN" solve --source "$TMP/verify.sh" -- sh "$TMP/verify.sh" 2>&1 | grep -q "SOLVED" \
-    && ok "solve repaired the source and reached green" || bad "solve did not reach green"
+# A shell library with one wrong token (`-gt` where `-ge` was meant), checked
+# by its behaviour. Only a real fix makes the check pass.
+printf 'is_adult() {\n  [ "$1" -gt 18 ]\n}\n' > "$TMP/limits.sh"
+cp "$TMP/limits.sh" "$TMP/limits.sh.orig"
+SOLVE_CHECK=". $TMP/limits.sh; { is_adult 18 && is_adult 40 && ! is_adult 17; } || { echo 'limits.sh:2:3: is_adult is wrong' >&2; exit 1; }"
+SOLVE_OUT="$("$BIN" solve --source "$TMP/limits.sh" -- sh -c "$SOLVE_CHECK" 2>&1)"
+printf '%s\n' "$SOLVE_OUT" | grep -E "axiom-solve\] (round|result)" | sed 's/^/    /'
+if printf '%s\n' "$SOLVE_OUT" | grep -q "result: SOLVED" \
+    && sh -c "$SOLVE_CHECK" 2>/dev/null \
+    && ! cmp -s "$TMP/limits.sh" "$TMP/limits.sh.orig"; then
+    ok "solve repaired the source and reached green"
+else
+    bad "solve did not reach green"
+fi
 
 step "grounding verification (server: flag an ungrounded claim) — Pillar against hallucination"
 if ! command -v curl >/dev/null 2>&1; then
