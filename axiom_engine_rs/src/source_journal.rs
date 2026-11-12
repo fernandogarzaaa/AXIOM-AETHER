@@ -223,6 +223,38 @@ fn close_to_others(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Could somebody other than this user have changed the journal file at
+/// `path`? True for one that belongs to another user, that group or others
+/// may write to, or that is not a regular file (a link could point anywhere).
+/// A file that does not exist was not changed. Always false off Unix, where
+/// there are no mode bits to check.
+///
+/// The journal creates its files owner-only, so this is never true for a
+/// file it wrote. A directory that others could only read is closed and kept
+/// ([`ensure_private_dir`]); a file in it that was open to writing is the one
+/// thing there they could have altered.
+fn others_could_have_changed(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(_) => true,
+            // SAFETY: geteuid(2) has no preconditions and cannot fail.
+            Ok(meta) => {
+                !meta.is_file()
+                    || meta.uid() != unsafe { libc::geteuid() }
+                    || meta.mode() & 0o022 != 0
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Make sure `dir` exists and belongs to this user alone. It holds copies of
 /// source files, and [`recover`] writes what it finds there back over source
 /// files, so nobody else may read it or put files in it.
@@ -845,6 +877,20 @@ fn recover_entries(dir: &Path, held: Option<&Path>) -> (Vec<Recovery>, bool) {
         }
         let stem = lock_path.with_extension("");
         let orig_path = stem.with_extension("orig");
+        // What an entry says is written over a source file, so an entry
+        // somebody else could have edited is not acted on. It is left where
+        // it is: the saved original may still be wanted.
+        if ["orig", "json", "cand"]
+            .iter()
+            .any(|ext| others_could_have_changed(&stem.with_extension(ext)))
+        {
+            eprintln!(
+                "[axiom-journal] not restoring from {}: its files could have been changed by \
+                 other users. Nothing was touched; check the saved original by hand.",
+                orig_path.display()
+            );
+            continue;
+        }
         let meta = fs::read(stem.with_extension("json"))
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Meta>(&bytes).ok());
@@ -1339,6 +1385,54 @@ mod tests {
         let err = protect_in(&aside[0], &source).err().expect("refused");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_whose_files_others_could_write_to_is_not_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let set_modes = |journal: &Path, mode: u32| {
+            for ext in ["orig", "json", "cand", "lock"] {
+                let file = journal.join(format!("0123456789abcdef-1-0.{ext}"));
+                fs::set_permissions(file, fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        let (tmp, journal, source) = fixture("original\n");
+        let victim = tmp.path().join("victim.sh");
+        fs::write(&victim, "the user's real file\n").unwrap();
+        let victim = fs::canonicalize(&victim).unwrap();
+
+        // The directory only ever let others read it, so nobody else could
+        // add a file. But the entry's files are open to writing: anybody
+        // could have replaced the saved "original" and its recorded hash.
+        let forged = plant_forged_entry(&journal, &victim);
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o755)).unwrap();
+        set_modes(&journal, 0o666);
+
+        // A solve closes the directory and keeps it, and uses nothing from
+        // that entry. The entry stays, for a look by hand.
+        let guard = protect_in(&journal, &source).unwrap();
+        drop(guard);
+        assert_eq!(
+            fs::metadata(&journal).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(recover_in(&journal).is_empty());
+        assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
+        assert_eq!(entry_files(&journal), 4);
+        assert_eq!(
+            fs::read(journal.join("0123456789abcdef-1-0.orig")).unwrap(),
+            forged
+        );
+        assert!(set_aside_dirs(tmp.path(), "journal").is_empty());
+
+        // It is the files' openness that is refused, nothing else about the
+        // entry: with the same files closed, recovery acts on it.
+        set_modes(&journal, 0o600);
+        let recovered = recover_in(&journal);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].outcome, RecoveryOutcome::Restored);
+        assert_eq!(fs::read(&victim).unwrap(), forged);
     }
 
     #[cfg(unix)]
