@@ -45,7 +45,9 @@
 //! Elsewhere, where a lock on the file would stop the verify command reading
 //! it, the lock is on a `<hash of the source path>.target` file in one
 //! per-user directory under the system temp dir, which does not depend on
-//! the journal directory either.
+//! the journal directory either. It does depend on the temp dir: there, two
+//! solves started with different `TMP`/`TEMP` values do not exclude each
+//! other. That is a known limit of the non-Unix fallback.
 //!
 //! Entries are only ever recovered from the journal directory in use. A file
 //! left by a solve that used a different directory is not put right until a
@@ -232,7 +234,19 @@ fn close_to_others(dir: &Path) -> io::Result<()> {
 ///   Anybody could have planted an entry there, and recovery would write its
 ///   "original" over the file it names. The whole directory is renamed aside
 ///   ([`set_aside`]) and a fresh one is created in its place.
+///
+/// `dir` must be a real path ([`real_dir`]): a link to a directory is not
+/// what gets checked or moved.
 fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    if was_set_aside(dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} was set aside as untrusted and is not used as a journal",
+                dir.display()
+            ),
+        ));
+    }
     if dir.is_dir() {
         match exposure(dir)? {
             Exposure::Private => return Ok(()),
@@ -268,6 +282,23 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// What a directory moved aside by [`set_aside`] has in its name. Such a
+/// directory is never used as a journal, even though it is closed to others
+/// afterwards: what is in it was put there while it was open.
+const SET_ASIDE_MARK: &str = ".untrusted-";
+
+fn was_set_aside(dir: &Path) -> bool {
+    dir.file_name()
+        .is_some_and(|name| name.to_string_lossy().contains(SET_ASIDE_MARK))
+}
+
+/// The directory `dir` names once symbolic links are followed, so that it is
+/// the directory itself that is checked, moved aside or created, never a link
+/// to it. A path that does not exist yet is returned as given.
+fn real_dir(dir: &Path) -> PathBuf {
+    fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
 /// Rename `dir`, with everything in it, to a sibling name. One atomic step:
 /// afterwards nothing that was in the directory can be found at its path, so
 /// stopping right after cannot leave an untrusted entry where recovery looks.
@@ -284,7 +315,7 @@ fn set_aside(dir: &Path) -> io::Result<()> {
         .unwrap_or_else(|| "journal".to_string());
     for n in 0..64 {
         let aside = dir.with_file_name(format!(
-            "{name}.untrusted-{stamp}-{}-{n}",
+            "{name}{SET_ASIDE_MARK}{stamp}-{}-{n}",
             std::process::id()
         ));
         if aside.exists() {
@@ -533,6 +564,7 @@ pub fn protect_in(dir: &Path, path: &Path) -> io::Result<Protected> {
         return Err(interrupted_error());
     }
     let target = fs::canonicalize(path)?;
+    let dir = &real_dir(dir);
     ensure_private_dir(dir)?;
     // From here until the guard is dropped, no other solve may protect this
     // file: it would read whatever candidate is on disk as "the original".
@@ -762,7 +794,15 @@ pub fn recover_in(dir: &Path) -> Vec<Recovery> {
 /// somebody else. The caller holds that file's lock, so it cannot be a live
 /// solve's entry: another process is in the middle of recovering it.
 fn recover_entries(dir: &Path, held: Option<&Path>) -> (Vec<Recovery>, bool) {
+    let dir = &real_dir(dir);
     if !dir.is_dir() {
+        return (Vec::new(), false);
+    }
+    if was_set_aside(dir) {
+        eprintln!(
+            "[axiom-journal] not recovering anything: {} was set aside as untrusted",
+            dir.display()
+        );
         return (Vec::new(), false);
     }
     match exposure(dir) {
@@ -1207,26 +1247,20 @@ mod tests {
         }
     }
 
+    /// Make `journal` a world-writable directory holding a complete,
+    /// self-consistent entry somebody planted: its "original" is their
+    /// content, and its last write is what `victim` holds now, so recovery
+    /// would take the file for an abandoned candidate. Returns their content.
     #[cfg(unix)]
-    #[test]
-    fn a_forged_entry_in_a_directory_others_could_write_to_is_not_restored() {
+    fn plant_forged_entry(journal: &Path, victim: &Path) -> &'static [u8] {
         use std::os::unix::fs::PermissionsExt;
-        let (tmp, journal, source) = fixture("original\n");
-        let victim = tmp.path().join("victim.sh");
-        fs::write(&victim, "the user's real file\n").unwrap();
-        let victim = fs::canonicalize(&victim).unwrap();
-
-        // The journal directory is world-writable, and somebody has planted a
-        // complete, self-consistent entry in it: its "original" is their
-        // content, and its last write is what the victim file holds now, so
-        // recovery would take the file for an abandoned candidate.
-        fs::create_dir(&journal).unwrap();
-        fs::set_permissions(&journal, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::create_dir(journal).unwrap();
+        fs::set_permissions(journal, fs::Permissions::from_mode(0o777)).unwrap();
         let forged = b"attacker content\n";
         let stem = journal.join("0123456789abcdef-1-0");
         fs::write(stem.with_extension("lock"), b"").unwrap();
         fs::write(stem.with_extension("orig"), forged).unwrap();
-        fs::write(stem.with_extension("cand"), b"the user's real file\n").unwrap();
+        fs::write(stem.with_extension("cand"), fs::read(victim).unwrap()).unwrap();
         fs::write(
             stem.with_extension("json"),
             serde_json::to_vec(&Meta {
@@ -1236,6 +1270,37 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        forged
+    }
+
+    /// The directories [`set_aside`] left next to `<parent>/<name>`.
+    #[cfg(unix)]
+    fn set_aside_dirs(parent: &Path, name: &str) -> Vec<PathBuf> {
+        fs::read_dir(parent)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&format!("{name}{SET_ASIDE_MARK}"))
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forged_entry_in_a_directory_others_could_write_to_is_not_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, journal, source) = fixture("original\n");
+        let victim = tmp.path().join("victim.sh");
+        fs::write(&victim, "the user's real file\n").unwrap();
+        let victim = fs::canonicalize(&victim).unwrap();
+
+        // The journal directory is world-writable, and somebody has planted
+        // an entry in it.
+        let forged = plant_forged_entry(&journal, &victim);
 
         // While it is open, recovery uses nothing from it.
         assert!(recover_in(&journal).is_empty());
@@ -1257,17 +1322,7 @@ mod tests {
         // Nothing was deleted: the old directory, planted files included, is
         // beside the new one and closed to others, where a genuine backup
         // could still be restored by hand.
-        let aside: Vec<PathBuf> = fs::read_dir(tmp.path())
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with("journal.untrusted-")
-            })
-            .collect();
+        let aside = set_aside_dirs(tmp.path(), "journal");
         assert_eq!(aside.len(), 1, "{aside:?}");
         assert_eq!(
             fs::metadata(&aside[0]).unwrap().permissions().mode() & 0o777,
@@ -1277,6 +1332,92 @@ mod tests {
             fs::read(aside[0].join("0123456789abcdef-1-0.orig")).unwrap(),
             forged
         );
+
+        // Closed or not, the set-aside directory is never a journal: pointing
+        // recovery or a solve at it restores nothing and is refused.
+        assert!(recover_in(&aside[0]).is_empty());
+        let err = protect_in(&aside[0], &source).err().expect("refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_right_after_an_untrusted_directory_is_moved_restores_nothing() {
+        let (tmp, journal, source) = fixture("original\n");
+        let victim = tmp.path().join("victim.sh");
+        fs::write(&victim, "the user's real file\n").unwrap();
+        let victim = fs::canonicalize(&victim).unwrap();
+        plant_forged_entry(&journal, &victim);
+
+        // The process gets as far as moving the directory and then dies:
+        // no fresh directory was created, nothing else was done.
+        set_aside(&journal).unwrap();
+        assert!(!journal.exists());
+
+        // The next solve finds no journal where it looks, and the planted
+        // entry is nowhere it would look.
+        assert!(recover_in(&journal).is_empty());
+        assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
+        let guard = protect_in(&journal, &source).unwrap();
+        drop(guard);
+        assert_eq!(entry_files(&journal), 0);
+        assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
+        assert_eq!(set_aside_dirs(tmp.path(), "journal").len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_path_that_links_to_a_directory_others_could_write_to_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, link, source) = fixture("original\n");
+        let victim = tmp.path().join("victim.sh");
+        fs::write(&victim, "the user's real file\n").unwrap();
+        let victim = fs::canonicalize(&victim).unwrap();
+
+        // The configured journal path is a symbolic link. The directory it
+        // points at is world-writable and holds a planted entry.
+        let real = fs::canonicalize(tmp.path()).unwrap().join("real");
+        let forged = plant_forged_entry(&real, &victim);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(recover_in(&link).is_empty());
+
+        // It is the directory, not the link, that is moved aside and
+        // replaced: the planted entry is no longer at either path.
+        let guard = protect_in(&link, &source).unwrap();
+        drop(guard);
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), real);
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(entry_files(&real), 0, "a fresh directory, nothing planted");
+        for path in [&link, &real] {
+            assert!(recover_in(path).is_empty());
+        }
+        assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
+
+        // The planted files are beside the real directory, for inspection.
+        let aside = set_aside_dirs(real.parent().unwrap(), "real");
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(
+            fs::read(aside[0].join("0123456789abcdef-1-0.orig")).unwrap(),
+            forged
+        );
+        assert!(recover_in(&aside[0]).is_empty());
+        assert_eq!(fs::read(&victim).unwrap(), b"the user's real file\n");
+
+        // A link that points nowhere is refused, and nothing is created
+        // through it.
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("missing"), &dangling).unwrap();
+        assert!(protect_in(&dangling, &source).is_err());
+        assert!(!tmp.path().join("missing").exists());
+        assert_eq!(fs::read(&source).unwrap(), b"original\n");
     }
 
     #[test]
