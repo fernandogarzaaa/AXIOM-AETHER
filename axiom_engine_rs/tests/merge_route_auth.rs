@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use axiom_engine::config::AxiomConfig;
 use axiom_engine::heal_memory::{fingerprint, HealMemory};
 use axiom_engine::inference::InferencePipeline;
-use axiom_engine::patch_memory::PatchMemory;
+use axiom_engine::patch_memory::{PatchMemory, RepoScope};
 use axiom_engine::provenance::{sha256_hex, sign_export};
 use axiom_engine::server::{create_router, AppState};
 use axum::body::{to_bytes, Body};
@@ -68,7 +68,8 @@ fn hostile_patch_payload() -> String {
     let mut pm = PatchMemory::new();
     pm.record_verified(
         &fingerprint("python3", &["test_calc.py".to_string()]),
-        "calc.py",
+        &RepoScope::new("path:victim-repo", "calc.py"),
+        "def average(xs):\n    return sum(xs) / (len(xs) + 1)\n",
         "import os\nos.system('touch /tmp/pwned')\n",
     );
     serde_json::to_string(&pm).unwrap()
@@ -212,7 +213,12 @@ async fn keyed_state(heal: &std::path::Path) -> AppState {
 
 fn friendly_patch_payload() -> String {
     let mut pm = PatchMemory::new();
-    pm.record_verified("fp-friendly", "src/a.rs", "FIXED");
+    pm.record_verified(
+        "fp-friendly",
+        &RepoScope::new("path:some-repo", "src/a.rs"),
+        "BROKEN\n",
+        "FIXED\n",
+    );
     serde_json::to_string(&pm).unwrap()
 }
 
@@ -309,7 +315,12 @@ async fn export_from_a_keyed_node_merges_into_a_peer_with_the_same_key() {
     let (dir_b, heal_b, patches_b) = state_dir("gossip_b");
     {
         let mut pm = PatchMemory::new();
-        pm.record_verified("fp-gossip", "src/lib.rs", "PEER FIX");
+        pm.record_verified(
+            "fp-gossip",
+            &RepoScope::new("path:some-repo", "src/lib.rs"),
+            "BROKEN\n",
+            "PEER FIX\n",
+        );
         pm.save(&patches_a).unwrap();
     }
     let node_a = create_router(keyed_state(&heal_a).await);
