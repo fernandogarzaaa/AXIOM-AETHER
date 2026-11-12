@@ -117,8 +117,9 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
             }
         };
         if !report.already_merged {
-            // The store first, then the record that it holds this export.
-            if let Err(e) = memory.save(&path).and_then(|()| ledger.save()) {
+            // The record that this export was merged goes to disk first, then
+            // the store; see `ExportLedger::save_around` for why.
+            if let Err(e) = ledger.save_around(&export.payload, || memory.save(&path)) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({

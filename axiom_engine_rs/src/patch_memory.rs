@@ -610,8 +610,9 @@ impl PatchMemory {
     /// `ledger` is the store's [`ExportLedger`]: an authenticated export that
     /// is already in it is reported as
     /// [`PatchMergeReport::already_merged`] and the store is left untouched;
-    /// a new one is merged and recorded. The caller saves the store, then the
-    /// ledger. A *different* export from a key-holder still counts.
+    /// a new one is merged and recorded. The caller persists both with
+    /// [`ExportLedger::save_around`]. A *different* export from a key-holder
+    /// still counts.
     pub fn merge_signed_once(
         &mut self,
         export: &SignedExport,

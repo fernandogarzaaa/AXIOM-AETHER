@@ -1400,9 +1400,11 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                         .merge_json_once(&peer_json, ledger)
                         .map_err(candle_core::Error::Msg)?;
                     if !report.already_merged {
-                        memory.save().and_then(|()| ledger.save()).map_err(|e| {
-                            candle_core::Error::Msg(format!("memory save failed: {e}"))
-                        })?;
+                        ledger
+                            .save_around(&peer_json, || memory.save())
+                            .map_err(|e| {
+                                candle_core::Error::Msg(format!("memory save failed: {e}"))
+                            })?;
                     }
                     Ok::<_, candle_core::Error>(report)
                 })?;

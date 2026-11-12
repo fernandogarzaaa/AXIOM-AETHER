@@ -7,7 +7,8 @@
 //! record's evidence, without a single new verification. The shortest version
 //! needs no peer: read a node's own export and post it straight back.
 //!
-//! So each store has a ledger beside it, `<store>.exports.json`, holding the
+//! So each store has a ledger beside it, `<store file name>.exports.json`
+//! (`heal_memory.json` → `heal_memory.json.exports.json`), holding the
 //! SHA-256 digests of the export payloads the store has merged, and of the
 //! ones the node has handed out itself. An export whose digest is in the
 //! ledger is not merged again.
@@ -18,6 +19,14 @@
 //! saved in between.
 //!
 //! * It is written by rename, so a reader never sees half a file.
+//! * A merge records the export in the ledger *before* it saves the store,
+//!   and takes the record back if the store cannot be saved
+//!   ([`ExportLedger::save_around`]). The two files cannot be written as one,
+//!   so one order has to be chosen, and this one fails the safe way: if the
+//!   process dies between the two writes, the export reads as merged when it
+//!   was not, and its content arrives with the peer's next changed export (an
+//!   export is the peer's whole store). The other order would let a retry
+//!   count the same export twice, which is what the ledger exists to stop.
 //! * [`ExportLedger::with`] runs one load, check and save at a time within
 //!   this process. Two processes updating the same ledger at the same instant
 //!   can still lose one of the two digests; that export would then count once
@@ -62,10 +71,12 @@ pub struct ExportLedger {
 }
 
 impl ExportLedger {
-    /// Where the ledger for the store at `store` lives:
-    /// `heal_memory.json` → `heal_memory.exports.json`.
+    /// Where the ledger for the store at `store` lives: the store's whole
+    /// file name with `.exports.json` after it, so that two stores never
+    /// share a ledger (`heal.json` and `heal.bak` would, if the extension
+    /// were replaced). `heal_memory.json` → `heal_memory.json.exports.json`.
     pub fn path_for(store: &Path) -> PathBuf {
-        store.with_extension("exports.json")
+        with_suffix(store, ".exports.json")
     }
 
     /// Load the ledger of the store at `store`, run `f` on it, and return
@@ -110,8 +121,48 @@ impl ExportLedger {
         true
     }
 
-    /// Write the ledger, if [`Self::remember`] added anything, by writing a
-    /// file beside it and renaming that over it.
+    /// Take back a record made by [`Self::remember`]. Returns `false` if
+    /// there was none.
+    pub fn forget(&mut self, payload: &str) -> bool {
+        let digest = sha256_hex(payload.as_bytes());
+        let before = self.seen.len();
+        self.seen.retain(|seen| seen != &digest);
+        let forgotten = self.seen.len() != before;
+        self.changed |= forgotten;
+        forgotten
+    }
+
+    /// Persist a merge of `payload`, which the caller has already
+    /// [`Self::remember`]ed: write the ledger, then run `save_store`. If the
+    /// store cannot be saved, the record is taken back and the ledger written
+    /// again, so that a retry merges the export instead of finding it "already
+    /// merged".
+    ///
+    /// Nothing is saved, and `save_store` is not run, if the ledger cannot be
+    /// written: a store that holds a merge the ledger does not know about
+    /// would count the same export again on every retry.
+    pub fn save_around(
+        &mut self,
+        payload: &str,
+        save_store: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.save()?;
+        let Err(store_error) = save_store() else {
+            return Ok(());
+        };
+        self.forget(payload);
+        match self.save() {
+            Ok(()) => Err(store_error),
+            Err(undo_error) => Err(io::Error::other(format!(
+                "{store_error}; and the export could not be taken off the record \
+                 ({undo_error}), so it will read as already merged until the peer's \
+                 export changes"
+            ))),
+        }
+    }
+
+    /// Write the ledger, if [`Self::remember`] or [`Self::forget`] changed
+    /// anything, by writing a file beside it and renaming that over it.
     pub fn save(&mut self) -> io::Result<()> {
         if !self.changed {
             return Ok(());
@@ -123,9 +174,7 @@ impl ExportLedger {
             seen: self.seen.clone(),
         })
         .map_err(|e| io::Error::other(e.to_string()))?;
-        let scratch = self
-            .path
-            .with_extension(format!("json.tmp-{}", std::process::id()));
+        let scratch = with_suffix(&self.path, &format!(".tmp-{}", std::process::id()));
         std::fs::write(&scratch, json)?;
         if let Err(e) = std::fs::rename(&scratch, &self.path) {
             let _ = std::fs::remove_file(&scratch);
@@ -134,6 +183,13 @@ impl ExportLedger {
         self.changed = false;
         Ok(())
     }
+}
+
+/// `path` with `suffix` appended to its last component.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 #[cfg(test)]
@@ -158,7 +214,7 @@ mod tests {
         });
         assert_eq!(
             ExportLedger::path_for(&store),
-            store.with_file_name("heal_memory.exports.json")
+            store.with_file_name("heal_memory.json.exports.json")
         );
         ExportLedger::with(&store, |ledger| {
             assert!(ledger.contains("export one"));
@@ -211,7 +267,81 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["damaged.exports.json".to_string()]);
+        assert_eq!(names, vec!["damaged.json.exports.json".to_string()]);
+    }
+
+    #[test]
+    fn stores_that_share_a_stem_do_not_share_a_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = ["heal.json", "heal.bak", "heal"].map(|name| dir.path().join(name));
+        ExportLedger::with(&stores[0], |ledger| {
+            ledger.remember("export");
+            ledger.save().unwrap();
+        });
+        for other in &stores[1..] {
+            ExportLedger::with(other, |ledger| {
+                assert!(
+                    !ledger.contains("export"),
+                    "{} read the ledger of heal.json",
+                    other.display()
+                );
+            });
+        }
+        let ledgers: std::collections::BTreeSet<PathBuf> =
+            stores.iter().map(|s| ExportLedger::path_for(s)).collect();
+        assert_eq!(ledgers.len(), 3, "{ledgers:?}");
+    }
+
+    #[test]
+    fn a_merge_is_on_record_before_the_store_is_saved_and_off_it_if_that_fails() {
+        let (_dir, store) = store_path("around");
+
+        // The store save fails: the record is taken back, on disk too, so a
+        // retry merges the export.
+        ExportLedger::with(&store, |ledger| {
+            ledger.remember("export");
+            let on_disk_during_the_store_save = std::cell::Cell::new(false);
+            let err = ledger
+                .save_around("export", || {
+                    let text = std::fs::read_to_string(ExportLedger::path_for(&store)).unwrap();
+                    on_disk_during_the_store_save.set(text.contains(&sha256_hex(b"export")));
+                    Err(io::Error::other("disk full"))
+                })
+                .unwrap_err();
+            assert_eq!(err.to_string(), "disk full");
+            assert!(
+                on_disk_during_the_store_save.get(),
+                "the ledger must be written before the store"
+            );
+        });
+        ExportLedger::with(&store, |ledger| assert!(!ledger.contains("export")));
+
+        // The store save succeeds: the record stays.
+        ExportLedger::with(&store, |ledger| {
+            ledger.remember("export");
+            ledger.save_around("export", || Ok(())).unwrap();
+        });
+        ExportLedger::with(&store, |ledger| assert!(ledger.contains("export")));
+    }
+
+    #[test]
+    fn the_store_is_not_saved_when_the_ledger_cannot_be_written() {
+        let (_dir, store) = store_path("unwritable");
+        // A directory sits where the ledger file goes: it cannot be replaced.
+        std::fs::create_dir(ExportLedger::path_for(&store)).unwrap();
+        ExportLedger::with(&store, |ledger| {
+            ledger.remember("export");
+            let store_saved = std::cell::Cell::new(false);
+            let result = ledger.save_around("export", || {
+                store_saved.set(true);
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(
+                !store_saved.get(),
+                "a store holding a merge the ledger does not know would count it again"
+            );
+        });
     }
 
     #[test]

@@ -809,8 +809,9 @@ impl HealMemory {
     /// observed. `ledger` is this memory's [`crate::export_ledger::ExportLedger`]:
     /// a payload already in it is reported as
     /// [`MergeReport::already_merged`] and the memory is left untouched; a
-    /// new one is merged and recorded. The caller saves the memory, then the
-    /// ledger. A *different* export from the same peer still merges.
+    /// new one is merged and recorded. The caller persists both with
+    /// [`crate::export_ledger::ExportLedger::save_around`]. A *different*
+    /// export from the same peer still merges.
     pub fn merge_json_once(
         &mut self,
         peer_json: &str,

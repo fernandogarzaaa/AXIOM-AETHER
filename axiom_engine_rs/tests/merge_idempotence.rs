@@ -216,7 +216,62 @@ async fn a_nodes_own_patch_export_posted_back_changes_nothing() {
     // Nothing was written to the store at any point; what was handed out is
     // on record beside it.
     assert_eq!(std::fs::read(&patches).unwrap(), store_before);
-    assert!(dir.join("axiom_patch_memory.exports.json").is_file());
+    assert!(dir.join("axiom_patch_memory.json.exports.json").is_file());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_merge_that_cannot_be_recorded_is_not_saved_and_not_counted_on_retry() {
+    let (dir, heal, patches) = state_dir("patch_unrecorded");
+    let mut local = PatchMemory::new();
+    local.record_verified("fp", &scope(), "BROKEN\n", "FIXED\n");
+    local.save(&patches).unwrap();
+    let mut peer = PatchMemory::new();
+    peer.record_verified("fp", &scope(), "BROKEN\n", "FIXED\n");
+    let export = serde_json::to_string(&peer.export_signed(Some(FLEET_KEY))).unwrap();
+
+    // The ledger cannot be written: a directory sits where its file goes.
+    let ledger = dir.join("axiom_patch_memory.json.exports.json");
+    std::fs::create_dir(&ledger).unwrap();
+
+    // Every attempt is refused, and none of them leaves a merge in the store
+    // for the next attempt to count again.
+    let node = keyed_node(&heal).await;
+    for attempt in 1..=3 {
+        let resp = node
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/patches/merge")
+                    .header("host", LOOPBACK_HOST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(export.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "attempt {attempt}"
+        );
+        assert_eq!(
+            confirmations(&patches),
+            1,
+            "attempt {attempt}: a merge that could not be recorded was saved"
+        );
+    }
+
+    // Once the ledger can be written, the export merges, once.
+    std::fs::remove_dir(&ledger).unwrap();
+    let merged = post_merge(&node, "/v1/patches/merge", &export).await;
+    assert_eq!(merged["reinforced"], 1, "{merged}");
+    assert_eq!(confirmations(&patches), 2);
+    let again = post_merge(&node, "/v1/patches/merge", &export).await;
+    assert_eq!(again["already_merged"], true, "{again}");
+    assert_eq!(confirmations(&patches), 2);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -297,7 +352,7 @@ async fn a_nodes_own_immunity_export_posted_back_changes_nothing() {
         "the export must not change when nothing was learned"
     );
     assert_eq!(std::fs::read(&heal).unwrap(), store_before);
-    assert!(dir.join("heal_memory.exports.json").is_file());
+    assert!(dir.join("heal_memory.json.exports.json").is_file());
 
     let _ = std::fs::remove_dir_all(dir);
 }

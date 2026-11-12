@@ -288,8 +288,9 @@ async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Res
             }
         };
         if !report.already_merged {
-            // The memory first, then the record that it holds this export.
-            if let Err(e) = memory.save().and_then(|()| ledger.save()) {
+            // The record that this export was merged goes to disk first, then
+            // the memory; see `ExportLedger::save_around` for why.
+            if let Err(e) = ledger.save_around(&payload, || memory.save()) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": format!("merge succeeded but save failed: {e}")})),
