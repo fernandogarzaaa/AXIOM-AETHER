@@ -1394,17 +1394,17 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 };
                 // An export counts once: pulling a peer that has not changed
                 // since the last pull must not compound its evidence.
-                let report = crate::export_ledger::ExportLedger::with(&local, |ledger| {
+                let report = crate::export_ledger::ExportLedger::with(&local, |handed_out| {
                     let mut memory = heal_memory::HealMemory::load(&local);
                     let report = memory
-                        .merge_json_once(&peer_json, ledger)
+                        .merge_json_once(&peer_json, handed_out)
                         .map_err(candle_core::Error::Msg)?;
                     if !report.already_merged {
-                        ledger
-                            .save_around(&peer_json, || memory.save())
-                            .map_err(|e| {
-                                candle_core::Error::Msg(format!("memory save failed: {e}"))
-                            })?;
+                        // One write: the memory carries the record that it
+                        // merged this export.
+                        memory.save().map_err(|e| {
+                            candle_core::Error::Msg(format!("memory save failed: {e}"))
+                        })?;
                     }
                     Ok::<_, candle_core::Error>(report)
                 })?;

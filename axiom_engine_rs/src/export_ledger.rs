@@ -1,4 +1,4 @@
-//! Which fleet exports a store has already counted.
+//! Counting a fleet export once.
 //!
 //! A signed export ([`crate::provenance::SignedExport`]) says who produced it,
 //! not how many times it was delivered. Anyone who has seen one valid export
@@ -7,36 +7,32 @@
 //! record's evidence, without a single new verification. The shortest version
 //! needs no peer: read a node's own export and post it straight back.
 //!
-//! So each store has a ledger beside it, `<store file name>.exports.json`
-//! (`heal_memory.json` → `heal_memory.json.exports.json`), holding the
-//! SHA-256 digests of the export payloads the store has merged, and of the
-//! ones the node has handed out itself. An export whose digest is in the
-//! ledger is not merged again.
+//! So a store does not merge an export it has merged before, or one the node
+//! handed out itself. The two kinds are remembered in two places, because
+//! they are written at two different moments:
 //!
-//! The ledger is a file of its own, not a field of the store, so that
-//! recording an export never rewrites the store. The export routes are polled,
-//! and a store rewritten on a read could drop a fix that a solve or a merge
-//! saved in between.
+//! * **Merged exports** are remembered in the store file itself
+//!   (`merged_exports`), written by the same save as the merge. One file,
+//!   one write: either both the merge and its record are on disk or neither
+//!   is, so a failed or interrupted save can neither count an export twice
+//!   on retry nor mark as merged an export that was not.
+//! * **Handed-out exports** are remembered in a ledger beside the store,
+//!   `<store file name>.exports.json` ([`ExportLedger`]). The export routes
+//!   are polled, and they must not rewrite the store on a read: a fix saved
+//!   by a solve or a merge in between would be overwritten by the older
+//!   snapshot. The ledger is written by rename, so a reader never sees half
+//!   a file. A missing or unreadable ledger is an empty one.
 //!
-//! * It is written by rename, so a reader never sees half a file.
-//! * A merge records the export in the ledger *before* it saves the store,
-//!   and takes the record back if the store cannot be saved
-//!   ([`ExportLedger::save_around`]). The two files cannot be written as one,
-//!   so one order has to be chosen, and this one fails the safe way: if the
-//!   process dies between the two writes, the export reads as merged when it
-//!   was not, and its content arrives with the peer's next changed export (an
-//!   export is the peer's whole store). The other order would let a retry
-//!   count the same export twice, which is what the ledger exists to stop.
-//! * [`ExportLedger::with`] runs one load, check and save at a time within
-//!   this process. Two processes updating the same ledger at the same instant
-//!   can still lose one of the two digests; that export would then count once
-//!   more if it were delivered again.
-//! * A missing or unreadable ledger is an empty one. Refusing to merge
-//!   because the record of past merges is damaged would stop a fleet for the
-//!   sake of a counter.
-//! * It is bounded ([`MAX_SEEN_EXPORTS`]). A digest is added only when a new
-//!   export is merged or the node's own export changes, so the bound covers
-//!   that many distinct exports.
+//! Both are SHA-256 digests of the export payload, bounded to the last
+//! [`MAX_SEEN_EXPORTS`], oldest dropped first. A digest is added only when a
+//! new export is merged or the node's own export changes, so the bound covers
+//! that many distinct exports; a repeat does not move a digest back to the
+//! front.
+//!
+//! [`ExportLedger::with`] runs one transaction at a time within this process,
+//! and the merge routes do their whole load, check, merge and save inside
+//! one, so the same export arriving twice at once is merged once. Another
+//! process doing the same at the same instant is not excluded.
 //!
 //! A *different* export from a key-holder is new information and counts. How
 //! often one holder's changing store may count is not something a digest can
@@ -50,7 +46,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::provenance::sha256_hex;
 
-/// How many export digests a ledger remembers, oldest dropped first.
+/// How many export digests are remembered, per store and per ledger, oldest
+/// dropped first.
 pub const MAX_SEEN_EXPORTS: usize = 1024;
 
 /// One ledger transaction at a time in this process.
@@ -62,7 +59,7 @@ struct LedgerFile {
     seen: Vec<String>,
 }
 
-/// The digests of the exports a store has merged or handed out.
+/// The digests of the exports this node has handed out from one store.
 #[derive(Debug)]
 pub struct ExportLedger {
     path: PathBuf,
@@ -99,70 +96,21 @@ impl ExportLedger {
         })
     }
 
-    /// Has this exact export payload been merged, or handed out, already?
+    /// Has this exact export payload been handed out by this node?
     pub fn contains(&self, payload: &str) -> bool {
-        let digest = sha256_hex(payload.as_bytes());
-        self.seen.contains(&digest)
+        has_digest(&self.seen, payload)
     }
 
-    /// Record `payload`. Returns `false`, changing nothing, if it was
-    /// recorded before. The record is in memory until [`Self::save`].
+    /// Record `payload` as handed out. Returns `false`, changing nothing, if
+    /// it was recorded before. The record is in memory until [`Self::save`].
     pub fn remember(&mut self, payload: &str) -> bool {
-        let digest = sha256_hex(payload.as_bytes());
-        if self.seen.contains(&digest) {
-            return false;
-        }
-        self.seen.push(digest);
-        if self.seen.len() > MAX_SEEN_EXPORTS {
-            let excess = self.seen.len() - MAX_SEEN_EXPORTS;
-            self.seen.drain(..excess);
-        }
-        self.changed = true;
-        true
+        let added = remember_digest(&mut self.seen, payload);
+        self.changed |= added;
+        added
     }
 
-    /// Take back a record made by [`Self::remember`]. Returns `false` if
-    /// there was none.
-    pub fn forget(&mut self, payload: &str) -> bool {
-        let digest = sha256_hex(payload.as_bytes());
-        let before = self.seen.len();
-        self.seen.retain(|seen| seen != &digest);
-        let forgotten = self.seen.len() != before;
-        self.changed |= forgotten;
-        forgotten
-    }
-
-    /// Persist a merge of `payload`, which the caller has already
-    /// [`Self::remember`]ed: write the ledger, then run `save_store`. If the
-    /// store cannot be saved, the record is taken back and the ledger written
-    /// again, so that a retry merges the export instead of finding it "already
-    /// merged".
-    ///
-    /// Nothing is saved, and `save_store` is not run, if the ledger cannot be
-    /// written: a store that holds a merge the ledger does not know about
-    /// would count the same export again on every retry.
-    pub fn save_around(
-        &mut self,
-        payload: &str,
-        save_store: impl FnOnce() -> io::Result<()>,
-    ) -> io::Result<()> {
-        self.save()?;
-        let Err(store_error) = save_store() else {
-            return Ok(());
-        };
-        self.forget(payload);
-        match self.save() {
-            Ok(()) => Err(store_error),
-            Err(undo_error) => Err(io::Error::other(format!(
-                "{store_error}; and the export could not be taken off the record \
-                 ({undo_error}), so it will read as already merged until the peer's \
-                 export changes"
-            ))),
-        }
-    }
-
-    /// Write the ledger, if [`Self::remember`] or [`Self::forget`] changed
-    /// anything, by writing a file beside it and renaming that over it.
+    /// Write the ledger, if [`Self::remember`] added anything, by writing a
+    /// file beside it and renaming that over it.
     pub fn save(&mut self) -> io::Result<()> {
         if !self.changed {
             return Ok(());
@@ -183,6 +131,27 @@ impl ExportLedger {
         self.changed = false;
         Ok(())
     }
+}
+
+/// Is the digest of `payload` in `digests`?
+pub(crate) fn has_digest(digests: &[String], payload: &str) -> bool {
+    let digest = sha256_hex(payload.as_bytes());
+    digests.contains(&digest)
+}
+
+/// Add the digest of `payload` to `digests`, dropping the oldest beyond
+/// [`MAX_SEEN_EXPORTS`]. Returns `false`, changing nothing, if it was there.
+pub(crate) fn remember_digest(digests: &mut Vec<String>, payload: &str) -> bool {
+    let digest = sha256_hex(payload.as_bytes());
+    if digests.contains(&digest) {
+        return false;
+    }
+    digests.push(digest);
+    if digests.len() > MAX_SEEN_EXPORTS {
+        let excess = digests.len() - MAX_SEEN_EXPORTS;
+        digests.drain(..excess);
+    }
+    true
 }
 
 /// `path` with `suffix` appended to its last component.
@@ -290,86 +259,5 @@ mod tests {
         let ledgers: std::collections::BTreeSet<PathBuf> =
             stores.iter().map(|s| ExportLedger::path_for(s)).collect();
         assert_eq!(ledgers.len(), 3, "{ledgers:?}");
-    }
-
-    #[test]
-    fn a_merge_is_on_record_before_the_store_is_saved_and_off_it_if_that_fails() {
-        let (_dir, store) = store_path("around");
-
-        // The store save fails: the record is taken back, on disk too, so a
-        // retry merges the export.
-        ExportLedger::with(&store, |ledger| {
-            ledger.remember("export");
-            let on_disk_during_the_store_save = std::cell::Cell::new(false);
-            let err = ledger
-                .save_around("export", || {
-                    let text = std::fs::read_to_string(ExportLedger::path_for(&store)).unwrap();
-                    on_disk_during_the_store_save.set(text.contains(&sha256_hex(b"export")));
-                    Err(io::Error::other("disk full"))
-                })
-                .unwrap_err();
-            assert_eq!(err.to_string(), "disk full");
-            assert!(
-                on_disk_during_the_store_save.get(),
-                "the ledger must be written before the store"
-            );
-        });
-        ExportLedger::with(&store, |ledger| assert!(!ledger.contains("export")));
-
-        // The store save succeeds: the record stays.
-        ExportLedger::with(&store, |ledger| {
-            ledger.remember("export");
-            ledger.save_around("export", || Ok(())).unwrap();
-        });
-        ExportLedger::with(&store, |ledger| assert!(ledger.contains("export")));
-    }
-
-    #[test]
-    fn the_store_is_not_saved_when_the_ledger_cannot_be_written() {
-        let (_dir, store) = store_path("unwritable");
-        // A directory sits where the ledger file goes: it cannot be replaced.
-        std::fs::create_dir(ExportLedger::path_for(&store)).unwrap();
-        ExportLedger::with(&store, |ledger| {
-            ledger.remember("export");
-            let store_saved = std::cell::Cell::new(false);
-            let result = ledger.save_around("export", || {
-                store_saved.set(true);
-                Ok(())
-            });
-            assert!(result.is_err());
-            assert!(
-                !store_saved.get(),
-                "a store holding a merge the ledger does not know would count it again"
-            );
-        });
-    }
-
-    #[test]
-    fn concurrent_transactions_lose_no_record() {
-        let (_dir, store) = store_path("concurrent");
-        let threads: Vec<_> = (0..8)
-            .map(|t| {
-                let store = store.clone();
-                std::thread::spawn(move || {
-                    for i in 0..20 {
-                        ExportLedger::with(&store, |ledger| {
-                            assert!(ledger.remember(&format!("export {t}-{i}")));
-                            ledger.save().unwrap();
-                        });
-                    }
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().unwrap();
-        }
-        ExportLedger::with(&store, |ledger| {
-            assert_eq!(ledger.seen.len(), 160);
-            for t in 0..8 {
-                for i in 0..20 {
-                    assert!(ledger.contains(&format!("export {t}-{i}")));
-                }
-            }
-        });
     }
 }

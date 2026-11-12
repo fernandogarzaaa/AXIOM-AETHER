@@ -65,12 +65,12 @@ Each node exposes:
 - `GET /v1/immunity` — its heal-memory, **HMAC-signed** with `AXIOM_FLEET_KEY`.
 - `POST /v1/immunity/merge` — folds a peer's signed export in (verifies first;
   local learning is never weakened — dirs are unioned, tensions count-weighted).
-  An export counts once while its digest remains in the node's export ledger:
-  merging the same export again answers `"already_merged": true` and changes
-  nothing, so a sync that runs every few minutes does not compound evidence
-  while the peers are unchanged. The ledger keeps the last 1,024 digests;
-  after that many newer exports have displaced a peer's digest, the next sync
-  merges that export once more.
+  An export counts once while the node still remembers its digest: merging
+  the same export again answers `"already_merged": true` and changes nothing,
+  so a sync that runs every few minutes does not compound evidence while the
+  peers are unchanged. A node remembers the last 1,024 digests; after that
+  many newer exports have displaced a peer's digest, the next sync merges
+  that export once more.
 
 The **gossip CronJob** (default every 5 min) reads the headless service's
 Endpoints to find live pods, pulls each pod's signed export, and fans it out to

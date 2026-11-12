@@ -97,15 +97,15 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
     // (no key → `NoFleetKey`, refused). Byzantine-robust: a peer holding the
     // key still cannot inflate trust or flood the store — the robust policy
     // bounds per-peer contribution. Once only: the whole step runs as one
-    // ledger transaction, so the same export arriving twice at once is still
-    // merged once.
-    crate::export_ledger::ExportLedger::with(&path, |ledger| {
+    // transaction in this process, so the same export arriving twice at once
+    // is still merged once.
+    crate::export_ledger::ExportLedger::with(&path, |handed_out| {
         let mut memory = crate::patch_memory::PatchMemory::load(&path);
         let report = match memory.merge_signed_once(
             &export,
             state.fleet_key.as_deref(),
             crate::patch_memory::FleetTrustPolicy::robust(),
-            ledger,
+            handed_out,
         ) {
             Ok(report) => report,
             Err(e) => {
@@ -117,9 +117,9 @@ async fn post_patches_merge(State(state): State<AppState>, body: String) -> Resp
             }
         };
         if !report.already_merged {
-            // The record that this export was merged goes to disk first, then
-            // the store; see `ExportLedger::save_around` for why.
-            if let Err(e) = ledger.save_around(&export.payload, || memory.save(&path)) {
+            // One write: the store carries the record that it merged this
+            // export, so the two cannot come apart.
+            if let Err(e) = memory.save(&path) {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({

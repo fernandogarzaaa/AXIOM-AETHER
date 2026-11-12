@@ -273,11 +273,11 @@ async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Res
                 .into_response();
         }
     };
-    // Once only: the whole step runs as one ledger transaction, so the same
-    // export arriving twice at once is still merged once.
-    crate::export_ledger::ExportLedger::with(path, |ledger| {
+    // Once only: the whole step runs as one transaction in this process, so
+    // the same export arriving twice at once is still merged once.
+    crate::export_ledger::ExportLedger::with(path, |handed_out| {
         let mut memory = crate::heal_memory::HealMemory::load(path);
-        let report = match memory.merge_json_once(&payload, ledger) {
+        let report = match memory.merge_json_once(&payload, handed_out) {
             Ok(report) => report,
             Err(e) => {
                 return (
@@ -288,9 +288,9 @@ async fn post_immunity_merge(State(state): State<AppState>, body: String) -> Res
             }
         };
         if !report.already_merged {
-            // The record that this export was merged goes to disk first, then
-            // the memory; see `ExportLedger::save_around` for why.
-            if let Err(e) = ledger.save_around(&payload, || memory.save()) {
+            // One write: the memory carries the record that it merged this
+            // export, so the two cannot come apart.
+            if let Err(e) = memory.save() {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": format!("merge succeeded but save failed: {e}")})),

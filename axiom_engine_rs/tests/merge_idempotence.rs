@@ -214,29 +214,23 @@ async fn a_nodes_own_patch_export_posted_back_changes_nothing() {
         "the export must not change when nothing was learned"
     );
     // Nothing was written to the store at any point; what was handed out is
-    // on record beside it.
+    // on record beside it. The store's own bookkeeping is never exported.
     assert_eq!(std::fs::read(&patches).unwrap(), store_before);
     assert!(dir.join("axiom_patch_memory.json.exports.json").is_file());
+    assert!(!exports[0].contains("merged_exports"), "{}", exports[0]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
-async fn a_merge_that_cannot_be_recorded_is_not_saved_and_not_counted_on_retry() {
-    let (dir, heal, patches) = state_dir("patch_unrecorded");
-    let mut local = PatchMemory::new();
-    local.record_verified("fp", &scope(), "BROKEN\n", "FIXED\n");
-    local.save(&patches).unwrap();
+async fn a_merge_that_cannot_be_saved_leaves_no_record_and_a_retry_merges_it_once() {
+    let (dir, heal, patches) = state_dir("patch_unsaved");
     let mut peer = PatchMemory::new();
     peer.record_verified("fp", &scope(), "BROKEN\n", "FIXED\n");
     let export = serde_json::to_string(&peer.export_signed(Some(FLEET_KEY))).unwrap();
 
-    // The ledger cannot be written: a directory sits where its file goes.
-    let ledger = dir.join("axiom_patch_memory.json.exports.json");
-    std::fs::create_dir(&ledger).unwrap();
-
-    // Every attempt is refused, and none of them leaves a merge in the store
-    // for the next attempt to count again.
+    // The store cannot be saved: a directory sits where its file goes.
+    std::fs::create_dir(&patches).unwrap();
     let node = keyed_node(&heal).await;
     for attempt in 1..=3 {
         let resp = node
@@ -257,21 +251,26 @@ async fn a_merge_that_cannot_be_recorded_is_not_saved_and_not_counted_on_retry()
             StatusCode::INTERNAL_SERVER_ERROR,
             "attempt {attempt}"
         );
-        assert_eq!(
-            confirmations(&patches),
-            1,
-            "attempt {attempt}: a merge that could not be recorded was saved"
-        );
     }
+    // The merge and the record of it are one file. Neither was written, and
+    // nothing beside the store says otherwise.
+    assert!(!dir.join("axiom_patch_memory.json.exports.json").exists());
 
-    // Once the ledger can be written, the export merges, once.
-    std::fs::remove_dir(&ledger).unwrap();
+    // Once the store can be saved, the export is new, and merges once.
+    std::fs::remove_dir(&patches).unwrap();
     let merged = post_merge(&node, "/v1/patches/merge", &export).await;
-    assert_eq!(merged["reinforced"], 1, "{merged}");
-    assert_eq!(confirmations(&patches), 2);
+    assert_eq!(merged["already_merged"], false, "{merged}");
+    assert_eq!(merged["new_candidates"], 1, "{merged}");
+    assert_eq!(confirmations(&patches), 1);
     let again = post_merge(&node, "/v1/patches/merge", &export).await;
     assert_eq!(again["already_merged"], true, "{again}");
-    assert_eq!(confirmations(&patches), 2);
+    assert_eq!(confirmations(&patches), 1);
+
+    // The record is in the store file, and only there.
+    assert!(std::fs::read_to_string(&patches)
+        .unwrap()
+        .contains("merged_exports"));
+    assert!(!dir.join("axiom_patch_memory.json.exports.json").exists());
 
     let _ = std::fs::remove_dir_all(dir);
 }
