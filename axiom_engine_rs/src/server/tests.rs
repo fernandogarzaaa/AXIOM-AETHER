@@ -681,6 +681,75 @@ mod tests {
         safe_drop(state.pipeline.clone()).await;
     }
 
+    #[tokio::test]
+    async fn a_fingerprint_cancelled_between_its_check_and_its_create_adapts_nothing() {
+        // The window: a fingerprint closure has checked the cancellation flag
+        // (not set) and has not yet created its sub-session when the request
+        // is cancelled. The cleanup finds nothing of that run's to remove,
+        // and the closure used to go on to create the sub-session and adapt
+        // in it, for a request nobody was waiting for.
+        //
+        // The closure takes the pipeline read lock between its check and the
+        // create, so holding the write lock parks it exactly there.
+        let state = make_test_state().await;
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let pipeline = state.pipeline.clone();
+        let gate = std::thread::spawn(move || {
+            let _write = pipeline.write().expect("pipeline lock poisoned");
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run_state = state.clone();
+        let run_cancelled = cancelled.clone();
+        let handle = tokio::spawn(async move {
+            responses_run_fingerprint(
+                &run_state,
+                "responses-window#r0",
+                "The quick brown fox jumps over the lazy dog.",
+                "latest query",
+                run_cancelled,
+                true,
+            )
+            .await
+        });
+        // Let the closure start, pass its check and park on the read lock.
+        // If it has not started by then, it sees the flag at its first check
+        // instead: the test still passes, it just proves less.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // The request is cancelled: what the cleanup guard's drop does.
+        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        cleanup_responses_run_subsessions(&state, "responses-window", 1, true);
+
+        release_tx.send(()).unwrap();
+        gate.join().unwrap();
+        let result = handle.await.expect("fingerprint task panicked");
+        match result {
+            Err(ApiError::Internal(message)) => assert!(
+                message.contains("cancelled"),
+                "expected the cancellation, got: {message}"
+            ),
+            Err(_) => panic!("expected the cancellation, got another error"),
+            Ok(_) => panic!(
+                "a cancelled run created its sub-session after the cleanup and adapted in it"
+            ),
+        }
+        let left: Vec<String> = state
+            .ttt_sessions
+            .snapshot_handles()
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| id.contains("#r"))
+            .collect();
+        assert!(left.is_empty(), "sub-session left behind: {left:?}");
+
+        safe_drop(state.pipeline.clone()).await;
+    }
+
     fn seed_active_test_session(state: &AppState, session_id: &str) {
         let now = unix_now();
         let states = state
