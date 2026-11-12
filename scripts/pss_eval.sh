@@ -15,8 +15,8 @@
 #      AXIOM_ADAPTIVE_TTL=on AXIOM_MODEL_ROUTE=auto
 #      AXIOM_LOCAL_TRIVIAL=on needs a verified checkpoint: export
 #      AXIOM_CHECKPOINT_SHA256 for the checkpoint under test before running,
-#      and AXIOM_TOKENIZER for the tokenizer it was trained with, or the
-#      PSS-on proxy refuses to start.
+#      and AXIOM_TOKENIZER plus AXIOM_TOKENIZER_SHA256 for the tokenizer it
+#      was trained with, or the PSS-on proxy refuses to start.
 #
 # It is the ONLY authority for flipping those five flags to defaults. This
 # script only MEASURES and REPORTS -- flipping the defaults is a SEPARATE PR

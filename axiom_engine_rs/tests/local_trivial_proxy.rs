@@ -418,6 +418,69 @@ async fn the_server_refuses_to_start_when_the_checkpoints_tokenizer_is_not_in_us
     );
 }
 
+#[tokio::test]
+async fn the_server_refuses_to_start_when_the_tokenizer_in_use_is_not_pinned() {
+    // The checkpoint is verified and its sidecar names the tokenizer file
+    // that is configured and loads. But a file name is not content: nothing
+    // says this `tok.json` holds the vocabulary the checkpoint was trained
+    // with. The short-circuit needs the tokenizer's hash pinned too.
+    use sha2::{Digest, Sha256};
+
+    let _guard = env_lock().lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoint = dir.path().join("model.safetensors");
+    let tensor = candle_core::Tensor::zeros((1,), candle_core::DType::F32, &Device::Cpu).unwrap();
+    candle_core::safetensors::save(
+        &std::collections::HashMap::from([("unused".to_string(), tensor)]),
+        &checkpoint,
+    )
+    .unwrap();
+    let digest = format!("{:x}", Sha256::digest(std::fs::read(&checkpoint).unwrap()));
+    std::fs::write(
+        dir.path().join("model.meta.json"),
+        r#"{"schema_version":1,"d_model":16,"n_layers":1,"vocab_size":64,"lr_inner":0.001,"norm_eps":1e-6,"val_ce":3.0,"tokenizer":"tok.json"}"#,
+    )
+    .unwrap();
+    let tokenizer = dir.path().join("tok.json");
+    std::fs::write(
+        &tokenizer,
+        r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"vocab":{"a":0,"b":1,"c":2},"merges":[]}}"#,
+    )
+    .unwrap();
+
+    let _c1 = EnvVarGuard::set("AXIOM_LOCAL_TRIVIAL", "on");
+    let _c2 = EnvVarGuard::set("AXIOM_CHECKPOINT_SHA256", &digest);
+    let _c3 = EnvVarGuard::set("AXIOM_TOKENIZER", tokenizer.to_str().unwrap());
+    let _c4 = EnvVarGuard::unset("AXIOM_TOKENIZER_SHA256");
+
+    let config = AxiomConfig {
+        d_model: 16,
+        n_layers: 1,
+        vocab_size: 64,
+        lr_inner: 1e-3,
+        norm_eps: 1e-6,
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        run_server(
+            "127.0.0.1",
+            0,
+            config,
+            checkpoint.to_str().unwrap(),
+            Device::Cpu,
+        ),
+    )
+    .await
+    .expect("run_server must refuse to start, not serve");
+    let err = result.expect_err("an unpinned tokenizer is an error");
+    let message = err.to_string();
+    assert!(message.contains("AXIOM_LOCAL_TRIVIAL"), "{message}");
+    assert!(
+        message.contains("AXIOM_TOKENIZER_SHA256"),
+        "names the setting to pin: {message}"
+    );
+}
+
 /// The proxy must not end an agent's turn on its own under default settings.
 /// With `AXIOM_LOCAL_TRIVIAL` unset and nothing else configured, a small clean
 /// `tool_result` (a build finished, a file listing) has to reach the model:

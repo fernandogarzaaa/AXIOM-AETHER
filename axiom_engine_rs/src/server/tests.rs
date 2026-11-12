@@ -52,41 +52,66 @@ mod tests {
     fn local_trivial_needs_the_tokenizer_the_checkpoint_was_trained_with() {
         let bpe = std::path::Path::new("/models/axiom_bpe.json");
         let other = std::path::Path::new("/models/other_bpe.json");
+        let check = check_local_trivial_tokenizer;
 
-        // The sidecar names a tokenizer and that file is the one in use.
+        // The sidecar names a tokenizer, that file is the one in use, and it
+        // is pinned.
         assert_eq!(
-            check_local_trivial_tokenizer(Some(bpe), true, Some("checkpoints/axiom_bpe.json")),
+            check(Some(bpe), true, Some("checkpoints/axiom_bpe.json"), true),
             Ok(())
         );
         // No sidecar: nothing is recorded to compare against. A checkpoint
-        // from before sidecars runs on the hash tokenizer or on a configured
-        // one, as long as the configured one loaded.
-        assert_eq!(check_local_trivial_tokenizer(None, false, None), Ok(()));
-        assert_eq!(check_local_trivial_tokenizer(Some(bpe), true, None), Ok(()));
+        // from before sidecars runs on the hash tokenizer, or on a configured
+        // tokenizer that loaded and is pinned.
+        assert_eq!(check(None, false, None, false), Ok(()));
+        assert_eq!(check(Some(bpe), true, None, true), Ok(()));
         // A sidecar that names no tokenizer is the same as none recorded.
-        assert_eq!(check_local_trivial_tokenizer(None, false, Some("  ")), Ok(()));
+        assert_eq!(check(None, false, Some("  "), false), Ok(()));
 
         // Trained with a tokenizer file, running on the hash tokenizer.
-        let err = check_local_trivial_tokenizer(None, false, Some("checkpoints/axiom_bpe.json"))
-            .unwrap_err();
+        let err = check(None, false, Some("checkpoints/axiom_bpe.json"), false).unwrap_err();
         assert!(err.contains("AXIOM_LOCAL_TRIVIAL"), "{err}");
         assert!(err.contains("axiom_bpe.json"), "{err}");
         assert!(err.contains("AXIOM_TOKENIZER is not set"), "{err}");
         assert!(err.contains("unset AXIOM_LOCAL_TRIVIAL"), "{err}");
 
         // Trained with one tokenizer file, running on another.
-        let err = check_local_trivial_tokenizer(Some(other), true, Some("axiom_bpe.json"))
-            .unwrap_err();
+        let err = check(Some(other), true, Some("axiom_bpe.json"), true).unwrap_err();
         assert!(err.contains("axiom_bpe.json"), "{err}");
         assert!(err.contains("other_bpe.json"), "{err}");
 
         // A tokenizer was configured but did not load: the pipeline fell back
         // to the hash tokenizer, with or without a sidecar.
         for trained_with in [None, Some("axiom_bpe.json")] {
-            let err = check_local_trivial_tokenizer(Some(bpe), false, trained_with).unwrap_err();
+            let err = check(Some(bpe), false, trained_with, true).unwrap_err();
             assert!(err.contains("did not load"), "{err}");
             assert!(err.contains("/models/axiom_bpe.json"), "{err}");
         }
+    }
+
+    #[test]
+    fn local_trivial_needs_the_tokenizer_in_use_to_be_pinned() {
+        let bpe = std::path::Path::new("/models/axiom_bpe.json");
+        // The right file name is not enough: a file name says nothing about
+        // the file's content. With or without a sidecar, a tokenizer file in
+        // use must have its hash pinned.
+        for trained_with in [Some("checkpoints/axiom_bpe.json"), None] {
+            let err = check_local_trivial_tokenizer(Some(bpe), true, trained_with, false)
+                .unwrap_err();
+            assert!(err.contains("AXIOM_LOCAL_TRIVIAL"), "{err}");
+            assert!(err.contains("AXIOM_TOKENIZER_SHA256"), "{err}");
+            assert!(err.contains("/models/axiom_bpe.json"), "{err}");
+            assert!(err.contains("unset AXIOM_LOCAL_TRIVIAL"), "{err}");
+            assert_eq!(
+                check_local_trivial_tokenizer(Some(bpe), true, trained_with, true),
+                Ok(())
+            );
+        }
+        // The hash tokenizer has no file to pin.
+        assert_eq!(
+            check_local_trivial_tokenizer(None, false, None, false),
+            Ok(())
+        );
     }
 
     #[tokio::test]

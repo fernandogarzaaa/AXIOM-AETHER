@@ -336,18 +336,39 @@ pub fn resolve_local_trivial(
 /// * `trained_with`: the tokenizer file recorded in the checkpoint's sidecar
 ///   (`<checkpoint>.meta.json`), when it has one.
 ///
+/// * `pinned`: whether `AXIOM_TOKENIZER_SHA256` is set. The caller has
+///   already required a verified checkpoint, and with a pin set that includes
+///   the tokenizer file hashing to it.
+///
+/// A tokenizer file in use must be pinned. The sidecar records only the
+/// tokenizer's file name, and a name says nothing about what the file holds:
+/// a different vocabulary saved under the same name would pass a name check.
+/// The pin is how the operator vouches for the tokenizer's bytes, the same
+/// way `AXIOM_CHECKPOINT_SHA256` vouches for the weights.
+///
 /// A checkpoint without a sidecar records nothing about its tokenizer (the
 /// hash-tokenizer checkpoints that predate sidecars are of this kind), so it
-/// is accepted as long as a configured tokenizer did load.
+/// is accepted on the hash tokenizer, or on a configured tokenizer that
+/// loaded and is pinned.
 pub fn check_local_trivial_tokenizer(
     configured: Option<&FsPath>,
     loaded: bool,
     trained_with: Option<&str>,
+    pinned: bool,
 ) -> std::result::Result<(), String> {
     const WAYS_OUT: &str = "or unset AXIOM_LOCAL_TRIVIAL";
     if let Some(path) = configured.filter(|_| !loaded) {
         return Err(format!(
             "AXIOM_LOCAL_TRIVIAL is on but the tokenizer at {} did not load, so the model              is running on the hash tokenizer and its surprisal cannot gate local answers:              fix AXIOM_TOKENIZER, {WAYS_OUT}",
+            path.display()
+        ));
+    }
+    if let Some(path) = configured.filter(|_| !pinned) {
+        return Err(format!(
+            "AXIOM_LOCAL_TRIVIAL is on and the model reads its input through the tokenizer \
+             at {}, but that file is not pinned, so nothing vouches for its content: set \
+             AXIOM_TOKENIZER_SHA256 to the hash of the tokenizer the checkpoint was trained \
+             with, {WAYS_OUT}",
             path.display()
         ));
     }
