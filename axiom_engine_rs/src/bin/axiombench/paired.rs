@@ -1812,13 +1812,85 @@ mod tests {
 
     fn fake_solver(dir: &Path, name: &str, script: &str) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_executable(&path, script);
         path
+    }
+
+    /// Write `script` to `path` and make it executable, without this process
+    /// ever having the file open for writing.
+    ///
+    /// A file that any process has open for writing cannot be executed ("Text
+    /// file busy"). Writing it here with `std::fs::write` holds it open only
+    /// for a moment, but a process another thread starts in that moment
+    /// begins as a copy of this one and keeps the file open until it has
+    /// turned into its own program. Run before then, the script is refused.
+    /// So a child writes the file: nothing this process starts can inherit a
+    /// file this process never opened, and the child has exited, with
+    /// everything it started, before this returns.
+    #[cfg(unix)]
+    fn write_executable(path: &Path, script: &str) {
+        let mut writer = Command::new("sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("start sh to write the script");
+        writer
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(script.as_bytes())
+            .expect("send the script to sh");
+        let status = writer.wait().expect("wait for sh");
+        assert!(status.success(), "writing {} failed", path.display());
+    }
+
+    /// Nothing is executed by path where there is no execute bit to set.
+    #[cfg(not(unix))]
+    fn write_executable(path: &Path, script: &str) {
+        std::fs::write(path, script).unwrap();
+    }
+
+    /// A script `fake_solver` returns can be run at once, whatever the rest
+    /// of the test binary is doing: see `write_executable`.
+    #[cfg(unix)]
+    #[test]
+    fn a_fake_solver_can_be_run_while_other_threads_start_processes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const SCRIPTS: usize = 150;
+        let dir = tempfile::tempdir().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let others: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+
+        let mut refused = Vec::new();
+        for n in 0..SCRIPTS {
+            let solver = fake_solver(dir.path(), &format!("solver{n}"), "#!/bin/sh\nexit 0\n");
+            match Command::new(&solver).status() {
+                Ok(status) => assert!(status.success()),
+                Err(e) => refused.push(e.to_string()),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for other in others {
+            other.join().unwrap();
+        }
+        assert!(
+            refused.is_empty(),
+            "{} of {SCRIPTS} scripts could not be run; the first: {}",
+            refused.len(),
+            refused[0]
+        );
     }
 
     fn executor_with_solver(
