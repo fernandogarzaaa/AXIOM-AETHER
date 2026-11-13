@@ -80,13 +80,14 @@ regenerates them on every push and fails if the repair gate regresses.
 
 | Metric | Value | Config | Measured |
 |---|---|---|---|
-| **Autonomous repair** — `axiom eval-agentic` | 32/32 = 100% | 12 localization + 2 multi-file + 18 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, ~15 s | 2026-11-08 |
+| **Autonomous repair** — `axiom eval-agentic` | 32/32 = 100% | 12 localization + 2 multi-file + 18 real-interpreter fixtures (python3, node, sh, go, rustc, gcc, ruby), CPU, no LLM, ~15 s | 2026-11-13 |
+| **Autonomous repair, held-out, harder seeder** — `scripts/bench_repair.sh` | 26/40 = 65% on seed 7 regenerated with the current seeder, which since #294 also plants `deref`, `cast` and `ret` faults; 0.7.0 scores 28/40 on the same corpus, and the two it loses are faults inside a multi-line assertion, which 0.8.0 no longer edits (#286); 0 rollback violations | `scripts/seed_faults.py --seed 7 --balance` on `axiom_mesh_core`, no LLM ([0.8.0](bench/results/repair-heldout-seed7-v0.8.0-2026-11-13.md), [0.7.0 baseline](bench/results/repair-heldout-seed7-v0.7.0-baseline-2026-11-13.md)) | 2026-11-13 |
 | **Autonomous repair, held-out** — `scripts/bench_repair.sh` | 38/40 = 95% on a fresh seed (15/17 on faults outside the tuning set; 0.6.0: 20/40, 6/17); 39/40 on the tuning seed; 32/40 and 33/40 verified correct against a strengthened suite (0.6.0: 16/40); 0 rollback violations | random single-token faults seeded into `axiom_mesh_core`, which the engine was never shown; no LLM ([write-up](bench/results/SEEDED-HELDOUT-v2-2026-11-06.md)) | 2026-11-06 |
 | **Autonomous repair, developer bugs** — QuixBugs via `scripts/bench_repair.sh` | 9/40 = 22.5% held out, all 9 verified correct against the reference fixes (14/40 in-sample after three operator families chosen from its failures); 0 rollback violations, 0 test edits | 40 Python programs with one human-written bug each (QuixBugs @ 4257f44); no operator tuned on them; no LLM ([write-up](bench/results/QUIXBUGS-2026-11-07.md)) | 2026-11-07 |
-| **Compression** — `axiom bench axiom_engine_rs/src` | 86.7% savings, 2229/2229 = 100% round-trip | `AXIOM_PRODUCTION_BPE=1` | 2026-08-09 |
-| **Compression** — same, legacy tokenizer | 84.5% savings, 3085/3085 = 100% round-trip | `AXIOM_PRODUCTION_BPE=0` | 2026-11-08 |
+| **Compression** — `axiom bench axiom_engine_rs/src` | 87.6% savings, 3608/3608 = 100% round-trip | `AXIOM_PRODUCTION_BPE=1` | 2026-11-13 |
+| **Compression** — same, legacy tokenizer | 85.7% savings, 3608/3608 = 100% round-trip | `AXIOM_PRODUCTION_BPE=0` | 2026-11-13 |
 | **Cost, real traffic** — `/metrics` delta | 65.1% / 41.4% quota savings | two live Claude Code sessions | 2026-07-17 |
-| **Trust gate** — `axiombench` | 100% supported coverage; contradiction catch-rate 10% → 100% (τ=0.75) | 240 calibration claims | AxiomBench |
+| **Trust gate** — `axiombench` | 100% supported coverage; contradiction catch-rate 10% → 100% (τ=0.75) | 240 calibration claims | 2026-11-13 |
 
 Each figure's caveat travels with it in [What is measured vs
 simulated](#cvm-cost-stack) below and in [`RESULTS.md`](RESULTS.md) — don't

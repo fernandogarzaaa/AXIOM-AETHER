@@ -153,6 +153,9 @@ for dir in "$CORPUS"/*/; do
   end="$(date +%s.%N)"
   secs="$(python3 -c "print(f'{$end-$start:.1f}')")"
   how="$(printf '%s\n' "$log" | grep -oE 'mutation repair verified green \([^)]*\)|source repair solved it \(patched=[a-z]+\)|environment heal solved it|fleet patch [0-9a-f]+ verified green locally|LLM-proposed patch verified green' | head -1)"
+  # The description lands in a Markdown table cell: a `|` in it (a logic
+  # operator such as `||`) would split the row into extra cells.
+  how="${how//|/\\|}"
 
   # 3. Re-verify, then refuse a pass that edited the oracle.
   if ( cd "$work" && verify_bounded "${VERIFY[@]}" >/dev/null 2>&1 ); then

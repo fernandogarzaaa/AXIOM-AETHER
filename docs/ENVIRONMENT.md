@@ -12,7 +12,8 @@ unset. When you add a variable, add it here.
 |---|---|---|
 | `AXIOM_HOST` / `AXIOM_PORT` | `127.0.0.1` / `3000` | Bind address for `--mode server`. A non-loopback bind requires `AXIOM_API_KEY` or `AXIOM_ALLOW_OPEN=1`. |
 | `AXIOM_ALLOW_OPEN` | unset | Allow a non-loopback bind without `AXIOM_API_KEY` (loud startup warning). |
-| `AXIOM_API_KEY` | unset (open) | Data-plane key; every route but `/healthz`, `/readyz`, `/metrics` needs `X-Axiom-Key`. |
+| `AXIOM_API_KEY` | unset (open) | Data-plane key; every route but `/healthz`, `/readyz` and `/mcp` needs `X-Axiom-Key`, `/metrics` included (since 0.8.0). Only that header is accepted, so a Prometheus scrape must be able to send it. `/mcp` takes `Authorization: Bearer <AXIOM_MCP_TOKEN>` when that is set, and otherwise this key (as `X-Axiom-Key` or a bearer token). |
+| `AXIOM_CORS_ORIGINS` | unset (no cross-origin access) | Comma-separated exact origins allowed to call the API from a browser (e.g. `https://app.example.com,http://localhost:3000`). Unlisted origins get no `Access-Control-Allow-Origin`; `*` is ignored with a warning. Requests without an `Origin` header are unaffected. Also the `Origin` allowlist of the merge routes. |
 | `AXIOM_MCP_HTTP` | unset (`/mcp` returns 503) | `1` enables the HTTP MCP transport. |
 | `AXIOM_MCP_TOKEN` | unset | Bearer token for `/mcp`. Unset + `AXIOM_API_KEY` set ⇒ `/mcp` requires the API key instead. |
 | `AXIOM_ENABLE_JIT_EXEC` | unset (403) | Enables `POST /v1/hypervisor/jit_run` (process execution). |
@@ -31,6 +32,7 @@ unset. When you add a variable, add it here.
 | `AXIOM_TTT_COMPRESS` | off | Enable proxy context compression on `/v1/messages` and `/v1/chat/completions`. |
 | `AXIOM_TTT_COMPRESS_THRESHOLD_TOKENS` / `AXIOM_TTT_COMPRESS_TOP_K` | see README | Compression threshold and recall depth. |
 | `AXIOM_RESPONSES_COMPRESS` | on | `0` disables `/v1/responses` input compression. |
+| `AXIOM_LOCAL_TRIVIAL` | off | `1`, `true`, `yes` or `on` lets `/v1/messages` answer provably trivial tool-result turns locally (see README). Needs a verified checkpoint (`AXIOM_CHECKPOINT_SHA256`) and, when `AXIOM_TOKENIZER` is set, `AXIOM_TOKENIZER_SHA256`; otherwise the server refuses to start. |
 | `AXIOM_RESPONSES_RELAY_EXTRA` | empty | Extra lowercase client header names relayed to the Responses upstream (allowlist extension). |
 | `AXIOM_OPENAI_RESPONSES_WS_UPSTREAM` | derived from headers | Explicit WebSocket upstream for `GET /v1/responses`. |
 | `AXIOM_CACHE_SAFE`, `AXIOM_CVM_DIGEST`, `AXIOM_CVM_DIGEST_THRESHOLD_TOKENS`, `AXIOM_PREFIX_DEDUP`, `AXIOM_KEEPALIVE` | see README § CVM Cost Stack | Cost-stack levers. |
@@ -51,6 +53,7 @@ unset. When you add a variable, add it here.
 | `AXIOM_PRODUCTION_BPE` | auto | Unset: use the production model `axiom init` installed under `~/.axiom/models/` when both checkpoint and tokenizer are there, else the legacy model. `1`: force the production path (`AXIOM_BPE_CKPT`/`AXIOM_TOKENIZER`, else the installed model, else `checkpoints/`). `0`: force the legacy model. |
 | `AXIOM_TOKENIZER` / `AXIOM_BPE_CKPT` | `checkpoints/axiom_bpe.json` / `checkpoints/axiom_production_bpe.bin` | Tokenizer and checkpoint paths. |
 | `AXIOM_CHECKPOINT_URL` / `AXIOM_TOKENIZER_URL` | unset | Fetch at boot; pair with `AXIOM_CHECKPOINT_SHA256` / `AXIOM_TOKENIZER_SHA256` to fail closed on a mismatch. |
+| `AXIOM_META_SHA256` | unset | Pinned SHA-256 for the checkpoint's `.meta.json` sidecar fetched by `axiom init`; `meta_sha256` under `[models]` in `~/.axiom/config.toml` wins over it. |
 | `AXIOM_REQUIRE_VERIFIED_CHECKPOINT` | unset (off) | `1` makes `GET /readyz` return 503 unless the production checkpoint exists, its tokenizer is present, and its SHA-256 matches `AXIOM_CHECKPOINT_SHA256`. Off by default: the legacy bootstrap model still reports ready. Set to `1` in production alongside a pinned `AXIOM_CHECKPOINT_SHA256`; pinning the hash alone does not enable the gate. |
 | `AXIOM_EMB_CKPT` | `checkpoints/axiom_embedder.bin` | Embedding model used by MCP memory recall and `eval_recall`. |
 | `AXIOM_FORGET_GATE` | `1.0` | Parameter-free forget gate α on the delta rule (α < 1 decays fast-weight memory). |
