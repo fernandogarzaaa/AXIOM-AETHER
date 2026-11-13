@@ -5,15 +5,228 @@ releases are described on the GitHub Releases page.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-13
+
+Headline: 0.8.0 is a hardening release. On a default install a web page
+could get a fix stored that `axiom solve` later wrote into your source and
+ran; fleet merges now need a key and an allowed Host and Origin. A stored fix
+could overwrite uncommitted work or another project's file of the same name;
+a fix now applies only to the exact file it was made against. `axiom solve`
+no longer passes a check by editing it, and an interrupted solve leaves your
+files as they were. The proxy's local trivial-turn short-circuit, which could
+end an agent's turn with a canned reply, is now opt-in. Cross-origin access is
+deny-by-default and `/metrics` is behind the API key. Several of these change
+behaviour: read **Upgrade notes** before upgrading a server or a fleet.
+
+Proof loop: repair 32/32, compression 85.7% (legacy tokenizer) and 87.6%
+(production BPE) at 3608/3608 round-trip, trust gate 100% supported coverage
+([table](bench/results/proof-loop-2026-11-13.md)).
+
+### Upgrade notes
+
+- **A fleet merge needs a fleet key.** `POST /v1/patches/merge` and
+  `POST /v1/immunity/merge` answer 401 unless the node has `AXIOM_FLEET_KEY`
+  set and the export's HMAC verifies under it. Unsigned exports and raw
+  heal-memory payloads are no longer accepted. Set the same `AXIOM_FLEET_KEY`
+  on every fleet member; in the Helm chart, set `secrets.fleetKey`. Without
+  it, the gossip CronJob logs 401s and nothing propagates.
+  `AXIOM_FLEET_KEY_PREV` is not accepted on these routes (#300).
+- **Merge routes check `Host` and `Origin`.** `Host` must be `localhost`, an
+  IP literal, or a name listed in the new `AXIOM_MERGE_ALLOWED_HOSTS`
+  (comma-separated); anything else gets 403. A request that carries an
+  `Origin` must name an origin listed in `AXIOM_CORS_ORIGINS`, and `null` is
+  never accepted. Peers that call each other by pod IP, as the chart's gossip
+  does, keep working. If you merge through a DNS name, a Service name or a
+  reverse proxy, add that name to `AXIOM_MERGE_ALLOWED_HOSTS` (#300).
+- **Stored fixes from 0.7.0 are discarded.** A fix in the patch store
+  (`~/.axiom/axiom_patch_memory.json`, beside the heal memory) is now a diff
+  tied to one repository and to the SHA-256 of the file it was made against.
+  0.7.0 stored whole files keyed by file name. Those entries are dropped when
+  the store is loaded, gone from the file at the next save, and refused in
+  peer exports. Nothing can convert them: the fixes are learned again as
+  `axiom solve` repairs. 0.7.0 and 0.8.0 nodes cannot exchange patches, so
+  upgrade every node of a fleet together (#301).
+- **The local trivial-turn short-circuit is off by default.** In 0.7.0,
+  `/v1/messages` answered small, clean tool results itself ("Acknowledged …",
+  `stop_reason: end_turn`) unless `AXIOM_LOCAL_TRIVIAL` was exactly `off`.
+  Now it runs only when `AXIOM_LOCAL_TRIVIAL` is `1`, `true`, `yes` or `on`,
+  *and* the checkpoint is verified (`AXIOM_CHECKPOINT_SHA256` pinned and
+  matching). With the flag on and no verified checkpoint, the server refuses
+  to start and the error names both remedies. If you rely on the
+  short-circuit, pin the checkpoint hash. Otherwise remove the flag (#302).
+- **With `AXIOM_LOCAL_TRIVIAL` on, the tokenizer must be pinned too.** If
+  `AXIOM_TOKENIZER` is set, `AXIOM_TOKENIZER_SHA256` must be set to its hash,
+  or the server refuses to start. It also refuses when `AXIOM_TOKENIZER` does
+  not load. It refuses as well when the checkpoint's sidecar names a
+  tokenizer and `AXIOM_TOKENIZER` is unset or names a different file. The
+  hash tokenizer needs no pin (#302, #306).
+- **`/metrics` requires `X-Axiom-Key` when `AXIOM_API_KEY` is set.** Without
+  the key it now answers 401, the same as the data plane; `/healthz` and
+  `/readyz` stay open. The chart's ServiceMonitor cannot send that header. So
+  with an API key set (`secrets.apiKey`, or `AXIOM_API_KEY` in
+  `existingSecret`), Prometheus scrapes fail until you configure the scrape
+  credential yourself. This includes the new `values-staging.yaml` and
+  `values-prod.yaml` overlays, which enable the ServiceMonitor. With no API key
+  set, `/metrics` is open as before (#284).
+- **`axiom_session_residency` no longer carries raw session ids.** The
+  `session_id` label is now the first 16 hex characters of the id's SHA-256,
+  and at most 100 sessions are emitted. Update any dashboard or alert that
+  matched raw ids. `axiom_active_sessions` and `axiom_quantized_sessions`
+  still carry the totals (#284).
+- **CORS is deny-by-default.** The server used to answer every origin with a
+  permissive CORS layer. Now it sends no `Access-Control-Allow-Origin` unless
+  the origin is listed in the new `AXIOM_CORS_ORIGINS` (comma-separated exact
+  origins, e.g. `https://app.example.com,http://localhost:3000`). A browser
+  app that calls the API from another origin must be listed. `*` is ignored
+  with a warning. Requests without an `Origin` header (curl, SDKs,
+  same-origin pages) are unaffected (#285).
+- **The Helm chart pins image digests.** `image.digest`, `gossip.digest` and
+  `tests.digest` now default to sha256 pins, and the chart renders
+  `repo:tag@digest`. The digest wins at pull time. So if you override
+  `image.tag` (or `gossip.image` / `tests.image`), set the matching digest or
+  clear it with `--set image.digest=`. Otherwise you get the pinned image,
+  whatever tag you asked for. `values-gpu.yaml` clears `image.digest` for this
+  reason. The Dockerfile's `FROM` lines are pinned the same way (#281).
+- **Readiness can now require a verified checkpoint (opt-in).** With the new
+  `AXIOM_REQUIRE_VERIFIED_CHECKPOINT=1` (Helm `config.requireVerifiedCheckpoint`),
+  `GET /readyz` returns 503 unless the checkpoint exists, its tokenizer is
+  present, and its SHA-256 matches `AXIOM_CHECKPOINT_SHA256` (Helm
+  `checkpoint.sha256`). When `AXIOM_TOKENIZER_SHA256` is also set, the
+  tokenizer must match it. The server still starts and `/healthz` stays 200.
+  Off by default, so existing deployments are unchanged. The new staging and
+  prod overlays turn it on: replace their placeholder hashes before using them
+  (#283, #298).
+- **The container entrypoint verifies pinned downloads.** When
+  `AXIOM_CHECKPOINT_URL` / `AXIOM_TOKENIZER_URL` are set together with
+  `AXIOM_CHECKPOINT_SHA256` / `AXIOM_TOKENIZER_SHA256`, a download that does
+  not match is refused and the container exits non-zero. A file already at
+  the target path that does not match is deleted and downloaded again. After
+  a refused download no checkpoint is left in place, so a rollback has to
+  install a good one. Without a pinned hash, nothing changes except that the
+  computed hash is printed (#282).
+- **Helm: gossip and `helm test` send `X-Axiom-Key`.** This is not breaking.
+  To require the key in-cluster, set the new `secrets.apiKey`; app pods, the
+  gossip CronJob and the test pod all pick it up. With `existingSecret`, put
+  it in that Secret under the key `AXIOM_API_KEY`. Chart 0.3.0 → 0.3.1 (#280).
+
+### Known issues
+
+- The Helm chart in this tag still pins `image.digest` to the `latest`
+  image resolved on 2026-11-09, which predates 0.8.0, and the digest wins over
+  `image.tag`. Set `image.digest` to the 0.8.0 image's digest (given in the
+  GitHub release notes) or clear it with `--set image.digest=` and set
+  `image.tag`.
+- A Prometheus ServiceMonitor cannot send `X-Axiom-Key`, so with
+  `AXIOM_API_KEY` set, the chart's scrape of `/metrics` gets 401 (see Upgrade
+  notes).
+- `axiom_stream_backpressure_stalls_total` is exported but nothing increments
+  it yet; it reads 0 (#291).
+- `axiom init` downloads the model from Hugging Face by default. Those files
+  are not the ones listed in a release's `SHA256SUMS.txt`, so pinning
+  `AXIOM_CHECKPOINT_SHA256` to a release hash makes the default fetch fail.
+  Pin the hash `axiom init` prints, or point `AXIOM_CHECKPOINT_URL` /
+  `AXIOM_TOKENIZER_URL` at the release assets.
+
+### Security
+
+- **An unauthenticated request could get code run as the user.** On a default
+  install (no `AXIOM_API_KEY`, no `AXIOM_FLEET_KEY`), the merge routes stored
+  any export that matched its own SHA-256. A web page could send it as a
+  `text/plain` POST, with no CORS preflight. `axiom solve` later wrote the
+  stored fix into the blamed file and ran the verify command on it. Merged
+  immunity records were injected into upstream prompts. Merges are now
+  HMAC-authenticated and Host/Origin-checked; see Upgrade notes (#300).
+- **A stored fix could destroy work.** `axiom solve` wrote a whole stored file
+  back over the current one when the tests then passed. That could discard
+  uncommitted changes, or replace a different project's file with the same name
+  and test command, and it reported `SOLVED`. A fix is now considered only
+  when the repository and path match and the file hashes to the fix's
+  pre-image. A fix whose diff does not reproduce its recorded result is
+  discarded (#301).
+- Any website could read API responses cross-origin through the permissive
+  CORS layer. Cross-origin access is now an explicit allowlist (#285).
+- `/metrics` was public and labelled series with raw, client-supplied session
+  ids, with no bound on their number (#284).
+- Checkpoint installs are verified before they are trusted. The model fetch
+  used by `axiom init` (and `axiom daemon start`) now honours pinned hashes
+  from
+  `~/.axiom/config.toml` (`base_model_sha256`, `tokenizer_sha256`,
+  `meta_sha256` under `[models]`; config wins over env), and from the new
+  `AXIOM_META_SHA256`. A fresh install is validated (non-empty checkpoint,
+  strict sidecar parse with a supported schema and sane dims, matching
+  tokenizer name, tokenizer loads with the sidecar's vocab size) and deleted
+  if it fails. A failed or truncated download no longer leaves a partial
+  `.download` file behind (#282).
+
+### Added
+
+- Real token streaming on the local route.
+  `POST /v1/chat/completions` with `"stream": true`, when routed to a local
+  Ollama model, now sends each token as Ollama produces it. The route used to
+  buffer the whole answer and send it as one body. A client disconnect aborts
+  the upstream request. If the local stream cannot start, the request falls
+  back to the cloud path. A streamed request may run up to 30 minutes (#289).
+- New Prometheus series on `/metrics`:
+  - `axiom_first_token_latency_seconds` (#289);
+  - `axiom_stage_latency_seconds{stage="compress"|"route"|"forward"|"fingerprint"}`;
+  - `axiom_process_rss_bytes` (Linux; 0 elsewhere);
+  - `axiom_session_memory_bytes`, including compression sessions;
+  - `axiom_stream_backpressure_stalls_total`, which is not yet incremented
+    anywhere and reads 0.
+
+  Stage latencies count completed stages only. Streamed Anthropic forwards
+  are not timed (#291).
+- `/readyz` responses include `"checkpoint": "verified" | "absent" |
+  "mismatched" | "unverified"`. A 503 from the readiness gate says why
+  (#283).
+- Helm values `checkpoint.sha256`, `checkpoint.tokenizerSha256`,
+  `config.requireVerifiedCheckpoint` (#283) and `secrets.apiKey` (#280).
+- Helm overlays `values-staging.yaml` (one replica, readiness gate on, one
+  CORS origin) and `values-prod.yaml` (three replicas, PDB `minAvailable: 2`,
+  autoscaling, CORS deny-all). Both expect an `existingSecret` and have
+  placeholder checkpoint hashes. A rollback and recovery runbook is in
+  `docs/ROLLBACK-RECOVERY.md`, the prod-like deploy checklist is in
+  `docs/PROD-LIKE-DEPLOY.md`, and `scripts/rollback_drill.sh --local` runs a
+  rollback drill without a cluster (#298).
+
+### Changed
+
+- `axiom solve` now reports `source_patched=true` (as well as
+  `fleet_patched`) when a stored fix changed a file (#301).
+- A fix is keyed to its repository:
+  - `git:<root commit>` for a git checkout with full history, which its clones
+    share;
+  - otherwise `path:<hash of the root directory>`, which also covers shallow
+    clones and folders without git.
+
+  A fix from one machine's non-git folder or shallow clone is never reused
+  elsewhere (#301).
+- `/v1/responses` sends one stable `Idempotency-Key` with every upstream
+  attempt. It uses yours if you send one, or derives one from the request
+  otherwise.
+  - A network error or 5xx is retried with the same compressed payload under
+    the same key. It no longer falls back to the uncompressed payload.
+  - A 400 falls back to your original body under a separate key that stays
+    the same if you retry. A 400 that reports an idempotency-key conflict is
+    not retried.
+  - 401, 403, 429 and other 4xx are never retried (#290).
+- The Helm chart's gossip and test images now run at pinned digests, and
+  `NOTES.txt` prints the digest (#281).
+- `axiom eval-agentic`: the 12 fixtures that were solved by the removed
+  rewrites are now shell programs with a real one-token bug, checked by
+  behaviour. Fixture names changed (`shell-exit-flip` → `sh-self-naming-frame`,
+  `fixture-marker` → `sh-wrong-arith`, `rust-assert-flip` → `rust-arrow-frame`).
+  The suite is still 32 cases (#304).
+
 ### Fixed
 
 - `axiom solve` no longer "repairs" a failing check by editing it. The first
   source-repair phase only knew fixture-shaped rewrites (`exit 1` → `exit 0`,
   a marker rename, replacing the file with a script that exits 0) and reported
   SOLVED when one made the command pass. It is removed from the solve loop;
-  source repair starts at the mutation layer.
+  source repair starts at the mutation layer (#304).
 - A source file longer than 4096 characters is no longer cut while a patch is
-  being tried (`axiom solve`, and `POST /v1/hypervisor/jit_run`).
+  being tried (`axiom solve`, and `POST /v1/hypervisor/jit_run`) (#304).
 - `axiom solve` no longer leaves a candidate fix in your file when it is
   interrupted. The original of every file it writes to is saved to disk first
   (`~/.axiom/journal`, or `AXIOM_JOURNAL_DIR`) and restored on failure, on
@@ -22,10 +235,10 @@ releases are described on the GitHub Releases page.
   and the saved original's path is printed. The journal directory and its
   files are owner-only; a directory other users could write to has its
   existing contents set aside, never restored. Two solves never repair the
-  same file at once: the second one leaves that file alone.
+  same file at once: the second one leaves that file alone (#304).
 - `POST /v1/hypervisor/jit_run` no longer replaces a file longer than 4096
   characters with a two-line script when the file contains `throw `,
-  `Write-Error` or a fixture marker.
+  `Write-Error` or a fixture marker (#304).
 - A fleet export counts once. Delivering the same signed export again to
   `POST /v1/patches/merge` or `POST /v1/immunity/merge` (a retry, a sync job
   on a timer, a replay, or a node's own export posted back to it) used to
@@ -34,7 +247,7 @@ releases are described on the GitHub Releases page.
   `"already_merged": true` and changes nothing. A store remembers the last
   1024 exports it merged, in the store file, and the last 1024 it handed
   out, in `<store>.exports.json` beside it. `axiom immunity pull` says when
-  a peer's export was merged before.
+  a peer's export was merged before (#307).
 - The patch store and the heal memory are saved by rename instead of being
   written in place. A save that is interrupted, or read while it is in
   progress, used to leave or show a partly written file, and a store that
@@ -45,15 +258,67 @@ releases are described on the GitHub Releases page.
   file mounted into a container, a directory the process may not create
   files in), or could only be replaced by a file with a different owner or
   group, it is written in place, as before. Access control lists and other
-  extended attributes on a store are not carried over to the new file.
+  extended attributes on a store are not carried over to the new file (#309).
+- A multi-file edit by the agentic loop (`agent_task_mcp`) could leave earlier
+  files modified when a later write failed. It could also delete an original
+  it could not read instead of restoring it. Every target is now snapshotted
+  before the first write, only files a write was attempted on are restored,
+  and a failed restoration is reported in the task record ("ROLLBACK FAILED
+  …") instead of being dropped (#276).
+- A verifier that prints without limit no longer grows memory without bound.
+  Each output stream keeps its first and last 512 KiB, joined by an
+  `[output truncated: …]` marker that gives the total (#277).
+- `POST /v1/hypervisor/jit_run` left the candidate patch in the source file
+  when the verifier timed out or failed to run. The original is now restored
+  on every exit except a passing report (#278).
+- The Rust compile verifier (`AXIOM_COMPILE_VERIFY`) now kills `cargo check`
+  and everything it started on a timeout, and removes its temporary workspace
+  on every exit (#279).
+- Mutation repair could make a test pass by flipping a comparison on the
+  second line of a multi-line `assert (…)` / `assert!(…)`. Continuation lines
+  of an assertion are now never mutated (#286).
+- Planning mutation candidates for a large file no longer holds a full copy of
+  the file for every candidate. Planning a 2,000-line file for one candidate
+  took about 222 MB before and about 22 MB after; the two figures come from
+  different measurement setups (#287).
+- `/v1/responses` with compression could leave temporary per-run sessions
+  registered when the client disconnected while fingerprints were being
+  generated (#288). A request cancelled at the wrong moment could also still
+  start a full model adaptation that nobody was waiting for (#308).
+- A local stream that fails or ends early now ends without `data: [DONE]`, so
+  the client can tell it is incomplete (#289).
 
-### Changed
+### Release and CI
 
-- `axiom eval-agentic`: the 12 fixtures that were solved by the removed
-  rewrites are now shell programs with a real one-token bug, checked by
-  behaviour. Fixture names changed (`shell-exit-flip` → `sh-self-naming-frame`,
-  `fixture-marker` → `sh-wrong-arith`, `rust-assert-flip` → `rust-arrow-frame`).
-  The suite is still 32 cases.
+- `publish.yml` treats crates.io's "already uploaded" error like "already
+  exists", so a re-run does not fail after a duplicate upload (#275).
+- Each release archive and checkpoint asset ships with a source SBOM
+  (`.sbom.json`), a syft SBOM (`.sbom.syft.json`) and a provenance
+  attestation (`.provenance.json`). The release fails if the syft SBOM is
+  missing or invalid. Container images carry buildx SBOM and provenance, and
+  tagged releases attach `image.provenance.json` and `image.sbom.syft.json`.
+  To verify an asset, run `python3 scripts/generate_attestation.py verify`;
+  see `docs/RELEASE-PROVENANCE.md` (#297).
+- New CI jobs:
+  - `session-concurrency-stress`, a graded p95 / RSS / session-registry stress
+    harness at 1 to 32 concurrent sessions (#292; RSS slack widened from 16 to
+    24 MiB after flaky misses, #305);
+  - `perf-regression`, which compares against
+    `bench/results/perf-baseline.json` and requires the demo-regression arm to
+    fail (#299);
+  - `pinned-images`, which runs `scripts/check-pinned-images.sh` (#281);
+  - `helm`, which lints the chart and checks its auth renders (#280);
+  - `release-gate`, which combines all gates into one PASS/FAIL. It still
+    reports two gates as not evaluated; see `docs/RELEASE-GATES.md` (#296).
+- AxiomBench gained:
+  - a paired A–E runner (`axiombench paired`) with fixtures for four more task
+    families (#293);
+  - a regenerated 36-fixture "unseen" seeded-fault suite with no tuning
+    overlap (#294);
+  - per-arm promotion verdicts in `bench/results/PAIRED-VERDICTS-2026-11-11.md`
+    (#295).
+- Test helpers write fake executables from a child process, which fixes
+  intermittent "Text file busy" failures (#310).
 
 ## [0.7.0] - 2026-11-08
 
