@@ -76,6 +76,10 @@ it. Update **both** on every release.
 
 | Metric | Value | Config | Measured | Release |
 |---|---|---|---|---|
+| Autonomous repair | **32/32 = 100%** | 12 localization fixtures (since 0.8.0 shell programs with a real one-token bug, checked by behaviour) + 2 multi-file + 18 real-interpreter fixtures, CPU, no LLM | 2026-11-13 | v0.8.0 |
+| Compression | **85.7% savings, 3608/3608 = 100% round-trip** | `AXIOM_PRODUCTION_BPE=0`, `axiom_engine_rs/src` (now 317,014 tokens) | 2026-11-13 | v0.8.0 |
+| Compression | **87.6% savings, 3608/3608 = 100% round-trip** | `AXIOM_PRODUCTION_BPE=1` with the v0.7.0 release checkpoint and tokenizer, `axiom_engine_rs/src` (942,678 tokens) | 2026-11-13 | v0.8.0 |
+| Trust gate | **100% supported coverage; catch-rate 10% → 100% (τ=0.75)** | 240 calibration claims, `bench/trust/claims.jsonl` | 2026-11-13 | v0.8.0 |
 | Autonomous repair | **32/32 = 100%** | 12 localization + 2 multi-file + 18 real-interpreter fixtures, CPU, no LLM, ~15 s wall clock | 2026-11-08 | v0.7.0 |
 | Compression | **84.5% savings, 3085/3085 = 100% round-trip** | `AXIOM_PRODUCTION_BPE=0`, `axiom_engine_rs/src` (now 260,383 tokens) | 2026-11-08 | v0.7.0 |
 | Autonomous repair, **developer bugs** | **9/40 = 22.5%** held out on QuixBugs, all 9 correct (14/40 in-sample after operators chosen from its failures); 0 rollback violations; 0 test edits | 40 Python programs with one human-written bug each, QuixBugs @ `4257f44`, no operator tuned on them, no LLM ([write-up](../bench/results/QUIXBUGS-2026-11-07.md)) | 2026-11-07 | v0.7.0 |
