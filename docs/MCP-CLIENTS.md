@@ -38,13 +38,18 @@ The plugin registers the `axiom` MCP server (`axiom --mode mcp`) for you.
 
 **Prerequisite:** the `axiom` binary must be on your `PATH` -- the plugin
 manifest declares the server, it does not compile the engine. Install it with
-`scripts/install.sh` (Linux/macOS), `scripts/install.ps1` (Windows),
-`cargo install --path axiom_engine_rs`, or `pip install axiom-engine`. Verify
-with `axiom --version` before installing the plugin.
+`pip install axiom-aether` (prebuilt binary, see the README's "Install"),
+`scripts/install.sh` (Linux/macOS), `scripts/install.ps1` (Windows), or
+`cargo install --path axiom_engine_rs`. (`pip install axiom-engine` is a
+different package -- the pure-Python reference implementation -- and does not
+ship the `axiom` binary.) Verify with `axiom --version` before installing the
+plugin, then run `axiom init` once to install the model under `~/.axiom/`.
 
-To pin a trained checkpoint instead of the auto-bootstrapped model, use the
-manual `.mcp.json` route below and append
-`"--checkpoint", "checkpoints/axiom_production_bpe.bin"` to `args`.
+The server finds the model `axiom init` installed on its own. To pin a
+different trained checkpoint, use the manual `.mcp.json` route below and
+append `"--checkpoint", "/absolute/path/to/checkpoint.bin"` to `args` -- an
+absolute path, because the host starts the server in whatever project is
+open (see [Where the stdio server keeps its state](#where-the-stdio-server-keeps-its-state)).
 
 Manifest files: [`.claude-plugin/plugin.json`](../.claude-plugin/plugin.json),
 [`.claude-plugin/marketplace.json`](../.claude-plugin/marketplace.json), and a
@@ -65,19 +70,24 @@ Claude Code, and Cline use for local MCP servers.
   "mcpServers": {
     "axiom": {
       "command": "axiom",
-      "args": ["--mode", "mcp", "--checkpoint", "checkpoints/axiom_production_bpe.bin"]
+      "args": ["--mode", "mcp"]
     }
   }
 }
 ```
 
-(Omit `--checkpoint` to use the auto-bootstrapped model.)
+This uses the model `axiom init` installed under `~/.axiom/models/`. To pin
+another checkpoint, add `"--checkpoint", "/absolute/path/to/checkpoint.bin"`.
 
-**Claude Code** -- register the same server:
+**Claude Code** -- register the same server once, for every project:
 
 ```bash
-claude mcp add axiom -- axiom --mode mcp
+claude mcp add --scope user axiom -- axiom --mode mcp
 ```
+
+Claude Code starts the server in the project you have open; its memory and
+task board still live under `~/.axiom/`, so the same memory follows you from
+repo to repo.
 
 **Cline (VS Code)** -- add to `cline_mcp_settings.json` (see
 [`CLINE-SETUP.md`](CLINE-SETUP.md) for the full configuration):
@@ -87,7 +97,7 @@ claude mcp add axiom -- axiom --mode mcp
   "mcpServers": {
     "axiom": {
       "command": "axiom",
-      "args": ["--mode", "mcp", "--checkpoint", "checkpoints/axiom_production_bpe.bin"]
+      "args": ["--mode", "mcp"]
     }
   }
 }
@@ -95,6 +105,65 @@ claude mcp add axiom -- axiom --mode mcp
 
 Then ask Claude/Cline to "compress this repo with axiom" or "check this code for
 drift" and it will call the tools.
+
+## Where the stdio server keeps its state
+
+`axiom --mode mcp` keeps its state per user, under `~/.axiom/`
+(`%USERPROFILE%\.axiom` on Windows), whatever directory the host starts it in.
+Each variable, when set, wins over the default:
+
+| State | Default | Override |
+|---|---|---|
+| Memory (`axiom_remember` / `axiom_recall`) | `~/.axiom/memory/` | `AXIOM_MEMORY_DIR` |
+| Task board (`axiom_post_task` ...) | `~/.axiom/tasks/` | `AXIOM_TASK_DIR` |
+| Master vibe (`axiom_compress_path`) | `~/.axiom/axiom_master_vibe.bin` | `AXIOM_VIBE_PATH` |
+| Small offline model (`axiom init`) | `~/.axiom/models/axiom_kernel_v1.safetensors` | `--checkpoint` |
+
+Memory scoped `personal` (the default) is shared by every project;
+`project:<name>` scopes keep repo-specific memory apart inside the same store.
+`axiom run` uses the same locations, so what it remembers with
+`AXIOM_RUN_REMEMBER=1` is what `axiom_recall` finds.
+
+The HTTP server (`axiom --mode server`, including its `/mcp` route) is
+unchanged: it still resolves these paths relative to the directory it is
+started in (`checkpoints/memory/`, `checkpoints/tasks/`,
+`axiom_master_vibe.bin`), which the launch scripts rely on.
+
+### Moving existing memory
+
+Releases up to 0.7.0 wrote the stdio server's state into the project
+directory: `checkpoints/memory/`, `checkpoints/tasks/` and
+`axiom_master_vibe.bin`. The server no longer reads them there; when it
+starts in a project that still has `checkpoints/memory/*.jsonl` it says so on
+stderr. To carry that memory over, run this once from the root of each such
+project (on Windows, in Git Bash):
+
+```bash
+mkdir -p ~/.axiom/memory ~/.axiom/tasks
+for f in checkpoints/memory/*.jsonl; do
+  [ -e "$f" ] || continue
+  cat "$f" >> ~/.axiom/memory/"$(basename "$f")"
+done
+for f in checkpoints/tasks/*.jsonl; do
+  [ -e "$f" ] || continue
+  cat "$f" >> ~/.axiom/tasks/"$(basename "$f")"
+done
+if [ -e axiom_master_vibe.bin ] && [ ! -e ~/.axiom/axiom_master_vibe.bin ]; then
+  cp axiom_master_vibe.bin ~/.axiom/
+fi
+```
+
+Every store file is an append-only log with unique record ids, so appending
+several projects' files into one store merges them. Run it once per project: a
+second run appends the same entries again. There is only one master vibe, so
+the first project's is kept. Once `axiom_recall` finds your old memories you
+can delete `checkpoints/memory/`, `checkpoints/tasks/` and
+`axiom_master_vibe.bin` from the project -- unless you also run the HTTP
+server from it, which still uses those paths.
+
+To keep using a project-local store instead, set the variable to an absolute
+path in the server's `env`, for example
+`"env": {"AXIOM_MEMORY_DIR": "/home/me/work/repo/checkpoints/memory"}`.
 
 ## ChatGPT connector / Claude remote -- remote HTTP transport
 

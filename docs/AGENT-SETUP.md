@@ -62,15 +62,22 @@ cargo install --path .            # installs into ~/.cargo/bin (usually on PATH)
 ### Path A â€” Claude (stdio, simplest)
 
 ```bash
-# Claude Code:
-claude mcp add axiom -- axiom --mode mcp
+# Claude Code (once, for every project):
+claude mcp add --scope user axiom -- axiom --mode mcp
 ```
 Claude Desktop â€” add to `claude_desktop_config.json`:
 ```json
 { "mcpServers": { "axiom": { "command": "axiom", "args": ["--mode", "mcp"] } } }
 ```
 Then ask Claude to "compress this repo with Axiom" or "recall what I decided
-about X". (Add `"--checkpoint", "<path>"` to use a trained model.)
+about X". The server keeps its memory, task board and master vibe under
+`~/.axiom/`, not in the project Claude has open, so what you remember in one
+repo is recalled in the next; `AXIOM_MEMORY_DIR` / `AXIOM_TASK_DIR` /
+`AXIOM_VIBE_PATH` override that. It uses the model `axiom init` installed; add
+`"--checkpoint", "/absolute/path/to/checkpoint.bin"` to pin another one (a
+relative path would resolve against whichever project is open). Memory an
+older release wrote into `<repo>/checkpoints/memory`:
+[move it](MCP-CLIENTS.md#moving-existing-memory).
 
 ### Path B â€” ChatGPT / Codex (remote HTTP)
 
@@ -208,10 +215,12 @@ verify.
 > Do this and report each step:
 > 1. Ensure an `axiom` binary exists (`cargo build --release --locked` in
 >    `axiom_engine_rs` if needed; on Windows prefer the MSVC toolchain).
-> 2. Register it for Claude Code: `claude mcp add axiom -- axiom --mode mcp`
+> 2. Register it for Claude Code: `claude mcp add --scope user axiom -- axiom --mode mcp`
 >    (or, for Claude Desktop, add the `mcpServers.axiom` entry to
 >    `claude_desktop_config.json` with `command: "axiom"`, `args:
->    ["--mode","mcp"]`). Use `--checkpoint <path>` if a trained checkpoint exists.
+>    ["--mode","mcp"]`). Run `axiom init` once so the model is installed under
+>    `~/.axiom/`; pass `--checkpoint <absolute path>` only to pin another one.
+>    Memory and tasks go to `~/.axiom/`, not the current repo.
 > 3. Verify the server starts and lists its tools (`tools/list`); show me the
 >    names. I expect `search`, `fetch`, and the `axiom_*` tools.
 > 4. Demonstrate one real call â€” e.g. `axiom_remember` a test note then

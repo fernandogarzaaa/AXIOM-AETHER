@@ -9,6 +9,10 @@ use sha2::{Digest, Sha256};
 use crate::model_meta::{ModelMeta, MODEL_META_SCHEMA_VERSION};
 
 pub const DEFAULT_CHECKPOINT_PATH: &str = "axiom_kernel_v1.safetensors";
+/// Working-directory default for the recall memory store (`AXIOM_MEMORY_DIR`).
+pub const DEFAULT_MEMORY_DIR: &str = "checkpoints/memory";
+/// Working-directory default for the task board (`AXIOM_TASK_DIR`).
+pub const DEFAULT_TASK_DIR: &str = "checkpoints/tasks";
 pub const DEFAULT_EOS_TOKEN: u32 = 2;
 pub const DEFAULT_BASE_MODEL_FILE: &str = "axiom_production_bpe.bin";
 pub const DEFAULT_MODEL_URL: &str =
@@ -74,6 +78,15 @@ pub struct AxiomPaths {
     pub run_dir: PathBuf,
     pub hypervisor_log: PathBuf,
     pub pid_file: PathBuf,
+    /// Per-user recall memory store (`~/.axiom/memory`).
+    pub memory_dir: PathBuf,
+    /// Per-user task board (`~/.axiom/tasks`).
+    pub tasks_dir: PathBuf,
+    /// Per-user master vibe (`~/.axiom/axiom_master_vibe.bin`).
+    pub vibe_path: PathBuf,
+    /// Where `axiom init` bootstraps the small offline kernel
+    /// (`~/.axiom/models/axiom_kernel_v1.safetensors`).
+    pub kernel_path: PathBuf,
 }
 
 impl AxiomPaths {
@@ -93,6 +106,10 @@ impl AxiomPaths {
             config: home.join("config.toml"),
             hypervisor_log: logs_dir.join("hypervisor.log"),
             pid_file: run_dir.join("axiom.pid"),
+            memory_dir: home.join("memory"),
+            tasks_dir: home.join("tasks"),
+            vibe_path: home.join(crate::vibe_memory::DEFAULT_VIBE_PATH),
+            kernel_path: models_dir.join(DEFAULT_CHECKPOINT_PATH),
             home,
             logs_dir,
             models_dir,
@@ -130,6 +147,141 @@ impl AxiomPaths {
             tokenizer,
         })
     }
+}
+
+/// Which defaults a command uses for its state files when `AXIOM_MEMORY_DIR`,
+/// `AXIOM_TASK_DIR` or `AXIOM_VIBE_PATH` is unset. An explicit variable always
+/// wins over either default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateScope {
+    /// Per-user state under `~/.axiom/`: the stdio MCP server (`--mode mcp`)
+    /// and `axiom run`. MCP hosts start the server in whatever project is
+    /// open, so a working-directory default would write into that repo and
+    /// give every repo its own, separate memory.
+    User,
+    /// Paths relative to the working directory: the HTTP server (including its
+    /// `/mcp` route) and `axiom prime`, which are started from a fixed root
+    /// whose launch scripts pin or assume these locations.
+    WorkingDir,
+}
+
+/// Resolved state locations for one process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatePaths {
+    /// Recall memory store root (`AXIOM_MEMORY_DIR`).
+    pub memory_dir: PathBuf,
+    /// Task board root (`AXIOM_TASK_DIR`).
+    pub task_dir: PathBuf,
+    /// Master vibe file (`AXIOM_VIBE_PATH`).
+    pub vibe_path: PathBuf,
+}
+
+impl StatePaths {
+    /// Resolve from the process environment and the user's home directory.
+    pub fn resolve(scope: StateScope) -> Self {
+        let user = match scope {
+            StateScope::User => AxiomPaths::discover().ok(),
+            StateScope::WorkingDir => None,
+        };
+        Self::resolve_with(scope, |key| std::env::var(key).ok(), user.as_ref())
+    }
+
+    /// [`Self::resolve`] with the environment and home passed in (for tests).
+    /// An empty variable counts as unset. A `User` scope whose home cannot be
+    /// resolved falls back to the working-directory defaults.
+    pub fn resolve_with(
+        scope: StateScope,
+        env: impl Fn(&str) -> Option<String>,
+        user: Option<&AxiomPaths>,
+    ) -> Self {
+        let var = |key: &str| env(key).filter(|v| !v.trim().is_empty()).map(PathBuf::from);
+        let user = match scope {
+            StateScope::User => user,
+            StateScope::WorkingDir => None,
+        };
+        let (memory, tasks, vibe) = match user {
+            Some(u) => (
+                u.memory_dir.clone(),
+                u.tasks_dir.clone(),
+                u.vibe_path.clone(),
+            ),
+            None => (
+                PathBuf::from(DEFAULT_MEMORY_DIR),
+                PathBuf::from(DEFAULT_TASK_DIR),
+                PathBuf::from(crate::vibe_memory::DEFAULT_VIBE_PATH),
+            ),
+        };
+        Self {
+            memory_dir: var("AXIOM_MEMORY_DIR").unwrap_or(memory),
+            task_dir: var("AXIOM_TASK_DIR").unwrap_or(tasks),
+            vibe_path: var("AXIOM_VIBE_PATH").unwrap_or(vibe),
+        }
+    }
+}
+
+/// The small legacy kernel a command loads when `--checkpoint` was not given.
+///
+/// `axiom init` bootstraps it at `~/.axiom/models/axiom_kernel_v1.safetensors`;
+/// older releases wrote `./axiom_kernel_v1.safetensors`, and `--mode train`
+/// still does. The first of the two that exists wins: the per-user one first
+/// for [`StateScope::User`], the working-directory one first otherwise. With
+/// neither present the preferred path is returned (the pipeline then starts
+/// from random weights, as before). An explicit `--checkpoint` is returned
+/// unchanged.
+pub fn resolve_kernel_checkpoint(cli_checkpoint: &str, scope: StateScope) -> String {
+    let user = AxiomPaths::discover().ok().map(|p| p.kernel_path);
+    resolve_kernel_with(cli_checkpoint, scope, user.as_deref(), |p| p.is_file())
+}
+
+/// [`resolve_kernel_checkpoint`] with the home and filesystem passed in.
+pub fn resolve_kernel_with(
+    cli_checkpoint: &str,
+    scope: StateScope,
+    user_kernel: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> String {
+    if cli_checkpoint != DEFAULT_CHECKPOINT_PATH {
+        return cli_checkpoint.to_string();
+    }
+    let cwd = Path::new(DEFAULT_CHECKPOINT_PATH);
+    let order: Vec<&Path> = match (scope, user_kernel) {
+        (_, None) => vec![cwd],
+        (StateScope::User, Some(u)) => vec![u, cwd],
+        (StateScope::WorkingDir, Some(u)) => vec![cwd, u],
+    };
+    order
+        .iter()
+        .find(|p| exists(p))
+        .unwrap_or(&order[0])
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A note for a user whose memory is still in the working directory from an
+/// older release: `Some` when `memory_dir` is not `./checkpoints/memory` and
+/// `cwd/checkpoints/memory` holds at least one `*.jsonl` store file.
+pub fn legacy_memory_notice(cwd: &Path, memory_dir: &Path) -> Option<String> {
+    let legacy = cwd.join(DEFAULT_MEMORY_DIR);
+    let same = match (fs::canonicalize(&legacy), fs::canonicalize(memory_dir)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => memory_dir == Path::new(DEFAULT_MEMORY_DIR),
+    };
+    if same {
+        return None;
+    }
+    let has_records = fs::read_dir(&legacy).ok()?.flatten().any(|e| {
+        let p = e.path();
+        p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+    });
+    has_records.then(|| {
+        format!(
+            "memory from an older Axiom is in {}, which this server no longer reads; it now \
+             uses {}. Merge it in (docs/MCP-CLIENTS.md, \"Moving existing memory\") or set \
+             AXIOM_MEMORY_DIR to keep using the old directory.",
+            legacy.display(),
+            memory_dir.display()
+        )
+    })
 }
 
 /// Look up the production model `axiom init` installed under `~/.axiom`,
@@ -1319,5 +1471,117 @@ mod tests {
         assert!(!paths.base_model_path(&cfg).exists());
         assert!(!paths.tokenizer_path(&cfg).exists());
         assert!(!paths.meta_path(&cfg).exists());
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn user_scope_defaults_to_the_home_directory() {
+        let home = AxiomPaths::from_home(PathBuf::from("/h/.axiom"));
+        let state = StatePaths::resolve_with(StateScope::User, env_of(&[]), Some(&home));
+        assert_eq!(state.memory_dir, PathBuf::from("/h/.axiom/memory"));
+        assert_eq!(state.task_dir, PathBuf::from("/h/.axiom/tasks"));
+        assert_eq!(
+            state.vibe_path,
+            PathBuf::from("/h/.axiom/axiom_master_vibe.bin")
+        );
+    }
+
+    #[test]
+    fn working_dir_scope_keeps_the_relative_defaults() {
+        let home = AxiomPaths::from_home(PathBuf::from("/h/.axiom"));
+        let state = StatePaths::resolve_with(StateScope::WorkingDir, env_of(&[]), Some(&home));
+        assert_eq!(state.memory_dir, PathBuf::from(DEFAULT_MEMORY_DIR));
+        assert_eq!(state.task_dir, PathBuf::from(DEFAULT_TASK_DIR));
+        assert_eq!(
+            state.vibe_path,
+            PathBuf::from(crate::vibe_memory::DEFAULT_VIBE_PATH)
+        );
+        // A user scope without a resolvable home falls back to the same.
+        assert_eq!(
+            StatePaths::resolve_with(StateScope::User, env_of(&[]), None),
+            state
+        );
+    }
+
+    #[test]
+    fn explicit_state_variables_win_in_both_scopes_and_empty_is_unset() {
+        let home = AxiomPaths::from_home(PathBuf::from("/h/.axiom"));
+        let env = env_of(&[
+            ("AXIOM_MEMORY_DIR", "/m"),
+            ("AXIOM_TASK_DIR", "rel/tasks"),
+            ("AXIOM_VIBE_PATH", "  "),
+        ]);
+        for scope in [StateScope::User, StateScope::WorkingDir] {
+            let state = StatePaths::resolve_with(scope, &env, Some(&home));
+            assert_eq!(state.memory_dir, PathBuf::from("/m"));
+            assert_eq!(state.task_dir, PathBuf::from("rel/tasks"));
+            let default_vibe = match scope {
+                StateScope::User => home.vibe_path.clone(),
+                StateScope::WorkingDir => PathBuf::from(crate::vibe_memory::DEFAULT_VIBE_PATH),
+            };
+            assert_eq!(state.vibe_path, default_vibe);
+        }
+    }
+
+    #[test]
+    fn kernel_lookup_prefers_the_scope_location_and_falls_back() {
+        let user = PathBuf::from("/h/.axiom/models/axiom_kernel_v1.safetensors");
+        let cwd = Path::new(DEFAULT_CHECKPOINT_PATH);
+        let both = |_: &Path| true;
+        let only_user = |p: &Path| p == user.as_path();
+        let only_cwd = |p: &Path| p == cwd;
+        let none = |_: &Path| false;
+        let user_s = user.to_string_lossy().into_owned();
+        let pick = |scope, exists: &dyn Fn(&Path) -> bool| {
+            resolve_kernel_with(DEFAULT_CHECKPOINT_PATH, scope, Some(&user), exists)
+        };
+
+        assert_eq!(pick(StateScope::User, &both), user_s);
+        assert_eq!(pick(StateScope::User, &only_cwd), DEFAULT_CHECKPOINT_PATH);
+        assert_eq!(pick(StateScope::User, &none), user_s);
+        assert_eq!(pick(StateScope::WorkingDir, &both), DEFAULT_CHECKPOINT_PATH);
+        assert_eq!(pick(StateScope::WorkingDir, &only_user), user_s);
+        assert_eq!(pick(StateScope::WorkingDir, &none), DEFAULT_CHECKPOINT_PATH);
+        // No home: the working-directory file, as before.
+        assert_eq!(
+            resolve_kernel_with(DEFAULT_CHECKPOINT_PATH, StateScope::User, None, none),
+            DEFAULT_CHECKPOINT_PATH
+        );
+        // An explicit --checkpoint is never replaced.
+        assert_eq!(
+            resolve_kernel_with("my.bin", StateScope::User, Some(&user), both),
+            "my.bin"
+        );
+    }
+
+    #[test]
+    fn legacy_memory_notice_only_for_old_records_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("repo");
+        let new_dir = tmp.path().join("home/.axiom/memory");
+        let legacy = cwd.join(DEFAULT_MEMORY_DIR);
+
+        // No old directory, or one without store files: nothing to say.
+        fs::create_dir_all(&cwd).unwrap();
+        assert_eq!(legacy_memory_notice(&cwd, &new_dir), None);
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("axiom_compression_cache.bin"), b"x").unwrap();
+        assert_eq!(legacy_memory_notice(&cwd, &new_dir), None);
+
+        fs::write(legacy.join("personal.jsonl"), b"{}\n").unwrap();
+        let note = legacy_memory_notice(&cwd, &new_dir).expect("old records found");
+        assert!(note.contains(&legacy.display().to_string()), "{note}");
+        assert!(note.contains(&new_dir.display().to_string()), "{note}");
+        assert!(note.contains("AXIOM_MEMORY_DIR"), "{note}");
+
+        // Already using the old directory: nothing to move.
+        assert_eq!(legacy_memory_notice(&cwd, &legacy), None);
     }
 }
