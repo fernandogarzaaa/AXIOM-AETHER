@@ -758,19 +758,46 @@ mod tests {
             use std::sync::atomic::{AtomicBool, Ordering};
             use std::sync::Arc;
 
+            /// Holds the process-starting threads. Dropping it (including while
+            /// unwinding from a failed assertion) sets the stop flag and joins them, so a
+            /// failure cannot leave them starting processes for the rest of the test run.
+            struct StopOnDrop {
+                stop: Arc<AtomicBool>,
+                threads: Vec<std::thread::JoinHandle<()>>,
+            }
+            impl StopOnDrop {
+                fn stop_and_join(mut self) {
+                    self.stop.store(true, Ordering::Relaxed);
+                    for thread in self.threads.drain(..) {
+                        thread.join().unwrap();
+                    }
+                }
+            }
+            impl Drop for StopOnDrop {
+                fn drop(&mut self) {
+                    self.stop.store(true, Ordering::Relaxed);
+                    for thread in self.threads.drain(..) {
+                        let _ = thread.join();
+                    }
+                }
+            }
+
             const SCRIPTS: usize = 150;
             let dir = tempfile::tempdir().unwrap();
             let stop = Arc::new(AtomicBool::new(false));
-            let others: Vec<_> = (0..8)
-                .map(|_| {
-                    let stop = stop.clone();
-                    std::thread::spawn(move || {
-                        while !stop.load(Ordering::Relaxed) {
-                            let _ = Command::new("true").status();
-                        }
+            let others = StopOnDrop {
+                stop: stop.clone(),
+                threads: (0..8)
+                    .map(|_| {
+                        let stop = stop.clone();
+                        std::thread::spawn(move || {
+                            while !stop.load(Ordering::Relaxed) {
+                                let _ = Command::new("true").status();
+                            }
+                        })
                     })
-                })
-                .collect();
+                    .collect(),
+            };
 
             let mut refused = Vec::new();
             for n in 0..SCRIPTS {
@@ -780,10 +807,7 @@ mod tests {
                     Err(e) => refused.push(e.to_string()),
                 }
             }
-            stop.store(true, Ordering::Relaxed);
-            for other in others {
-                other.join().unwrap();
-            }
+            others.stop_and_join();
             assert!(
                 refused.is_empty(),
                 "{} of {SCRIPTS} scripts could not be run; the first: {}",
