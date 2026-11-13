@@ -457,8 +457,12 @@ curl -X POST http://127.0.0.1:3000/v1/adapt \
 Run Axiom as an MCP server:
 
 ```bash
-axiom_engine --mode mcp --checkpoint checkpoints/axiom_production_bpe.bin
+axiom --mode mcp
 ```
+
+It loads the model `axiom init` installed and keeps memory, the task board and
+the master vibe under `~/.axiom/`, whatever directory the MCP host starts it in
+(see [docs/MCP-CLIENTS.md](docs/MCP-CLIENTS.md#where-the-stdio-server-keeps-its-state)).
 
 Tool catalog (17 tools; 20 with `--features experimental`, which adds the
 untrained predictive-reasoning tools `axiom_predict_states`,
@@ -529,7 +533,7 @@ Claude-style MCP config example:
   "mcpServers": {
     "axiom": {
       "command": "C:\\path\\to\\axiom_engine.exe",
-      "args": ["--mode", "mcp", "--checkpoint", "checkpoints/axiom_production_bpe.bin"]
+      "args": ["--mode", "mcp"]
     }
   }
 }

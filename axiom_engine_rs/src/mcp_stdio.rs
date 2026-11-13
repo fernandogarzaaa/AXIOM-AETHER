@@ -30,7 +30,7 @@ use candle_core::{Device, Tensor};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::config::AxiomConfig;
+use crate::config::{AxiomConfig, StatePaths, StateScope};
 use crate::context_compressor::{
     adapt_session_blocking, extract_memory_vector_blocking, MAX_ADAPT_CHUNK_TOKENS,
 };
@@ -76,7 +76,7 @@ pub struct McpContext {
     /// Base URL of the running Axiom HTTP proxy (for awareness endpoint calls).
     /// Override with `AXIOM_PROXY_URL` (default `http://127.0.0.1:3000`).
     pub proxy_url: String,
-    /// Inter-agent task board. Loaded once from AXIOM_TASK_DIR.
+    /// Inter-agent task board, opened once at [`StatePaths::task_dir`].
     task_board: Arc<crate::task_board::TaskBoard>,
     /// Per-session token-awareness store (PR #72). Used to record tool response
     /// costs and conditionally annotate responses with a meta cost line.
@@ -94,10 +94,15 @@ pub struct McpContext {
 /// device, and a checkpoint path. Shared by the stdio server and the HTTP/SSE
 /// transport ([`crate::server`]'s `/mcp` route) so both expose identical tools
 /// against identical engine internals.
+///
+/// `state` names the memory store, task board and master vibe: per-user for the
+/// stdio server, working-directory-relative for the HTTP server's `/mcp` route
+/// (see [`StateScope`]).
 pub async fn build_context(
     config: AxiomConfig,
     device: Device,
     checkpoint_path: String,
+    state: &StatePaths,
 ) -> Result<McpContext, String> {
     // Build the pipeline on a blocking thread. It owns a `reqwest::blocking::Client`
     // which carries its own runtime; constructing/dropping that inside the async
@@ -122,7 +127,12 @@ pub async fn build_context(
         .map_err(|e| format!("failed to assemble inference pipeline: {e}"))?
     };
 
-    let vibe = MasterVibe::from_env(config.n_layers, config.d_model, &device);
+    let vibe = MasterVibe::at_path_with_env_decay(
+        &state.vibe_path,
+        config.n_layers,
+        config.d_model,
+        &device,
+    );
     let prime = std::env::var("AXIOM_VIBE_PRIME")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -148,9 +158,8 @@ pub async fn build_context(
         .unwrap_or(1_048_576); // 1 MiB
 
     // Tier-2 memory store root (Phase 2.0). Override with AXIOM_MEMORY_DIR.
-    let memory_dir =
-        std::env::var("AXIOM_MEMORY_DIR").unwrap_or_else(|_| "checkpoints/memory".to_string());
-    let memory = MemoryStore::open(&memory_dir)
+    let memory_dir = state.memory_dir.display().to_string();
+    let memory = MemoryStore::open(&state.memory_dir)
         .map_err(|e| format!("failed to open memory store at {memory_dir}: {e}"))?;
     eprintln!("[mcp] memory store at {memory_dir}");
 
@@ -179,13 +188,14 @@ pub async fn build_context(
         max_bytes,
         proxy_url: std::env::var("AXIOM_PROXY_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
-        task_board: Arc::new(if std::env::var("AXIOM_TASK_DIR").is_ok() {
-            crate::task_board::TaskBoard::from_env()
-                .map_err(|e| format!("AXIOM_TASK_DIR open failed: {e}"))?
-        } else {
-            crate::task_board::TaskBoard::open("checkpoints/tasks")
-                .map_err(|e| format!("task board init failed: {e}"))?
-        }),
+        task_board: Arc::new(
+            crate::task_board::TaskBoard::open(&state.task_dir).map_err(|e| {
+                format!(
+                    "task board init failed at {}: {e}",
+                    state.task_dir.display()
+                )
+            })?,
+        ),
         awareness: Arc::new(AwarenessStore::new()),
         #[cfg(feature = "experimental")]
         align_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -201,7 +211,27 @@ pub async fn run_stdio_server(
     // All status output MUST go to stderr; stdout is reserved for JSON-RPC.
     eprintln!("[mcp] booting Axiom MCP stdio server (protocol {MCP_PROTOCOL_VERSION})");
 
-    let ctx = build_context(config, device, checkpoint_path).await?;
+    // MCP hosts start this server in whatever project is open, so state is
+    // per-user (~/.axiom) unless AXIOM_MEMORY_DIR / AXIOM_TASK_DIR /
+    // AXIOM_VIBE_PATH say otherwise.
+    let state = StatePaths::resolve(StateScope::User);
+    eprintln!(
+        "[mcp] task board at {}; master vibe at {}",
+        state.task_dir.display(),
+        state.vibe_path.display()
+    );
+    // Point a user upgrading from the working-directory default at their
+    // old records (it is the default that moved, not their explicit choice).
+    let memory_var_set = std::env::var("AXIOM_MEMORY_DIR").is_ok_and(|v| !v.trim().is_empty());
+    if !memory_var_set {
+        if let Some(note) = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| crate::config::legacy_memory_notice(&cwd, &state.memory_dir))
+        {
+            eprintln!("[mcp] {note}");
+        }
+    }
+    let ctx = build_context(config, device, checkpoint_path, &state).await?;
 
     eprintln!(
         "[mcp] ready — tools: axiom_compress_path, axiom_evaluate_drift, axiom_expand, \

@@ -14,7 +14,7 @@ use candle_core::{bail, Device, Result};
 #[cfg(feature = "experimental")]
 use cli::ChimeraCommand;
 use cli::{AxiomCommand, DaemonCommand, ParsedCli, SwarmCommand};
-use config::{AxiomConfig, DEFAULT_CHECKPOINT_PATH};
+use config::{AxiomConfig, StatePaths, StateScope, DEFAULT_CHECKPOINT_PATH};
 use inference::{InferencePipeline, InferenceRuntimeOptions};
 use train::AxiomTrainer;
 
@@ -126,6 +126,12 @@ fn resolve_production_model(legacy: AxiomConfig, default_ckpt: &str) -> (AxiomCo
             (legacy, default_ckpt.to_string())
         }
     }
+}
+
+/// The legacy kernel a subcommand loads (it takes no `--checkpoint`): see
+/// [`config::resolve_kernel_checkpoint`].
+fn default_kernel(scope: StateScope) -> String {
+    config::resolve_kernel_checkpoint(DEFAULT_CHECKPOINT_PATH, scope)
 }
 
 /// Resolve `--device auto` using the hardware co-tenancy guard rather than a
@@ -430,14 +436,17 @@ async fn run_main() -> Result<()> {
             let pipeline = InferencePipeline::with_checkpoint_and_options(
                 config,
                 device,
-                args.checkpoint_path,
+                config::resolve_kernel_checkpoint(&args.checkpoint_path, StateScope::WorkingDir),
                 runtime,
             )?;
             let output = pipeline.generate(&prompt, args.max_new_tokens)?;
             println!("{output}");
         }
         "server" => {
-            let (cfg, ckpt) = resolve_production_model(config.clone(), &args.checkpoint_path);
+            let (cfg, ckpt) = resolve_production_model(
+                config.clone(),
+                &config::resolve_kernel_checkpoint(&args.checkpoint_path, StateScope::WorkingDir),
+            );
             server::run_server(&args.host, args.port, cfg, &ckpt, device)
                 .await
                 .map_err(|e| candle_core::Error::Msg(format!("server startup failed: {e}")))?;
@@ -446,13 +455,19 @@ async fn run_main() -> Result<()> {
             // Native MCP server over JSON-RPC 2.0 stdio. Runs as a dedicated
             // process (separate from the HTTP proxy) so stdout stays a pure
             // protocol channel; all diagnostics go to stderr.
-            let (cfg, ckpt) = resolve_production_model(config.clone(), &args.checkpoint_path);
+            let (cfg, ckpt) = resolve_production_model(
+                config.clone(),
+                &config::resolve_kernel_checkpoint(&args.checkpoint_path, StateScope::User),
+            );
             mcp_stdio::run_stdio_server(cfg, device, ckpt)
                 .await
                 .map_err(|e| candle_core::Error::Msg(format!("mcp server failed: {e}")))?;
         }
         "lsp" => {
-            let (cfg, ckpt) = resolve_production_model(config.clone(), &args.checkpoint_path);
+            let (cfg, ckpt) = resolve_production_model(
+                config.clone(),
+                &config::resolve_kernel_checkpoint(&args.checkpoint_path, StateScope::WorkingDir),
+            );
             let runtime = InferenceRuntimeOptions {
                 tokenizer_path: args.tokenizer_path,
                 context_api_url: None,
@@ -752,6 +767,12 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             );
             println!("[axiom] config: {}", paths.config.display());
             println!("[axiom] logs:   {}", paths.logs_dir.display());
+            // What the stdio MCP server (and `axiom run`) will use, after
+            // AXIOM_MEMORY_DIR / AXIOM_TASK_DIR / AXIOM_VIBE_PATH.
+            let state = StatePaths::resolve(StateScope::User);
+            println!("[axiom] memory: {}", state.memory_dir.display());
+            println!("[axiom] tasks:  {}", state.task_dir.display());
+            println!("[axiom] vibe:   {}", state.vibe_path.display());
 
             // Prefer a real trained production checkpoint when AXIOM_CHECKPOINT_URL
             // is configured (same convention scripts/docker_entrypoint.sh uses) --
@@ -775,14 +796,18 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                     &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
                 )
                 .unwrap_or(Device::Cpu);
-                match bootstrap::ensure_checkpoint(DEFAULT_CHECKPOINT_PATH, device) {
+                // Next to the models, not in the working directory: init runs
+                // from anywhere, and every command finds the kernel here (see
+                // config::resolve_kernel_checkpoint).
+                let kernel = paths.kernel_path.to_string_lossy().into_owned();
+                match bootstrap::ensure_checkpoint(&kernel, device) {
                     Ok(true) => println!(
-                        "[axiom] bootstrapped a local checkpoint at {DEFAULT_CHECKPOINT_PATH} \
+                        "[axiom] bootstrapped a local checkpoint at {kernel} \
                          (small offline model — run train_tokenizer + train_semantic for the \
                          full scaled model)"
                     ),
                     Ok(false) => println!(
-                        "[axiom] checkpoint already present at {DEFAULT_CHECKPOINT_PATH} — skipping bootstrap"
+                        "[axiom] checkpoint already present at {kernel} — skipping bootstrap"
                     ),
                     Err(err) => eprintln!(
                         "[axiom] checkpoint bootstrap skipped: {err}. The proxy will boot on \
@@ -833,8 +858,10 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             )?;
             // Small CPU-friendly base; resolve_production_model upgrades it to
             // the scaled BPE model when the checkpoint artifacts are present.
-            let (cfg, ckpt) =
-                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
+            let (cfg, ckpt) = resolve_production_model(
+                AxiomConfig::runtime_small(),
+                &default_kernel(StateScope::WorkingDir),
+            );
             let runtime = InferenceRuntimeOptions {
                 tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
                 context_api_url: None,
@@ -862,8 +889,10 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             let device = device_from_str(
                 &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
             )?;
-            let (cfg, ckpt) =
-                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
+            let (cfg, ckpt) = resolve_production_model(
+                AxiomConfig::runtime_small(),
+                &default_kernel(StateScope::WorkingDir),
+            );
             let runtime = InferenceRuntimeOptions {
                 tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
                 context_api_url: None,
@@ -933,8 +962,10 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             let device = device_from_str(
                 &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
             )?;
-            let (cfg, ckpt) =
-                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
+            let (cfg, ckpt) = resolve_production_model(
+                AxiomConfig::runtime_small(),
+                &default_kernel(StateScope::WorkingDir),
+            );
             let runtime = InferenceRuntimeOptions {
                 tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
                 context_api_url: None,
@@ -1089,8 +1120,10 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             let device = device_from_str(
                 &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
             )?;
-            let (cfg, ckpt) =
-                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
+            let (cfg, ckpt) = resolve_production_model(
+                AxiomConfig::runtime_small(),
+                &default_kernel(StateScope::WorkingDir),
+            );
             let runtime = InferenceRuntimeOptions {
                 tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
                 context_api_url: None,
@@ -1177,25 +1210,22 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
                 .ok_or_else(|| candle_core::Error::Msg("axiom run needs a command".into()))?;
             let program = program.clone();
             let args = args.to_vec();
+            // `axiom run` is started from any project, like the stdio MCP
+            // server, and what it remembers is read back through that server's
+            // axiom_recall — so it uses the same per-user state (~/.axiom).
+            let state = StatePaths::resolve(StateScope::User);
             // Opt-in persistence: AXIOM_RUN_VIBE=1 folds the run's failure
-            // history into the master vibe (AXIOM_VIBE_PATH or the default).
-            let vibe_path = (std::env::var("AXIOM_RUN_VIBE").as_deref() == Ok("1")).then(|| {
-                std::env::var("AXIOM_VIBE_PATH")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::path::PathBuf::from(vibe_memory::DEFAULT_VIBE_PATH))
-            });
+            // history into the master vibe (AXIOM_VIBE_PATH or ~/.axiom).
+            let vibe_path = (std::env::var("AXIOM_RUN_VIBE").as_deref() == Ok("1"))
+                .then(|| state.vibe_path.clone());
             // Learned immunity is on by default (~/.axiom/heal_memory.json);
             // AXIOM_HEAL_MEMORY overrides the path, "0"/"off" disables it.
             let heal_memory_path = heal_memory::HealMemory::default_path();
             // Opt-in: AXIOM_RUN_REMEMBER=1 writes novel healed failures into the
-            // recall memory store (AXIOM_MEMORY_DIR or the default), so the proxy
-            // can surface them into Claude's context later.
-            let remember_into =
-                (std::env::var("AXIOM_RUN_REMEMBER").as_deref() == Ok("1")).then(|| {
-                    std::env::var("AXIOM_MEMORY_DIR")
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|_| std::path::PathBuf::from("checkpoints/memory"))
-                });
+            // recall memory store (AXIOM_MEMORY_DIR or ~/.axiom/memory), so
+            // axiom_recall can surface them into Claude's context later.
+            let remember_into = (std::env::var("AXIOM_RUN_REMEMBER").as_deref() == Ok("1"))
+                .then(|| state.memory_dir.clone());
             let opts = self_heal::SupervisorOptions {
                 max_restarts,
                 vibe_path,
@@ -1227,8 +1257,10 @@ async fn handle_axiom_command(command: AxiomCommand) -> Result<()> {
             let device = device_from_str(
                 &std::env::var("AXIOM_DEVICE").unwrap_or_else(|_| "cpu".to_string()),
             )?;
-            let (cfg, ckpt) =
-                resolve_production_model(AxiomConfig::runtime_small(), DEFAULT_CHECKPOINT_PATH);
+            let (cfg, ckpt) = resolve_production_model(
+                AxiomConfig::runtime_small(),
+                &default_kernel(StateScope::User),
+            );
             let runtime = InferenceRuntimeOptions {
                 tokenizer_path: std::env::var("AXIOM_TOKENIZER").ok(),
                 context_api_url: None,

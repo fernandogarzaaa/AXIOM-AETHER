@@ -7,6 +7,33 @@ releases are described on the GitHub Releases page.
 
 ### Fixed
 
+- The stdio MCP server (`axiom --mode mcp`) no longer writes into the project
+  you have open. With `AXIOM_MEMORY_DIR`, `AXIOM_TASK_DIR` and
+  `AXIOM_VIBE_PATH` unset it used `checkpoints/memory/`,
+  `checkpoints/tasks/` and `axiom_master_vibe.bin` relative to the directory
+  the host started it in, so every registration (`claude mcp add`, the root
+  `.mcp.json`, the plugin) put those files into each repo and gave each repo
+  its own memory -- `personal` memory did not follow you. The defaults are now
+  `~/.axiom/memory/`, `~/.axiom/tasks/` and `~/.axiom/axiom_master_vibe.bin`;
+  a variable that is set still wins. `axiom run` (`AXIOM_RUN_REMEMBER=1`,
+  `AXIOM_RUN_VIBE=1`) uses the same locations, so `axiom_recall` finds what
+  it remembers. The HTTP server (`--mode server`, including `/mcp`) and
+  `axiom prime` keep their working-directory defaults.
+- `axiom init` bootstraps its offline kernel at
+  `~/.axiom/models/axiom_kernel_v1.safetensors` instead of
+  `./axiom_kernel_v1.safetensors`. Commands that load the kernel without
+  `--checkpoint` look in both places (the MCP server and `axiom run` try
+  `~/.axiom/models` first, everything else the working directory first).
+- Upgrading: memory an older release wrote into `<repo>/checkpoints/memory`
+  is not read any more, and the MCP server says so on stderr when it starts
+  in such a repo. docs/MCP-CLIENTS.md ("Moving existing memory") has the
+  commands that merge it into `~/.axiom/`.
+- docs/MCP-CLIENTS.md told you to `pip install axiom-engine`, the separate
+  pure-Python reference package; the package that ships the `axiom` binary is
+  `axiom-aether`. Its registration examples (and docs/AGENT-SETUP.md's) no
+  longer pass a relative `--checkpoint`, which resolved against whichever
+  project was open.
+
 - `axiom solve` no longer "repairs" a failing check by editing it. The first
   source-repair phase only knew fixture-shaped rewrites (`exit 1` → `exit 0`,
   a marker rename, replacing the file with a script that exits 0) and reported

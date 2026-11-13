@@ -106,6 +106,18 @@ impl MasterVibe {
     pub fn from_env(n_layers: usize, d_model: usize, device: &Device) -> Self {
         let path =
             std::env::var("AXIOM_VIBE_PATH").unwrap_or_else(|_| DEFAULT_VIBE_PATH.to_string());
+        Self::at_path_with_env_decay(path, n_layers, d_model, device)
+    }
+
+    /// Load (or lazily create) the master vibe at an already-resolved `path`
+    /// (see [`crate::config::StatePaths`]), reading `decay` from
+    /// `AXIOM_VIBE_DECAY` like [`Self::from_env`].
+    pub fn at_path_with_env_decay(
+        path: impl AsRef<Path>,
+        n_layers: usize,
+        d_model: usize,
+        device: &Device,
+    ) -> Self {
         let decay = std::env::var("AXIOM_VIBE_DECAY")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())

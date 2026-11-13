@@ -300,10 +300,13 @@ pub async fn run_server(
         .map(|v| v == "1")
         .unwrap_or(false)
     {
+        // The HTTP server keeps working-directory-relative state defaults
+        // (its launch scripts pin them); only the stdio server is per-user.
         match crate::mcp_stdio::build_context(
             config.clone(),
             device.clone(),
             checkpoint_path.to_string(),
+            &crate::config::StatePaths::resolve(crate::config::StateScope::WorkingDir),
         )
         .await
         {

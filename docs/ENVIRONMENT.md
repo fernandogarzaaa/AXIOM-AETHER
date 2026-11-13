@@ -55,7 +55,7 @@ unset. When you add a variable, add it here.
 | `AXIOM_EMB_CKPT` | `checkpoints/axiom_embedder.bin` | Embedding model used by MCP memory recall and `eval_recall`. |
 | `AXIOM_FORGET_GATE` | `1.0` | Parameter-free forget gate α on the delta rule (α < 1 decays fast-weight memory). |
 | `AXIOM_VIBE` / `AXIOM_VIBE_PRIME` | see README | Persistent fast-weight memory controls. |
-| `AXIOM_VIBE_PATH` | `axiom_master_vibe.bin` | Master vibe file. |
+| `AXIOM_VIBE_PATH` | `~/.axiom/axiom_master_vibe.bin` for `--mode mcp` and `axiom run`; `axiom_master_vibe.bin` (cwd) for `--mode server` and `axiom prime` | Master vibe file. |
 | `AXIOM_VIBE_DECAY` | `0.9` | EMA decay when sessions are merged into the master vibe. |
 | `AXIOM_DRIFT_THRESHOLD` | per build | Drift score threshold for `axiom_evaluate_drift`. |
 
@@ -65,7 +65,8 @@ unset. When you add a variable, add it here.
 |---|---|---|
 | `AXIOM_MCP_MAX_FILES` | `512` | Files `axiom_compress_path` will absorb per call. |
 | `AXIOM_MCP_MAX_BYTES` | `1048576` | Bytes `axiom_compress_path` will absorb per call (cut at a char boundary). |
-| `AXIOM_TASK_DIR` | `checkpoints/tasks/` | Task-board storage; set an absolute path because MCP hosts may start the server from a read-only cwd. |
+| `AXIOM_MEMORY_DIR` | `~/.axiom/memory/` for `--mode mcp` and `axiom run`; `checkpoints/memory/` (cwd) for the HTTP server's `/mcp` | Recall memory store (`axiom_remember` / `axiom_recall`). Per user so `personal` memory follows you across repos; see [MCP-CLIENTS.md](MCP-CLIENTS.md#moving-existing-memory) to move memory an older release wrote into a project. When it is set and `AXIOM_EPISTEMIC_TELEMETRY_PATH` is not, epistemic telemetry is written here too. |
+| `AXIOM_TASK_DIR` | `~/.axiom/tasks/` for `--mode mcp`; `checkpoints/tasks/` (cwd) for the HTTP server's `/mcp` | Task-board storage. |
 
 ## Backends and routing
 

@@ -31,10 +31,11 @@ trap cleanup EXIT
 export HOME="$NEWHOME"
 export AXIOM_DEVICE=cpu
 unset AXIOM_HEAL_MEMORY AXIOM_FLEET_KEY ANTHROPIC_API_KEY 2>/dev/null || true
-# Run from inside the throwaway workspace so commands that write a *relative*
-# artifact (e.g. `axiom init` bootstraps ./axiom_kernel_v1.safetensors when no
-# model can be fetched) keep it inside the temp dir, never the caller's repo —
-# the simulation must be fully isolated, not rely on .gitignore to hide leaks.
+# Run from inside the throwaway workspace so any command that writes a
+# *relative* artifact (older releases' `axiom init` bootstrapped
+# ./axiom_kernel_v1.safetensors; it now goes to ~/.axiom/models) keeps it inside
+# the temp dir, never the caller's repo — the simulation must be fully
+# isolated, not rely on .gitignore to hide leaks.
 cd "$WORK" || { echo "cannot enter workspace"; exit 1; }
 
 P=0; F=0
