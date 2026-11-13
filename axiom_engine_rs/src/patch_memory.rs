@@ -390,15 +390,13 @@ impl PatchMemory {
         });
     }
 
-    /// Persist to disk (pretty JSON).
+    /// Persist to disk (pretty JSON). The file is replaced by rename
+    /// ([`crate::atomic_write::write_replacing`]): a reader, or a save that is
+    /// cut short, finds the whole old store or the whole new one, never part
+    /// of one.
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(self).expect("serialize patch memory");
-        if let Some(parent) = path.as_ref().parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        std::fs::write(path, json)
+        crate::atomic_write::write_replacing(path.as_ref(), json.as_bytes())
     }
 
     /// Record a locally-verified fix: in `scope`, the file whose content was
@@ -1666,6 +1664,40 @@ mod tests {
         });
         assert!(local.is_empty());
         assert!(local.merged_exports.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_never_overwrites_the_store_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("axiom_patch_memory.json");
+        let mut memory = PatchMemory::new();
+        memory.record_verified("fp", &scope("a.rs"), "BAD\n", "FIX\n");
+        memory.save(&store).unwrap();
+        let as_it_was = std::fs::read(&store).unwrap();
+
+        // A second name for the same file on disk. If the next save writes
+        // into that file, this name shows the new bytes, and a save cut short
+        // would have left the only copy half written.
+        let kept = dir.path().join("as-it-was");
+        std::fs::hard_link(&store, &kept).unwrap();
+
+        memory.record_verified("fp2", &scope("b.rs"), "BAD\n", "OTHER\n");
+        memory.save(&store).unwrap();
+        assert!(
+            std::fs::read(&kept).unwrap() == as_it_was,
+            "the save wrote into the existing store file instead of replacing it"
+        );
+        assert_eq!(PatchMemory::load(&store).candidates("fp2").len(), 1);
+
+        // Nothing is left beside the store.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["as-it-was", "axiom_patch_memory.json"]);
     }
 
     #[test]

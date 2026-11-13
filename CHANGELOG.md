@@ -26,6 +26,26 @@ releases are described on the GitHub Releases page.
 - `POST /v1/hypervisor/jit_run` no longer replaces a file longer than 4096
   characters with a two-line script when the file contains `throw `,
   `Write-Error` or a fixture marker.
+- A fleet export counts once. Delivering the same signed export again to
+  `POST /v1/patches/merge` or `POST /v1/immunity/merge` (a retry, a sync job
+  on a timer, a replay, or a node's own export posted back to it) used to
+  count as a fresh confirmation each time: a stored fix's `verified_count`
+  rose and a heal record's evidence compounded. It now answers
+  `"already_merged": true` and changes nothing. A store remembers the last
+  1024 exports it merged, in the store file, and the last 1024 it handed
+  out, in `<store>.exports.json` beside it. `axiom immunity pull` says when
+  a peer's export was merged before.
+- The patch store and the heal memory are saved by rename instead of being
+  written in place. A save that is interrupted, or read while it is in
+  progress, used to leave or show a partly written file, and a store that
+  does not parse loads as empty. The old file now stays whole until the new
+  one is complete. The file keeps its permissions, owner and group; a store
+  that is a symbolic link stays a link; a store the process could not have
+  written in place is refused. Where a file cannot be replaced (a single
+  file mounted into a container, a directory the process may not create
+  files in), or could only be replaced by a file with a different owner or
+  group, it is written in place, as before. Access control lists and other
+  extended attributes on a store are not carried over to the new file.
 
 ### Changed
 
