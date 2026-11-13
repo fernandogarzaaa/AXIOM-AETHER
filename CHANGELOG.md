@@ -20,7 +20,10 @@ behaviour: read **Upgrade notes** before upgrading a server or a fleet.
 
 Proof loop: repair 32/32, compression 85.7% (legacy tokenizer) and 87.6%
 (production BPE) at 3608/3608 round-trip, trust gate 100% supported coverage
-([table](bench/results/proof-loop-2026-11-13.md)).
+([table](bench/results/proof-loop-2026-11-13.md)). Held-out repair on a
+seed-7 corpus from the current, harder seeder: 26/40, against 28/40 for 0.7.0
+on the same corpus; the two lost fixtures have their fault inside a multi-line
+assertion, which 0.8.0 deliberately no longer edits.
 
 ### Upgrade notes
 
@@ -276,7 +279,10 @@ Proof loop: repair 32/32, compression 85.7% (legacy tokenizer) and 87.6%
   on every exit (#279).
 - Mutation repair could make a test pass by flipping a comparison on the
   second line of a multi-line `assert (…)` / `assert!(…)`. Continuation lines
-  of an assertion are now never mutated (#286).
+  of an assertion are now never mutated. The rule covers assertions in
+  production code too, so a fault inside a multi-line `assert!` precondition
+  is no longer repaired: on a seed-7 held-out corpus this costs 2 of 40
+  fixtures that 0.7.0 repaired (28/40 → 26/40) (#286).
 - Planning mutation candidates for a large file no longer holds a full copy of
   the file for every candidate. Planning a 2,000-line file for one candidate
   took about 222 MB before and about 22 MB after; the two figures come from
