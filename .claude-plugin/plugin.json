@@ -1,6 +1,6 @@
 {
   "name": "axiom",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Axiom — local-first online Test-Time Training runtime. Adds 17 MCP tools (20 with `--features experimental`) for context compression, persistent memory and recall, grounding verification, drift detection, learned self-healing immunity, and a multi-agent task board.",
   "author": {
     "name": "fernandogarzaaa",

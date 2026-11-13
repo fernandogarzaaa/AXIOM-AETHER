@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Axiom — a local-first Rust runtime for online Test-Time Training, context compression, grounding, and self-healing execution.",
-    "version": "0.7.0"
+    "version": "0.8.0"
   },
   "plugins": [
     {
