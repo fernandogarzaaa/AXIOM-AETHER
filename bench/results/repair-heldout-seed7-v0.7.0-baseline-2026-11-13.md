@@ -10,7 +10,7 @@ Corpus: `/tmp/claude-0/-home-user-AXIOM-AETHER/3625c33e-e5a7-566a-8b5d-bee72903a
 | gumbel-L78-deref-13 | rust | FAIL | no repair found | 31.6s, tree intact |
 | gumbel-L88-offbyone-29 | rust | PASS | mutation repair verified green (off-by-one:L88 drop `- 1`) | 3.4s, authored fix, pinned 0 file(s) intact |
 | idc-L123-cast-34 | rust | FAIL | no repair found | 30.6s, tree intact |
-| idc-L162-logic-15 | rust | PASS | mutation repair verified green (logic:L162 || -> &&) | 3.3s, authored fix, pinned 0 file(s) intact |
+| idc-L162-logic-15 | rust | PASS | mutation repair verified green (logic:L162 \|\| -> &&) | 3.3s, authored fix, pinned 0 file(s) intact |
 | idc-L69-cast-03 | rust | FAIL | no repair found | 31.0s, tree intact |
 | idc-L78-cast-12 | rust | FAIL | no repair found | 30.8s, tree intact |
 | idc-L80-shift-09 | rust | FAIL | no repair found | 26.5s, tree intact |
@@ -20,7 +20,7 @@ Corpus: `/tmp/claude-0/-home-user-AXIOM-AETHER/3625c33e-e5a7-566a-8b5d-bee72903a
 | mesh-L192-cast-23 | rust | FAIL | no repair found | 29.8s, tree intact |
 | mesh-L214-cmp-35 | rust | PASS | mutation repair verified green (comparison:L214 == -> !=) | 2.4s, authored fix, pinned 0 file(s) intact |
 | mesh-L233-idswap-14 | rust | FAIL | no repair found | 33.1s, tree intact |
-| mesh-L269-logic-38 | rust | PASS | mutation repair verified green (logic:L269 && -> ||) | 17.4s, authored fix, pinned 0 file(s) intact |
+| mesh-L269-logic-38 | rust | PASS | mutation repair verified green (logic:L269 && -> \|\|) | 17.4s, authored fix, pinned 0 file(s) intact |
 | mesh-L275-minmax-16 | rust | PASS | mutation repair verified green (off-by-one:L275 1 -> 2) | 2.3s, different fix, pinned 0 file(s) intact |
 | mesh-L283-idswap-37 | rust | PASS | mutation repair verified green (ident-swap:L283 swap `total_visits` <-> `config`) | 5.9s, authored fix, pinned 0 file(s) intact |
 | mesh-L314-ret-08 | rust | FAIL | no repair found | 27.9s, tree intact |
@@ -39,7 +39,7 @@ Corpus: `/tmp/claude-0/-home-user-AXIOM-AETHER/3625c33e-e5a7-566a-8b5d-bee72903a
 | mesh-L476-argswap-21 | rust | PASS | mutation repair verified green (swap-args:L476 swap args `residual` <-> `payload`) | 3.7s, authored fix, pinned 0 file(s) intact |
 | mesh-L484-bool-02 | rust | PASS | mutation repair verified green (boolean:L484 true -> false) | 15.2s, authored fix, pinned 0 file(s) intact |
 | mesh-L488-cmp-24 | rust | PASS | mutation repair verified green (comparison:L488 > -> >=) | 12.1s, authored fix, pinned 0 file(s) intact |
-| mesh-L488-logic-27 | rust | PASS | mutation repair verified green (logic:L488 && -> ||) | 19.7s, authored fix, pinned 0 file(s) intact |
+| mesh-L488-logic-27 | rust | PASS | mutation repair verified green (logic:L488 && -> \|\|) | 19.7s, authored fix, pinned 0 file(s) intact |
 | mesh-L489-flow-04 | rust | PASS | mutation repair verified green (api-swap:L489 break -> continue) | 22.4s, authored fix, pinned 0 file(s) intact |
 | mesh-L491-bool-22 | rust | PASS | mutation repair verified green (boolean:L491 false -> true) | 16.3s, authored fix, pinned 0 file(s) intact |
 | mesh-L502-range-19 | rust | PASS | mutation repair verified green (off-by-one:L502 ..= -> ..) | 4.4s, authored fix, pinned 0 file(s) intact |

@@ -12,7 +12,7 @@ unset. When you add a variable, add it here.
 |---|---|---|
 | `AXIOM_HOST` / `AXIOM_PORT` | `127.0.0.1` / `3000` | Bind address for `--mode server`. A non-loopback bind requires `AXIOM_API_KEY` or `AXIOM_ALLOW_OPEN=1`. |
 | `AXIOM_ALLOW_OPEN` | unset | Allow a non-loopback bind without `AXIOM_API_KEY` (loud startup warning). |
-| `AXIOM_API_KEY` | unset (open) | Data-plane key; every route but `/healthz` and `/readyz` needs `X-Axiom-Key`, `/metrics` included (since 0.8.0). Only that header is accepted, so a Prometheus scrape must be able to send it. |
+| `AXIOM_API_KEY` | unset (open) | Data-plane key; every route but `/healthz`, `/readyz` and `/mcp` needs `X-Axiom-Key`, `/metrics` included (since 0.8.0). Only that header is accepted, so a Prometheus scrape must be able to send it. `/mcp` takes `Authorization: Bearer <AXIOM_MCP_TOKEN>` when that is set, and otherwise this key (as `X-Axiom-Key` or a bearer token). |
 | `AXIOM_CORS_ORIGINS` | unset (no cross-origin access) | Comma-separated exact origins allowed to call the API from a browser (e.g. `https://app.example.com,http://localhost:3000`). Unlisted origins get no `Access-Control-Allow-Origin`; `*` is ignored with a warning. Requests without an `Origin` header are unaffected. Also the `Origin` allowlist of the merge routes. |
 | `AXIOM_MCP_HTTP` | unset (`/mcp` returns 503) | `1` enables the HTTP MCP transport. |
 | `AXIOM_MCP_TOKEN` | unset | Bearer token for `/mcp`. Unset + `AXIOM_API_KEY` set ⇒ `/mcp` requires the API key instead. |
