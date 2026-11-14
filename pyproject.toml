@@ -34,7 +34,7 @@ server = [
 ]
 dev = [
     "pytest>=9.1.1",
-    "pytest-asyncio>=0.23",
+    "pytest-asyncio>=1.4.1.post1",
     "httpx>=0.28.1",  # async test client for FastAPI
 ]
 
