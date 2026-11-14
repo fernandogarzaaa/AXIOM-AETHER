@@ -172,7 +172,7 @@ tower-lsp = "0.20"
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 safetensors = "0.8"
-dashmap = "5.5"
+dashmap = "6.2"
 walkdir = "2.5"
 clap = { version = "4.6.1", features = ["derive"] }
 toml = "1.1.2"
