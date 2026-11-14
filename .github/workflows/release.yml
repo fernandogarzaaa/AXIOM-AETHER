@@ -177,7 +177,7 @@ jobs:
             --sbom "${{ env.ASSET }}.sbom.json"
 
       - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.VERSION }}
           files: |
@@ -276,7 +276,7 @@ jobs:
           done
 
       - name: Upload checkpoint assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.VERSION }}
           files: |
