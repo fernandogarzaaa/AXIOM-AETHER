@@ -1004,6 +1004,15 @@ impl AppState {
         new_count
     }
 
+    /// Test hook: preset a session's R3 gap state so an integration test can
+    /// reach the long-gap threshold without waiting out real 5-minute gaps.
+    #[doc(hidden)]
+    pub fn seed_pss_gap(&self, session_id: &str, last_turn_unix: u64, long_gap_count: u32) {
+        if let Ok(mut map) = self.pss_gap.write() {
+            map.insert(session_id.to_string(), (last_turn_unix, long_gap_count));
+        }
+    }
+
     /// P3 (PSS) L-B retry guard. Given this turn's `inbound_hash` and the
     /// current time, decide whether the trivial turn may be answered locally.
     /// Returns `false` (→ forward upstream) when the identical inbound was
