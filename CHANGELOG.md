@@ -5,6 +5,16 @@ releases are described on the GitHub Releases page.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Subagent calls through the proxy no longer fail with API 400.** Once a
+  session had several long gaps, the adaptive cache TTL step (R3) marked the
+  newest breakpoint `"ttl":"1h"` even when the tools or system breakpoints
+  before it were 5-minute ones. The API rejects a 1h breakpoint after a 5m
+  one, so every Claude Code subagent launched from such a session failed. R3
+  now adds the 1h ttl only when every earlier breakpoint is already 1h, and
+  otherwise leaves the request as the client sent it.
+
 ## [0.8.0] - 2026-11-13
 
 Headline: 0.8.0 is a hardening release. On a default install a web page

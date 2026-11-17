@@ -262,7 +262,7 @@ async fn adaptive_ttl_does_not_fire_without_long_gaps() {
     // Rapid back-to-back turns: the inter-turn gap is milliseconds, far under
     // the 240s window, so the long-gap count never reaches the threshold and
     // no `"ttl":"1h"` is added. (The positive path is covered by rebase.rs
-    // unit tests: next_long_gap_count + choose_ttl + set_newest_cache_ttl.)
+    // unit tests: next_long_gap_count + choose_ttl; the past-threshold cases are below.)
     for _ in 0..4 {
         assert_eq!(
             post_messages(&app, body_with_old_heavy("ttl-nogap", "steady prefix")).await,
@@ -277,4 +277,193 @@ async fn adaptive_ttl_does_not_fire_without_long_gaps() {
             .any(|r| r.to_string().contains("\"ttl\":\"1h\"")),
         "no long gaps -> adaptive TTL stays at the default 5-minute window"
     );
+}
+
+/// Every `cache_control` breakpoint in the order the Anthropic API processes
+/// them (tools, then system, then messages, with blocks nested in a
+/// `tool_result` before the block itself), as `(location, ttl)`. A breakpoint
+/// with no `ttl` is the 5-minute default.
+fn breakpoints(body: &Value) -> Vec<(String, String)> {
+    fn ttl_of(block: &Value) -> Option<String> {
+        let cc = block.get("cache_control")?;
+        Some(
+            cc.get("ttl")
+                .and_then(Value::as_str)
+                .unwrap_or("5m")
+                .to_string(),
+        )
+    }
+    let mut out = Vec::new();
+    for (i, tool) in body["tools"].as_array().into_iter().flatten().enumerate() {
+        if let Some(ttl) = ttl_of(tool) {
+            out.push((format!("tools[{i}]"), ttl));
+        }
+    }
+    for (i, block) in body["system"].as_array().into_iter().flatten().enumerate() {
+        if let Some(ttl) = ttl_of(block) {
+            out.push((format!("system[{i}]"), ttl));
+        }
+    }
+    for (m, msg) in body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (b, block) in msg["content"].as_array().into_iter().flatten().enumerate() {
+            for (n, inner) in block["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if let Some(ttl) = ttl_of(inner) {
+                    out.push((format!("messages[{m}][{b}][{n}]"), ttl));
+                }
+            }
+            if let Some(ttl) = ttl_of(block) {
+                out.push((format!("messages[{m}][{b}]"), ttl));
+            }
+        }
+    }
+    out
+}
+
+/// The API rejects a request where a 1h breakpoint comes after a 5m one.
+fn assert_ttl_order_accepted(body: &Value) {
+    let points = breakpoints(body);
+    if let Some(first_5m) = points.iter().position(|(_, ttl)| ttl != "1h") {
+        let late_1h: Vec<_> = points[first_5m..]
+            .iter()
+            .filter(|(_, ttl)| ttl == "1h")
+            .collect();
+        assert!(
+            late_1h.is_empty(),
+            "1h breakpoint after a 5m one at {:?} (would be API 400): {points:?}",
+            points[first_5m].0
+        );
+    }
+}
+
+fn ephemeral(ttl: Option<&str>) -> Value {
+    match ttl {
+        Some(ttl) => json!({"type": "ephemeral", "ttl": ttl}),
+        None => json!({"type": "ephemeral"}),
+    }
+}
+
+/// A request shaped like Claude Code's: breakpoints on the last tool, the
+/// system prompt, an earlier user turn and the newest user turn.
+fn claude_code_shaped(
+    session_id: &str,
+    prefix_ttl: Option<&str>,
+    earlier_ttl: Option<&str>,
+    newest_ttl: Option<&str>,
+) -> Value {
+    json!({
+        "model": "claude-sonnet-5",
+        "max_tokens": 16,
+        "session_id": session_id,
+        "tools": [
+            {"name": "Read", "input_schema": {"type": "object"}},
+            {"name": "Bash", "input_schema": {"type": "object"},
+             "cache_control": ephemeral(prefix_ttl)},
+        ],
+        "system": [
+            {"type": "text", "text": "You are a helpful agent.",
+             "cache_control": ephemeral(prefix_ttl)},
+        ],
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "first task",
+                 "cache_control": ephemeral(earlier_ttl)}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "working on it"}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "newest turn",
+                 "cache_control": ephemeral(newest_ttl)}]},
+        ],
+    })
+}
+
+/// Forward `body` for a session already past the R3 long-gap threshold and
+/// return what the upstream received.
+async fn forward_past_ttl_threshold(session_id: &str, body: Value) -> Value {
+    let (upstream, capture, _task) = start_capturing_upstream().await;
+    let state = build_state(upstream).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    state.seed_pss_gap(session_id, now, 5);
+    let app = create_router(state);
+    assert_eq!(post_messages(&app, body).await, StatusCode::OK);
+    let captured = capture.requests.lock().unwrap();
+    assert_eq!(captured.len(), 1, "exactly one upstream call");
+    captured[0].clone()
+}
+
+#[tokio::test]
+async fn adaptive_ttl_never_puts_1h_after_a_default_subagent_breakpoint() {
+    let _guard = env_lock().lock().await;
+    std::env::set_var("AXIOM_ADAPTIVE_TTL", "on");
+    let _cleanup = EnvVarGuard("AXIOM_ADAPTIVE_TTL");
+
+    // A subagent request: default (5m) breakpoints everywhere, sent under the
+    // parent's session id, which has already crossed the long-gap threshold.
+    let inbound = claude_code_shaped("ttl-subagent", None, None, None);
+    let outbound = forward_past_ttl_threshold("ttl-subagent", inbound.clone()).await;
+
+    assert_ttl_order_accepted(&outbound);
+    assert_eq!(
+        breakpoints(&outbound),
+        breakpoints(&inbound),
+        "breakpoint ttls are left as the client sent them"
+    );
+}
+
+#[tokio::test]
+async fn adaptive_ttl_keeps_an_all_1h_main_thread_request_valid() {
+    let _guard = env_lock().lock().await;
+    std::env::set_var("AXIOM_ADAPTIVE_TTL", "on");
+    let _cleanup = EnvVarGuard("AXIOM_ADAPTIVE_TTL");
+
+    let inbound = claude_code_shaped("ttl-main", Some("1h"), Some("1h"), Some("1h"));
+    let outbound = forward_past_ttl_threshold("ttl-main", inbound.clone()).await;
+
+    assert_ttl_order_accepted(&outbound);
+    assert_eq!(breakpoints(&outbound), breakpoints(&inbound));
+}
+
+#[tokio::test]
+async fn adaptive_ttl_elects_1h_when_every_earlier_breakpoint_is_1h() {
+    let _guard = env_lock().lock().await;
+    std::env::set_var("AXIOM_ADAPTIVE_TTL", "on");
+    let _cleanup = EnvVarGuard("AXIOM_ADAPTIVE_TTL");
+
+    let inbound = claude_code_shaped("ttl-elect", Some("1h"), Some("1h"), None);
+    let outbound = forward_past_ttl_threshold("ttl-elect", inbound).await;
+
+    assert_ttl_order_accepted(&outbound);
+    let points = breakpoints(&outbound);
+    assert_eq!(
+        points.last(),
+        Some(&("messages[2][0]".to_string(), "1h".to_string())),
+        "the newest breakpoint is upgraded to 1h: {points:?}"
+    );
+}
+
+#[tokio::test]
+async fn adaptive_ttl_skips_when_an_earlier_message_breakpoint_is_default() {
+    let _guard = env_lock().lock().await;
+    std::env::set_var("AXIOM_ADAPTIVE_TTL", "on");
+    let _cleanup = EnvVarGuard("AXIOM_ADAPTIVE_TTL");
+
+    // tools and system are 1h, but an earlier message breakpoint is 5m: a 1h
+    // newest breakpoint would still come after a 5m one.
+    let inbound = claude_code_shaped("ttl-mixed", Some("1h"), None, None);
+    let outbound = forward_past_ttl_threshold("ttl-mixed", inbound.clone()).await;
+
+    assert_ttl_order_accepted(&outbound);
+    assert_eq!(breakpoints(&outbound), breakpoints(&inbound));
 }

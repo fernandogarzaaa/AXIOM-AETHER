@@ -700,19 +700,24 @@ async fn compressed_messages_path(
     // losing the 5-minute prompt cache and re-paying the full write. Once a
     // session's long-gap count crosses the threshold, elect Anthropic's 1-hour
     // TTL (a one-time 2x write premium beats repeated 1.25x full re-writes) by
-    // annotating the newest `cache_control` breakpoint with `"ttl":"1h"`. This
-    // only ever ADDS a field to the final breakpoint block; it never reorders
-    // or removes content, so the cached prefix stays byte-stable. Default ON
-    // since the 2026-07-16 live eval; opt out with AXIOM_ADAPTIVE_TTL=off.
+    // annotating the newest `cache_control` breakpoint with `"ttl":"1h"`, and
+    // only when every earlier breakpoint is already 1h: the API rejects a 1h
+    // breakpoint after a 5m one (tools, system, messages order). It only ever
+    // ADDS a field to the final breakpoint block, so the cached prefix stays
+    // byte-stable. Default ON since the 2026-07-16 live eval; opt out with
+    // AXIOM_ADAPTIVE_TTL=off.
     if std::env::var("AXIOM_ADAPTIVE_TTL").as_deref() != Ok("off") {
         let count = state.pss_gap_tick(&session_id, unix_now(), 240);
         if let Some(ttl) = crate::rebase::choose_ttl(count, 3) {
-            if let Some(msgs) = outbound.get_mut("messages").and_then(Value::as_array_mut) {
-                if crate::rebase::set_newest_cache_ttl(msgs, ttl) {
-                    eprintln!(
-                        "[axiom-pss] R3 adaptive-ttl: session {session_id} long_gaps={count} -> ttl={ttl}"
-                    );
-                }
+            let election = crate::rebase::elect_newest_cache_ttl(&mut outbound, ttl);
+            if election == crate::rebase::TtlElection::Applied {
+                eprintln!(
+                    "[axiom-pss] R3 adaptive-ttl: session {session_id} long_gaps={count} -> ttl={ttl}"
+                );
+            } else if election == crate::rebase::TtlElection::EarlierShorterTtl {
+                eprintln!(
+                    "[axiom-pss] R3 adaptive-ttl: session {session_id} long_gaps={count} skipped (an earlier breakpoint is 5m)"
+                );
             }
         }
     }

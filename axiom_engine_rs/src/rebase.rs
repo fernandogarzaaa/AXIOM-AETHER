@@ -71,28 +71,91 @@ pub fn is_genuine_break(prev_len: usize, prev_hash: &str, frozen: &[Value]) -> b
     head_hash != prev_hash
 }
 
-/// Annotate the newest cache breakpoint with an explicit `ttl`. Walks
-/// `messages` from the end and, in the first message whose content array holds
-/// a block carrying a `cache_control` object, sets `cache_control.ttl = ttl` on
-/// the last such block. Returns `true` if a breakpoint was found and updated.
-/// Only ever ADDS a field -- content, order, and count are untouched -- so the
-/// cached prefix stays byte-stable.
-pub fn set_newest_cache_ttl(messages: &mut [Value], ttl: &str) -> bool {
-    for msg in messages.iter_mut().rev() {
-        let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for block in content.iter_mut().rev() {
-            if let Some(cc) = block
-                .get_mut("cache_control")
-                .and_then(Value::as_object_mut)
-            {
-                cc.insert("ttl".to_string(), Value::String(ttl.to_string()));
-                return true;
-            }
+/// What [`elect_newest_cache_ttl`] did to a request body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtlElection {
+    /// The newest breakpoint now carries the elected ttl.
+    Applied,
+    /// The newest breakpoint already carried it; nothing changed.
+    AlreadySet,
+    /// An earlier breakpoint is 5m (or has no ttl), and the API rejects a 1h
+    /// breakpoint after a 5m one; nothing changed.
+    EarlierShorterTtl,
+    /// The body has a top-level `cache_control` (automatic caching), whose
+    /// placement the proxy does not model; nothing changed.
+    AutomaticCaching,
+    /// No breakpoint to annotate.
+    NoBreakpoint,
+}
+
+/// Every `cache_control` object in the order the API processes breakpoints
+/// (`tools`, then `system`, then `messages`; blocks nested in a `tool_result`
+/// before the block itself), as `(JSON pointer, is_1h)`. A breakpoint without
+/// `"ttl":"1h"` is the 5-minute default.
+fn cache_breakpoints(body: &Value) -> Vec<(String, bool)> {
+    fn push(out: &mut Vec<(String, bool)>, block: &Value, path: String) {
+        if let Some(cc) = block.get("cache_control").filter(|cc| cc.is_object()) {
+            let is_1h = cc.get("ttl").and_then(Value::as_str) == Some("1h");
+            out.push((format!("{path}/cache_control"), is_1h));
         }
     }
-    false
+    fn items<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = (usize, &'a Value)> {
+        v.get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+    }
+    let mut out = Vec::new();
+    for (i, tool) in items(body, "tools") {
+        push(&mut out, tool, format!("/tools/{i}"));
+    }
+    for (i, block) in items(body, "system") {
+        push(&mut out, block, format!("/system/{i}"));
+    }
+    for (m, msg) in items(body, "messages") {
+        for (b, block) in items(msg, "content") {
+            let path = format!("/messages/{m}/content/{b}");
+            for (n, inner) in items(block, "content") {
+                push(&mut out, inner, format!("{path}/content/{n}"));
+            }
+            push(&mut out, block, path);
+        }
+    }
+    out
+}
+
+/// Annotate the newest cache breakpoint with `ttl`, but only when the result
+/// is a request the API accepts: a 1h breakpoint must never come after a 5m
+/// one, in the order tools, system, messages. Claude Code subagents send 5m
+/// breakpoints on tools and system under the parent's session id, so
+/// upgrading their newest breakpoint alone was an API 400 on every call.
+///
+/// Only ever ADDS a field to the final breakpoint. Earlier breakpoints are
+/// never rewritten, so the cached prefix the client already paid for keeps
+/// its bytes and its ttl.
+pub fn elect_newest_cache_ttl(body: &mut Value, ttl: &str) -> TtlElection {
+    if body.get("cache_control").is_some() {
+        return TtlElection::AutomaticCaching;
+    }
+    let points = cache_breakpoints(body);
+    let Some(((newest, newest_is_1h), earlier)) = points.split_last() else {
+        return TtlElection::NoBreakpoint;
+    };
+    let electing_1h = ttl == "1h";
+    if electing_1h && *newest_is_1h {
+        return TtlElection::AlreadySet;
+    }
+    if electing_1h && earlier.iter().any(|(_, is_1h)| !is_1h) {
+        return TtlElection::EarlierShorterTtl;
+    }
+    match body.pointer_mut(newest).and_then(Value::as_object_mut) {
+        Some(cc) => {
+            cc.insert("ttl".to_string(), Value::String(ttl.to_string()));
+            TtlElection::Applied
+        }
+        None => TtlElection::NoBreakpoint,
+    }
 }
 
 /// Flatten a `tool_result` block's own `content` (which is independently a
@@ -298,24 +361,99 @@ mod tests {
     }
 
     #[test]
-    fn set_newest_cache_ttl_annotates_only_the_last_breakpoint() {
-        let mut messages = vec![
-            json!({"role":"user","content":[
-                {"type":"text","text":"old","cache_control":{"type":"ephemeral"}}]}),
-            json!({"role":"user","content":[
+    fn elect_newest_cache_ttl_annotates_only_the_last_breakpoint() {
+        let mut body = json!({"messages":[
+            {"role":"user","content":[
+                {"type":"text","text":"old","cache_control":{"type":"ephemeral","ttl":"1h"}}]},
+            {"role":"user","content":[
                 {"type":"text","text":"a"},
-                {"type":"text","text":"newest","cache_control":{"type":"ephemeral"}}]}),
-        ];
-        assert!(set_newest_cache_ttl(&mut messages, "1h"));
-        // newest breakpoint gets the ttl...
+                {"type":"text","text":"newest","cache_control":{"type":"ephemeral"}}]},
+        ]});
         assert_eq!(
-            messages[1]["content"][1]["cache_control"]["ttl"],
-            json!("1h")
+            elect_newest_cache_ttl(&mut body, "1h"),
+            TtlElection::Applied
         );
-        // ...and the older breakpoint is left untouched.
-        assert!(messages[0]["content"][0]["cache_control"]
-            .get("ttl")
+        assert_eq!(
+            body["messages"][1]["content"][1]["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
             .is_none());
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+    }
+
+    #[test]
+    fn elect_newest_cache_ttl_refuses_1h_after_any_earlier_5m_breakpoint() {
+        let default_cc = json!({"type":"ephemeral"});
+        let five_min = json!({"type":"ephemeral","ttl":"5m"});
+        let cases = [
+            (
+                "tool",
+                json!({
+                "tools":[{"name":"t","cache_control": default_cc}],
+                "messages":[{"role":"user","content":[
+                    {"type":"text","text":"n","cache_control":{"type":"ephemeral"}}]}]}),
+            ),
+            (
+                "system",
+                json!({
+                "system":[{"type":"text","text":"s","cache_control": five_min}],
+                "messages":[{"role":"user","content":[
+                    {"type":"text","text":"n","cache_control":{"type":"ephemeral"}}]}]}),
+            ),
+            (
+                "earlier message",
+                json!({"messages":[
+                {"role":"user","content":[
+                    {"type":"text","text":"o","cache_control": default_cc}]},
+                {"role":"user","content":[
+                    {"type":"text","text":"n","cache_control":{"type":"ephemeral"}}]}]}),
+            ),
+            (
+                "nested in tool_result",
+                json!({"messages":[
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"x","content":[
+                        {"type":"text","text":"o","cache_control": default_cc}]},
+                    {"type":"text","text":"n","cache_control":{"type":"ephemeral"}}]}]}),
+            ),
+        ];
+        for (name, body) in cases {
+            let mut out = body.clone();
+            assert_eq!(
+                elect_newest_cache_ttl(&mut out, "1h"),
+                TtlElection::EarlierShorterTtl,
+                "{name}"
+            );
+            assert_eq!(out, body, "{name}: body untouched");
+        }
+    }
+
+    #[test]
+    fn elect_newest_cache_ttl_leaves_automatic_caching_and_set_ttls_alone() {
+        let auto = json!({"cache_control":{"type":"ephemeral"},"messages":[
+            {"role":"user","content":[
+                {"type":"text","text":"n","cache_control":{"type":"ephemeral"}}]}]});
+        let mut out = auto.clone();
+        assert_eq!(
+            elect_newest_cache_ttl(&mut out, "1h"),
+            TtlElection::AutomaticCaching
+        );
+        assert_eq!(out, auto);
+
+        let set = json!({"system":"plain string, no breakpoints","messages":[
+            {"role":"user","content":[
+                {"type":"text","text":"n","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]});
+        let mut out = set.clone();
+        assert_eq!(
+            elect_newest_cache_ttl(&mut out, "1h"),
+            TtlElection::AlreadySet
+        );
+        assert_eq!(out, set);
     }
 
     #[test]
@@ -390,9 +528,13 @@ mod tests {
     }
 
     #[test]
-    fn set_newest_cache_ttl_is_false_without_a_breakpoint() {
-        let mut messages = vec![json!({"role":"user","content":[{"type":"text","text":"no cc"}]})];
-        assert!(!set_newest_cache_ttl(&mut messages, "1h"));
+    fn elect_newest_cache_ttl_reports_no_breakpoint() {
+        let mut body =
+            json!({"messages":[{"role":"user","content":[{"type":"text","text":"no cc"}]}]});
+        assert_eq!(
+            elect_newest_cache_ttl(&mut body, "1h"),
+            TtlElection::NoBreakpoint
+        );
     }
 
     #[test]
